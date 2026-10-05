@@ -133,6 +133,13 @@ def aolp_rgb(aolp_deg: np.ndarray, dolp: np.ndarray, scale: float = 0.2) -> np.n
     return np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
 
 
+def signed_rgb(t: np.ndarray) -> np.ndarray:
+    """t in [-1, 1] as uint8 RGB: blue (negative), white (0), red (positive)."""
+    t = np.clip(np.nan_to_num(np.asarray(t, dtype=np.float32)), -1.0, 1.0)[..., None]
+    neg, mid, pos = np.array([33, 102, 172.0]), np.array([247, 247, 247.0]), np.array([178, 24, 43.0])
+    return np.where(t < 0, mid + (neg - mid) * -t, mid + (pos - mid) * t).astype(np.uint8)
+
+
 def derived(s0: np.ndarray, s1: np.ndarray, s2: np.ndarray) -> dict[str, np.ndarray]:
     """Luminance DoLP, AoLP (degrees, [0, 180)) and normalised S1/S0, S2/S0, as the dataset defines them."""
     l0, l1, l2 = s0 @ LUMA, s1 @ LUMA, s2 @ LUMA

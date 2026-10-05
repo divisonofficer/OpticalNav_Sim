@@ -237,7 +237,7 @@ def build_scene(scene: str, project: Path, repo_root: Path, out: Path, mode: str
             entry[key] = src
         variants[variant] = entry
 
-    tasks, problems = scene_tasks(scene, project, out)
+    tasks, problems = scene_tasks(scene, project, out, mode)
     references = capture_references(refs, project, dst / "reference", mode)
     meta = {
         "scan": scene,
@@ -289,8 +289,23 @@ def capture_references(refs: dict, project: Path, dst: Path, mode: str) -> list[
     return out
 
 
-def scene_tasks(scene: str, project: Path, out: Path) -> tuple[dict[str, list], list[str]]:
+def copy_navigation(scene: str, project: Path, out: Path, mode: str) -> int:
+    """The scene's navigation support graph (states and transitions; episode generation needs it) and its
+    original OpticalNav episodes (step-aligned path_nodes/path_headings; replay needs them) into the pack."""
+    src, dst = project / "scenes" / scene, out / "scenes" / scene
+    graph = src / "navigation_support_graph.json"
+    if graph.is_file():
+        link(graph, dst / "navigation_support_graph.json", mode)
+    count = 0
+    for path in sorted(src.glob("episodes/*/*.json")):
+        link(path, dst / "episodes" / path.parent.name / path.name, mode)
+        count += 1
+    return count
+
+
+def scene_tasks(scene: str, project: Path, out: Path, mode: str = "hard") -> tuple[dict[str, list], list[str]]:
     """R2R rows for one scene from the project's episodes and the pack's connectivity -> scenes/<scene>/r2r.json."""
+    copy_navigation(scene, project, out, mode)
     rows = json.loads((out / "connectivity" / f"{scene}_connectivity.json").read_text())
     pos = {r["image_id"]: (r["pose"][3], r["pose"][7], r["pose"][11]) for r in rows}
     adjacency = {(rows[i]["image_id"], rows[j]["image_id"]) for i in range(len(rows))
@@ -349,7 +364,7 @@ def main() -> int:
     for scene in scenes:
         try:
             if args.tasks_only:
-                scene_tasks(scene, project, out)
+                scene_tasks(scene, project, out, args.link)
             else:
                 build_scene(scene, project, repo_root, out, args.link)
         except Exception as exc:  # noqa: BLE001 - one broken scene must not sink the pack

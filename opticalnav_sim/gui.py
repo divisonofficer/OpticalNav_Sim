@@ -37,13 +37,6 @@ PAGE = Path(__file__).with_name("gui.html")
 CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2")
 
 
-def _diverging(t: np.ndarray) -> np.ndarray:
-    """t in [-1, 1]: blue (negative), white (0), red (positive)."""
-    t = np.clip(np.nan_to_num(t), -1.0, 1.0)[..., None]
-    neg, mid, pos = np.array([33, 102, 172.0]), np.array([247, 247, 247.0]), np.array([178, 24, 43.0])
-    return np.where(t < 0, mid + (neg - mid) * -t, mid + (pos - mid) * t).astype(np.uint8)
-
-
 def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
     """uint8 RGB image of one channel; ``scale`` is the DoLP (and |S1/S0|, |S2/S0|) shown at full colour."""
     if channel == "rgb":
@@ -54,7 +47,7 @@ def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
     if channel == "aolp":
         return stokes.aolp_rgb(d["aolp_deg"], d["dolp"], scale)
     if channel in ("s1", "s2"):
-        return _diverging(d[f"{channel}_over_s0"] / scale)
+        return stokes.signed_rgb(d[f"{channel}_over_s0"] / scale)
     raise KeyError(channel)
 
 

@@ -288,6 +288,117 @@ def test_gui_session_and_routes():
         locked.shutdown()
 
 
+def test_episode_replay_bundle(tmp_path=None):
+    import tempfile
+
+    from opticalnav_sim import episodes, tonemap
+    from opticalnav_sim.bundle import BundleWriter
+
+    raw = {"episode_id": "scene_val_unseen_000001", "scene_id": "scene", "split": "val_unseen",
+           "path_nodes": ["v0", "v0", "v1", "v1"], "path_headings": ["h_000", "h_015", "h_015", "h_015"],
+           "actions": ["turn_right", "move_forward", "move_forward", "stop"], "timesteps": []}
+    ep = episodes.parse(raw)
+    assert [s.frame_key for s in ep.steps][1] == ("v0", "h_015") and ep.unique_frames() == [
+        ("v0", "h_000"), ("v0", "h_015"), ("v1", "h_015")]
+    legacy = episodes.parse({"episode_id": "e", "scene_id": "scene", "path_nodes": ["v0", "v1"], "actions": ["a", "b", "c"],
+                             "timesteps": [{"action": a, "extras": {"node_id": n, "heading_id": h}}
+                                           for a, n, h in (("a", "v0", "h_000"), ("b", "v0", "h_030"), ("c", "v1", "h_030"))]})
+    assert [s.frame_key for s in legacy.steps] == [("v0", "h_000"), ("v0", "h_030"), ("v1", "h_030")]
+    # camera and flat layout round-trip the export's convention
+    c2w = episodes.camera_to_world((1.0, -2.0), 15.0, MOUNT)
+    assert np.abs(frames.legacy_flat_to_matrix(episodes.flat(c2w)) - c2w).max() == 0.0
+    assert abs(episodes.base_pose((1.0, -2.0), 15.0, MOUNT)[1, 3] - 1.5) < 1e-12
+
+    # one exposure for every frame: a bright frame does not darken the next one
+    dim = np.full((8, 8, 3), 0.1, np.float32)
+    bright = dim.copy(); bright[:2] = 50.0
+    tone = tonemap.Tone("fixed", exposure=5.0, white=4.0)
+    assert tone(dim)[4, 4, 0] == tone(bright)[4, 4, 0]
+    auto = tonemap.Tone("auto")
+    assert auto(dim)[4, 4, 0] != auto(bright)[4, 4, 0]
+    ep_tone = tonemap.Tone("episode")
+    first = ep_tone(dim)
+    assert ep_tone(bright)[4, 4, 0] == first[4, 4, 0]
+
+    out = Path(tempfile.mkdtemp())
+    w = BundleWriter(out, tone=tone, hdr=("npz",))
+    stk = {k: np.full((6, 8, 3), v, np.float32) for k, v in (("s0", 0.5), ("s1", 0.05), ("s2", -0.05), ("s3", 0.0))}
+    for variant in ("base", "active_polar"):
+        w.add_frame(scene_id="scene", variant=variant, node_id="v0", heading_id="h_015", camera_to_world=c2w,
+                    base_pose=None, fov_deg=90.0, resolution=(8, 6), stokes_images=stk, render={"spp": 4})
+    w.add_frame(scene_id="scene", variant="base", node_id="v0", heading_id="h_015", camera_to_world=c2w,
+                base_pose=None, fov_deg=90.0, resolution=(8, 6), stokes_images=stk, render={"spp": 4})  # dedup
+    w.add_episode(raw)
+    meta = w.close()
+    rows = [json.loads(line) for line in (out / "index.jsonl").read_text().splitlines()]
+    assert meta["frame_count"] == 2 and len(rows) == 6 and meta["tonemap"]["scope"] == "fixed"
+    assert {r["variant"] for r in rows} == {"base", "perturbed_active_polar"}
+    assert rows[0]["frame_id"] == "scene_v0_h_015" and rows[0]["vp_id"] == "v0" and rows[0]["yaw_deg"] == 15.0
+    assert (out / rows[0]["image"]).is_file() and (out / "episodes/val_unseen/scene_val_unseen_000001.json").is_file()
+    raw_npz = np.load(out / "polarization_raw/base/scene_v0_h_015__polar_cam__stokes.npz")
+    assert raw_npz["s1"].dtype == np.float16 and raw_npz["s0"].shape == (6, 8, 3)
+
+    # the same bundle read back as the wizard uploads it: zipped under bundle/, split into byte parts
+    import zipfile
+
+    from opticalnav_sim.sources import open_source
+
+    up = Path(tempfile.mkdtemp())
+    with zipfile.ZipFile(up / "bundle.zip", "w") as z:
+        for f in out.rglob("*"):
+            if f.is_file():
+                z.write(f, "bundle/" + f.relative_to(out).as_posix())
+    data = (up / "bundle.zip").read_bytes()
+    (up / "bundle.zip").unlink()
+    for i in range(0, len(data), 1500):
+        (up / f"bundle.zip.part{i // 1500:03d}").write_bytes(data[i:i + 1500])
+    assert len(list(up.glob("bundle.zip.part*"))) > 2
+    for where in (up / "bundle.zip.part000", up, out):
+        src = open_source(where)
+        assert src.kind == "export bundle"
+        got = src.episodes("scene", ["val_unseen"])
+        assert [e.episode_id for e in got] == ["scene_val_unseen_000001"] and got[0].steps[2].node_id == "v1"
+        s = src.stokes("scene", "active_polar", "v0", "h_015")
+        assert s is not None and float(s["s1"][0, 0, 0]) == float(np.float16(0.05))
+        assert src.stokes("scene", "base", "v9", "h_000") is None
+
+
+def test_generated_episodes_follow_the_support_graph():
+    from opticalnav_sim import episodes
+    from opticalnav_sim.generate import SupportGraph, generate
+
+    # a 1x5 lane of poses 0.25 m apart, 24 headings each, forward lanes both ways along x
+    poses = [{"motion_pose_id": f"p{i}", "position": [0.25 * i, 0.0, 0.0]} for i in range(5)]
+    heads = [f"h_{15 * k:03d}" for k in range(24)]
+    states = [{"motion_state_id": f"p{i}:{h}", "motion_pose_id": f"p{i}", "heading_id": h} for i in range(5) for h in heads]
+    trans, edges, n = [], [], 0
+    for i in range(5):
+        for k, h in enumerate(heads):
+            for action, kk in (("turn_left", (k + 1) % 24), ("turn_right", (k - 1) % 24)):
+                n += 1
+                trans.append({"transition_id": f"t{n}", "source_state_id": f"p{i}:{h}",
+                              "target_state_id": f"p{i}:{heads[kk]}", "action": action})
+        for j, h in ((i + 1, "h_090"), (i - 1, "h_270")):
+            if 0 <= j < 5:
+                n += 1
+                trans.append({"transition_id": f"t{n}", "source_state_id": f"p{i}:{h}", "target_state_id": f"p{j}:{h}",
+                              "action": "move_forward"})
+                edges.append({"source": f"p{i}", "target": f"p{j}", "distance_m": 0.25, "action": "move_forward"})
+    raw = {"profile_id": "adaptive_navigation_support_v4", "scene_id": "scene", "place_graph_id": "g", "poses": poses,
+           "states": states, "transitions": trans, "edges": edges, "forward_step_m": 0.25}
+    graph = SupportGraph(raw)
+    eps = generate(graph, 4, "val_unseen", seed=3, min_m=0.5, max_m=1.0)
+    assert len(eps) == 4 and len({(e["start_node"], e["goal_node"]) for e in eps}) == 4
+    valid = {(t["source_state_id"], t["target_state_id"], t["action"]) for t in trans}
+    for e in eps:
+        st = [f"{a}:{b}" for a, b in zip(e["path_nodes"], e["path_headings"])]
+        assert all((a, b, act) in valid for a, b, act in zip(st, st[1:], e["actions"])) and e["actions"][-1] == "stop"
+        assert 0.5 <= e["metadata"]["path_distance_m"] <= 1.0 and e["episode_id"].startswith("scene_val_unseen_sim_")
+        assert len(episodes.parse(e).steps) == len(e["actions"]) == len(e["timesteps"])
+    assert generate(graph, 4, seed=3, min_m=0.5, max_m=1.0)[0]["path_nodes"] == \
+        generate(graph, 4, seed=3, min_m=0.5, max_m=1.0)[0]["path_nodes"]  # the seed fixes the draw
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
