@@ -165,10 +165,12 @@ class Resident:
 
             fkey = ("batch",) + key + (int(spp), int(seed))
             if fkey not in self.frozen:
+                # the sensor is an argument, not a closure value: a frozen replay only sees updated slot
+                # poses on objects it receives as inputs (production keeps its batch sensor inside the scene)
                 self.frozen[fkey] = dr.freeze(
-                    lambda scene, sn=sensor, n=int(spp), sd=int(seed): mi.render(scene, sensor=sn, spp=n, seed=sd),
+                    lambda scene, sn, n=int(spp), sd=int(seed): mi.render(scene, sensor=sn, spp=n, seed=sd),
                     backend=dr.JitBackend.CUDA)
-            img = np.array(self.frozen[fkey](self.scene))
+            img = np.array(self.frozen[fkey](self.scene, sensor))
         w = int(width)
         return [img[:, i * w:(i + 1) * w] for i in range(k)]
 

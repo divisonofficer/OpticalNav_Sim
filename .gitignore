@@ -3,3 +3,4 @@ packs_done_*.flag
 __pycache__/
 *.egg-info/
 results*.json
+runs/

@@ -51,7 +51,12 @@ def main() -> int:
                  for i in range(k)]
         for rep in range(args.repeat):
             t = time.perf_counter()
-            client.render(views)
+            try:
+                client.render(views)
+            except RuntimeError as exc:  # e.g. out of GPU memory at large K: record it and move on
+                rows.append({"mode": args.mode, "spp": args.spp, "k": k, "error": str(exc)[:200]})
+                print(json.dumps(rows[-1]), flush=True)
+                break
             wall = time.perf_counter() - t
             tm = client.last_timing
             row = {"mode": args.mode, "spp": args.spp, "k": k, "rep": rep, "wall_s": round(wall, 2),
