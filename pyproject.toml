@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opticalnav-sim"
+version = "0.1.0"
+description = "Matterport3DSimulator-compatible API for OpticalNav scenes with physically based polarization (Stokes) renders"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "GPL-3.0-or-later"}
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+server = ["pillow"]   # plus a Mitsuba 3 build with an *_rgb_polarized variant (see README)
+
+[tool.setuptools]
+packages = ["opticalnav_sim"]
