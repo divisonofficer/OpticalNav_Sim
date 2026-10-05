@@ -142,6 +142,7 @@ print(sim.timingInfo())
   - 데이터셋 `heading_id` h_XXX ↔ heading π − radians(XXX).
 - **에피소드:** 0.25 m 격자라 최단 경로도 평균 약 230스텝입니다. 평가 성공 반경 기본 3 m(R2R), OpticalNav 자체 프로토콜은 0.5 m였습니다.
 - **freeze 없이 돌릴 때:** 패스 크기 `OPTICALNAV_SIM_SPP_CHUNK`(polar, 기본 64), `OPTICALNAV_SIM_SPP_CHUNK_RGB`(기본 256)가 메모리를 정하고, 패스마다 트레이싱이 반복됩니다. 배치에서는 이 값이 K개 뷰의 합계 예산입니다.
+- **git:** 저장소 파일은 NAS의 uid 1025 소유(권한 777)라 다른 PC에서는 `dubious ownership`이 납니다. `git config --global --add safe.directory /jarvis/project/opticalnav_sim`을 한 번 실행하세요. 이 서버에서는 전역 설정을 건드리지 않고 `GIT_CONFIG_GLOBAL`로 우회했습니다.
 - **서버 운영:**
   - 서버는 시작할 때 팩의 씬 목록을 읽으므로 씬을 추가하면 재시작하세요.
   - 공유 장비에서는 `timeout`으로 띄워 GPU를 붙잡은 채 남지 않게 하세요. Device 2에서 3시간 대여를 7시간 넘긴 적이 있습니다.
