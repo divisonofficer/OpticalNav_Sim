@@ -212,6 +212,82 @@ def test_http_roundtrip():
         secured.shutdown()
 
 
+def test_gui_session_and_routes():
+    from urllib.request import Request, urlopen
+
+    from opticalnav_sim import gui
+
+    sim = MatterSim.Simulator()
+    sim.setCameraResolution(64, 48)
+    sim.initialize()
+    sim._client = FakeClient(_rows([(0, 0), (0, 2), (2, 0)], [(0, 1), (0, 2)]))
+    session = gui.Session(sim, {"scene": ["base", "perturbed"]}, pass_spp=16, target_spp=48)
+    st = session.start("scene", "v0", 0.0)
+    assert st["frame_spp"] == 16 and st["passes"] == 1 and not st["done"]
+    assert [c["viewpoint"] for c in st["candidates"]] == ["v1"]
+    first = sim._client.views[-1]
+    assert first["spp"] == 16 and first["seed"] == 0 and first["preview"] is False
+    for want in (2, 3):  # passes keep the spp (one freeze recording) and change the seed
+        st = session.refine(st["frame_id"])
+        assert st["passes"] == want and sim._client.views[-1]["seed"] == want - 1 and sim._client.views[-1]["spp"] == 16
+    assert st["done"] and st["frame_spp"] == 48
+    assert session.refine(st["frame_id"])["passes"] == 3  # target reached: no more passes
+    assert session.refine(st["frame_id"] - 1)["frame_id"] == st["frame_id"]  # stale refine is a no-op
+    st = session.act("forward")
+    assert st["passes"] == 1 and sim._client.views[-1]["seed"] == 0  # a move starts over
+    assert st["viewpoint"] == "v1" and st["step"] == 1 and st["trail"] == [[0.0, 0.0], [0.0, 2.0]]
+    st = session.act("turn", 6)  # 6 x 15 degrees
+    assert abs(st["heading_deg"] - 90.0) < 1e-6
+    st = session.configure({"variant": "perturbed"})
+    assert sim._client.views[-1]["variant"] == "perturbed" and st["frame_variant"] == "perturbed"
+    st = session.goto(1.9, 0.1)
+    assert st["viewpoint"] == "v2" and st["step"] == 0
+    for ch in gui.CHANNELS:
+        assert session.image(st["frame_id"], ch, 0.2)[:2] == b"\xff\xd8"  # JPEG
+    assert session.probe(st["frame_id"], 999, -5)["x"] == 63
+
+    httpd = gui.ThreadingHTTPServer(("127.0.0.1", 0), gui.make_handler(session))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        assert b"OpticalNav Sim Viewer" in urlopen(base + "/").read()
+        post = Request(base + "/api/action", data=json.dumps({"op": "pitch", "value": 1}).encode(),
+                       headers={"Content-Type": "application/json"})
+        st = json.loads(urlopen(post).read())
+        assert abs(st["elevation_deg"] - 10.0) < 1e-6
+        assert urlopen(f"{base}/api/frame/{st['frame_id']}/aolp.jpg").read()[:2] == b"\xff\xd8"
+        assert len(json.loads(urlopen(base + "/api/graph?scene=scene").read())["x"]) == 3
+        try:
+            urlopen(Request(base + "/api/action", data=b'{"op": "move", "value": 7}'))
+            raise AssertionError("invalid candidate accepted")
+        except Exception as exc:  # urllib raises HTTPError for 400
+            assert "400" in str(exc)
+    finally:
+        httpd.shutdown()
+
+    locked = gui.ThreadingHTTPServer(("127.0.0.1", 0), gui.make_handler(session, token="s3cret"))
+    threading.Thread(target=locked.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{locked.server_address[1]}"
+        for path in ("/", "/api/state", f"/api/state?token=wrong"):
+            try:
+                urlopen(base + path)
+                raise AssertionError(f"{path} served without the token")
+            except Exception as exc:
+                assert "401" in str(exc)
+        assert json.loads(urlopen(Request(base + "/api/state", headers={"Authorization": "Bearer s3cret"})).read())["started"]
+        assert json.loads(urlopen(Request(base + "/api/state", headers={"Cookie": "opticalnav_gui=s3cret"})).read())["started"]
+        # /?token= sets the cookie and redirects to / (urllib follows the redirect but keeps no cookies)
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", locked.server_address[1])
+        conn.request("GET", "/?token=s3cret")
+        resp = conn.getresponse()
+        assert resp.status == 303 and "opticalnav_gui=s3cret" in resp.getheader("Set-Cookie") and resp.getheader("Location") == "/"
+        conn.close()
+    finally:
+        locked.shutdown()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

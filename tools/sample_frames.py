@@ -4,9 +4,10 @@
     python tools/sample_frames.py --pack packs/opticalnav-v0.2 --scene SCENE --server URL \
         --mode polar --spp 128 --denoise off,on --out samples/
 
-Writes JPEGs of the RGB preview and, in polar mode, a DoLP map (fixed 0-0.2 range,
-the same scale for every image) for the simulator frames and for the stored dataset
-frame of the same view, plus samples.json with the per-image S0 error and timing.
+Writes JPEGs of the RGB preview and, in polar mode, DoLP (black to red, fixed 0-0.2
+range) and AoLP (hue, brightness DoLP) maps for the simulator frames and for the
+stored dataset frame of the same view, plus samples.json with the per-image S0
+error and timing.
 """
 from __future__ import annotations
 
@@ -21,16 +22,6 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from opticalnav_sim import MatterSim, frames, stokes  # noqa: E402
-
-LUT = np.array([[0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66],
-                [245, 125, 21], [250, 193, 39], [252, 255, 164]], np.float32)  # inferno-like stops
-
-
-def colorize(v: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    t = np.clip((np.nan_to_num(v) - lo) / (hi - lo), 0.0, 1.0) * (len(LUT) - 1)
-    i = np.minimum(t.astype(int), len(LUT) - 2)
-    f = (t - i)[..., None]
-    return (LUT[i] * (1 - f) + LUT[i + 1] * f).astype(np.uint8)
 
 
 def save(img: np.ndarray, path: Path) -> None:
@@ -60,7 +51,9 @@ def main() -> int:
     record = json.loads(record_path.read_text()) if record_path.is_file() else {"view": ref, "frames": []}
     if not (args.out / "dataset_rgb.jpg").is_file():
         save(np.asarray(Image.open(folder / "polar_rgb_preview.png").convert("RGB")), args.out / "dataset_rgb.jpg")
-        save(colorize(stokes.derived(s0r, s1r, s2r)["dolp"], 0.0, 0.2), args.out / "dataset_dolp.jpg")
+        dr = stokes.derived(s0r, s1r, s2r)
+        save(stokes.dolp_rgb(dr["dolp"]), args.out / "dataset_dolp.jpg")
+        save(stokes.aolp_rgb(dr["aolp_deg"], dr["dolp"]), args.out / "dataset_aolp.jpg")
 
     sim = MatterSim.Simulator()
     sim.setDatasetPath(args.server)
@@ -95,8 +88,9 @@ def main() -> int:
             if st.stokes is not None:
                 d = stokes.derived(st.stokes["s0"].astype(np.float32), st.stokes["s1"].astype(np.float32),
                                    st.stokes["s2"].astype(np.float32))
-                save(colorize(d["dolp"], 0.0, 0.2), args.out / f"{stem}_dolp.jpg")
-                entry["dolp"] = f"{stem}_dolp.jpg"
+                save(stokes.dolp_rgb(d["dolp"]), args.out / f"{stem}_dolp.jpg")
+                save(stokes.aolp_rgb(d["aolp_deg"], d["dolp"]), args.out / f"{stem}_aolp.jpg")
+                entry["dolp"], entry["aolp"] = f"{stem}_dolp.jpg", f"{stem}_aolp.jpg"
                 ref_dolp = stokes.derived(s0r, s1r, s2r)["dolp"]
                 entry["dolp_mae"] = round(float(np.abs(d["dolp"] - ref_dolp).mean()), 4)
             record["frames"] = [f for f in record["frames"] if f.get("rgb") != entry["rgb"]] + [entry]

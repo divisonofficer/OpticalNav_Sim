@@ -116,11 +116,25 @@ class Resident:
             return (acc / total).astype(np.float32)
         import drjit as dr
 
-        key = (int(spp), int(width), int(height), int(seed))
-        if key not in self.frozen:  # spp, film size and seed are baked into each recording
-            self.frozen[key] = dr.freeze(lambda scene, n=int(spp), s=int(seed): mi.render(scene, spp=n, seed=s),
-                                         backend=dr.JitBackend.CUDA)
-        return np.array(self.frozen[key](self.scene))
+        key = (int(spp), int(width), int(height))
+        if key not in self.frozen:  # spp and film size are baked into each recording
+            # the seed is an input rather than a constant, so one recording serves every seed
+            # (progressive viewers render the same camera again and again with new seeds); every input
+            # changes between frames, so all are recorded opaque rather than as literals
+            self.frozen[key] = dr.freeze(lambda scene, sd, n=int(spp): mi.render(scene, spp=n, seed=sd),
+                                         backend=dr.JitBackend.CUDA, auto_opaque=False)
+            self._settle(self.frozen[key], self.scene)
+        return np.array(self.frozen[key](self.scene, dr.opaque(mi.UInt32, int(seed))))
+
+    def _settle(self, frozen, *args) -> None:
+        """Record, then replay once. The second call of a new recording records again (measured on
+        Device 1: 79 s, then 71 s, then 0.1 s, with the same or a new seed; pre-seeding the sensor's
+        sampler did not prevent it), most likely because the first render leaves scene state such as the
+        sampler and film in a new layout. Paying both now keeps later frames at replay speed."""
+        import drjit as dr
+
+        for _ in range(2):
+            dr.eval(frozen(*args, dr.opaque(self.mi.UInt32, 0)))
 
 
     def render_many(self, cams: list, width: int, height: int, hfov_deg: float, spp: int, seed: int) -> list:
@@ -163,14 +177,15 @@ class Resident:
         else:
             import drjit as dr
 
-            fkey = ("batch",) + key + (int(spp), int(seed))
+            fkey = ("batch",) + key + (int(spp),)
             if fkey not in self.frozen:
-                # the sensor is an argument, not a closure value: a frozen replay only sees updated slot
-                # poses on objects it receives as inputs (production keeps its batch sensor inside the scene)
+                # the sensor and seed are arguments, not closure values: a frozen replay only sees updated
+                # slot poses on objects it receives as inputs (production keeps its batch sensor inside the scene)
                 self.frozen[fkey] = dr.freeze(
-                    lambda scene, sn, n=int(spp), sd=int(seed): mi.render(scene, sensor=sn, spp=n, seed=sd),
-                    backend=dr.JitBackend.CUDA)
-            img = np.array(self.frozen[fkey](self.scene, sensor))
+                    lambda scene, sn, sd, n=int(spp): mi.render(scene, sensor=sn, spp=n, seed=sd),
+                    backend=dr.JitBackend.CUDA, auto_opaque=False)
+                self._settle(self.frozen[fkey], self.scene, sensor)
+            img = np.array(self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed))))
         w = int(width)
         return [img[:, i * w:(i + 1) * w] for i in range(k)]
 
@@ -357,13 +372,18 @@ class Renderer:
         return outs, kernels, t1 - t0, time.perf_counter() - t1
 
     @staticmethod
-    def _finish(mode: str, out: dict, dtype) -> dict[str, np.ndarray]:
+    def _finish(mode: str, out: dict, dtype, preview: bool = True) -> dict[str, np.ndarray]:
+        """``preview=False`` skips the dataset preview recipe (about 40 ms at 512x384); the client then
+        tonemaps the radiance itself (MatterSim.setPreviewEnabled)."""
         if mode == "rgb":
             rad = out["radiance"]
-            return {"rgb": stokes.rgb_preview(rad, rad, np.zeros_like(rad), np.zeros_like(rad), percentile=0.995, blur=0.0),
-                    "radiance": rad.astype(dtype)}
-        result = {"rgb": stokes.rgb_preview(out["rgb_src"], out["s0"], out["s1"], out["s2"])}
-        result.update({k: out[k].astype(dtype) for k in ("s0", "s1", "s2", "s3")})
+            result = {"radiance": rad.astype(dtype)}
+            if preview:
+                result["rgb"] = stokes.rgb_preview(rad, rad, np.zeros_like(rad), np.zeros_like(rad), percentile=0.995, blur=0.0)
+            return result
+        result = {k: out[k].astype(dtype) for k in ("s0", "s1", "s2", "s3")}
+        if preview:
+            result["rgb"] = stokes.rgb_preview(out["rgb_src"], out["s0"], out["s1"], out["s2"])
         return result
 
     def render_views(self, views: list[dict], dtype) -> tuple[list[dict[str, np.ndarray]], dict[str, float]]:
@@ -380,7 +400,8 @@ class Renderer:
             outs, kernels, render_s, denoise_s = self._on_main(
                 key[2], self._render_on_worker, key, [c for _, c in checked[i:j]])
             t0 = time.perf_counter()
-            results.extend(self._finish(key[2], out, dtype) for out in outs)
+            results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)))
+                           for n, out in enumerate(outs))
             timing = {"render_s": render_s, "denoise_s": denoise_s if key[8] else 0.0,
                       "post_s": time.perf_counter() - t0, **kernels, "calls": 1,
                       # what is left of the render call once kernels are accounted for: tracing the scene

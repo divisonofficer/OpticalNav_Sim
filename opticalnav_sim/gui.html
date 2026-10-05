@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1316">
+<title>OpticalNav Sim Viewer</title>
+<style>
+/* Instrument layout. Desktop: two camera panes over a status strip, map and readouts on the right.
+   Phone: one pane with a channel switcher, a thumb pad under it, map and readouts below. */
+:root {
+  --bg: #0e1316; --panel: #151c20; --panel-2: #1b2429; --ink: #e2e9ec; --muted: #8b9ca4; --rule: #27333a;
+  --accent: #3fc9d4; --accent-2: #f08250; --warn: #e3a05a; --bad: #ef6b6b;
+  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); display: flex; flex-direction: column;
+  padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+button, select, input, summary { touch-action: manipulation; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 10px 16px; border-bottom: 1px solid var(--rule); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; font-weight: 700; }
+details.settings > summary { display: none; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.controls label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+select { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 6px; font: inherit; max-width: 100%; }
+input[type=range], input[type=checkbox] { accent-color: var(--accent); }
+select:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
+.views { min-width: 0; display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
+.panes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.pane { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.pane-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; min-height: 28px; }
+.tabs { display: flex; gap: 2px; background: var(--panel-2); border-radius: 5px; padding: 2px; flex-wrap: wrap; }
+.tabs button { font: 12px var(--mono); color: var(--muted); background: none; border: 0; border-radius: 3px; padding: 4px 9px; cursor: pointer; }
+.tabs button[aria-pressed=true] { background: var(--rule); color: var(--ink); }
+.scale { display: flex; align-items: center; gap: 6px; color: var(--muted); font: 12px var(--mono); }
+.scale input { width: 110px; }
+.frame { position: relative; background: #000; border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; aspect-ratio: 4 / 3; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
+.frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
+.cands { position: absolute; inset: 0; pointer-events: none; }
+.cand { position: absolute; transform: translate(-50%, -50%); pointer-events: auto; cursor: pointer;
+  min-width: 30px; height: 30px; border-radius: 15px; border: 2px solid var(--accent); background: rgba(14, 19, 22, .72);
+  color: var(--ink); font: 700 13px var(--mono); display: grid; place-items: center; padding: 0 6px; }
+.cand:hover, .cand:focus-visible { background: var(--accent); color: #062126; outline: none; }
+.cand.first { border-color: var(--accent-2); }
+.badge { position: absolute; left: 8px; top: 8px; font: 12px var(--mono); background: rgba(14, 19, 22, .75); padding: 2px 7px; border-radius: 3px; pointer-events: none; }
+.note { top: auto; bottom: 10px; right: 8px; left: 8px; text-align: center; white-space: normal; }
+.progress { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); width: 0; transition: width .12s linear; }
+.legend { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font: 11.5px var(--mono); color: var(--muted); min-height: 16px; }
+.legend-bar { height: 8px; border-radius: 2px; }
+.pad { display: none; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.pad button { min-height: 52px; font: 600 14px var(--sans); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-radius: 8px; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; line-height: 1.2; }
+.pad button span { font: 11px var(--sans); color: var(--muted); }
+.pad button:active { background: var(--rule); }
+.pad .go { border-color: var(--accent); }
+.status { display: flex; flex-wrap: wrap; gap: 4px 16px; font: 12.5px var(--mono); color: var(--muted); padding: 8px 10px; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; }
+.status b { color: var(--ink); font-weight: 500; }
+.busy { color: var(--warn); }
+.err { color: var(--bad); white-space: pre-wrap; font: 12.5px var(--mono); background: var(--panel); border: 1px solid var(--bad); border-radius: 4px; padding: 8px 10px; }
+aside { border-left: 1px solid var(--rule); background: var(--panel); display: flex; flex-direction: column; gap: 14px; padding: 14px; min-width: 0; }
+aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 6px; font-weight: 700; }
+#map { width: 100%; aspect-ratio: 1; background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; cursor: pointer; display: block; touch-action: manipulation; }
+dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; margin: 0; font: 12.5px var(--mono); }
+dt { color: var(--muted); }
+dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.keys { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; font-size: 12.5px; color: var(--muted); }
+kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: 3px; padding: 0 5px; }
+.hint { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+.touch-only { display: none; }
+@media (hover: none), (max-width: 760px) {
+  .pad { display: grid; }
+  .touch-only { display: block; }
+  .desk-only { display: none; }
+}
+@media (max-width: 1000px) {
+  main { grid-template-columns: minmax(0, 1fr); }
+  aside { border-left: 0; border-top: 1px solid var(--rule); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+}
+@media (max-width: 760px) {
+  header { padding: 8px 12px; gap: 6px 12px; }
+  details.settings { width: 100%; }
+  details.settings > summary { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--muted); font-size: 13px; list-style: none; padding: 4px 0; }
+  details.settings > summary::-webkit-details-marker { display: none; }
+  details.settings > summary::before { content: "▸"; }
+  details.settings[open] > summary::before { content: "▾"; }
+  .controls { flex-direction: column; align-items: stretch; gap: 8px; padding-top: 6px; }
+  .controls label { justify-content: space-between; }
+  .controls select { flex: 1; min-width: 0; }
+  .views { padding: 10px 12px; }
+  .panes { grid-template-columns: minmax(0, 1fr); }
+  #pane-b { display: none; }
+  aside { grid-template-columns: minmax(0, 1fr); padding: 12px; }
+  .scale input { width: 90px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>OpticalNav Sim Viewer</h1>
+  <details class="settings" id="settings">
+    <summary>설정</summary>
+    <div class="controls">
+      <label for="scene">씬 <select id="scene"></select></label>
+      <label for="variant">변형 <select id="variant"></select></label>
+      <label for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다.">패스 spp <select id="pass"></select></label>
+      <label for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다.">목표 spp <select id="target"></select></label>
+      <label for="denoise" title="패스마다 적용합니다"><input type="checkbox" id="denoise"> 디노이저</label>
+      <label for="auto"><input type="checkbox" id="auto" checked> 멈추면 누적</label>
+    </div>
+  </details>
+</header>
+<main>
+  <section class="views">
+    <div class="panes">
+      <div class="pane" id="pane-a">
+        <div class="pane-head">
+          <div class="tabs" role="group" aria-label="왼쪽 화면 채널" data-pane="a"></div>
+          <label class="scale" for="scale">범위 <input type="range" id="scale" min="0.05" max="1" step="0.05" value="0.2"> <span id="scale-v">0.20</span></label>
+        </div>
+        <div class="frame" id="frame-a">
+          <img id="img-a" alt="현재 시점">
+          <div class="cands" id="cands"></div>
+          <span class="badge" id="badge"></span>
+          <div class="progress" id="progress"></div>
+        </div>
+        <div class="legend" id="legend-a"></div>
+      </div>
+      <div class="pane" id="pane-b">
+        <div class="pane-head">
+          <div class="tabs" role="group" aria-label="오른쪽 화면 채널" data-pane="b"></div>
+        </div>
+        <div class="frame" id="frame-b"><img id="img-b" alt="현재 시점의 두 번째 채널"></div>
+        <div class="legend" id="legend-b"></div>
+      </div>
+    </div>
+    <div class="pad" role="group" aria-label="조작">
+      <button type="button" data-op="turn" data-v="-1">↶ 왼쪽<span id="pad-turn-l"></span></button>
+      <button type="button" class="go" data-op="forward">↑ 앞으로<span>정면 후보</span></button>
+      <button type="button" data-op="turn" data-v="1">↷ 오른쪽<span id="pad-turn-r"></span></button>
+      <button type="button" data-op="pitch" data-v="1">고개 위<span id="pad-up"></span></button>
+      <button type="button" data-op="about">↓ 뒤로 돌기<span>180°</span></button>
+      <button type="button" data-op="pitch" data-v="-1">고개 아래<span id="pad-down"></span></button>
+    </div>
+    <div class="status" id="status"><span>서버에 연결하는 중…</span></div>
+    <div class="err" id="error" hidden></div>
+  </section>
+  <aside>
+    <div>
+      <h2>지도</h2>
+      <canvas id="map" width="600" height="600" aria-label="연결 그래프 지도. 누르면 가장 가까운 지점으로 이동"></canvas>
+      <p class="hint">지도를 누르면 가장 가까운 그래프 지점으로 이동합니다(에피소드 단계가 0으로 돌아갑니다).</p>
+    </div>
+    <div>
+      <h2>현재 상태</h2>
+      <dl id="readout"></dl>
+      <h2 style="margin-top: 14px">픽셀 값</h2>
+      <dl id="probe"><dt>위치</dt><dd class="desk-only">이미지 위에 마우스를 올리세요</dd><dd class="touch-only">이미지를 탭하세요</dd></dl>
+    </div>
+    <div class="desk-only">
+      <h2>조작</h2>
+      <div class="keys">
+        <span><kbd>↑</kbd> <kbd>W</kbd></span><span>정면에 가장 가까운 후보로 이동</span>
+        <span><kbd>1</kbd>–<kbd>9</kbd></span><span>번호 후보로 이동</span>
+        <span><kbd>←</kbd> <kbd>→</kbd></span><span id="k-turn">좌우 회전</span>
+        <span><kbd>↓</kbd> <kbd>S</kbd></span><span>뒤로 돌기 (180°)</span>
+        <span><kbd>R</kbd> <kbd>F</kbd></span><span id="k-pitch">위/아래 보기</span>
+        <span><kbd>Space</kbd></span><span>누적 일시정지 / 재개</span>
+      </div>
+    </div>
+    <div class="touch-only">
+      <h2>터치 조작</h2>
+      <p class="hint">아래 버튼으로 움직이거나, 화면을 좌우로 밀어 회전합니다. 번호 원을 누르면 그 지점으로 갑니다. 화면을 탭하면 그 픽셀의 편광 값이 나옵니다.</p>
+    </div>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const PASS = [1, 2, 4, 8, 16, 32, 64];
+const TARGET = [64, 128, 256, 512, 1024, 2048, 4096];
+const CHANNELS = [["rgb", "RGB"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"]];
+const view = { a: "rgb", b: "dolp" };
+let S = null, graph = null;
+let queue = [], busy = false, busySince = 0, refineTimer = null;
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const res = await fetch(path, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function fillSelect(sel, values, current) {
+  sel.innerHTML = "";
+  for (const v of values) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = v; o.selected = String(v) === String(current);
+    sel.appendChild(o);
+  }
+}
+
+function buildTabs() {
+  document.querySelectorAll(".tabs").forEach((box) => {
+    const pane = box.dataset.pane;
+    box.innerHTML = "";
+    for (const [ch, label] of CHANNELS) {
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = label; b.dataset.ch = ch;
+      b.setAttribute("aria-pressed", String(view[pane] === ch));
+      b.addEventListener("click", () => {
+        view[pane] = ch;
+        box.querySelectorAll("button").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
+        showImages(); renderLegends();
+      });
+      box.appendChild(b);
+    }
+  });
+}
+
+async function boot() {
+  const wide = window.matchMedia("(min-width: 761px)");
+  const syncSettings = () => { $("settings").open = wide.matches; };
+  syncSettings(); wide.addEventListener("change", syncSettings);
+  buildTabs();
+  S = await api("/api/state");
+  const scenes = Object.keys(S.scans).sort();
+  const first = S.scene || scenes[0];
+  fillSelect($("scene"), scenes, first);
+  fillSelect($("pass"), PASS, S.pass_spp);
+  fillSelect($("target"), TARGET, S.target_spp);
+  $("denoise").checked = S.denoise;
+  $("k-turn").textContent = `좌우 ${S.turn_deg}° 회전`;
+  $("k-pitch").textContent = `위/아래 ${S.pitch_deg}° 보기`;
+  $("pad-turn-l").textContent = $("pad-turn-r").textContent = `${S.turn_deg}°`;
+  $("pad-up").textContent = $("pad-down").textContent = `${S.pitch_deg}°`;
+  fillVariants(first);
+  if (S.started) { await loadGraph(S.scene); render("load"); }
+  else await run(() => api("/api/start", { scene: first }), "첫 프레임", "move");
+}
+
+function fillVariants(scene) { fillSelect($("variant"), S.scans[scene] || ["base"], S.variant); }
+async function loadGraph(scene) { if (!graph || graph.scene !== scene) graph = await api(`/api/graph?scene=${encodeURIComponent(scene)}`); }
+
+// --- requests: one at a time; inputs that arrive meanwhile queue (up to 4) and cancel accumulation ---
+async function run(fn, what, kind) {
+  busy = true; busySince = performance.now(); tick(what);
+  clearTimeout(refineTimer);
+  try {
+    S = await fn();
+    $("error").hidden = true;
+    await loadGraph(S.scene);
+    render(kind);
+  } catch (e) {
+    $("error").hidden = false;
+    $("error").textContent = `${what} 실패: ${e.message}` +
+      (/frozen|not permitted|record/.test(e.message) ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "");
+    queue = [];
+  } finally {
+    busy = false; tick();
+    if (queue.length) { const next = queue.shift(); run(next.fn, next.what, "move"); }
+    else scheduleRefine(kind);
+  }
+}
+function enqueue(fn, what) {
+  clearTimeout(refineTimer);
+  if (!busy) return run(fn, what, "move");
+  if (queue.length < 4) queue.push({ fn, what });
+}
+function act(op, value) { enqueue(() => api("/api/action", { op, value }), op === "forward" ? "이동" : op); }
+
+let paused = false;
+function scheduleRefine(kind) {
+  clearTimeout(refineTimer);
+  if (paused || !$("auto").checked || !S || !S.started || S.done) return;
+  const id = S.frame_id;
+  // after a move, wait briefly in case another key follows; after a pass, go straight to the next one
+  refineTimer = setTimeout(() => {
+    if (!busy && !queue.length && S.frame_id === id) run(() => api("/api/refine", { frame_id: id }), "누적", "pass");
+  }, kind === "pass" ? 0 : 150);
+}
+
+function tick(what) {
+  if (what) tick.what = what;
+  if (!busy) { renderStatus(); return; }
+  const ms = performance.now() - busySince;
+  if (ms > 600) {
+    const slow = ms > 3000 ? " · 이 spp의 첫 렌더면 freeze 기록에 약 70 s, 새 변형이면 씬 로드에 약 80 s가 더 걸립니다" : "";
+    $("status").innerHTML = `<span class="busy">${tick.what} 렌더 중 ${(ms / 1000).toFixed(1)} s${slow}</span>`;
+  }
+  setTimeout(() => { if (busy) tick(); }, 200);
+}
+
+// --- drawing ---
+function frameUrl(ch) { return `/api/frame/${S.frame_id}/${ch}.jpg?scale=${$("scale").value}`; }
+function swap(img, url) { const pre = new Image(); pre.onload = () => { img.src = url; }; pre.src = url; }
+function showImages() {
+  if (!S || !S.started) return;
+  swap($("img-a"), frameUrl(view.a));
+  if (getComputedStyle($("pane-b")).display !== "none") swap($("img-b"), frameUrl(view.b));
+}
+
+function render(kind) {
+  if (!S || !S.started) return;
+  showImages();
+  $("badge").textContent = `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
+  $("progress").style.width = `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
+  if (kind !== "pass") { drawCandidates(); drawMap(); renderReadout(); }
+  renderStatus(); renderLegends();
+  if ($("variant").value !== S.frame_variant) fillVariants(S.scene);
+}
+
+function drawCandidates() {
+  const box = $("cands"); box.innerHTML = "";
+  if (!S.candidates.length) {
+    const note = document.createElement("span");
+    note.className = "badge note";
+    note.textContent = "화면 안에 갈 수 있는 지점이 없습니다. 좌우로 돌아보세요";
+    box.appendChild(note);
+  }
+  const th = Math.tan(S.hfov_deg * Math.PI / 360), tv = Math.tan(S.vfov_deg * Math.PI / 360);
+  S.candidates.slice(0, 9).forEach((c, i) => {
+    const x = 50 * (1 + Math.tan(c.rel_heading_deg * Math.PI / 180) / th);
+    const y = Math.min(88, Math.max(14, 50 * (1 - Math.tan(c.rel_elevation_deg * Math.PI / 180) / tv) + 18));
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "cand" + (i === 0 ? " first" : ""); btn.textContent = String(i + 1);
+    btn.style.left = `${Math.min(96, Math.max(4, x))}%`; btn.style.top = `${y}%`;
+    btn.title = `${c.viewpoint} · ${c.rel_heading_deg.toFixed(0)}° · ${c.distance_m.toFixed(2)} m`;
+    btn.setAttribute("aria-label", `후보 ${i + 1}로 이동: ${btn.title}`);
+    btn.addEventListener("click", (ev) => { ev.stopPropagation(); if (!busy) act("move", c.index); });
+    box.appendChild(btn);
+  });
+}
+
+function mapTransform(canvas) {
+  const pad = 24, w = canvas.width, h = canvas.height;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (let i = 0; i < graph.x.length; i++) { x0 = Math.min(x0, graph.x[i]); x1 = Math.max(x1, graph.x[i]); y0 = Math.min(y0, graph.y[i]); y1 = Math.max(y1, graph.y[i]); }
+  const s = Math.min((w - 2 * pad) / Math.max(x1 - x0, 1e-3), (h - 2 * pad) / Math.max(y1 - y0, 1e-3));
+  const ox = (w - s * (x1 - x0)) / 2 - s * x0, oy = (h + s * (y1 - y0)) / 2 + s * y0;
+  return { to: (x, y) => [ox + s * x, oy - s * y], from: (px, py) => [(px - ox) / s, (oy - py) / s] };
+}
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function drawMap() {
+  const c = $("map"), g = c.getContext("2d");
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  if (!r.width) return;
+  c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr);
+  g.clearRect(0, 0, c.width, c.height);
+  if (!graph) return;
+  const T = mapTransform(c);
+  g.fillStyle = css("--muted"); g.globalAlpha = 0.55;
+  const dot = Math.max(1.5, 1.8 * dpr);
+  for (let i = 0; i < graph.x.length; i++) { const [px, py] = T.to(graph.x[i], graph.y[i]); g.fillRect(px - dot / 2, py - dot / 2, dot, dot); }
+  g.globalAlpha = 1;
+  if (S.trail.length > 1) {
+    g.strokeStyle = css("--accent-2"); g.lineWidth = 2 * dpr; g.beginPath();
+    S.trail.forEach(([x, y], i) => { const [px, py] = T.to(x, y); i ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.stroke();
+  }
+  const [cx, cy] = T.to(S.position[0], S.position[1]);
+  const h = S.heading_deg * Math.PI / 180, half = S.hfov_deg * Math.PI / 360, len = 46 * dpr;
+  g.fillStyle = "rgba(63, 201, 212, 0.18)"; g.beginPath(); g.moveTo(cx, cy);
+  for (const a of [h - half, h + half]) g.lineTo(cx + len * Math.sin(a), cy - len * Math.cos(a));
+  g.closePath(); g.fill();
+  g.fillStyle = css("--accent");
+  for (const cand of S.candidates.slice(0, 9)) { const [px, py] = T.to(cand.x, cand.y); g.beginPath(); g.arc(px, py, 2.5 * dpr, 0, 7); g.fill(); }
+  g.beginPath(); g.arc(cx, cy, 5 * dpr, 0, 7); g.fill();
+}
+
+function renderReadout() {
+  const rows = [["씬", S.scene], ["변형", S.frame_variant], ["지점", S.viewpoint], ["단계", S.step],
+    ["위치 (m)", `${S.position[0].toFixed(2)}, ${S.position[1].toFixed(2)}`],
+    ["헤딩", `${S.heading_deg.toFixed(1)}°`], ["고도각", `${S.elevation_deg.toFixed(1)}°`], ["보이는 후보", S.candidates.length]];
+  $("readout").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+
+function renderStatus() {
+  if (!S || !S.started || busy && performance.now() - busySince > 600) return;
+  const t = S.timing;
+  $("status").innerHTML = `<span><b>${S.frame_spp}</b>/${S.target_spp} spp</span><span>패스 <b>${S.passes}</b> × ${S.pass_spp}</span>` +
+    `<span>패스 왕복 <b>${t.wall_ms.toFixed(0)}</b> ms</span><span>서버 <b>${t.server_ms.toFixed(0)}</b> ms</span>` +
+    `<span>GPU <b>${t.gpu_ms.toFixed(0)}</b> ms</span><span>≈ <b>${(1000 / Math.max(t.wall_ms, 1)).toFixed(1)}</b> fps</span>` +
+    (paused ? `<span class="busy">누적 멈춤 (Space)</span>` : "") + (queue.length ? `<span class="busy">대기 ${queue.length}</span>` : "");
+}
+
+const GRAD = {
+  dolp: "linear-gradient(90deg,#000,#f00)",
+  aolp: "linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)",
+  s: "linear-gradient(90deg,#2166ac,#f7f7f7,#b2182b)",
+};
+function legendHtml(ch, sc) {
+  if (ch === "rgb") return "";
+  if (ch === "dolp") return `<span>0</span><div class="legend-bar" style="background:${GRAD.dolp}"></div><span>DoLP ${sc}</span>`;
+  if (ch === "aolp") return `<span>0°</span><div class="legend-bar" style="background:${GRAD.aolp}"></div><span>180° · 밝기 = DoLP/${sc}</span>`;
+  return `<span>−${sc}</span><div class="legend-bar" style="background:${GRAD.s}"></div><span>+${sc}</span>`;
+}
+function renderLegends() {
+  const sc = Number($("scale").value).toFixed(2);
+  $("scale-v").textContent = sc;
+  $("legend-a").innerHTML = legendHtml(view.a, sc);
+  $("legend-b").innerHTML = legendHtml(view.b, sc);
+}
+
+// --- probe: hover on desktop, tap on touch ---
+let probeTimer = null;
+function probeAt(img, clientX, clientY) {
+  if (!S || !S.started) return;
+  const r = img.getBoundingClientRect();
+  const k = Math.min(r.width / S.width, r.height / S.height);
+  const x = Math.floor((clientX - r.left - (r.width - k * S.width) / 2) / k), y = Math.floor((clientY - r.top - (r.height - k * S.height) / 2) / k);
+  if (x < 0 || y < 0 || x >= S.width || y >= S.height) return;
+  clearTimeout(probeTimer);
+  probeTimer = setTimeout(async () => {
+    try {
+      const p = await api(`/api/probe?frame=${S.frame_id}&x=${x}&y=${y}`);
+      $("probe").innerHTML = [["위치", `${p.x}, ${p.y}`], ["S0 (휘도)", p.s0.toFixed(4)], ["DoLP", p.dolp.toFixed(4)],
+        ["AoLP", `${p.aolp_deg.toFixed(1)}°`], ["S1/S0", p.s1_over_s0.toFixed(4)], ["S2/S0", p.s2_over_s0.toFixed(4)]]
+        .map(([k2, v]) => `<dt>${k2}</dt><dd>${v}</dd>`).join("");
+    } catch (e) { /* the frame moved on; the next probe asks again */ }
+  }, 60);
+}
+for (const id of ["frame-a", "frame-b"]) {
+  const frame = $(id), img = frame.querySelector("img");
+  frame.addEventListener("mousemove", (ev) => probeAt(img, ev.clientX, ev.clientY));
+  // touch: a horizontal swipe turns (drag the world: swipe left looks right), a tap probes
+  let start = null;
+  frame.addEventListener("pointerdown", (ev) => { if (ev.pointerType !== "mouse") start = { x: ev.clientX, y: ev.clientY }; });
+  frame.addEventListener("pointerup", (ev) => {
+    if (!start || ev.target.closest(".cand")) { start = null; return; }
+    const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
+    start = null;
+    if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) {
+      const steps = Math.min(4, Math.max(1, Math.round(Math.abs(dx) / 70)));
+      for (let i = 0; i < steps; i++) act("turn", dx < 0 ? 1 : -1);
+    } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) probeAt(img, ev.clientX, ev.clientY);
+  });
+  frame.addEventListener("pointercancel", () => { start = null; });
+}
+
+// --- controls ---
+document.querySelectorAll(".pad button").forEach((b) => b.addEventListener("click", () => act(b.dataset.op, Number(b.dataset.v || 0))));
+$("scale").addEventListener("input", () => { renderLegends(); showImages(); });
+$("scene").addEventListener("change", () => { const sc = $("scene").value; fillVariants(sc); graph = null; enqueue(() => api("/api/start", { scene: sc }), "씬 전환"); });
+$("variant").addEventListener("change", () => enqueue(() => api("/api/configure", { variant: $("variant").value }), "변형 전환"));
+$("pass").addEventListener("change", () => enqueue(() => api("/api/configure", { pass_spp: Number($("pass").value) }), "패스 spp 변경"));
+$("target").addEventListener("change", async () => { S = await api("/api/configure", { target_spp: Number($("target").value) }); render("pass"); scheduleRefine("pass"); });
+$("denoise").addEventListener("change", () => enqueue(() => api("/api/configure", { denoise: $("denoise").checked }), "디노이저 전환"));
+$("auto").addEventListener("change", () => scheduleRefine("pass"));
+$("map").addEventListener("click", (ev) => {
+  if (!graph) return;
+  const c = $("map"), r = c.getBoundingClientRect(), dpr = c.width / r.width;
+  const [x, y] = mapTransform(c).from((ev.clientX - r.left) * dpr, (ev.clientY - r.top) * dpr);
+  enqueue(() => api("/api/goto", { x, y }), "지도 이동");
+});
+window.addEventListener("resize", () => { if (S && S.started) { drawMap(); showImages(); } });
+document.addEventListener("keydown", (ev) => {
+  if (ev.target.closest("select, input") || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
+  const k = ev.key;
+  let handled = true;
+  if (k === "ArrowLeft" || k === "a" || k === "A") act("turn", -1);
+  else if (k === "ArrowRight" || k === "d" || k === "D") act("turn", 1);
+  else if (k === "ArrowUp" || k === "w" || k === "W") act("forward");
+  else if (k === "ArrowDown" || k === "s" || k === "S") act("about");
+  else if (k === "r" || k === "R" || k === "PageUp") act("pitch", 1);
+  else if (k === "f" || k === "F" || k === "PageDown") act("pitch", -1);
+  else if (/^[1-9]$/.test(k)) { const c = S.candidates[Number(k) - 1]; if (c && !busy) act("move", c.index); }
+  else if (k === " ") { paused = !paused; renderStatus(); scheduleRefine("pass"); }
+  else handled = false;
+  if (handled) ev.preventDefault();
+});
+
+boot().catch((e) => { $("error").hidden = false; $("error").textContent = `시작 실패: ${e.message}`; });
+</script>
+</body>
+</html>

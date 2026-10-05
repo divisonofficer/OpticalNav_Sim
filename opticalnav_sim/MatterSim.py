@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import frames
+from . import frames, stokes
 from .client import RenderClient
 from .navgraph import NavGraph, ViewPoint
 
@@ -90,6 +90,7 @@ class Simulator:
         self.variant = "base"
         self.renderMode = "polar"
         self.denoise = False
+        self.preview = True
         self.spp = 64
         self.seed = 0
         self.stokesDtype = "float16"
@@ -174,6 +175,11 @@ class Simulator:
     def setDenoiser(self, enabled: bool) -> None:
         """OptiX AI denoiser on each frame (polar mode denoises the 0/45/90/135 degree polarizer images)."""
         self.denoise = bool(enabled)
+
+    def setPreviewEnabled(self, enabled: bool) -> None:
+        """False skips the server's dataset preview recipe (~40 ms per frame); state.rgb is then a plain
+        tonemap of the radiance made here (stokes.quick_preview)."""
+        self.preview = bool(enabled)
 
     def setRenderSeed(self, seed: int) -> None:
         self.seed = int(seed)
@@ -327,7 +333,7 @@ class Simulator:
     def _view(self, scene, variant, c2w, width, height, hfov_deg) -> dict:
         return {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": width, "height": height,
                 "hfov_deg": hfov_deg, "spp": self.spp, "seed": self.seed, "mode": self.renderMode,
-                "denoise": self.denoise}
+                "denoise": self.denoise, "preview": self.preview}
 
     def _set_heading_elevation(self, heading, elevation) -> None:
         for state, h, e in zip(self.states, heading, elevation):
@@ -383,9 +389,10 @@ class Simulator:
             views.append(self._view(scene, variant, c2w, self.width, self.height, hfov))
         results = self._client.render(views, self.stokesDtype)
         for state, out in zip(self.states, results):
-            state.rgb = np.ascontiguousarray(out["rgb"][:, :, ::-1])  # BGR, as MatterSim's cv::Mat
             state.stokes = {k: out[k] for k in ("s0", "s1", "s2", "s3")} if "s0" in out else None
             state.radiance = out["s0"] if "s0" in out else out["radiance"]
+            rgb = out["rgb"] if "rgb" in out else stokes.quick_preview(state.radiance)
+            state.rgb = np.ascontiguousarray(rgb[:, :, ::-1])  # BGR, as MatterSim's cv::Mat
         self._frames += len(self.states)
         self._render_s += time.perf_counter() - started
         self._server_s += self._client.last_render_seconds

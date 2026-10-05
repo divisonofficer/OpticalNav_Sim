@@ -105,6 +105,34 @@ def rgb_preview(rgb: np.ndarray, s0: np.ndarray, s1: np.ndarray, s2: np.ndarray,
     return np.asarray(Image.fromarray(u8, mode="RGB").filter(ImageFilter.GaussianBlur(radius=blur)))
 
 
+def quick_preview(radiance: np.ndarray, percentile: float = 0.992) -> np.ndarray:
+    """Plain display tonemap of linear RGB (exposure from a percentile, then sRGB), uint8 RGB.
+    No despeckle, hole filling or blur, so it costs a few ms instead of the preview recipe's ~40 ms."""
+    safe = np.nan_to_num(np.asarray(radiance, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    sample = safe[::4, ::4]
+    positive = sample[sample > 0]
+    scale = max(float(np.quantile(positive, percentile)) if positive.size else 1.0, 1e-6)
+    return np.clip(np.round(_srgb(safe / scale) * 255.0), 0, 255).astype(np.uint8)
+
+
+def dolp_rgb(dolp: np.ndarray, scale: float = 0.2) -> np.ndarray:
+    """DoLP as uint8 RGB from black (0) to full red (``scale`` and above)."""
+    t = np.clip(np.nan_to_num(np.asarray(dolp, dtype=np.float32)) / scale, 0.0, 1.0)
+    out = np.zeros(t.shape + (3,), np.uint8)
+    out[..., 0] = np.round(255.0 * t)
+    return out
+
+
+def aolp_rgb(aolp_deg: np.ndarray, dolp: np.ndarray, scale: float = 0.2) -> np.ndarray:
+    """AoLP as hue around the whole colour circle (AoLP repeats every 180 degrees, so 0 and 180 meet in
+    red, 90 is cyan), brightness DoLP / ``scale``. Unpolarised light is black; no image underneath."""
+    h = np.mod(np.nan_to_num(np.asarray(aolp_deg, dtype=np.float32)), 180.0) / 180.0
+    v = np.clip(np.nan_to_num(np.asarray(dolp, dtype=np.float32)) / scale, 0.0, 1.0)
+    k = (np.array([5.0, 3.0, 1.0], np.float32) + h[..., None] * 6.0) % 6.0  # HSV -> RGB at full saturation
+    rgb = v[..., None] * (1.0 - np.clip(np.minimum(k, 4.0 - k), 0.0, 1.0))
+    return np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
+
+
 def derived(s0: np.ndarray, s1: np.ndarray, s2: np.ndarray) -> dict[str, np.ndarray]:
     """Luminance DoLP, AoLP (degrees, [0, 180)) and normalised S1/S0, S2/S0, as the dataset defines them."""
     l0, l1, l2 = s0 @ LUMA, s1 @ LUMA, s2 @ LUMA

@@ -7,7 +7,7 @@
 Agents follow the shortest path to their episode's goal through the MatterSim
 API (discretised 30 degree turns). With ``--agents N`` the simulator runs N
 episodes as one batch, so every step is a single render call for all N views.
-Each video frame shows the agents' RGB preview (plus DoLP in polar mode), a
+Each video frame shows the agents' RGB preview (plus DoLP and AoLP in polar mode), a
 bird's-eye map of the graph with planned and travelled paths, and the step,
 action and server render time.
 """
@@ -32,8 +32,6 @@ from opticalnav_sim.navgraph import NavGraph  # noqa: E402
 
 COLORS = [(63, 201, 212), (240, 130, 80), (166, 142, 240), (76, 201, 148)]
 BG, PANEL, INK, MUTED = (15, 19, 21), (22, 28, 31), (228, 233, 235), (140, 153, 160)
-LUT = np.array([[0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66],
-                [245, 125, 21], [250, 193, 39], [252, 255, 164]], np.float32)
 
 
 def font(size: int, bold: bool = False):
@@ -44,12 +42,10 @@ def font(size: int, bold: bool = False):
         return ImageFont.load_default()
 
 
-def dolp_image(st) -> Image.Image:
-    d = stokes.derived(*(st.stokes[k].astype(np.float32) for k in ("s0", "s1", "s2")))["dolp"]
-    t = np.clip(d / 0.2, 0, 1) * (len(LUT) - 1)
-    i = np.minimum(t.astype(int), len(LUT) - 2)
-    f = (t - i)[..., None]
-    return Image.fromarray((LUT[i] * (1 - f) + LUT[i + 1] * f).astype(np.uint8))
+def polar_images(st) -> tuple[Image.Image, Image.Image]:
+    """DoLP (black to red at 0.2) and AoLP (hue around the colour circle, brightness DoLP / 0.2)."""
+    d = stokes.derived(*(st.stokes[k].astype(np.float32) for k in ("s0", "s1", "s2")))
+    return Image.fromarray(stokes.dolp_rgb(d["dolp"], 0.2)), Image.fromarray(stokes.aolp_rgb(d["aolp_deg"], d["dolp"], 0.2))
 
 
 class Map:
@@ -129,8 +125,8 @@ def main() -> int:
                "episode": e["episode_id"]} for i, e in enumerate(episodes)]
 
     view_w, view_h = 384, 288
-    per_agent_w = view_w * (2 if args.mode == "polar" else 1)
-    cols = 1 if len(agents) == 1 else 2
+    per_agent_w = view_w * (3 if args.mode == "polar" else 1)
+    cols = 1 if len(agents) == 1 or args.mode == "polar" else 2
     rws = math.ceil(len(agents) / cols)
     map_size = max(rws * view_h, 360)
     W, H = cols * per_agent_w + map_size, 56 + max(rws * view_h, map_size)
@@ -158,8 +154,11 @@ def main() -> int:
                 rgb = Image.fromarray(np.ascontiguousarray(st.rgb[:, :, ::-1])).resize((view_w, view_h))
                 frame.paste(rgb, (x0, y0))
                 if args.mode == "polar":
-                    frame.paste(dolp_image(st).resize((view_w, view_h)), (x0 + view_w, y0))
+                    dolp, aolp = polar_images(st)
+                    frame.paste(dolp.resize((view_w, view_h)), (x0 + view_w, y0))
+                    frame.paste(aolp.resize((view_w, view_h)), (x0 + 2 * view_w, y0))
                     draw.text((x0 + view_w + 8, y0 + 6), "DoLP 0-0.2", font=f_tag, fill=INK)
+                    draw.text((x0 + 2 * view_w + 8, y0 + 6), "AoLP hue 0-180°, brightness DoLP", font=f_tag, fill=INK)
                 draw.rectangle([x0 + 6, y0 + 6, x0 + 18, y0 + 18], fill=a["color"])
                 label = f"{a['action']}  ·  {st.location.viewpointId}  ·  {math.degrees(st.heading):.0f}°"
                 draw.text((x0 + 24, y0 + 5), label, font=f_tag, fill=INK)

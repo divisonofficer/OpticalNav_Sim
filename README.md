@@ -59,6 +59,19 @@ python -m opticalnav_sim.eval --pack packs/opticalnav-v0.2 --split val_unseen --
 
 Replace `choose_action` in `examples/run_agent.py` with your policy. Use `--no-render` to test graph logic without a server.
 
+**5. Drive it by hand in a browser.** The viewer needs numpy and Pillow (`pip install -e .[gui]`).
+
+```bash
+python -m opticalnav_sim.gui --pack packs/opticalnav-v0.2 --server http://127.0.0.1:18770 --pass-spp 16 --target-spp 1024
+# open http://127.0.0.1:18780 (from another machine or a phone: ssh -L 18780:127.0.0.1:18780 <host>)
+```
+
+The page has two camera panes, each showing RGB, DoLP, AoLP, S1/S0 or S2/S0 (one pane on a phone). The visible candidates are numbered buttons on the first pane. The page also shows a map of the graph and the Stokes values of the pixel under the mouse (or a tapped pixel). Keys: ↑/W moves to the candidate nearest the image centre, 1–9 picks a candidate, ←/→ turns 15°, ↓/S turns around, R/F looks up or down, and Space pauses accumulation. On touch screens a button pad replaces the keys, and a horizontal swipe turns. Clicking the map jumps to the nearest viewpoint.
+
+Rendering is progressive. Every render is one pass of `--pass-spp` samples with its own seed. A move shows its first pass at once. While the camera stays put, passes add up to a running mean until `--target-spp`, and the next input starts over. The seed is an input of the server's freeze recording, so one pass spp costs one recording however many passes run. The first frame for a pass spp records twice, about 150 s on Device 1 (see `Resident._settle`).
+
+Measured on an RTX 5090 with a 16 spp pass: 135 ms per pass round trip (99 ms server, 40 ms GPU), so about 7.4 fps while moving and 136 ms from a key press during accumulation to the new view. 1024 spp builds up in about 8.6 s. S0 error against the dataset frame fell from 16.2% (1 pass) to 6.2% (8 passes) and 2.9% (64 passes), the same as one render of the same spp.
+
 ## API
 
 | MatterSim | opticalnav_sim | Notes |
@@ -151,7 +164,7 @@ The scene is loaded once (25–35 s) and stays on the GPU. Dr.Jit's kernel histo
 | Device 2 `mitsuba3-optix7` | `cuda_ad_rgb_polarized` (+ `cuda_rgb`) | no | Correctness checks, at about 50 s per polar pass and 11 s per rgb pass. |
 | Device 2 `mitsuba3-optix7-rgbpolar` | `cuda_rgb_polarized` | no | Same tracing cost as AD; no speed gain. |
 
-The first frame for each spp, resolution and seed combination records the freeze and is slow. Later frames replay. Use `--preload` to load scenes at start. Each server process serialises renders, and all Mitsuba calls run on its main thread; run one server per GPU to scale out. The server reads the pack's scene list at start, so restart it after adding scenes.
+The first frame for each spp and resolution records the freeze, twice (the second call of a new recording records again, so the server pays both up front): about 150 s on Device 1. Later frames replay, for any camera and any seed. Use `--preload` to load scenes at start. Each server process serialises renders, and all Mitsuba calls run on its main thread; run one server per GPU to scale out. The server reads the pack's scene list at start, so restart it after adding scenes.
 
 Without freeze, renders are split into passes to bound GPU memory: at most 64 spp in polar mode (`OPTICALNAV_SIM_SPP_CHUNK`) and 256 spp in rgb mode (`OPTICALNAV_SIM_SPP_CHUNK_RGB`). Each pass is traced again, so frame time grows with the number of passes.
 
