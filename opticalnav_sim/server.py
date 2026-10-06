@@ -188,14 +188,14 @@ class Resident:
             with ACTIVITY.doing(f"recording {spp} spp {width}x{height}"):
                 if self.sensor_input:
                     scene = self.scene
-                    self.frozen[key] = dr.freeze(
-                        lambda sn, sd, n=int(spp): mi.render(scene, sensor=sn, spp=n, seed=sd),
-                        backend=dr.JitBackend.CUDA, auto_opaque=False)
-                    self._settle(self.frozen[key], self.sensor)
+                    frozen = dr.freeze(lambda sn, sd, n=int(spp): mi.render(scene, sensor=sn, spp=n, seed=sd),
+                                       backend=dr.JitBackend.CUDA, auto_opaque=False)
+                    self._settle(frozen, self.sensor)
                 else:
-                    self.frozen[key] = dr.freeze(lambda scene, sd, n=int(spp): mi.render(scene, spp=n, seed=sd),
-                                                 backend=dr.JitBackend.CUDA, auto_opaque=False)
-                    self._settle(self.frozen[key], self.scene)
+                    frozen = dr.freeze(lambda scene, sd, n=int(spp): mi.render(scene, spp=n, seed=sd),
+                                       backend=dr.JitBackend.CUDA, auto_opaque=False)
+                    self._settle(frozen, self.scene)
+                self.frozen[key] = frozen  # listed by /v1/status only once both recordings are done
             t2 = time.perf_counter()
         source = self.sensor if self.sensor_input else self.scene
         img = self.frozen[key](source, dr.opaque(mi.UInt32, int(seed)))  # replays, launching the kernels

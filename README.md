@@ -15,7 +15,7 @@ A Matterport3DSimulator-compatible Python API for OpticalNav indoor scenes. Ever
 
 ## Quick start
 
-**1. Start a render server** on a GPU host that has the scene packs and a Mitsuba build (see *Hosting*).
+**1. Start a render server** on a GPU host that has the scene packs and a Mitsuba build (see *Environment setup*).
 
 ```bash
 PYTHONPATH=<mitsuba-build>/python python -m opticalnav_sim.server \
@@ -103,6 +103,108 @@ python tools/replay_episode.py --pack packs/opticalnav-v0.2 --server http://127.
 * **Graph.** The support graph (`scenes/<scene>/navigation_support_graph.json`, copied into the pack by `build_pack.py`) is a state machine of support pose × 24 headings. Its transitions are `turn_left` / `turn_right` (15°) and `move_forward` (0.25 m along collision-checked lanes). Every generated step is one of those transitions (checked: 0 invalid in 20 episodes), and the episode, timestep and extras fields match the dataset's.
 * **Routes.** A start state and a goal state are drawn under `--seed` with lane distance in `[--min-m, --max-m]`, then joined by the fewest-action route. `--goal-heading arrive` stops on arrival instead of turning to a drawn heading. robomituba chooses routes differently (blueprint routes, `global_room_length_balance_v1`; 76 of 80 dataset episodes checked were 1–60% longer than the fewest-action route). Its blueprint fields (`blueprint_id`, `pair_signature`, ...) are absent, and `metadata.episode_selection_policy` is `opticalnav_sim_fewest_actions_v1`.
 * **Speed.** 20 episodes (43–260 steps) took 0.4 s; rendering one 216-frame episode at 64 spp took 87 s on an RTX 5090.
+
+## Environment setup
+
+The client side (agents, `MatterSim`, evaluation, the browser viewer) needs only Python and numpy (plus Pillow for the viewer). The render server needs an NVIDIA GPU, a Mitsuba 3 build with the right variants, and the scene packs. This section walks through the render host. The paths in the examples are Device 1's (RTX 5090, WSL2).
+
+### 1. Host
+
+| Item | Requirement | Device 1 |
+|---|---|---|
+| GPU | NVIDIA with OptiX; one resident scene takes about 10 GB, large residences more | RTX 5090, 32 GB, driver 580.97 |
+| CUDA toolkit | only to build Mitsuba | 12.8 |
+| OS | Linux, or WSL2 | WSL2 (Ubuntu) |
+| Python | the version Mitsuba was built for | 3.10.12 (`/usr/bin/python3.10`) |
+
+On WSL2 the CUDA driver library lives in `/usr/lib/wsl/lib`, so put it on the library path in every shell that imports Mitsuba:
+
+```bash
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+```
+
+### 2. Mitsuba 3
+
+**Variants.** `polar` mode needs `cuda_rgb_polarized` (the server falls back to `cuda_ad_rgb_polarized`, which renders the same images but needs more GPU memory). `rgb` mode needs `cuda_rgb` or `cuda_ad_rgb`. A PyPI `mitsuba` wheel ships a fixed set of variants; check `mi.variants()`, and build from source when the RGB polarized variants are missing.
+
+**Real-time rendering** needs `dr.freeze` (Dr.Jit ≥ 1.0 with Mitsuba ≥ 3.6; this code also passes `auto_opaque`, present in Dr.Jit 1.2). Without it every frame re-traces the scene, about 50 s per polar frame.
+
+**Plugins for `active_polar`.** Scenes render through the robomituba fork of Mitsuba (`robomituba/modules/mitsuba3`): v3.7.1 plus the `polarized_area` emitter (commit `0b79cb01`, branch `stable`). Two-pass `active_polar` scenes also need the `path_nocaustics` integrator. In that tree it is still an uncommitted file (`src/integrators/path_nocaustics.cpp`, listed in `src/integrators/CMakeLists.txt`) and Device 1's current build does not contain it, so the server reports `path_nocaustics=False` and hides those variants. `base` and `perturbed` need neither plugin.
+
+**Build** (once per host and Python version):
+
+```bash
+cd robomituba/modules/mitsuba3          # or: git clone --recursive https://github.com/mitsuba-renderer/mitsuba3
+mkdir -p build && cd build
+cmake -GNinja .. -DPython_EXECUTABLE=/usr/bin/python3.10   # the Python that will run the server
+# cmake writes build/mitsuba.conf; set its "enabled" list, then configure again:
+#   "enabled": ["scalar_rgb", "cuda_rgb", "cuda_rgb_polarized", "cuda_ad_rgb_polarized"]
+cmake -GNinja ..
+ninja                                    # tens of minutes; each variant adds compile time
+```
+
+Device 1's build is at `/home/jinnyeong/robomituba-build/mitsuba3` and also enables `cuda_spectral`, `cuda_ad_spectral` and `cuda_ad_spectral_polarized`.
+
+**Activate and check.** A build only imports in the Python it was configured with. With any other version, `import drjit` fails with "the Python version for which Dr.Jit was compiled (3.10.12) is incompatible with the current interpreter".
+
+```bash
+B=/home/jinnyeong/robomituba-build/mitsuba3
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$B:$LD_LIBRARY_PATH PYTHONPATH=$B/python   # or: source $B/setpath.sh
+/usr/bin/python3.10 - <<'PY'
+import mitsuba as mi, drjit as dr
+print(mi.__version__, dr.__version__, "freeze:", hasattr(dr, "freeze"))
+print([v for v in mi.variants() if v.startswith("cuda")])
+mi.set_variant("cuda_rgb_polarized")
+for plugin in ("polarized_area", "path_nocaustics"):
+    try:
+        mi.load_dict({"type": plugin}); print(plugin, "ok")
+    except Exception as exc:
+        print(plugin, "missing")
+PY
+```
+
+On Device 1 this prints `3.7.1 1.2.0 freeze: True`, the CUDA variants, `polarized_area ok` and `path_nocaustics missing`.
+
+### 3. Python packages
+
+| Process | Python | Packages |
+|---|---|---|
+| render server (`opticalnav_sim.server`), `tools/check_parity.py` with a local renderer | the Mitsuba Python (3.10 on Device 1) | numpy, Pillow |
+| `MatterSim` client, agents, `opticalnav_sim.eval`, replay and generation tools | any Python ≥ 3.8 | numpy (`pip install -e .`) |
+| browser viewer (`opticalnav_sim.gui`), sample frames | any Python ≥ 3.8 | numpy, Pillow (`pip install -e .[gui]`) |
+| `tools/record_episode.py` | any | numpy, Pillow, and the `ffmpeg` binary |
+
+### 4. Scene packs
+
+Build packs from a robomituba OpticalNav project with `tools/build_pack.py` (see *Scene packs*), or copy one from another host. With `--link hard` a pack costs no extra disk on the same filesystem; use `--link copy` for a pack you move elsewhere. Each scene folder holds its scene XMLs and assets (relative paths only), `scene.json`, the navigation support graph, the original episodes and a few dataset reference frames.
+
+### 5. Start and warm up
+
+```bash
+cd opticalnav_sim
+B=/home/jinnyeong/robomituba-build/mitsuba3
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$B:$LD_LIBRARY_PATH PYTHONPATH=$B/python:.
+CUDA_VISIBLE_DEVICES=0 timeout 6h /usr/bin/python3.10 -u -m opticalnav_sim.server \
+    --pack packs/opticalnav-v0.2 --port 18770 --modes polar --max-resident 1 \
+    --preload infinigen_apartment_natural_v1_20268504:base:polar
+```
+
+* The start line should read `modes={'polar': 'cuda_rgb_polarized'} … freeze=True`.
+* **Expect waits.** Loading a scene takes about 100 s (`--preload`, or the first request for it). The first frame of each spp and resolution records the freeze twice, about 150 s. Later frames replay in tens of milliseconds. Every scene or variant switch with `--max-resident 1` pays the load and the recordings again. `GET /v1/status` (and the viewer's status bar) says which of these is running.
+* **GPU memory.** Use `--max-resident 1` when the GPU is shared. Freeze recordings failed twice when the card was nearly full, and a server whose recording failed fails every later render until it restarts.
+* **Shared machines.** Start servers under `timeout` so a forgotten one does not hold the GPU. Bind beyond localhost only with a token (`--host 0.0.0.0 --token …`). On WSL2, other machines reach the port only after Windows forwards it (`netsh interface portproxy add v4tov4 listenport=18780 connectaddress=<WSL IP> connectport=18780` and a firewall rule).
+
+### 6. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `ImportError: … Python version for which Dr.Jit was compiled (3.10.12) is incompatible` | wrong interpreter: run the Python the build was configured with |
+| `libcuda.so` not found, or no CUDA device (WSL2) | `export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH` |
+| `no Mitsuba variant for polar mode` | the build lacks `cuda_rgb_polarized` / `cuda_ad_rgb_polarized`: enable it in `mitsuba.conf` and rebuild |
+| start line says `freeze=False` | Dr.Jit older than 1.0: every frame re-traces (~50 s polar); upgrade Mitsuba/Dr.Jit |
+| `active_polar` missing for new scenes, `path_nocaustics=False` | build the fork with `path_nocaustics.cpp` |
+| `record(): … not permitted` or `error encountered while recording a frozen function` | a freeze recording failed, usually with GPU memory nearly full; restart the server, keep `--max-resident 1`, free the GPU |
+| the first frame takes minutes | a scene load or freeze recording; see `GET /v1/status` or the viewer's status bar |
 
 ## API
 
@@ -209,11 +311,7 @@ python tools/benchmark_modes.py --pack packs/opticalnav-v0.2 --scene infinigen_a
     --modes rgb,polar --spp 128,256,512,1024,2048 --denoise off,on --frames 3 --out bench.json
 ```
 
-Self-hosting requirements:
-
-* A Mitsuba 3 build with an `*_rgb_polarized` CUDA variant.
-* For `active_polar`, the robomituba Mitsuba fork's `polarized_area` emitter, plus its `path_nocaustics` integrator for two-pass scenes. The server hides two-pass `active_polar` when `path_nocaustics` is missing (see `/v1/info`).
-* The scene packs.
+Self-hosting requirements are in *Environment setup*.
 
 ## Scene packs
 
