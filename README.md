@@ -25,7 +25,13 @@ An R2R episode driven through the MatterSim API, every frame rendered live at 64
 
 ## Quick start
 
-**Scene pack download:** `opticalnav-v0.2`, 13 verified scenes. Google Drive folder: `<DRIVE_FOLDER_LINK>` (to be filled in after upload). Fetch it with `tools/fetch_pack.py` (see *Sharing packs*).
+**Scene pack download:** `opticalnav-v0.2`, 13 verified scenes, 13.5 GB (70.6 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI). Fetch all or some of it with `tools/fetch_pack.py` (see *Sharing packs*):
+
+```bash
+pip install gdown                       # and: apt install zstd
+python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --list
+python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504
+```
 
 **0. Build Mitsuba 3 on the GPU host** (once). The server needs the RGB polarized CUDA variants and `dr.freeze` (Mitsuba ≥ 3.6, Dr.Jit ≥ 1.0). *Environment setup* has the details, the plugins `active_polar` needs, and a check script.
 
@@ -402,8 +408,8 @@ A pack is too large for git (71 GB, 60,740 files, mostly text OBJ meshes), so th
 
 ```bash
 git clone https://github.com/divisonofficer/OpticalNav_Sim && cd OpticalNav_Sim
-python tools/fetch_pack.py --from <DRIVE_FOLDER_LINK> --out packs/opticalnav-v0.2 --list        # scenes on offer
-python tools/fetch_pack.py --from <DRIVE_FOLDER_LINK> --out packs/opticalnav-v0.2 \
+python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --list        # scenes on offer
+python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 \
     --scene infinigen_apartment_natural_v1_20268504                                              # or all scenes
 ```
 
