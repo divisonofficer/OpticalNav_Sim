@@ -13,12 +13,36 @@ A Matterport3DSimulator-compatible Python API for OpticalNav indoor scenes. Ever
 * **Optical variants.** There are three: `base`, `perturbed` (mirrors and glass), and `active_polar` (perturbed plus a camera-aligned linearly polarized flash).
 * **Data.** Connectivity is in Matterport3D format and annotations are in R2R format. The evaluation reports NE, OSR, SR and SPL, the same metrics as R2R `eval.py`.
 
+## Demo
+
+[![Browser viewer: walking an R2R path, accumulating to 1024 spp, switching polarization channels](docs/media/viewer.gif)](docs/media/viewer.mp4)
+
+The browser viewer on an RTX 5090. Each move renders one 16 spp pass. While the camera stays put, passes accumulate up to 1024 spp. The second pane switches between DoLP, AoLP, S1/S0 and S2/S0, and the side panel shows the graph map and per-pixel Stokes values. Click the preview for the 40 s recording. It was made before W/A/S/D free movement was added.
+
+[![An R2R episode rendered live: RGB, DoLP, AoLP and the path on the graph](docs/media/episode_polar.gif)](docs/media/episode_polar.mp4)
+
+An R2R episode driven through the MatterSim API, every frame rendered live at 64 spp. The panels are the RGB preview, DoLP (black to red over 0–0.2), AoLP (hue around the colour circle for 0–180°, brightness DoLP / 0.2), and the planned and travelled path. [Two agents rendered in one call](docs/media/two_agents.mp4) (7 s).
+
 ## Quick start
+
+**0. Build Mitsuba 3 on the GPU host** (once). The server needs the RGB polarized CUDA variants and `dr.freeze` (Mitsuba ≥ 3.6, Dr.Jit ≥ 1.0). *Environment setup* has the details, the plugins `active_polar` needs, and a check script.
+
+```bash
+git clone --recursive https://github.com/mitsuba-renderer/mitsuba3   # active_polar: use the robomituba fork instead
+cd mitsuba3 && mkdir build && cd build
+cmake -GNinja .. -DPython_EXECUTABLE=$(which python3.10) \
+    -DMI_DEFAULT_VARIANTS=scalar_rgb,cuda_rgb,cuda_rgb_polarized,cuda_ad_rgb_polarized
+ninja                                   # tens of minutes
+source setpath.sh                       # WSL2: also export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+python3.10 -c "import mitsuba as mi, drjit as dr; mi.set_variant('cuda_rgb_polarized'); print(mi.__version__, 'freeze', hasattr(dr, 'freeze'))"
+```
+
+`MI_DEFAULT_VARIANTS` applies only when `build/mitsuba.conf` does not exist yet. In an existing build directory, edit the `"enabled"` list in `mitsuba.conf` and run `cmake` again. The build imports only in the Python it was configured with (`Python_EXECUTABLE`), so run the server with that Python.
 
 **1. Start a render server** on a GPU host that has the scene packs and a Mitsuba build (see *Environment setup*).
 
 ```bash
-PYTHONPATH=<mitsuba-build>/python python -m opticalnav_sim.server \
+PYTHONPATH=<mitsuba-build>/python python3.10 -m opticalnav_sim.server \
     --pack packs/opticalnav-v0.2 --port 18770 --preload infinigen_apartment_natural_v1_20268504
 ```
 
@@ -136,10 +160,11 @@ export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 ```bash
 cd robomituba/modules/mitsuba3          # or: git clone --recursive https://github.com/mitsuba-renderer/mitsuba3
 mkdir -p build && cd build
-cmake -GNinja .. -DPython_EXECUTABLE=/usr/bin/python3.10   # the Python that will run the server
-# cmake writes build/mitsuba.conf; set its "enabled" list, then configure again:
+cmake -GNinja .. -DPython_EXECUTABLE=/usr/bin/python3.10 \
+    -DMI_DEFAULT_VARIANTS=scalar_rgb,cuda_rgb,cuda_rgb_polarized,cuda_ad_rgb_polarized
+# MI_DEFAULT_VARIANTS seeds build/mitsuba.conf when it is created. In an existing build directory, edit its
 #   "enabled": ["scalar_rgb", "cuda_rgb", "cuda_rgb_polarized", "cuda_ad_rgb_polarized"]
-cmake -GNinja ..
+# and run cmake -GNinja .. again.
 ninja                                    # tens of minutes; each variant adds compile time
 ```
 
