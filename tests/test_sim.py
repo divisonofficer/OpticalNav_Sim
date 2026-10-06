@@ -158,6 +158,37 @@ def test_simulator_discretized_actions_follow_mattersim():
     assert st.location.viewpointId == "v0" and abs(st.camera_to_world[1, 3] - 1.2) < 1e-12
 
 
+def test_pipelined_executor_overlaps_neighbours():
+    ex = server.MainThreadExecutor()
+    ex.main = -1  # run_forever runs on a helper thread here
+    log = []
+
+    def start(name, fail=False):
+        log.append(f"start {name}")
+        if fail:
+            raise RuntimeError(name)
+
+        def finish():
+            log.append(f"finish {name}")
+            return name.upper()
+        return finish
+
+    futures = [ex.submit_pipelined(start, "a"), ex.submit_pipelined(start, "b"),
+               ex.submit_pipelined(start, "bad", True), ex.submit(lambda: log.append("plain") or "p")]
+    worker = threading.Thread(target=ex.run_forever)
+    worker.start()
+    assert [f.result(timeout=5) for f in futures[:2]] == ["A", "B"] and futures[3].result(timeout=5) == "p"
+    try:
+        futures[2].result(timeout=5)
+        raise AssertionError("failed start not reported")
+    except RuntimeError as exc:
+        assert str(exc) == "bad"
+    ex.jobs.put((None, (), None, False))
+    worker.join(timeout=5)
+    # b is queued on the GPU before a is read back; a plain job completes the job in flight first
+    assert log.index("start b") < log.index("finish a") and log.index("finish b") < log.index("plain")
+
+
 class FakeRenderer:
     pack = Path(".")
     variant, has_nocaustics, freeze, cache = "fake", False, False, {}
@@ -222,25 +253,29 @@ def test_gui_session_and_routes():
     sim.initialize()
     sim._client = FakeClient(_rows([(0, 0), (0, 2), (2, 0)], [(0, 1), (0, 2)]))
     session = gui.Session(sim, {"scene": ["base", "perturbed"]}, pass_spp=16, target_spp=48)
-    st = session.start("scene", "v0", 0.0)
-    assert st["frame_spp"] == 16 and st["passes"] == 1 and not st["done"]
+    session.run("start", session.start, "scene", "v0", 0.0)
+    st = session.wait_idle(10)  # inputs return at once; the render loop accumulates to the target by itself
+    assert st["done"] and st["frame_spp"] == 48 and st["passes"] == 3
     assert [c["viewpoint"] for c in st["candidates"]] == ["v1"]
-    first = sim._client.views[-1]
-    assert first["spp"] == 16 and first["seed"] == 0 and first["preview"] is False
-    for want in (2, 3):  # passes keep the spp (one freeze recording) and change the seed
-        st = session.refine(st["frame_id"])
-        assert st["passes"] == want and sim._client.views[-1]["seed"] == want - 1 and sim._client.views[-1]["spp"] == 16
-    assert st["done"] and st["frame_spp"] == 48
-    assert session.refine(st["frame_id"])["passes"] == 3  # target reached: no more passes
-    assert session.refine(st["frame_id"] - 1)["frame_id"] == st["frame_id"]  # stale refine is a no-op
-    st = session.act("forward")
-    assert st["passes"] == 1 and sim._client.views[-1]["seed"] == 0  # a move starts over
+    views = sim._client.views
+    assert [v["seed"] for v in views] == [0, 1, 2] and {v["spp"] for v in views} == {16}  # one recording, new seeds
+    assert views[0]["preview"] is False
+
+    st = session.run("forward", session.act, "forward")
     assert st["viewpoint"] == "v1" and st["step"] == 1 and st["trail"] == [[0.0, 0.0], [0.0, 2.0]]
-    st = session.act("turn", 6)  # 6 x 15 degrees
-    assert abs(st["heading_deg"] - 90.0) < 1e-6
-    st = session.configure({"variant": "perturbed"})
+    assert st["stale"]  # the new camera has no frame yet; the last one stays readable
+    st = session.wait_idle(10)
+    assert not st["stale"] and st["passes"] == 3 and sim._client.views[-3]["seed"] == 0  # a move starts over
+    session.configure({"auto": False})
+    session.run("turn", session.act, "turn", 6)  # 6 x 15 degrees
+    st = session.wait_frame(st["frame_id"], 10)
+    assert abs(st["heading_deg"] - 90.0) < 1e-6 and st["passes"] == 1 and st["done"]  # no accumulation when off
+    session.configure({"auto": True})
+    session.run("configure", session.configure, {"variant": "perturbed"})
+    st = session.wait_idle(10)
     assert sim._client.views[-1]["variant"] == "perturbed" and st["frame_variant"] == "perturbed"
-    st = session.goto(1.9, 0.1)
+    session.run("goto", session.goto, 1.9, 0.1)
+    st = session.wait_idle(10)
     assert st["viewpoint"] == "v2" and st["step"] == 0
     for ch in gui.CHANNELS:
         assert session.image(st["frame_id"], ch, 0.2)[:2] == b"\xff\xd8"  # JPEG
@@ -255,6 +290,9 @@ def test_gui_session_and_routes():
                        headers={"Content-Type": "application/json"})
         st = json.loads(urlopen(post).read())
         assert abs(st["elevation_deg"] - 10.0) < 1e-6
+        polled = json.loads(urlopen(f"{base}/api/state?after={st['version']}&wait=5").read())  # long poll
+        assert polled["version"] > st["version"]
+        st = session.wait_idle(10)
         assert urlopen(f"{base}/api/frame/{st['frame_id']}/aolp.jpg").read()[:2] == b"\xff\xd8"
         assert len(json.loads(urlopen(base + "/api/graph?scene=scene").read())["x"]) == 3
         try:
@@ -264,6 +302,46 @@ def test_gui_session_and_routes():
             assert "400" in str(exc)
     finally:
         httpd.shutdown()
+
+    # free viewpoint: WASD-style moves leave the graph; G snaps back to the nearest viewpoint
+    import math as _m
+    h = sim.getState()[0].heading
+    x0, y0, z0 = session.free_pose()
+    fst = session.run("fly", session.act, "fly", {"forward": 0.5, "up": 10.0})
+    assert fst["free"] and abs(fst["position"][0] - (x0 + 0.5 * _m.sin(h))) < 1e-3 \
+        and abs(fst["position"][1] - (y0 + 0.5 * _m.cos(h))) < 1e-3 and fst["height_m"] == 3.0  # height is clamped
+    session.run("fly", session.act, "fly", {"yaw_deg": 90.0, "right": 0.25})
+    h2 = sim.getState()[0].heading
+    assert abs((h2 - h - _m.pi / 2 + _m.pi) % (2 * _m.pi) - _m.pi) < 1e-9
+    session.wait_idle(10)
+    assert abs(np.asarray(sim._client.views[-1]["camera_to_world"])[1, 3] - 3.0) < 1e-12  # rendered at that height
+    back = session.run("free_off", session.act, "free_off")
+    assert not back["free"] and back["viewpoint"] in ("v0", "v1", "v2")
+    st = session.wait_idle(10)
+
+    # a slow render (e.g. a freeze recording) holds up neither inputs nor /api/state
+    import time as _time
+
+    slow_client = sim._client
+    real_render = slow_client.render
+
+    def slow_render(views, dtype):
+        _time.sleep(0.8)
+        return real_render(views, dtype)
+
+    slow_client.render = slow_render
+    t0 = _time.perf_counter()
+    session.run("turn", session.act, "turn", 1)
+    busy = session.status()
+    assert _time.perf_counter() - t0 < 0.1 and busy["server"]["busy"] and busy["stale"]
+    assert busy["frame_id"] == st["frame_id"]  # the last finished frame stays readable meanwhile
+    assert session.image(busy["frame_id"], "rgb", 0.2)[:2] == b"\xff\xd8"
+    # inputs that arrive mid-render win: the loop renders the newest camera, not every one in between
+    for _ in range(3):
+        session.run("turn", session.act, "turn", 1)
+    slow_client.render = real_render
+    done = session.wait_idle(20)
+    assert not done["server"]["busy"] and abs(done["heading_deg"] - (_m.degrees(h2) + 60.0) % 360) < 1e-6
 
     locked = gui.ThreadingHTTPServer(("127.0.0.1", 0), gui.make_handler(session, token="s3cret"))
     threading.Thread(target=locked.serve_forever, daemon=True).start()

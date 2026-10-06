@@ -62,6 +62,10 @@ class RenderClient:
     def info(self) -> dict:
         return self._json("/v1/info")
 
+    def status(self) -> dict:
+        """What the render server is doing now (loading a scene, recording a freeze, rendering)."""
+        return self._json("/v1/status")
+
     def scans(self) -> list[str]:
         return self._json("/v1/scans")
 

@@ -22,6 +22,7 @@ float32 HxWx3. The ``X-Render-Timing`` header gives render / denoise / post seco
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hmac
 import io
@@ -41,12 +42,43 @@ import numpy as np
 from . import frames, stokes
 
 MAX_PIXELS = 2048 * 2048
+
+
+class Activity:
+    """What the render loop is doing now, readable from HTTP threads while it works (GET /v1/status)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.what, self.since = "", None
+
+    @contextlib.contextmanager
+    def doing(self, what: str):
+        with self.lock:
+            prev = (self.what, self.since)
+            self.what, self.since = what, time.time()
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.what, self.since = prev
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {"what": self.what, "elapsed_s": round(time.time() - self.since, 1) if self.since else 0.0}
+
+
+ACTIVITY = Activity()
 MAX_SPP = 8192
 MAX_VIEWS = 64
 MAX_BODY = 1 << 20
 MODE_VARIANTS = {"polar": ("cuda_rgb_polarized", "cuda_ad_rgb_polarized"), "rgb": ("cuda_rgb", "cuda_ad_rgb")}
 # Without dr.freeze, high spp is rendered in passes of at most this many samples (wavefront memory);
 # a polarized path carries Mueller matrices, so its passes are smaller.
+# What a frozen render takes as input. "scene": the whole scene, so Dr.Jit walks every texture and mesh
+# on each replay (~23 ms on Device 1). "sensor": only the camera, with the static scene captured when the
+# function is recorded; a replay then walks the sensor alone. Flash scenes always use "scene" (the flash
+# moves with the camera).
+FREEZE_INPUT = os.environ.get("OPTICALNAV_SIM_FREEZE_INPUT", "scene")
 SPP_CHUNK = {"polar": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK", "64"))),
              "rgb": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK_RGB", "256")))}
 
@@ -84,27 +116,59 @@ class Resident:
         self.k_polarizer = next((k for k in keys if k.startswith("camera_assist_polarizer") and k.endswith("to_world")), None)
         if flash is not None and self.k_flash is None:
             raise RuntimeError(f"{xml}: flash scene has no camera_assist_light transform")
+        # Camera-only updates traverse just the sensor: traversing and updating the whole scene (thousands
+        # of textures and meshes) cost ~46 ms per frame on Device 1. A flash scene also moves its flash, so
+        # it keeps the whole-scene path.
+        self.sensor = self.scene.sensors()[0]
+        sensor_keys = set(mi.traverse(self.sensor).keys())
+        self.ks_size = "film.size" if "film.size" in sensor_keys else None
+        self.size = self.fov = None
         # dr.freeze records the render once per (spp, film size, seed) and replays its kernels, like
         # the production renderer on Device 1; without it every frame re-traces the scene.
         self.freeze = freeze
+        self.sensor_input = FREEZE_INPUT == "sensor" and flash is None
         self.frozen: dict[tuple, object] = {}
         self.batch_sensors: dict[tuple, object] = {}
 
     def render(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int) -> np.ndarray:
+        img, self.breakdown = self.finish(self.launch(c2w, width, height, hfov_deg, spp, seed))
+        return img
+
+    def launch(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int) -> tuple:
+        """Set the camera and queue the render on the GPU. Returns a handle for ``finish``, which waits for
+        the GPU and reads the image back, so the caller can queue the next view in between (CUDA runs
+        the queued kernels in order)."""
         mi = self.mi
-        p = mi.traverse(self.scene)  # fresh map: a frozen replay swaps the variables an old map holds
+        t0 = time.perf_counter()
         origin, target, up = frames.lookat(c2w)
-        p[self.k_to_world] = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
-        p[self.k_fov] = float(hfov_deg)
-        if self.k_size is not None:
-            p[self.k_size] = mi.ScalarVector2u(int(width), int(height))
-        if self.flash is not None:
+        look = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
+        if self.flash is None:
+            p = mi.traverse(self.sensor)  # fresh map: a frozen replay swaps the variables an old map holds
+            t1 = time.perf_counter()
+            p["to_world"] = look
+            if self.fov != float(hfov_deg):
+                p["x_fov"] = float(hfov_deg)
+                self.fov = float(hfov_deg)
+            if self.ks_size is not None and self.size != (int(width), int(height)):
+                p[self.ks_size] = mi.ScalarVector2u(int(width), int(height))
+                self.size = (int(width), int(height))
+            p.update()
+            t2 = time.perf_counter()
+        else:
+            p = mi.traverse(self.scene)
+            t1 = time.perf_counter()
+            p[self.k_to_world] = look
+            p[self.k_fov] = float(hfov_deg)
+            if self.k_size is not None:
+                p[self.k_size] = mi.ScalarVector2u(int(width), int(height))
             d = float(self.flash["distance_m"])
             p[self.k_flash] = mi.ScalarTransform4f(flash_matrix(c2w, self.flash["size_world"], d).tolist())
             if self.k_polarizer is not None:
                 p[self.k_polarizer] = mi.ScalarTransform4f(flash_matrix(
                     c2w, self.flash["size_world"], d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0)).tolist())
-        p.update()
+            p.update()
+            t2 = time.perf_counter()
+        breakdown = {"traverse_s": t1 - t0, "update_s": t2 - t1}
         if not self.freeze:
             # passes of at most SPP_CHUNK samples, averaged by sample count
             total, done, acc, i = int(spp), 0, None, 0
@@ -113,7 +177,7 @@ class Resident:
                 img = np.array(mi.render(self.scene, spp=n, seed=int(seed) + 104729 * i), dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
-            return (acc / total).astype(np.float32)
+            return (acc / total).astype(np.float32), breakdown
         import drjit as dr
 
         key = (int(spp), int(width), int(height))
@@ -121,10 +185,34 @@ class Resident:
             # the seed is an input rather than a constant, so one recording serves every seed
             # (progressive viewers render the same camera again and again with new seeds); every input
             # changes between frames, so all are recorded opaque rather than as literals
-            self.frozen[key] = dr.freeze(lambda scene, sd, n=int(spp): mi.render(scene, spp=n, seed=sd),
-                                         backend=dr.JitBackend.CUDA, auto_opaque=False)
-            self._settle(self.frozen[key], self.scene)
-        return np.array(self.frozen[key](self.scene, dr.opaque(mi.UInt32, int(seed))))
+            with ACTIVITY.doing(f"recording {spp} spp {width}x{height}"):
+                if self.sensor_input:
+                    scene = self.scene
+                    self.frozen[key] = dr.freeze(
+                        lambda sn, sd, n=int(spp): mi.render(scene, sensor=sn, spp=n, seed=sd),
+                        backend=dr.JitBackend.CUDA, auto_opaque=False)
+                    self._settle(self.frozen[key], self.sensor)
+                else:
+                    self.frozen[key] = dr.freeze(lambda scene, sd, n=int(spp): mi.render(scene, spp=n, seed=sd),
+                                                 backend=dr.JitBackend.CUDA, auto_opaque=False)
+                    self._settle(self.frozen[key], self.scene)
+            t2 = time.perf_counter()
+        source = self.sensor if self.sensor_input else self.scene
+        img = self.frozen[key](source, dr.opaque(mi.UInt32, int(seed)))  # replays, launching the kernels
+        breakdown["replay_s"] = time.perf_counter() - t2
+        return img, breakdown
+
+    def finish(self, handle: tuple) -> tuple[np.ndarray, dict]:
+        img, breakdown = handle
+        if isinstance(img, np.ndarray):
+            return img, breakdown
+        import drjit as dr
+
+        t0 = time.perf_counter()
+        dr.sync_thread()  # wait for this view's kernels (and any queued before them)
+        t1 = time.perf_counter()
+        out = np.array(img)
+        return out, {**breakdown, "wait_s": t1 - t0, "readback_s": time.perf_counter() - t1}
 
     def _settle(self, frozen, *args) -> None:
         """Record, then replay once. The second call of a new recording records again (measured on
@@ -221,25 +309,62 @@ class MainThreadExecutor:
         if threading.get_ident() == self.main:  # start-up work (preload) before the loop runs
             future.set_result(fn(*args))
         else:
-            self.jobs.put((fn, args, future))
+            self.jobs.put((fn, args, future, False))
         return future
 
+    def submit_pipelined(self, start, *args) -> Future:
+        """``start(*args)`` queues GPU work and returns ``finish()``, which completes the job. The loop starts
+        the next queued job before finishing this one, so the CPU work of one view (camera update, kernel
+        launch, readback, post-processing) overlaps the GPU work of its neighbour."""
+        future = Future()
+        self.jobs.put((start, args, future, True))
+        return future
+
+    @staticmethod
+    def _complete(pending) -> None:
+        finish, future = pending
+        try:
+            future.set_result(finish())
+        except BaseException as exc:  # noqa: BLE001 - delivered to the waiting request
+            future.set_exception(exc)
+
     def run_forever(self) -> None:
+        pending = None  # (finish, future) of the job whose GPU work is in flight
         while True:
-            fn, args, future = self.jobs.get()
+            try:  # with work in flight, take the next job only if it is already waiting
+                fn, args, future, pipelined = self.jobs.get(timeout=0.002) if pending else self.jobs.get()
+            except queue.Empty:
+                self._complete(pending)
+                pending = None
+                continue
             if fn is None:
+                if pending:
+                    self._complete(pending)
                 return
+            if not pipelined:
+                if pending:
+                    self._complete(pending)
+                    pending = None
+                try:
+                    future.set_result(fn(*args))
+                except BaseException as exc:  # noqa: BLE001
+                    future.set_exception(exc)
+                continue
             try:
-                future.set_result(fn(*args))
-            except BaseException as exc:  # noqa: BLE001 - delivered to the waiting request
+                finish = fn(*args)
+            except BaseException as exc:  # noqa: BLE001
                 future.set_exception(exc)
+                continue
+            if pending:
+                self._complete(pending)
+            pending = (finish, future)
 
 
 class Renderer:
     """Mitsuba work runs on the main thread (see MainThreadExecutor); one process serialises its renders."""
 
     def __init__(self, pack: Path, variant: str | None, max_resident: int, freeze: str = "auto",
-                 rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",)):
+                 rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False):
         import drjit as dr
         import mitsuba as mi
 
@@ -254,8 +379,11 @@ class Renderer:
         self.mi, self.dr, self.pack = mi, dr, pack
         self.variant = next(iter(self.variant_of.values()))
         mi.set_variant(self.variant)
-        # Per-kernel codegen / compile / GPU times, so a frame splits into tracing vs ray tracing.
-        dr.set_flag(dr.JitFlag.KernelHistory, True)
+        # Per-kernel codegen / compile / GPU times split a frame into tracing vs ray tracing, but reading the
+        # history synchronises the device, which stops one view's GPU work overlapping the next one's CPU
+        # work. Off by default; --kernel-history turns it on for measurements (benchmark_modes, frame_overhead).
+        self.kernel_history = bool(kernel_history)
+        dr.set_flag(dr.JitFlag.KernelHistory, self.kernel_history)
         # ponytail: one render loop per server process; run one server per GPU to scale out.
         self.executor = MainThreadExecutor()
         self.max_resident = max(1, max_resident)
@@ -278,7 +406,8 @@ class Renderer:
 
     def _on_main(self, mode: str, fn, *args):
         def job():
-            self.mi.set_variant(self.variant_of[mode])
+            if self.mi.variant() != self.variant_of[mode]:
+                self.mi.set_variant(self.variant_of[mode])
             return fn(*args)
         return self.executor.submit(job).result()
 
@@ -296,12 +425,17 @@ class Renderer:
         while len(self.cache) >= self.max_resident:
             self.cache.popitem(last=False)
             gc.collect()
+            # Dr.Jit keeps freed GPU buffers in its allocation cache; hand them back before the next scene
+            # loads, or the old scene's memory and the new one's add up (28 of 32.6 GB on Device 1 while a
+            # variant switch loaded, with another process holding 8.8 GB) and freeze recordings fail
+            self.dr.flush_malloc_cache()
         base = self.pack / "scenes" / scan  # XML asset paths are relative to this directory
-        if spec.get("flash_xml"):  # two passes: passive scene + flash-only scene, summed
-            loaded = [Resident(self.mi, base / spec["xml"], mode, freeze=self.freeze),
-                      Resident(self.mi, base / spec["flash_xml"], mode, flash=spec["flash"], freeze=self.freeze)]
-        else:  # one pass; an older active scene carries its flash, which follows the camera
-            loaded = [Resident(self.mi, base / spec["xml"], mode, flash=spec.get("flash"), freeze=self.freeze)]
+        with ACTIVITY.doing(f"loading {scan} {variant}"):
+            if spec.get("flash_xml"):  # two passes: passive scene + flash-only scene, summed
+                loaded = [Resident(self.mi, base / spec["xml"], mode, freeze=self.freeze),
+                          Resident(self.mi, base / spec["flash_xml"], mode, flash=spec["flash"], freeze=self.freeze)]
+            else:  # one pass; an older active scene carries its flash, which follows the camera
+                loaded = [Resident(self.mi, base / spec["xml"], mode, flash=spec.get("flash"), freeze=self.freeze)]
         self.cache[key] = loaded
         return loaded
 
@@ -333,20 +467,52 @@ class Renderer:
             raise ValueError("camera_to_world must be finite")
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise), c2w
 
-    def _render_on_worker(self, key: tuple, cams: list) -> tuple:
+    def _start(self, key: tuple, cams: list, submitted: float):
+        """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined)."""
+        started = time.perf_counter()
         scan, variant, mode, width, height, hfov, spp, seed, denoise = key
-        residents = self._resident(scan, variant, mode)
-        self.dr.kernel_history()  # discard kernels launched before this call
-        t0 = time.perf_counter()
-        per_resident = [r.render_many(cams, width, height, hfov, spp, seed) for r in residents]
+        if self.mi.variant() != self.variant_of[mode]:
+            self.mi.set_variant(self.variant_of[mode])
+        with ACTIVITY.doing("rendering"):
+            residents = self._resident(scan, variant, mode)
+            if self.kernel_history:
+                self.dr.kernel_history()  # discard kernels launched before this call
+            t0 = time.perf_counter()
+            if len(cams) == 1:  # the pipelined path
+                handles = [r.launch(cams[0], width, height, hfov, spp, seed) for r in residents]
+            else:  # batch sensor: completes here
+                batch = [r.render_many(cams, width, height, hfov, spp, seed) for r in residents]
+            launch_s = time.perf_counter() - t0
+
+        def finish():
+            with ACTIVITY.doing("rendering"):
+                t1 = time.perf_counter()
+                parts: dict[str, float] = {"queue_s": started - submitted, "launch_s": launch_s}
+                if len(cams) == 1:
+                    done = [r.finish(h) for r, h in zip(residents, handles)]
+                    per_resident = [[img] for img, _ in done]
+                    breakdowns = [b for _, b in done]
+                else:
+                    per_resident, breakdowns = batch, [getattr(r, "breakdown", None) or {} for r in residents]
+                for b in breakdowns:
+                    for k, v in b.items():
+                        parts[k] = parts.get(k, 0.0) + v
+                render_s = launch_s + time.perf_counter() - t1
+                return self._assemble(key, cams, per_resident, parts, render_s)
+        return finish
+
+    def _assemble(self, key: tuple, cams: list, per_resident: list, parts: dict, render_s: float) -> tuple:
+        scan, variant, mode, width, height, hfov, spp, seed, denoise = key
         t1 = time.perf_counter()
-        history = self.dr.kernel_history()
-        kernels = {  # milliseconds in Dr.Jit's history -> seconds
-            "kernels": len(history),
-            "codegen_s": sum(k.get("codegen_time", 0.0) for k in history) / 1000.0,
-            "compile_s": sum(k.get("backend_time", 0.0) for k in history) / 1000.0,
-            "gpu_s": sum(k.get("execution_time", 0.0) for k in history) / 1000.0,
-        }
+        kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0}
+        if self.kernel_history:
+            history = self.dr.kernel_history()
+            kernels = {  # milliseconds in Dr.Jit's history -> seconds
+                "kernels": len(history),
+                "codegen_s": sum(k.get("codegen_time", 0.0) for k in history) / 1000.0,
+                "compile_s": sum(k.get("backend_time", 0.0) for k in history) / 1000.0,
+                "gpu_s": sum(k.get("execution_time", 0.0) for k in history) / 1000.0,
+            }
         outs = []
         for i in range(len(cams)):
             passes = [views[i] for views in per_resident]
@@ -369,7 +535,9 @@ class Renderer:
                     rgb = s0
                 out = {"rgb_src": rgb, "s0": s0, "s1": s1, "s2": s2, "s3": s3}
             outs.append(out)
-        return outs, kernels, t1 - t0, time.perf_counter() - t1
+        kernels.update(parts)
+        kernels["split_s"] = time.perf_counter() - t1
+        return outs, kernels, render_s, time.perf_counter() - t1
 
     @staticmethod
     def _finish(mode: str, out: dict, dtype, preview: bool = True) -> dict[str, np.ndarray]:
@@ -397,8 +565,8 @@ class Renderer:
             j = i + 1
             while j < len(checked) and checked[j][0] == key:
                 j += 1
-            outs, kernels, render_s, denoise_s = self._on_main(
-                key[2], self._render_on_worker, key, [c for _, c in checked[i:j]])
+            outs, kernels, render_s, denoise_s = self.executor.submit_pipelined(
+                self._start, key, [c for _, c in checked[i:j]], time.perf_counter()).result()
             t0 = time.perf_counter()
             results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)))
                            for n, out in enumerate(outs))
@@ -406,7 +574,8 @@ class Renderer:
                       "post_s": time.perf_counter() - t0, **kernels, "calls": 1,
                       # what is left of the render call once kernels are accounted for: tracing the scene
                       # into JIT IR, plus readback. dr.freeze removes the tracing, codegen and compile parts.
-                      "trace_s": max(0.0, render_s - kernels["codegen_s"] - kernels["compile_s"] - kernels["gpu_s"])}
+                      "trace_s": (max(0.0, render_s - kernels["codegen_s"] - kernels["compile_s"] - kernels["gpu_s"])
+                                  if self.kernel_history else 0.0)}
             for k, v in timing.items():
                 total[k] = total.get(k, 0.0) + v
             i = j
@@ -453,6 +622,14 @@ def make_handler(renderer: Renderer, token: str | None = None):
                 return
             parts = [p for p in self.path.split("?")[0].split("/") if p]
             try:
+                if parts == ["v1", "status"]:  # cheap; answers while a render, load or recording runs
+                    resident = list(renderer.cache.items())
+                    return self._json(200, {
+                        "activity": ACTIVITY.snapshot(), "freeze": renderer.freeze,
+                        "resident": [list(k) for k, _ in resident],
+                        # freeze recordings per resident scene: [spp, width, height] of each single-view recording
+                        "recorded": {"|".join(k): sorted({tuple(f) for r in rs for f in r.frozen if f[0] != "batch"})
+                                     for k, rs in resident}})
                 if parts == ["v1", "info"]:
                     return self._json(200, {
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,
@@ -493,8 +670,10 @@ def make_handler(renderer: Renderer, token: str | None = None):
                 started = time.time()
                 results, total = renderer.render_views(views, dtype)
                 arrays = {f"{k}_{i}": v for i, result in enumerate(results) for k, v in result.items()}
+                t_enc = time.perf_counter()
                 buf = io.BytesIO()
                 np.savez(buf, **arrays)
+                total["encode_s"] = time.perf_counter() - t_enc
                 self._send(200, buf.getvalue(), "application/octet-stream",
                            {"X-Render-Seconds": f"{time.time() - started:.4f}",
                             "X-Render-Timing": json.dumps({k: round(v, 4) for k, v in total.items()})})
@@ -521,6 +700,9 @@ def main() -> int:
     ap.add_argument("--preload", action="append", default=[], help="SCAN[:VARIANT[:MODE]] to load at start (repeatable)")
     ap.add_argument("--freeze", choices=["auto", "on", "off"], default="auto",
                     help="replay renders with dr.freeze (auto: when this Dr.Jit has it)")
+    ap.add_argument("--kernel-history", action="store_true",
+                    help="record per-kernel codegen/compile/GPU times (X-Render-Timing gpu_s etc.). Reading them "
+                         "synchronises the GPU every view, so views no longer overlap; use it for measurements")
     ap.add_argument("--token", default=os.environ.get("OPTICALNAV_SIM_TOKEN"),
                     help="require 'Authorization: Bearer <token>' (default $OPTICALNAV_SIM_TOKEN)")
     args = ap.parse_args()
@@ -529,7 +711,8 @@ def main() -> int:
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
-    renderer = Renderer(Path(args.pack).resolve(), args.variant, args.max_resident, args.freeze, args.rgb_variant, modes)
+    renderer = Renderer(Path(args.pack).resolve(), args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
+                        kernel_history=args.kernel_history)
     for item in args.preload:
         parts = item.split(":")
         scan, variant, mode = parts[0], (parts[1:2] or ["base"])[0], (parts[2:3] or [modes[0]])[0]
@@ -537,7 +720,8 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[serve] http://{args.host}:{args.port}  modes={renderer.variant_of}  scans={len(renderer.meta)}  "
-          f"path_nocaustics={renderer.has_nocaustics}  freeze={renderer.freeze}", flush=True)
+          f"path_nocaustics={renderer.has_nocaustics}  freeze={renderer.freeze}  "
+          f"kernel_history={renderer.kernel_history}", flush=True)
     try:
         renderer.executor.run_forever()
     except KeyboardInterrupt:
