@@ -25,6 +25,8 @@ An R2R episode driven through the MatterSim API, every frame rendered live at 64
 
 ## Quick start
 
+**Scene pack download:** `opticalnav-v0.2`, 13 verified scenes. Google Drive folder: `<DRIVE_FOLDER_LINK>` (to be filled in after upload). Fetch it with `tools/fetch_pack.py` (see *Sharing packs*).
+
 **0. Build Mitsuba 3 on the GPU host** (once). The server needs the RGB polarized CUDA variants and `dr.freeze` (Mitsuba ≥ 3.6, Dr.Jit ≥ 1.0). *Environment setup* has the details, the plugins `active_polar` needs, and a check script.
 
 ```bash
@@ -39,7 +41,7 @@ python3.10 -c "import mitsuba as mi, drjit as dr; mi.set_variant('cuda_rgb_polar
 
 `MI_DEFAULT_VARIANTS` applies only when `build/mitsuba.conf` does not exist yet. In an existing build directory, edit the `"enabled"` list in `mitsuba.conf` and run `cmake` again. The build imports only in the Python it was configured with (`Python_EXECUTABLE`), so run the server with that Python.
 
-**1. Start a render server** on a GPU host that has the scene packs and a Mitsuba build (see *Environment setup*).
+**1. Start a render server** on a GPU host that has the scene packs (`tools/fetch_pack.py`, see *Sharing packs*) and a Mitsuba build (see *Environment setup*).
 
 ```bash
 PYTHONPATH=<mitsuba-build>/python python3.10 -m opticalnav_sim.server \
@@ -360,9 +362,35 @@ packs/<name>/
   connectivity/<scene>_connectivity.json   connectivity/scans.txt
   tasks/R2R/data/R2R_{train,val_seen,val_unseen}.json
   scenes/<scene>/{base,perturbed,active_polar,active_polar_flash}.xml  scene.json  r2r.json  assets/  reference/
+  scenes/<scene>/navigation_support_graph.json  episodes/<split>/<episode_id>.json
 ```
 
 Assets are hard links by default, so a pack costs no extra disk on the same filesystem. Use `--link copy` to produce a pack you can ship. Annotations follow R2R: `scan`, `path`, `heading`, `distance`, `instructions` and `path_id`, plus `episode_id`, `goal_node` and `actions`. Episodes come from the dataset's support-graph episodes with consecutive duplicate nodes removed.
+
+### Sharing packs
+
+A pack is too large for git (71 GB, 60,740 files, mostly text OBJ meshes), so the code travels through GitHub and the scenes through a shared folder, one compressed archive per scene.
+
+**Receiving.** You need `tar` and `zstd` (Ubuntu: `apt install zstd`), plus `pip install gdown` for a Google Drive link.
+
+```bash
+git clone https://github.com/divisonofficer/OpticalNav_Sim && cd OpticalNav_Sim
+python tools/fetch_pack.py --from <DRIVE_FOLDER_LINK> --out packs/opticalnav-v0.2 --list        # scenes on offer
+python tools/fetch_pack.py --from <DRIVE_FOLDER_LINK> --out packs/opticalnav-v0.2 \
+    --scene infinigen_apartment_natural_v1_20268504                                              # or all scenes
+```
+
+`fetch_pack.py` downloads only the scenes asked for and checks each archive's sha256 against `manifest.json` before it unpacks it. It then rewrites `pack.json`, `connectivity/scans.txt` and the R2R task files for the scenes present, so a partial pack works with the simulator and the evaluator. Run it again with more `--scene` options to add scenes later. `--from` also takes an rclone remote (`<remote>:path`) or a local folder.
+
+**Sharing.** `tools/export_pack.py` writes the archives and the manifest. Upload the folder as is.
+
+```bash
+python tools/export_pack.py --pack packs/opticalnav-v0.2 --out packs/share-opticalnav-v0.2 --verified-only
+rclone copy packs/share-opticalnav-v0.2 <remote>:dataset/opticalnav_sim/opticalnav-v0.2 --progress
+rclone link <remote>:dataset/opticalnav_sim/opticalnav-v0.2   # a link anyone can open; or share the folder in Drive
+```
+
+`--verified-only` leaves out the three scenes whose variants were matched by object ids (`scene.json` "inferred"). Hard links are stored as files, so each archive unpacks on its own. A Drive folder link lists at most 50 files for gdown, which is plenty for one archive per scene. `<remote>` is an rclone remote of storage type `drive`, set up once with `rclone config`. On WSL2 the browser step opens a localhost URL that Windows reaches.
 
 ## Sharing a server
 
