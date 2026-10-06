@@ -304,6 +304,12 @@ The residual falls with spp, so it is Monte Carlo noise rather than a scene diff
 * `variants_unavailable` lists variants whose staged scene file was deleted after rendering.
 * `"inferred"` marks a variant whose scene file was matched by object ids because the dataset's observation manifests no longer exist. Those variants have no reference frames and are unverified.
 
+### Frames by samples per pixel
+
+![One dataset view at 1024 spp and the simulator at 16, 64 and 256 spp, as RGB, DoLP and AoLP](docs/media/spp_samples.jpg)
+
+`base`, `support_pose_00159` at `h_180`. DoLP is drawn black to red over 0–0.2. AoLP maps 0–180° once around the colour circle (0° and 180° red, 90° cyan), with brightness DoLP / 0.2 so weakly polarized light goes dark, and nothing of the RGB image underneath. Polarization is noisier than intensity, so DoLP and AoLP need more samples than S0 to approach the dataset frame. The errors are for this one view, so they differ slightly from the three-view averages in *Performance and hosting*.
+
 ## Performance and hosting
 
 The scene is loaded once (25–35 s) and stays on the GPU. Dr.Jit's kernel history splits each frame into four parts: CPU tracing of the scene into JIT IR, code generation, compile, and GPU ray tracing. The server reports all four in the `X-Render-Timing` header. These are the measurements on Device 2 (RTX 3090, Dr.Jit 0.4, no `freeze`), at 512x384 and 128 spp with the scene resident:
@@ -337,6 +343,27 @@ To measure a build, run `tools/benchmark_modes.py`. It sweeps mode, spp and deno
 python tools/benchmark_modes.py --pack packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504 \
     --modes rgb,polar --spp 128,256,512,1024,2048 --denoise off,on --frames 3 --out bench.json
 ```
+
+### Pipelining and the frame-rate ceiling
+
+![Frame rate by samples per pixel: measured, estimated overlap ceiling, GPU limit, and measured with pipelining](docs/media/fps_by_spp.png)
+
+A server that handles one request at a time renders on the GPU, then post-processes and sends on the CPU, and the GPU idles meanwhile. Overlapping one frame's CPU work with the next frame's GPU work shortens the frame interval to the longer of the two. The estimate below was made from the measured GPU time and about 100 ms of CPU work per frame, before the overlap was built.
+
+| spp | one request at a time | overlap ceiling (estimate) | GPU limit (estimate) | bottleneck |
+|---:|---:|---:|---:|---|
+| 16 | 7.0 | ≈ 10 | 25.7 | CPU |
+| 32 | 5.5 | ≈ 10 | 13.0 | CPU |
+| 64 | 3.9 | 6.5 | 6.5 | GPU |
+| 128 | 2.5 | 3.2 | 3.2 | GPU |
+| 256 | 1.44 | 1.6 | 1.6 | GPU |
+| 1024 | 0.41 | 0.39 | 0.39 | GPU |
+
+**Measured after building it (16 spp).** Pipelined views on the render server, camera-only updates and a render loop in the viewer brought the viewer to about 11.5 fps while accumulating (from 7.0). The render server alone reached 11.4, 12.7 and 13.9 fps with 1, 2 and 3 requests in flight. That is past the old estimate because the per-view CPU work fell from ~100 ms to ~45 ms (camera update 15–30 ms, freeze replay ~23 ms). It is still short of the GPU limit, because that CPU work is as long as the GPU work and the camera update waits for the previous view's GPU work.
+
+* **Ceiling on one GPU at 512×384.** About 6.5 fps at 64 spp and 3.2 fps at 128 spp, where the GPU is the bottleneck. Below 32 spp the CPU side decides. Getting near the GPU limit (25.7 fps at 16 spp) needs the per-view CPU work cut further, for example double-buffered cameras so the update does not wait for the GPU.
+* **One agent cannot overlap.** Its next action waits for the current observation. Overlap pays off only with several environments at once (`setBatchSize` N, several clients, or the viewer's render loop).
+* **More GPUs.** Run one server per GPU; throughput grows almost linearly.
 
 Self-hosting requirements are in *Environment setup*.
 
