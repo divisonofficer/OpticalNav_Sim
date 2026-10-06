@@ -295,22 +295,31 @@ class Session:
             self.inflight -= 1
             self.cv.notify_all()
             if gen != self.gen:
-                return
-            for k in ("s0", "s1", "s2"):
-                a = np.asarray(out[k], dtype=np.float32)
-                self.acc[k] = a.copy() if k not in self.acc else self.acc[k] + a
-            self.passes += 1
-            passes = self.passes
-            s0, s1, s2 = (self.acc[k] / passes for k in ("s0", "s1", "s2"))
+                # the camera moved on while this pass rendered: while moving, still show it if it is newer than
+                # what the page has (a game shows the last finished frame), but never accumulate it
+                if seed != 0 or gen <= self.frame_meta.get("frame_gen", -1):
+                    return
+                passes = 1
+                s0, s1, s2 = (np.asarray(out[k], dtype=np.float32) for k in ("s0", "s1", "s2"))
+            else:
+                for k in ("s0", "s1", "s2"):
+                    a = np.asarray(out[k], dtype=np.float32)
+                    self.acc[k] = a.copy() if k not in self.acc else self.acc[k] + a
+                self.passes += 1
+                passes = self.passes
+                s0, s1, s2 = (self.acc[k] / passes for k in ("s0", "s1", "s2"))
         frame = {"rgb": stokes.quick_preview(s0), "s0_luma": s0 @ stokes.LUMA,
                  "derived": stokes.derived(s0, s1, s2), "spp": passes * view["spp"], "passes": passes,
                  "variant": view["variant"], "wall_ms": 1000.0 * wall,
                  "server_ms": 1000.0 * float(timing.get("render_s", 0.0)),
                  "gpu_ms": 1000.0 * float(timing.get("gpu_s", 0.0))}
         with self.cv:
-            if gen != self.gen or passes <= self.published:  # a newer camera, or a later pass got here first
+            if gen == self.gen:
+                if passes <= self.published:  # a later pass of this camera got here first
+                    return
+                self.published = passes
+            elif gen <= self.frame_meta.get("frame_gen", -1):  # an older camera, and something newer is shown
                 return
-            self.published = passes
             self.frame_id += 1
             self.frames[self.frame_id] = frame
             for old in [k for k in self.frames if k < self.frame_id - 3]:
