@@ -73,6 +73,7 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-
 .pad .go { border-color: var(--accent); }
 .status { display: flex; flex-wrap: wrap; gap: 4px 16px; font: 12.5px var(--mono); color: var(--muted); padding: 8px 10px; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; }
 .status b { color: var(--ink); font-weight: 500; }
+.status .jitlog { flex-basis: 100%; margin: 4px 0 0; max-height: 9.5em; overflow: auto; white-space: pre; font: 11.5px var(--mono); color: var(--muted); }
 .busy { color: var(--warn); }
 .err { color: var(--bad); white-space: pre-wrap; font: 12.5px var(--mono); background: var(--panel); border: 1px solid var(--bad); border-radius: 4px; padding: 8px 10px; }
 aside { border-left: 1px solid var(--rule); background: var(--panel); display: flex; flex-direction: column; gap: 14px; padding: 14px; min-width: 0; }
@@ -299,11 +300,12 @@ function renderMonitor() {
     : ws.readyState === WebSocket.CONNECTING ? ["warn", "연결 중"] : ["bad", "끊김, 다시 연결 중"];
   const server = r.reachable === true ? ["ok", "응답함"] : r.reachable === false ? ["bad", "응답 없음"] : ["", "확인 중"];
   const short = (S.scene || "").replace("infinigen_apartment_natural_v1_", "…").replace("infinigen_apartment_", "…");
-  const scene = what.startsWith("loading") ? ["warn", `로드 중 ${secs}`, "보통 1–2분"]
+  const prog = act.progress || null;
+  const scene = what.startsWith("loading") ? ["warn", `로드 중 ${prog && prog.files && prog.stage === "files" ? `${prog.files[0]}/${prog.files[1]}` : secs}`, progressText(prog) || "보통 1–2분"]
     : ready.scene ? ["ok", `${short} · ${S.variant}`, "렌더 서버 GPU에 올라가 있음"]
     : ready.scene === false ? ["", "아직 안 올라감", "첫 렌더 때 올립니다 (1–2분)"] : ["", "—"];
   const res = `${S.pass_spp} spp ${S.width}×${S.height}`;
-  const freeze = what.startsWith("recording") ? ["warn", `기록 중 ${secs}`, `${res}, 설정마다 처음 한 번 약 150 s`]
+  const freeze = (what.startsWith("recording") || (prog && prog.kernels)) ? ["warn", `기록 중 ${prog && prog.percent != null ? `${prog.percent}%` : secs}`, progressText(prog) || `${res}, 설정마다 처음 한 번 약 150 s`]
     : ready.freeze ? ["ok", `${res} 준비`, "기록된 커널을 재생합니다"]
     : ready.freeze === false ? ["", "아직 기록 안 됨", `${res}: 첫 렌더 때 기록 (약 150 s)`]
     : r.freeze_available === false ? ["", "꺼짐", "freeze 없이 매번 트레이싱합니다 (느림)"] : ["", "—"];
@@ -437,12 +439,27 @@ function lookAt(img, clientX, clientY) {
 }
 
 // --- server activity ---
+// How far a scene load or a freeze recording has got (the render server's progress.py): stage, files or
+// kernels, and with an earlier recording of the same settings, percent and time left.
+function progressText(p) {
+  if (!p) return "";
+  const left = p.eta_s != null ? ` · 약 ${Math.max(1, Math.round(p.eta_s))} s 남음` : "";
+  const pct = p.percent != null ? ` · ${p.percent}%` : "";
+  if (p.files) {
+    return p.stage === "optix" ? `OptiX 가속 구조 만드는 중 (파일 ${p.files[1]}개 읽음)`
+      : `파일 ${p.files[0]}/${p.files[1]}${pct}`;
+  }
+  const stage = p.stage === "codegen" ? `코드 생성 (커널 ${p.kernels[0]}/${p.kernels[1]})` : "트레이싱";
+  const call = p.calls > 1 ? `기록 ${Math.max(1, p.call)}/${p.calls} · ` : "다시 기록 · ";
+  return `${call}${stage}${pct}${left}`;
+}
 function rendererText(r) {
   if (!r) return "";
   if (r.error) return "렌더 서버에 연결할 수 없습니다 (다시 띄우는 중일 수 있습니다)";
-  const t = `${(r.elapsed_s || 0).toFixed(0)} s`;
-  if (r.what.startsWith("loading")) return `렌더 서버: 씬 로드 중 ${t} (${r.what.split(" ").slice(1).join(" · ")}, 보통 1–2분)`;
-  if (r.what.startsWith("recording")) return `렌더 서버: freeze 기록 중 ${t} (${r.what.replace("recording ", "")}, 설정마다 처음 한 번 약 150 s)`;
+  const t = `${(r.elapsed_s || 0).toFixed(0)} s`, p = progressText(r.progress);
+  if (r.what.startsWith("loading")) return `렌더 서버: 씬 로드 중 ${t} (${p || r.what.split(" ").slice(1).join(" · ")})`;
+  if (r.what.startsWith("recording")) return `렌더 서버: freeze 기록 중 ${t} (${r.what.replace("recording ", "")}${p ? ` · ${p}` : ""})`;
+  if (r.what && p) return `렌더 서버: freeze ${t} (${p}; 입력 구조가 바뀌어 다시 기록합니다)`;
   if (r.what) return `렌더 서버: 렌더 중 ${t}`;
   return "";
 }
@@ -592,8 +609,12 @@ function renderStatus() {
   if (!S) return;
   const sv = S.server || {};
   if (sv.busy && sv.elapsed_s > 0.6) {
+    const tail = ((sv.renderer || {}).progress || {}).log_tail || [];
+    const basis = ((sv.renderer || {}).progress || {}).eta_basis;
     $("status").innerHTML = `<span class="busy">새 화면을 기다리는 중 ${sv.elapsed_s.toFixed(1)} s</span>` +
-      (sv.renderer ? `<span class="busy">${rendererText(sv.renderer)}</span>` : "");
+      (sv.renderer ? `<span class="busy">${rendererText(sv.renderer)}</span>` : "") +
+      (basis ? `<span>예상 근거: ${basis}</span>` : "") +
+      (tail.length ? `<pre class="jitlog">${tail.map((l) => l.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])).join("\n")}</pre>` : "");
     return;
   }
   if (!S.has_frame) { $("status").innerHTML = "<span>첫 프레임을 렌더하는 중…</span>"; return; }
@@ -707,11 +728,17 @@ $("map").addEventListener("click", (ev) => {
   send("/api/goto", { x, y }, "지도 이동");
 });
 window.addEventListener("resize", () => { if (S && S.started) { drawMap(); subscribe(); } });
+// Letters and digits by physical key (ev.code): with a Korean IME on, ev.key is "ㅈ" or "Process" for W,
+// and a key pressed in one input mode and released in another would stay held.
+function keyOf(ev) {
+  if (/^Key[A-Z]$/.test(ev.code)) return ev.code.slice(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(ev.code)) return ev.code.slice(5);
+  return ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+}
 document.addEventListener("keydown", (ev) => {
   if (ev.target.closest("select, input") || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
-  const k = ev.key;
+  const key = keyOf(ev), k = key;
   let handled = true;
-  const key = k.length === 1 ? k.toLowerCase() : k;
   if (key in MOVE_KEYS) held.add(key);  // continuous while held; key repeats change nothing
   else if (key === "g") act("free_off");
   else if (key === "l") toggleFlash();
@@ -725,9 +752,11 @@ document.addEventListener("keydown", (ev) => {
   if (handled) ev.preventDefault();
 });
 
-document.addEventListener("keyup", (ev) => {
-  const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
-  held.delete(key);
+document.addEventListener("keyup", (ev) => { held.delete(keyOf(ev)); });
+// A menu, slider or checkbox keeps keyboard focus after it is used, and keys typed into it never reach the
+// walk controls: hand focus back to the page once the change is made.
+document.addEventListener("change", (ev) => {
+  if (ev.target.matches("select, input[type=range], input[type=checkbox]")) ev.target.blur();
 });
 window.addEventListener("blur", () => held.clear());  // a key released in another window must not stick
 

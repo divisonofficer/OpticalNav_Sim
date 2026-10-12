@@ -242,7 +242,7 @@ class Session:
         scene, variant = sim._split(st.scanId)
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
-                "denoise": sim.denoise, "preview": False, "lights": sim.lights, "env": dict(sim.env)}
+                "denoise": False, "preview": False, "lights": sim.lights, "env": dict(sim.env)}
         pos = st._free_position or (st.location.x, st.location.y)
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
             self.trail.append((pos[0], pos[1]))
@@ -327,6 +327,14 @@ class Session:
                 self.passes += 1
                 passes = self.passes
                 s0, s1, s2 = (self.acc[k] / passes for k in ("s0", "s1", "s2"))
+        if self.sim.denoise:
+            # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
+            # denoised 16 spp passes keeps just what every pass's denoiser agreed on, and smears detail)
+            try:
+                den = self._client().denoise({"s0": s0, "s1": s1, "s2": s2})
+                s0, s1, s2 = den["s0"], den["s1"], den["s2"]
+            except (ConnectionError, OSError, RuntimeError):
+                pass  # show the raw mean rather than nothing
         tone = self._tone(view["scan"], view["variant"], s0)
         frame = {"rgb": tonemap.reinhard(s0, tone["exposure"], tone["white"]), "s0_luma": s0 @ stokes.LUMA,
                  "derived": stokes.derived(s0, s1, s2), "spp": passes * view["spp"], "passes": passes,
@@ -440,7 +448,9 @@ class Session:
         resident = any("|".join(k) == key for k in info.get("resident", []))
         if "recorded" not in info or not info.get("freeze"):  # an older render server does not report recordings
             return {"scene": resident, "freeze": None}
-        recorded = [view["spp"], view["width"], view["height"]] in info["recorded"].get(key, [])
+        have, base = info["recorded"].get(key, []), int(info.get("freeze_spp") or 0)
+        recorded = [view["spp"], view["width"], view["height"]] in have or (
+            base > 0 and view["spp"] % base == 0 and [base, view["width"], view["height"]] in have)  # replayed repeatedly
         return {"scene": resident, "freeze": recorded}
 
     def _frame(self, frame_id: int) -> dict:

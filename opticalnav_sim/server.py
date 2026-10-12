@@ -10,6 +10,7 @@ variant; an ``*_rgb`` variant enables the faster RGB mode). Endpoints (JSON unle
     GET  /v1/scans/<scan>/meta          rig, intrinsics, variants, conventions
     GET  /v1/scans/<scan>/connectivity  Matterport3D connectivity JSON
     POST /v1/render                     {"views": [...]} -> NPZ (application/octet-stream)
+    POST /v1/denoise                    NPZ (s0, s1, s2 or radiance) -> the same, OptiX-denoised
 
 All Mitsuba calls run on the main thread; HTTP requests queue render jobs for it.
 
@@ -41,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import frames, stokes
+from . import frames, progress, stokes
 
 MAX_PIXELS = 2048 * 2048
 
@@ -66,13 +67,19 @@ class Activity:
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {"what": self.what, "elapsed_s": round(time.time() - self.since, 1) if self.since else 0.0}
+            out = {"what": self.what, "elapsed_s": round(time.time() - self.since, 1) if self.since else 0.0}
+        # how far a scene load or a freeze recording has got (see progress.py)
+        found = progress.FREEZE.snapshot() or progress.LOAD.snapshot()
+        if found:
+            out["progress"] = found
+        return out
 
 
 ACTIVITY = Activity()
 MAX_SPP = 8192
 MAX_VIEWS = 64
 MAX_BODY = 1 << 20
+MAX_DENOISE_BODY = 256 << 20  # a few 2048x2048 float32 Stokes images
 MODE_VARIANTS = {"polar": ("cuda_rgb_polarized", "cuda_ad_rgb_polarized"), "rgb": ("cuda_rgb", "cuda_ad_rgb")}
 # Without dr.freeze, high spp is rendered in passes of at most this many samples (wavefront memory);
 # a polarized path carries Mueller matrices, so its passes are smaller.
@@ -169,10 +176,61 @@ class Look:
     env_rotate_deg: float = 0.0
 
 
-def env_data(mi, path: Path, scale: float = 1.0) -> np.ndarray:
-    """An HDR environment image as linear RGB float32 at ENV_RES (height x width x 3)."""
+def env_data(mi, path: Path, scale: float = 1.0, sun_deg: float = 0.0) -> np.ndarray:
+    """An HDR environment image as linear RGB float32 at ENV_RES (height x width x 3), its sun spread over
+    ``sun_deg`` degrees when given (see soften_sun)."""
     bitmap = mi.Bitmap(str(path)).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32, srgb_gamma=False)
-    return np.ascontiguousarray(np.array(bitmap.resample([ENV_RES[0], ENV_RES[1]]), dtype=np.float32) * scale)
+    data = np.array(bitmap.resample([ENV_RES[0], ENV_RES[1]]), dtype=np.float32) * scale
+    return np.ascontiguousarray(soften_sun(data, sun_deg) if sun_deg > 0 else data)
+
+
+def soften_sun(data: np.ndarray, sigma_deg: float, threshold: float = 50.0) -> np.ndarray:
+    """Spread each tiny, very bright spot of an equirectangular environment (a sun) over a Gaussian of
+    ``sigma_deg`` degrees, keeping its power and colour.
+
+    Indoors, sunlight reaches a wall through window glass only along delta (glass) paths, which emitter
+    sampling cannot trace: a path finds the sun only by chance, and a 0.5 degree sun carrying most of a
+    map's light turns those rare hits into fireflies. A sun spread over a few degrees is hit hundreds of
+    times more often at a matching fraction of the radiance, so the same light arrives with far less
+    noise; sun shadows soften. Pixels brighter than ``threshold`` x the median luminance give up their
+    excess; skies without such spots (overcast) are unchanged."""
+    h, w, _ = data.shape
+    lum = data @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    limit = threshold * max(float(np.median(lum)), 1e-6)
+    hot = lum > limit
+    if not hot.any():
+        return data
+    theta = (np.arange(h) + 0.5) / h * np.pi
+    phi = (np.arange(w) + 0.5) / w * 2.0 * np.pi
+    st, ct, sp, cp = np.sin(theta)[:, None], np.cos(theta)[:, None], np.sin(phi)[None, :], np.cos(phi)[None, :]
+    dirs = np.stack([st * sp, np.broadcast_to(ct, (h, w)), -st * cp], axis=-1)  # any consistent sphere map
+    area = np.broadcast_to(st, (h, w))  # solid angle per pixel, up to a constant
+    out = data.copy()
+    excess = np.where(hot[..., None], data * (1.0 - limit / np.maximum(lum, 1e-12))[..., None], 0.0)
+    out -= excess
+    # group the hot pixels into spots (greedy, by angle), then lay each spot's power down as a Gaussian
+    ys, xs = np.nonzero(hot)
+    order = np.argsort(-(lum[ys, xs] * area[ys, xs]))
+    spots: list[list[int]] = []
+    centres: list[np.ndarray] = []
+    for i in order:
+        d = dirs[ys[i], xs[i]]
+        j = next((j for j, c in enumerate(centres) if float(c @ d) > np.cos(np.radians(10.0))), None)
+        if j is None:
+            spots.append([i]); centres.append(d)
+        else:
+            spots[j].append(i)
+    sigma = np.radians(sigma_deg)
+    for members in spots:
+        my, mx = ys[members], xs[members]
+        power = (excess[my, mx] * area[my, mx][:, None]).sum(axis=0)  # rgb
+        weight = (lum[my, mx] * area[my, mx])[:, None]
+        centre = (dirs[my, mx] * weight).sum(axis=0)
+        centre /= np.linalg.norm(centre)
+        angle = np.arccos(np.clip(dirs @ centre, -1.0, 1.0))
+        kernel = np.exp(-0.5 * (angle / sigma) ** 2)
+        out += kernel[..., None] * (power / (kernel * area).sum())[None, None, :]
+    return out.astype(np.float32)
 
 
 def controllable_env(mi, text: str, base: Path, blank: Path) -> tuple[str, np.ndarray | None]:
@@ -257,7 +315,7 @@ class Resident:
     recording, so later changes replay the same recording."""
 
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
-                 flash_xml: Path | None = None, hideable=(), envs=None):
+                 flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0):
         self.mi, self.mode = mi, mode
         started = time.time()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
@@ -265,7 +323,10 @@ class Resident:
             text = rgb_scene_text(text)
         text, self.env_original = controllable_env(mi, text, xml.parent, blank_env_file(mi))
         mi.Thread.thread().file_resolver().prepend(str(xml.parent))  # assets are relative to the XML
-        self.scene = mi.load_string(text)
+        self.name = f"{xml.parent.name}/{xml.name}" + (f"+{flash_xml.name}" if flash_xml is not None else "")
+        self.score = progress.scene_score(text)  # sizes the recording-time estimate before any history
+        with progress.watch_load(mi, text, self.name):
+            self.scene = mi.load_string(text)
         self.load_s = time.time() - started
         self.envs = envs  # name -> environment image at ENV_RES (Renderer.env_image)
         self.depth = {"own": integrator_spec(xml), "passive": integrator_spec(xml)}
@@ -308,10 +369,12 @@ class Resident:
         import drjit as dr
 
         params = mi.traverse(self.scene)
-        self.radiance = {k: dr.detach(params[k]) for k in keys
+        # (type, loaded values) copied to the host: a reference to the parameter would alias the emitter's own
+        # buffer, which the first write (lights off: 0) overwrites
+        self.radiance = {k: (type(params[k]), np.array(params[k], dtype=np.float64).ravel()) for k in keys
                          if k.endswith("emitter.radiance.value") and not k.startswith(ASSIST_PREFIX)}
-        for k, v in self.radiance.items():
-            params[k] = type(v)(v)
+        for k in self.radiance:
+            params[k] = self._radiance(k, 1.0)
         if self.env_original is not None:
             params[f"{ENV_ID}.data"] = mi.TensorXf(self.env_original)
             params[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, 1.0)
@@ -323,6 +386,9 @@ class Resident:
         # dr.freeze records the render once per (spp, film size, seed) and replays its kernels, like
         # the production renderer on Device 1; without it every frame re-traces the scene.
         self.freeze = freeze
+        # a request whose spp is a multiple of this replays the recording at this spp that many times (new
+        # seeds, averaged), so a new spp records nothing; 0 records every spp as asked
+        self.freeze_spp = int(freeze_spp)
         self.sensor_input = FREEZE_INPUT == "sensor" and self.k_flash is None
         self.frozen: dict[tuple, object] = {}
         self.batch_sensors: dict[tuple, object] = {}
@@ -370,8 +436,12 @@ class Resident:
             p = mi.traverse(self.scene)
             t1 = time.perf_counter()
             p[self.k_to_world] = camera
-            p[self.k_fov] = float(hfov_deg)
-            if self.k_size is not None:
+            # only when changed, as on the camera-only path: rewriting the field of view as a Python float
+            # changed the frozen render's inputs (Dr.Jit: "number of opaque variables ... changed from 42405
+            # to 42469"), so the first light, sky or mirror switch recorded again (~85 s)
+            if self.fov != float(hfov_deg):
+                p[self.k_fov] = float(hfov_deg)
+            if self.k_size is not None and self.size != (int(width), int(height)):
                 p[self.k_size] = mi.ScalarVector2u(int(width), int(height))
             if self.k_flash is not None:
                 # following: the flash rides 0.2 m ahead of the camera; parked: shrunk to nothing, so the
@@ -388,6 +458,19 @@ class Resident:
         self.fov, self.size, self.pose = float(hfov_deg), (int(width), int(height)), pose
         return {"traverse_s": t1 - t0, "update_s": time.perf_counter() - t1}
 
+    def _radiance(self, key: str, level: float):
+        """An indoor emitter's loaded radiance times ``level``, as a new opaque value: an evaluated variable
+        the frozen replay reads, never a literal (0 * radiance would fold to one and record again)."""
+        import drjit as dr
+
+        # One variable per channel, made with dr.opaque: built from Python floats and then made opaque,
+        # equal values (grey lights, lights of one colour, every channel at level 0) share one literal, so
+        # the count of the frozen render's opaque inputs followed the values (42405 vs 42469 on Device 1)
+        # and the first light switch recorded again.
+        mi, (kind, values) = self.mi, self.radiance[key]
+        channels = [dr.opaque(mi.Float, float(v) * float(level)) for v in values]
+        return kind(*channels) if len(channels) > 1 else kind(channels[0])
+
     def _write_look(self, p, look: Look) -> None:
         """Hidden shapes, indoor light level and environment: only what differs from the scene's Look."""
         import drjit as dr
@@ -401,8 +484,8 @@ class Resident:
                     verts[start:start + n] = verts[start]
             p[key] = mi.Float(verts.ravel())
         if look.lights != now.lights:
-            for k, v in self.radiance.items():
-                p[k] = v * float(look.lights)
+            for k in self.radiance:
+                p[k] = self._radiance(k, look.lights)
         if self.env_original is not None:
             if look.env != now.env:
                 p[f"{ENV_ID}.data"] = mi.TensorXf(self.env_original if look.env == "original" else self.envs(look.env))
@@ -436,19 +519,71 @@ class Resident:
             return (acc / total).astype(np.float32), breakdown
         import drjit as dr
 
-        key = (int(spp), int(width), int(height), pass_name)
+        spp, repeats = int(spp), 1
+        if self.freeze_spp and spp > self.freeze_spp and spp % self.freeze_spp == 0:
+            spp, repeats = self.freeze_spp, spp // self.freeze_spp
+        key = (spp, int(width), int(height), pass_name)
         t2 = time.perf_counter()
         if key not in self.frozen:  # spp and film size are baked into each recording
             # A two-pass scene records its passive and flash passes together, so switching the light on
             # later replays at once instead of stopping to record. The flash's place and the hidden
             # shapes are scene data, not part of a recording.
-            for name in (("passive", "flash") if "flash" in self.depth and pass_name != "own" else (pass_name,)):
-                self._record(int(spp), int(width), int(height), name)
+            names = ("passive", "flash") if "flash" in self.depth and pass_name != "own" else (pass_name,)
+            for name in names:
+                self._record(spp, int(width), int(height), name)
+            self._absorb([(spp, int(width), int(height), n) for n in names])
             t2 = time.perf_counter()
         source = self.sensor if self.sensor_input else self.scene
-        img = self.frozen[key](source, dr.opaque(mi.UInt32, int(seed)))  # replays, launching the kernels
+        # a replay whose inputs changed layout records again: report it like a recording (see progress.py)
+        progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=1, remember=False,
+                              score=self.score)
+        try:
+            img = self.frozen[key](source, dr.opaque(mi.UInt32, int(seed) * repeats))  # replays, launching the kernels
+            for i in range(1, repeats):  # same distribution as one render at spp x repeats
+                img = img + self.frozen[key](source, dr.opaque(mi.UInt32, int(seed) * repeats + i))
+        finally:
+            progress.FREEZE.end(False)
+        if repeats > 1:
+            img = img / float(repeats)
         breakdown["replay_s"] = time.perf_counter() - t2
         return img, breakdown
+
+    def _absorb(self, keys: list) -> None:
+        """After a recording, the first change of a light or sky *value* made each frozen function record
+        once more (Dr.Jit: "The number of opaque variables in the input changed from 42405 to 42469";
+        ~85 s on Device 1, on the first switch of lights, sky or mirrors alike, then never again). Rewriting
+        unchanged values does not set it off, nor does halving them: lights at 0 does. Make the changes a
+        viewer makes (lights and sky off, another sky map, then back) and replay after each, so the cost
+        lands in this recording instead of on the first switch."""
+        import drjit as dr
+
+        mi = self.mi
+        if not self.radiance and self.env_original is None:
+            return
+        source = self.sensor if self.sensor_input else self.scene
+        before = sum(getattr(f, "n_recordings", 0) for f in self.frozen.values())
+        with ACTIVITY.doing("recording (settling: one value change)"):
+            other = next(iter(sorted(getattr(self.envs, "__self__", None).envmaps)), None) \
+                if self.envs is not None and getattr(self.envs, "__self__", None) is not None else None
+            for factor in (0.0, 1.0):
+                p = mi.traverse(self.scene)
+                for k in self.radiance:
+                    p[k] = self._radiance(k, self.look.lights * factor)
+                if self.env_original is not None:
+                    p[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, float(self.look.env_scale) * factor)
+                    if other is not None:  # another map's pixels, then the current sky's again
+                        current = self.env_original if self.look.env == "original" else self.envs(self.look.env)
+                        p[f"{ENV_ID}.data"] = mi.TensorXf(self.envs(other) if factor == 0.0 else current)
+                p.update()
+                for key in keys:
+                    progress.FREEZE.begin(f"{self.name}|{self.mode}|{key[3]}|{key[0]}|{key[1]}x{key[2]}", calls=1,
+                                          remember=False, score=self.score)
+                    try:
+                        dr.eval(self.frozen[key](source, dr.opaque(mi.UInt32, 0)))
+                    finally:
+                        progress.FREEZE.end(False)
+        after = sum(getattr(f, "n_recordings", 0) for f in self.frozen.values())
+        print(f"[freeze] settle after a value change: {after - before} more recording(s)", flush=True)
 
     def _record(self, spp: int, width: int, height: int, pass_name: str) -> None:
         """Record the frozen render of one pass. The seed is an input rather than a constant, so one
@@ -460,19 +595,23 @@ class Resident:
         if key in self.frozen:
             return
         mi, integrator = self.mi, self.integrator(pass_name)
+        progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=2, score=self.score)
+        ok = False
         with ACTIVITY.doing(f"recording {spp} spp {width}x{height}" + ("" if pass_name == "own" else f" {pass_name}")):
             if self.sensor_input:
                 scene = self.scene
                 frozen = dr.freeze(lambda sn, sd, n=spp, it=integrator:
                                    mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
-                                   backend=dr.JitBackend.CUDA, auto_opaque=False)
+                                   backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
                 self._settle(frozen, self.sensor)
             else:
                 frozen = dr.freeze(lambda scene, sd, n=spp, it=integrator:
                                    mi.render(scene, integrator=it, spp=n, seed=sd),
-                                   backend=dr.JitBackend.CUDA, auto_opaque=False)
+                                   backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
                 self._settle(frozen, self.scene)
             self.frozen[key] = frozen  # listed by /v1/status only once both recordings are done
+            ok = True
+        progress.FREEZE.end(ok)
 
     def finish(self, handle: tuple) -> tuple[np.ndarray, dict]:
         img, breakdown = handle
@@ -494,6 +633,7 @@ class Resident:
         import drjit as dr
 
         for _ in range(2):
+            progress.FREEZE.next_call()
             dr.eval(frozen(*args, dr.opaque(self.mi.UInt32, 0)))
 
 
@@ -549,7 +689,7 @@ class Resident:
                 self.frozen[fkey] = dr.freeze(
                     lambda scene, sn, sd, n=int(spp), it=integrator:
                     mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
-                    backend=dr.JitBackend.CUDA, auto_opaque=False)
+                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
                 self._settle(self.frozen[fkey], self.scene, sensor)
             img = np.array(self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed))))
         w = int(width)
@@ -643,7 +783,7 @@ class Renderer:
 
     def __init__(self, pack: Path, variant: str | None, max_resident: int, freeze: str = "auto",
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
-                 envmap_dir: Path | None = None):
+                 envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16):
         import drjit as dr
         import mitsuba as mi
 
@@ -673,6 +813,7 @@ class Renderer:
         self.denoisers: dict[tuple[str, int, int], object] = {}
         # path_nocaustics with camera-assist modes (an older build of the plugin has none: active variants
         # that need it are hidden, and one-pass active variants keep a resident scene of their own)
+        self.progress_log = progress.install()  # Dr.Jit's log feeds freeze-recording progress
         self.has_nocaustics = self._has_plugin({"type": "path_nocaustics", "assist": ASSIST_PREFIX,
                                                 "assist_mode": "exclude"})
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
@@ -681,11 +822,13 @@ class Renderer:
         self.envmaps = {f.stem: f for f in sorted(folder.glob("*")) if f.suffix.lower() in (".exr", ".hdr")} \
             if folder.is_dir() else {}
         self.env_cache: dict[str, np.ndarray] = {}
+        self.sun_deg = float(sun_deg)
+        self.freeze_spp = int(freeze_spp)
 
     def env_image(self, name: str) -> np.ndarray:
         """An environment map of the --envmaps directory at ENV_RES (loaded once)."""
         if name not in self.env_cache:
-            self.env_cache[name] = env_data(self.mi, self.envmaps[name])
+            self.env_cache[name] = env_data(self.mi, self.envmaps[name], sun_deg=self.sun_deg)
         return self.env_cache[name]
 
     def _has_plugin(self, spec: dict) -> bool:
@@ -795,7 +938,7 @@ class Renderer:
         with ACTIVITY.doing(f"loading {scan} {variant}"):
             loaded = Resident(self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
                               flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
-                              envs=self.env_image)
+                              envs=self.env_image, freeze_spp=self.freeze_spp)
         self.cache[rkey] = loaded
         return loaded
 
@@ -807,6 +950,27 @@ class Renderer:
             self.denoisers[key] = self.mi.OptixDenoiser(input_size=self.mi.ScalarVector2u(w, h))
         noisy = self.mi.TensorXf(np.ascontiguousarray(np.clip(np.nan_to_num(img), 0.0, None), dtype=np.float32))
         return np.array(self.denoisers[key](noisy))[:, :, :3]
+
+    def _denoise_stokes(self, mode: str, s0, s1, s2) -> tuple:
+        """An intensity denoiser cannot take signed S1/S2: denoise what linear polarizers at 0/90/45/135
+        degrees would see, then recombine (S3 stays as given)."""
+        i0, i90 = self._denoise(mode, (s0 + s1) / 2), self._denoise(mode, (s0 - s1) / 2)
+        i45, i135 = self._denoise(mode, (s0 + s2) / 2), self._denoise(mode, (s0 - s2) / 2)
+        return (i0 + i90 + i45 + i135) / 2, i0 - i90, i45 - i135
+
+    def denoise_images(self, arrays: dict) -> dict:
+        """OptiX-denoise finished images (``s0``, ``s1``, ``s2`` or ``radiance``, HxWx3): a progressive
+        viewer accumulates raw passes and denoises the running mean, rather than averaging denoised passes,
+        which keeps only what every pass's denoiser agreed on and smears detail."""
+        mode = "polar" if "s0" in arrays else "rgb"
+        mode = mode if mode in self.variant_of else next(iter(self.variant_of))
+
+        def job():
+            if "s0" in arrays:
+                s0, s1, s2 = (np.asarray(arrays[k], dtype=np.float32) for k in ("s0", "s1", "s2"))
+                return dict(zip(("s0", "s1", "s2"), self._denoise_stokes(mode, s0, s1, s2)))
+            return {"radiance": self._denoise(mode, np.asarray(arrays["radiance"], dtype=np.float32))}
+        return self._on_main(mode, job)
 
     def _check(self, view: dict) -> tuple:
         """Validate one view; returns (group key, camera_to_world)."""
@@ -900,11 +1064,7 @@ class Renderer:
                     s0, s1, s2, s3 = s0 + f0, s1 + f1, s2 + f2, s3 + f3
                     rgb = s0
                 if denoise:
-                    # An intensity denoiser cannot take signed S1/S2: denoise what linear polarizers at
-                    # 0/90/45/135 degrees would see, then recombine (S3 stays as rendered).
-                    i0, i90 = self._denoise(mode, (s0 + s1) / 2), self._denoise(mode, (s0 - s1) / 2)
-                    i45, i135 = self._denoise(mode, (s0 + s2) / 2), self._denoise(mode, (s0 - s2) / 2)
-                    s0, s1, s2 = (i0 + i90 + i45 + i135) / 2, i0 - i90, i45 - i135
+                    s0, s1, s2 = self._denoise_stokes(mode, s0, s1, s2)
                     rgb = s0
                 out = {"rgb_src": rgb, "s0": s0, "s1": s1, "s2": s2, "s3": s3}
             outs.append(out)
@@ -998,11 +1158,15 @@ def make_handler(renderer: Renderer, token: str | None = None):
                 if parts == ["v1", "status"]:  # cheap; answers while a render, load or recording runs
                     served = renderer.served()
                     return self._json(200, {
-                        "activity": ACTIVITY.snapshot(), "freeze": renderer.freeze,
+                        "activity": ACTIVITY.snapshot(), "freeze": renderer.freeze, "freeze_spp": renderer.freeze_spp,
                         # every variant a resident scene renders (an active variant and its flash-off twin share one)
                         "resident": [list(k) for k, _, _ in served],
                         # freeze recordings per variant: [spp, width, height] recorded for all its passes
-                        "recorded": {"|".join(k): renderer.recorded(r, passes) for k, r, passes in served}})
+                        "recorded": {"|".join(k): renderer.recorded(r, passes) for k, r, passes in served},
+                        # freeze recordings made so far by the resident scenes (each new spp/size records twice);
+                        # a change that should replay leaves it unchanged
+                        "recordings": sum(getattr(f, "n_recordings", 0) for r in list(renderer.cache.values())
+                                          for f in list(r.frozen.values()))})
                 if parts == ["v1", "info"]:
                     return self._json(200, {
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,
@@ -1027,10 +1191,31 @@ def make_handler(renderer: Renderer, token: str | None = None):
             except Exception as exc:  # noqa: BLE001 - report, keep serving
                 self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
+        def _denoise_post(self):
+            """NPZ in (s0, s1, s2 or radiance; float16/32 HxWx3), the same arrays denoised out (float32)."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_DENOISE_BODY:
+                    raise ValueError(f"request body must be 1..{MAX_DENOISE_BODY} bytes")
+                npz = np.load(io.BytesIO(self.rfile.read(length)))
+                started = time.perf_counter()
+                out = renderer.denoise_images({k: npz[k] for k in npz.files})
+                buf = io.BytesIO()
+                np.savez(buf, **{k: np.asarray(v, dtype=np.float32) for k, v in out.items()})
+                self._send(200, buf.getvalue(), "application/octet-stream",
+                           {"X-Render-Seconds": f"{time.perf_counter() - started:.4f}"})
+            except (KeyError, ValueError, TypeError, OSError) as exc:
+                self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+            except Exception as exc:  # noqa: BLE001 - report, keep serving
+                self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
         def do_POST(self):
             if not self._authorized():
                 return
-            if self.path.split("?")[0].rstrip("/") != "/v1/render":
+            route = self.path.split("?")[0].rstrip("/")
+            if route == "/v1/denoise":
+                return self._denoise_post()
+            if route != "/v1/render":
                 return self._json(404, {"error": f"no route {self.path}"})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -1074,6 +1259,12 @@ def main() -> int:
     ap.add_argument("--preload", action="append", default=[], help="SCAN[:VARIANT[:MODE]] to load at start (repeatable)")
     ap.add_argument("--freeze", choices=["auto", "on", "off"], default="auto",
                     help="replay renders with dr.freeze (auto: when this Dr.Jit has it)")
+    ap.add_argument("--freeze-spp", type=int, default=16,
+                    help="record frozen renders at this spp only: a request for a multiple of it replays that "
+                         "recording several times (new seeds, averaged) instead of recording again; 0 records each spp")
+    ap.add_argument("--sun-deg", type=float, default=8.0,
+                    help="spread an environment map's sun over a Gaussian of this many degrees, keeping its power: "
+                         "sunlight through window glass otherwise renders as fireflies (0: as the file has it)")
     ap.add_argument("--envmaps", type=Path, default=None,
                     help="folder of .exr/.hdr environment maps a view may name (default: <pack>/envmaps)")
     ap.add_argument("--kernel-history", action="store_true",
@@ -1088,16 +1279,18 @@ def main() -> int:
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
     renderer = Renderer(Path(args.pack).resolve(), args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
-                        kernel_history=args.kernel_history, envmap_dir=args.envmaps)
-    for item in args.preload:
-        parts = item.split(":")
-        scan, variant, mode = parts[0], (parts[1:2] or ["base"])[0], (parts[2:3] or [modes[0]])[0]
-        print(f"[preload] {scan}:{variant}:{mode} in {renderer.preload(scan, variant, mode):.1f}s", flush=True)
+                        kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg,
+                        freeze_spp=args.freeze_spp)
+    # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[serve] http://{args.host}:{args.port}  modes={renderer.variant_of}  scans={len(renderer.meta)}  "
           f"path_nocaustics={renderer.has_nocaustics}  freeze={renderer.freeze}  "
           f"kernel_history={renderer.kernel_history}", flush=True)
+    for item in args.preload:
+        parts = item.split(":")
+        scan, variant, mode = parts[0], (parts[1:2] or ["base"])[0], (parts[2:3] or [modes[0]])[0]
+        print(f"[preload] {scan}:{variant}:{mode} in {renderer.preload(scan, variant, mode):.1f}s", flush=True)
     try:
         renderer.executor.run_forever()
     except KeyboardInterrupt:
