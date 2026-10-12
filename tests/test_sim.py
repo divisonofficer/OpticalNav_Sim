@@ -206,7 +206,7 @@ def test_extra_shapes_finds_added_mirrors_only():
 
 class FakeRenderer:
     pack = Path(".")
-    variant, has_nocaustics, freeze, cache, envmaps = "fake", False, False, {}, {}
+    variant, has_nocaustics, freeze, cache, envmaps, has_rgb2nir = "fake", False, False, {}, {}, False
     variant_of = {"polar": "fake", "rgb": "fake_rgb"}
     meta = {"scene": {"variants": {"base": {}}}}
 

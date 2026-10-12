@@ -52,6 +52,11 @@ so both MIS strategies drop the same set of paths.
      the environment) are ignored, and it is sampled directly, as if it were
      the scene's single emitter. ``all`` (the default) changes nothing. This
      lets one resident scene render a passive pass and a flash-only pass.
+ * - sky_nir
+   - |float|
+   - Factor on light from the environment emitter along rays whose time is 0.5 or more: the
+     near-infrared slot of a ``batch`` sensor with ``slot_time`` (daylight's near-infrared share).
+     (Default: 1)
  */
 
 template <typename Float, typename Spectrum>
@@ -65,6 +70,7 @@ public:
     PathNoCausticsIntegrator(const Properties &props) : Base(props) {
         m_specular_pdf_threshold = props.get<ScalarFloat>("specular_pdf_threshold", 20.f);
         m_caustics = props.get<bool>("caustics", false);
+        m_sky_nir = props.get<ScalarFloat>("sky_nir", 1.f);
         m_assist = std::string(props.get<std::string_view>("assist", ""));
         std::string mode(props.get<std::string_view>("assist_mode", "all"));
         if (mode == "all")
@@ -263,9 +269,11 @@ public:
                 Mask hit_active = (ls.prev_bsdf_pdf > 0.f) && counted;
                 if (!m_caustics)
                     hit_active &= !ls.prev_caustic;
+                // the environment in the near-infrared slot: daylight's near-infrared share
+                Float sky = dr::select(!si.is_valid() && (ls.ray.time > .5f), m_sky_nir, 1.f);
                 ls.result = spec_fma(
                     ls.throughput,
-                    ds.emitter->eval(si, hit_active) * mis_bsdf,
+                    ds.emitter->eval(si, hit_active) * (mis_bsdf * sky),
                     ls.result);
             }
 
@@ -306,6 +314,10 @@ public:
                         si, ls.sampler->next_2d(), true, active_em);
                     if (m_assist_mode == AssistMode::Exclude)
                         active_em &= ds.emitter != EmitterPtr(assist_emitter);
+                    if (m_sky_nir != 1.f && scene->environment() != nullptr) {
+                        Mask to_sky = (ds.emitter == EmitterPtr(scene->environment())) && (si.time > .5f);
+                        dr::masked(em_weight, to_sky) = em_weight * m_sky_nir;
+                    }
                 }
                 active_em &= (ds.pdf != 0.f);
 
@@ -457,6 +469,7 @@ public:
 
     ScalarFloat m_specular_pdf_threshold;
     bool m_caustics;
+    ScalarFloat m_sky_nir;
     std::string m_assist;
     AssistMode m_assist_mode;
 

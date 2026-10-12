@@ -28,6 +28,7 @@ import gc
 import hmac
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -148,7 +149,137 @@ def lit_scene_text(xml: Path, flash_xml: Path) -> str:
     return text[:end] + flash + "\n" + text[end:]
 
 
+NIR_BAND_ID = "nir_band"
+NIR_SLOTS = ("diffuse_reflectance", "specular_reflectance")  # base colours (pplastic, roughconductor)
+# robomituba's NIR_PASSIVE_SCALE_POLICY (tools/infinigen/adapt_stage2_for_hssd_renderer.py): near-infrared
+# radiance of a light class relative to its visible radiance (a light's colour collapses to its luminance)
+NIR_DEFAULTS = {"led": 0.0, "incandescent": 0.45, "daylight": 0.75}
+LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
+
+
+def nir_scene_text(text: str) -> str:
+    """Wrap every base-colour slot in an ``rgb2nir`` texture switched by one shared ``nir_band`` value, so
+    the loaded scene renders the visible or the pseudo near-infrared band (robomituba's pseudo_nir_albedo,
+    computed per lookup: no second set of textures)."""
+    slots = "|".join(NIR_SLOTS)
+    band = f'<ref name="band" id="{NIR_BAND_ID}" />'
+    text = re.sub(rf'<texture name="({slots})" type="([a-z_]+)">(.*?)</texture>',
+                  lambda m: (f'<texture name="{m.group(1)}" type="rgb2nir"><texture name="nested" type="{m.group(2)}">'
+                             f'{m.group(3)}</texture>{band}</texture>'), text, flags=re.S)
+    text = re.sub(rf'<rgb name="({slots})" value="([^"]*)"\s*/>',
+                  lambda m: (f'<texture name="{m.group(1)}" type="rgb2nir"><rgb name="nested" value="{m.group(2)}" />'
+                             f'{band}</texture>'), text)
+    opening = re.search(r"<scene\b[^>]*>", text)
+    declare = (f'\n  <texture type="uniform" id="{NIR_BAND_ID}"><float name="value" value="{uniform_tag(NIR_BAND_ID)}" />'
+               f'</texture>')
+    return text[:opening.end()] + declare + text[opening.end():]
+
+
+LIGHTING = {"none": (), "fixtures": ("fixture",), "all": ("fixture", "fill")}  # light groups kept per mode
+
+
+BAND_UNIFORMS = ("light_rgb_fixture", "light_rgb_fill", "light_nir_fixture_led", "light_nir_fixture_incandescent",
+                 "light_nir_fill_led", "light_nir_fill_incandescent", "flash_rgb", "flash_nir", "nir_band")
+
+
+def uniform_tag(name: str) -> float:
+    """A distinct value to declare a shared uniform with. The loader merges objects with equal properties
+    (merge_equivalent): uniforms declared alike (0, 1) became one object that every switch wrote at once.
+    Each is found after loading by its tag (Resident) and then given its real value."""
+    return round(0.731019 + 0.001317 * BAND_UNIFORMS.index(name), 6)  # odd values: no scene uniform holds one
+
+
+def band_lights_text(text: str, classes: dict[str, str], groups: dict[str, str]) -> str:
+    """Every area emitter's radiance behind a ``bandscale`` texture, scaled per band by shared uniforms: an
+    indoor light by ``light_rgb_<group>`` and ``light_nir_<group>_<class>`` (group: fixture or fill, class:
+    led or incandescent), the camera flash by ``flash_rgb`` and ``flash_nir``. One render then lights each
+    band right (a batch sensor's second slot, or ``nir_band``), and a level or lighting mode is a few
+    values written, never a light's own radiance."""
+    band = f'<ref name="band" id="{NIR_BAND_ID}" />'
+
+    def shape(m):
+        sid, body = m.group(2), m.group(3)
+        flash = sid.startswith(ASSIST_PREFIX)
+        group = groups.get(sid, "fixture")
+        rgb_id, nir_id = (("flash_rgb", "flash_nir") if flash else
+                          (f"light_rgb_{group}", f"light_nir_{group}_{classes.get(sid, 'led')}"))
+        body = re.sub(r'<rgb name="radiance" value="([^"]*)"\s*/>',
+                      lambda r: (f'<texture name="radiance" type="bandscale"><rgb name="nested" value="{r.group(1)}" />'
+                                 f'<ref name="rgb" id="{rgb_id}" /><ref name="nir" id="{nir_id}" />{band}</texture>'), body)
+        return f'\n  <shape type="{m.group(1)}" id="{sid}">{body}\n  </shape>'
+
+    text = re.sub(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>',
+                  lambda m: shape(m) if '<emitter type="' in m.group(3) else m.group(0), text, flags=re.S)
+    opening = re.search(r"<scene\b[^>]*>", text)
+    declare = "".join(f'\n  <texture type="uniform" id="{u}"><float name="value" value="{uniform_tag(u)}" />'
+                      f'</texture>' for u in BAND_UNIFORMS if u != NIR_BAND_ID)
+    return text[:opening.end()] + declare + text[opening.end():]
+
+
+_UNIT_RECT: list[Path] = []
+
+
+def unit_rectangle_ply() -> Path:
+    """Mitsuba's ``rectangle`` as a two-triangle PLY mesh (the same vertices, uvs and emitting side)."""
+    if not _UNIT_RECT:
+        import tempfile
+
+        path = Path(tempfile.gettempdir()) / "opticalnav_unit_rectangle.ply"
+        path.write_text("ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\n"
+                        "property float z\nproperty float u\nproperty float v\nelement face 2\n"
+                        "property list uchar int vertex_indices\nend_header\n"
+                        "-1 -1 0 0 0\n1 -1 0 1 0\n1 1 0 1 1\n-1 1 0 0 1\n3 0 1 2\n3 2 3 0\n")
+        _UNIT_RECT.append(path)
+    return _UNIT_RECT[0]
+
+
+def lights_as_meshes(text: str, ids) -> str:
+    """Rectangle lights as PLY meshes. A lighting mode lifts a removed light out of the room; for a
+    rectangle that is a write of its to_world, and the first such write after a recording changed the
+    frozen render's inputs (64 opaque variables per rectangle) and recorded again. A mesh moves by its
+    vertices, which a replay takes as they are."""
+    ply = unit_rectangle_ply()
+    for sid in ids:
+        text = text.replace(f'<shape type="rectangle" id="{sid}">',
+                            f'<shape type="ply" id="{sid}">\n    <string name="filename" value="{ply}" />')
+    return text
+
+
+def light_groups(text: str) -> dict[str, str]:
+    """Shape id -> 'fixture' (Infinigen's own lights, converted to emitter cubes or ceiling panels at their
+    lamp and ceiling-light meshes) or 'fill' (room softboxes robomituba's importer synthesizes to light rooms
+    evenly: apps/import_infinigen_scene.py, label light:softbox:...)."""
+    out = {}
+    for note in re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", text):
+        try:
+            obj = json.loads(note)
+        except ValueError:
+            continue
+        if obj.get("is_emitter"):
+            meta = obj.get("metadata") or {}
+            fill = str(obj.get("label", "")).startswith("light:softbox") or meta.get("softbox_proxy") or meta.get("synthesized")
+            out[obj["id"]] = "fill" if fill else "fixture"
+    return out
+
+
+def light_classes(text: str) -> dict[str, str]:
+    """Shape id -> light class ('led' or 'incandescent') from the scene file's opticalnav-obj notes: a
+    PointLampFactory lamp without a panel shape is a bulb (incandescent); ceiling panels and softboxes are
+    LED. Lights without a note count as LED."""
+    out = {}
+    for note in re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", text):
+        try:
+            obj = json.loads(note)
+        except ValueError:
+            continue
+        if obj.get("is_emitter"):
+            bulb = str(obj.get("label", "")).startswith("light:PointLampFactory") and not obj.get("emitter_shape")
+            out[obj["id"]] = "incandescent" if bulb else "led"
+    return out
+
+
 ENV_RES = (1024, 512)  # every environment map is resampled to this, so swapping maps never re-records
+DUAL_MARGIN = 3  # pixels a side each slot of a dual (visible | near-infrared) render has to spare at the seam
 _BLANK_ENV: list[Path] = []
 
 
@@ -174,6 +305,31 @@ class Look:
     env: str = "original"            # environment map name, or the scene's own sky
     env_scale: float = 1.0
     env_rotate_deg: float = 0.0
+    band: int = 0                    # 0 visible, 1 pseudo near-infrared, 2 both in one render (dual sensor)
+    nir: tuple = tuple(sorted(NIR_DEFAULTS.items()))  # near-infrared radiance per light class (and daylight)
+    flash_rgb: bool = True           # the camera flash emits in the visible band
+    flash_nir: bool = False          # ... and in the near-infrared band
+    groups: tuple = ("fixture", "fill")  # light groups on (lighting mode); the others are dark and removed
+
+    def light_level(self, light_class: str) -> float:
+        """Indoor emitter radiance factor for a light class in this band (scenes without bandscale lights)."""
+        return self.lights * (1.0 if self.band != 1 else dict(self.nir).get(light_class, 0.0))
+
+    def sky_level(self) -> float:
+        """The sky's scale: near-infrared only renders scale it by daylight's share; in a dual render the
+        integrator scales the near-infrared slot's sky instead (path_nocaustics sky_nir)."""
+        return self.env_scale * (1.0 if self.band != 1 else dict(self.nir).get("daylight", 0.0))
+
+    def uniforms(self) -> dict[str, float]:
+        """Values of the shared per-band light levels (band_lights_text)."""
+        nir, out = dict(self.nir), {}
+        for g in ("fixture", "fill"):
+            on = self.lights if g in self.groups else 0.0
+            out[f"light_rgb_{g}"] = on
+            for c in ("led", "incandescent"):
+                out[f"light_nir_{g}_{c}"] = on * nir.get(c, 0.0)
+        out.update(flash_rgb=float(self.flash_rgb), flash_nir=float(self.flash_nir), nir_band=float(self.band == 1))
+        return out
 
 
 def env_data(mi, path: Path, scale: float = 1.0, sun_deg: float = 0.0) -> np.ndarray:
@@ -263,7 +419,9 @@ def shape_vertices(mi, text: str, shape_id: str) -> np.ndarray:
     found = re.search(rf'\n  <shape type="([a-z_]+)" id="{re.escape(shape_id)}">(.*?)\n  </shape>', text, re.S)
     if found is None:
         raise RuntimeError(f"shape {shape_id!r} not found in the scene file")
-    body = re.sub(r'<ref id="[^"]*"\s*/>|<bsdf\b.*?</bsdf>|<bsdf\b[^>]*/>', "", found.group(2), flags=re.S)
+    # geometry only: materials, emitters and references to other objects stay out of a shape loaded alone
+    body = re.sub(r'<ref\b[^>]*/>|<bsdf\b.*?</bsdf>|<bsdf\b[^>]*/>|<emitter\b.*?</emitter>', "", found.group(2),
+                  flags=re.S)
     shape = mi.load_string(f'<shape version="3.0.0" type="{found.group(1)}">{body}<bsdf type="diffuse"/></shape>')
     return np.array(mi.traverse(shape)["vertex_positions"], dtype=np.float32).reshape(-1, 3)
 
@@ -315,12 +473,29 @@ class Resident:
     recording, so later changes replay the same recording."""
 
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
-                 flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0):
+                 flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
+                 pool: dict | None = None):
         self.mi, self.mode = mi, mode
         started = time.time()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
         if mode == "rgb":
             text = rgb_scene_text(text)
+        self.classes = light_classes(text)  # shape id -> 'led' | 'incandescent'
+        self.groups = light_groups(text)  # shape id -> 'fixture' | 'fill' (lighting modes remove whole groups)
+        text = lights_as_meshes(text, self.groups)
+        hideable = set(hideable) | {s for s in self.groups if re.search(rf'<shape type="[a-z_]+" id="{re.escape(s)}">', text)}
+        # the scene's own perturbation (the dataset's mirrors and glass walls), hidden when a pool is used
+        self.dataset_perturbation = {s for s in hideable if s.startswith(("mirror_auto_", "glass_auto_"))}
+        # a pool of candidate mirrors and glass walls (tools/build_perturbation_pool.py), loaded hidden-able:
+        # a view shows a density's share of it (see Renderer._pool_hidden)
+        self.pool = pool
+        if pool:
+            end = text.rindex("</scene>")
+            shapes = "".join(m["xml"] for m in pool["mirrors"]) + "".join(g["xml"] for g in pool["glass"])
+            text = text[:end] + pool["bsdf_xml"] + shapes + "\n" + text[end:]
+            hideable |= {m["id"] for m in pool["mirrors"]} | {g["id"] for g in pool["glass"]}
+        if nir:  # base colours behind one visible / near-infrared switch (rgb2nir), lights per band (bandscale)
+            text = band_lights_text(nir_scene_text(text), self.classes, self.groups)
         text, self.env_original = controllable_env(mi, text, xml.parent, blank_env_file(mi))
         mi.Thread.thread().file_resolver().prepend(str(xml.parent))  # assets are relative to the XML
         self.name = f"{xml.parent.name}/{xml.name}" + (f"+{flash_xml.name}" if flash_xml is not None else "")
@@ -353,14 +528,19 @@ class Resident:
         self.parked = self.k_flash is None  # assist shapes out of the way (tiny), or none
         self.look = Look()  # what the scene shows now
         self.blocks: dict = {}  # shape id -> (mesh key, first vertex, count) in the loaded (merged) meshes
+        self.transforms: dict[str, np.ndarray] = {}  # shape id -> loaded to_world, for shapes hidden by shrinking
         self.originals: dict[str, np.ndarray] = {}  # vertex positions (N x 3) of the meshes holding them
         if hideable:
             t = time.time()
-            source = xml.read_text()
+            source = text  # the scene as loaded (with any pool shapes)
             params = mi.traverse(self.scene)
             meshes = {k: np.array(params[k], dtype=np.float32).reshape(-1, 3)
                       for k in keys if k.endswith(".vertex_positions")}
-            self.blocks = locate_blocks(meshes, {s: shape_vertices(mi, source, s) for s in sorted(hideable)})
+            # shapes kept as a transform (rectangles: ceiling panels, softboxes) shrink in place instead
+            self.transforms = {s: np.array(params[f"{s}.to_world"].matrix, dtype=np.float64).reshape(4, 4)
+                               for s in sorted(hideable) if f"{s}.to_world" in params}
+            self.blocks = locate_blocks(meshes, {s: shape_vertices(mi, source, s) for s in sorted(hideable)
+                                                 if s not in self.transforms})
             self.originals = {key: meshes[key] for key, _, _ in self.blocks.values()}
             del meshes, params
             print(f"[resident] {len(self.blocks)} hideable shapes in {len(self.originals)} meshes "
@@ -371,18 +551,42 @@ class Resident:
         params = mi.traverse(self.scene)
         # (type, loaded values) copied to the host: a reference to the parameter would alias the emitter's own
         # buffer, which the first write (lights off: 0) overwrites
+        emitted = (".emitter.radiance.value", ".emitter.radiance.nested.value")  # plain, or behind bandscale
         self.radiance = {k: (type(params[k]), np.array(params[k], dtype=np.float64).ravel()) for k in keys
-                         if k.endswith("emitter.radiance.value") and not k.startswith(ASSIST_PREFIX)}
+                         if k.endswith(emitted) and not k.startswith(ASSIST_PREFIX)}
+        self.light_class = {k: self.classes.get(k.split(".emitter.radiance")[0], "led") for k in self.radiance}
+        # per-band light levels as shared uniforms (band_lights_text): written once per change, read per ray
+        tags = {uniform_tag(u): u for u in BAND_UNIFORMS}
+        self.band_keys = {}
+        for k in keys:
+            if k.endswith(".value") and not k.endswith(emitted):
+                v = np.array(params[k], dtype=np.float64).ravel()
+                if v.size == 1 and round(float(v[0]), 6) in tags:
+                    self.band_keys.setdefault(tags[round(float(v[0]), 6)], k)
         for k in self.radiance:
             params[k] = self._radiance(k, 1.0)
+        for u, k in self.band_keys.items():
+            params[k] = dr.opaque(mi.Float, Look().uniforms()[u])
+        # the camera flash's radiance, switched per band (an emitter without a colour texture: rgb or uniform)
+        self.k_flash_radiance = next((k for k in keys if k.startswith("camera_assist_light")
+                                      and k.endswith(emitted)), None)
+        if self.k_flash_radiance is not None:
+            self.radiance[self.k_flash_radiance] = (type(params[self.k_flash_radiance]),
+                                                    np.array(params[self.k_flash_radiance], dtype=np.float64).ravel())
+            params[self.k_flash_radiance] = self._radiance(self.k_flash_radiance, 1.0)
+        self.k_band = self.band_keys.pop(NIR_BAND_ID, None)  # nir_band: the near-infrared-only switch
+        if self.k_band is not None:
+            params[self.k_band] = dr.opaque(mi.Float, 0.0)
         if self.env_original is not None:
             params[f"{ENV_ID}.data"] = mi.TensorXf(self.env_original)
             params[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, 1.0)
             params[f"{ENV_ID}.to_world"] = mi.ScalarTransform4f()
         params.update()
         del params
-        print(f"[resident] {len(self.radiance)} indoor emitters, environment "
-              f"{'controllable' if self.env_original is not None else 'fixed'}", flush=True)
+        counts = {c: list(self.light_class.values()).count(c) for c in sorted(set(self.light_class.values()))}
+        print(f"[resident] {len(self.light_class)} indoor emitters {counts}, environment "
+              f"{'controllable' if self.env_original is not None else 'fixed'}, "
+              f"near-infrared {'on' if self.k_band else 'off'}", flush=True)
         # dr.freeze records the render once per (spp, film size, seed) and replays its kernels, like
         # the production renderer on Device 1; without it every frame re-traces the scene.
         self.freeze = freeze
@@ -392,21 +596,59 @@ class Resident:
         self.sensor_input = FREEZE_INPUT == "sensor" and self.k_flash is None
         self.frozen: dict[tuple, object] = {}
         self.batch_sensors: dict[tuple, object] = {}
+        self.dual_sensors: dict[tuple, object] = {}  # (width, height, hfov) -> batch sensor, visible | near-infrared
+        self.dual_pose: dict[tuple, bytes] = {}
+        self.frozen_args: dict[tuple, tuple] = {}  # recording key -> its inputs before the seed
+        self.sky_nir = NIR_DEFAULTS["daylight"]
 
-    def integrator(self, name: str):
-        """None for the scene's own integrator, else path_nocaustics in an assist mode."""
-        if name == "own":
+    def integrator(self, name: str, sky: float | None = None):
+        """path_nocaustics in an assist mode (or, for "own", as plain path: caustics kept, every emitter),
+        with ``sky`` (default: daylight's near-infrared share) on the sky seen by a dual render's
+        near-infrared slot. Without bandscale lights, "own" is the scene's own integrator (None)."""
+        if name == "own" and not self.band_keys:
             return None
-        if name not in self.integrators:
+        sky = self.sky_nir if sky is None else float(sky)
+        if (name, sky) not in self.integrators:
             spec = self.depth[name]
-            inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "assist": ASSIST_PREFIX,
-                     "assist_mode": "exclude" if name == "passive" else "only", "caustics": name == "passive"}
+            if name == "own":
+                inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "caustics": True}
+            else:
+                inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "assist": ASSIST_PREFIX,
+                         "assist_mode": "exclude" if name == "passive" else "only", "caustics": name == "passive"}
+            inner["sky_nir"] = sky
             if self.mode != "rgb":
                 inner = {"type": "stokes", "integrator": inner}
                 if spec["reference_axis"] is not None:
                     inner["reference_axis"] = self.mi.ScalarVector3f(*spec["reference_axis"])
-            self.integrators[name] = self.mi.load_dict(inner)
-        return self.integrators[name]
+            self.integrators[(name, sky)] = self.mi.load_dict(inner)
+        return self.integrators[(name, sky)]
+
+    def dual_sensor(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float):
+        """A batch sensor of two copies of the camera, the second's rays at time 1 (slot_time): the visible
+        band left, the near-infrared band right (rgb2nir, bandscale and sky_nir read the ray's time), in one
+        render. Each slot has DUAL_MARGIN extra pixels a side (field of view widened to match), cropped off
+        afterwards, so the reconstruction filter does not blend the two bands at the seam."""
+        mi = self.mi
+        key = (int(width), int(height), round(float(hfov_deg), 6))
+        if key not in self.dual_sensors:
+            wm = int(width) + 2 * DUAL_MARGIN
+            fov = math.degrees(2.0 * math.atan(math.tan(math.radians(float(hfov_deg)) / 2.0) * wm / int(width)))
+            slot = {"type": "perspective", "fov": fov, "fov_axis": "x"}
+            self.dual_sensors[key] = mi.load_dict({
+                "type": "batch", "slot_time": True, "slot0": dict(slot), "slot1": dict(slot),
+                "film": {"type": "hdrfilm", "width": 2 * wm, "height": int(height)},
+                "sampler": {"type": "independent", "sample_count": 1}})
+        sensor = self.dual_sensors[key]
+        pose = np.asarray(c2w, dtype=np.float64).tobytes()
+        if self.dual_pose.get(key) != pose:
+            origin, target, up = frames.lookat(c2w)
+            camera = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
+            p = mi.traverse(sensor)
+            for k in [k for k in p.keys() if k.endswith("to_world")]:
+                p[k] = camera
+            p.update()
+            self.dual_pose[key] = pose
+        return sensor
 
     def render(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int,
                pass_name: str = "own", follow: bool | None = None, look: Look = Look()) -> np.ndarray:
@@ -424,25 +666,22 @@ class Resident:
         t0 = time.perf_counter()
         origin, target, up = frames.lookat(c2w)
         camera = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
+        # The camera is always written through the sensor alone. Written through the whole scene's parameters
+        # instead (a frame that also moves the flash or changes the Look), it left the frozen render's inputs
+        # 64 opaque variables apart from a camera-only frame (43627 vs 43691 on Device 1), so a viewer that
+        # walks and switches modes recorded again and again.
+        ps = mi.traverse(self.sensor)  # fresh map: a frozen replay swaps the variables an old map holds
+        t1 = time.perf_counter()
+        ps["to_world"] = camera
+        if self.fov != float(hfov_deg):  # only when changed: a Python float rewritten every frame is a new input
+            ps["x_fov"] = float(hfov_deg)
+        if self.ks_size is not None and self.size != (int(width), int(height)):
+            ps[self.ks_size] = mi.ScalarVector2u(int(width), int(height))
+        ps.update()
         if not follow and self.parked and look == self.look:
-            p = mi.traverse(self.sensor)  # fresh map: a frozen replay swaps the variables an old map holds
-            t1 = time.perf_counter()
-            p["to_world"] = camera
-            if self.fov != float(hfov_deg):
-                p["x_fov"] = float(hfov_deg)
-            if self.ks_size is not None and self.size != (int(width), int(height)):
-                p[self.ks_size] = mi.ScalarVector2u(int(width), int(height))
+            p = None
         else:
             p = mi.traverse(self.scene)
-            t1 = time.perf_counter()
-            p[self.k_to_world] = camera
-            # only when changed, as on the camera-only path: rewriting the field of view as a Python float
-            # changed the frozen render's inputs (Dr.Jit: "number of opaque variables ... changed from 42405
-            # to 42469"), so the first light, sky or mirror switch recorded again (~85 s)
-            if self.fov != float(hfov_deg):
-                p[self.k_fov] = float(hfov_deg)
-            if self.k_size is not None and self.size != (int(width), int(height)):
-                p[self.k_size] = mi.ScalarVector2u(int(width), int(height))
             if self.k_flash is not None:
                 # following: the flash rides 0.2 m ahead of the camera; parked: shrunk to nothing, so the
                 # passive pass (which skips assist shapes anyway) is not shadowed by a stale flash
@@ -454,7 +693,7 @@ class Resident:
                         c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0)).tolist())
                 self.parked = not follow
             self._write_look(p, look)
-        p.update()
+            p.update()
         self.fov, self.size, self.pose = float(hfov_deg), (int(width), int(height)), pose
         return {"traverse_s": t1 - t0, "update_s": time.perf_counter() - t1}
 
@@ -471,26 +710,62 @@ class Resident:
         channels = [dr.opaque(mi.Float, float(v) * float(level)) for v in values]
         return kind(*channels) if len(channels) > 1 else kind(channels[0])
 
+    def _emitter_level(self, key: str, look: Look) -> float:
+        """An indoor emitter's radiance factor: 0 when removed; else 1 with bandscale lights (the shared
+        uniforms carry the levels), or its level for this band without them."""
+        if self.band_keys:  # levels and lighting modes are in the shared uniforms: the radiance stays as loaded
+            return 1.0
+        if key.split(".emitter.radiance")[0] in look.hidden:
+            return 0.0
+        return look.light_level(self.light_class[key])
+
+    @staticmethod
+    def _flash_level(look: Look) -> float:
+        return float(look.flash_nir if look.band == 1 else look.flash_rgb)
+
     def _write_look(self, p, look: Look) -> None:
         """Hidden shapes, indoor light level and environment: only what differs from the scene's Look."""
         import drjit as dr
 
         mi, now = self.mi, self.look
-        for key in {self.blocks[s][0] for s in look.hidden ^ now.hidden}:
+        for shape in (look.hidden ^ now.hidden) & set(self.transforms):
+            # lifted 3 m, through the ceiling, at full size: shrinking it changed the frozen render's inputs
+            # (Dr.Jit: opaque variables 42431 -> 43327) and every lighting switch recorded again (~90 s)
+            m = self.transforms[shape].copy()
+            if shape in look.hidden:
+                m[1, 3] += 3.0
+            p[f"{shape}.to_world"] = mi.ScalarTransform4f(m.tolist())
+        for key in {self.blocks[s][0] for s in look.hidden ^ now.hidden if s in self.blocks}:
             verts = self.originals[key].copy()
-            for shape in look.hidden:
+            for shape in look.hidden & set(self.blocks):
                 k, start, n = self.blocks[shape]
-                if k == key:  # every vertex onto the first: degenerate triangles, never hit
+                if k != key:
+                    continue
+                if shape in self.groups:  # a light: lifted 3 m at full size (a collapsed emitter's area-sampling
+                    verts[start:start + n] += np.array([0.0, 3.0, 0.0], np.float32)  # data changes layout)
+                else:  # every vertex onto the first: degenerate triangles, never hit
                     verts[start:start + n] = verts[start]
             p[key] = mi.Float(verts.ravel())
-        if look.lights != now.lights:
-            for k in self.radiance:
-                p[k] = self._radiance(k, look.lights)
+        for k in self.light_class:
+            level, before = self._emitter_level(k, look), self._emitter_level(k, now)
+            if level != before:  # a removed light (lighting mode) is hidden and dark
+                p[k] = self._radiance(k, level)
+        if self.band_keys:  # per-band levels: shared uniforms the lights (bandscale) read per ray
+            vals, was = look.uniforms(), now.uniforms()
+            for u, k in self.band_keys.items():  # (nir_band is k_band, below)
+                if vals[u] != was[u]:
+                    p[k] = dr.opaque(mi.Float, vals[u])
+        elif self.k_flash_radiance is not None and self._flash_level(look) != self._flash_level(now):
+            p[self.k_flash_radiance] = self._radiance(self.k_flash_radiance, self._flash_level(look))
+        if (look.band == 1) != (now.band == 1):
+            if self.k_band is None:
+                raise ValueError("near-infrared needs the rgb2nir plugin (see mitsuba/rgb2nir.cpp)")
+            p[self.k_band] = dr.opaque(mi.Float, 1.0 if look.band == 1 else 0.0)
         if self.env_original is not None:
             if look.env != now.env:
                 p[f"{ENV_ID}.data"] = mi.TensorXf(self.env_original if look.env == "original" else self.envs(look.env))
-            if look.env_scale != now.env_scale:
-                p[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, float(look.env_scale))
+            if look.sky_level() != now.sky_level():
+                p[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, float(look.sky_level()))
             if look.env_rotate_deg != now.env_rotate_deg:
                 p[f"{ENV_ID}.to_world"] = mi.ScalarTransform4f().rotate([0, 1, 0], float(look.env_rotate_deg))
         elif (look.env, look.env_scale, look.env_rotate_deg) != ("original", 1.0, 0.0):
@@ -506,13 +781,17 @@ class Resident:
         mi = self.mi
         follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
         breakdown = self._set_camera(c2w, width, height, hfov_deg, follow, look)
-        integrator = self.integrator(pass_name)
+        # both bands at once: the dual sensor, the near-infrared slot's sky at daylight's share
+        dual = self.dual_sensor(c2w, width, height, hfov_deg) if look.band == 2 else None
+        sky = dict(look.nir).get("daylight", self.sky_nir) if dual is not None else None
+        integrator = self.integrator(pass_name, sky)
         if not self.freeze:
             # passes of at most SPP_CHUNK samples, averaged by sample count
             total, done, acc, i = int(spp), 0, None, 0
             while done < total:
                 n = min(SPP_CHUNK[self.mode], total - done)
-                img = np.array(mi.render(self.scene, integrator=integrator, spp=n, seed=int(seed) + 104729 * i),
+                img = np.array(mi.render(self.scene, sensor=dual if dual is not None else self.sensor,
+                                         integrator=integrator, spp=n, seed=int(seed) + 104729 * i),
                                dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
@@ -522,7 +801,8 @@ class Resident:
         spp, repeats = int(spp), 1
         if self.freeze_spp and spp > self.freeze_spp and spp % self.freeze_spp == 0:
             spp, repeats = self.freeze_spp, spp // self.freeze_spp
-        key = (spp, int(width), int(height), pass_name)
+        tail = () if dual is None else ("dual", sky)
+        key = (spp, int(width), int(height), pass_name) + tail
         t2 = time.perf_counter()
         if key not in self.frozen:  # spp and film size are baked into each recording
             # A two-pass scene records its passive and flash passes together, so switching the light on
@@ -530,17 +810,17 @@ class Resident:
             # shapes are scene data, not part of a recording.
             names = ("passive", "flash") if "flash" in self.depth and pass_name != "own" else (pass_name,)
             for name in names:
-                self._record(spp, int(width), int(height), name)
-            self._absorb([(spp, int(width), int(height), n) for n in names])
+                self._record(spp, int(width), int(height), name, dual, sky)
+            self._absorb([(spp, int(width), int(height), n) + tail for n in names])
             t2 = time.perf_counter()
-        source = self.sensor if self.sensor_input else self.scene
         # a replay whose inputs changed layout records again: report it like a recording (see progress.py)
         progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=1, remember=False,
                               score=self.score)
         try:
-            img = self.frozen[key](source, dr.opaque(mi.UInt32, int(seed) * repeats))  # replays, launching the kernels
+            args = self.frozen_args[key]
+            img = self.frozen[key](*args, dr.opaque(mi.UInt32, int(seed) * repeats))  # replays, launching the kernels
             for i in range(1, repeats):  # same distribution as one render at spp x repeats
-                img = img + self.frozen[key](source, dr.opaque(mi.UInt32, int(seed) * repeats + i))
+                img = img + self.frozen[key](*args, dr.opaque(mi.UInt32, int(seed) * repeats + i))
         finally:
             progress.FREEZE.end(False)
         if repeats > 1:
@@ -548,13 +828,32 @@ class Resident:
         breakdown["replay_s"] = time.perf_counter() - t2
         return img, breakdown
 
+    def _place_shapes(self, p, hidden: frozenset) -> None:
+        """Write every hideable shape as ``hidden`` has it (see _write_look): lights lifted 3 m at full
+        size, other shapes collapsed to a point, the rest as loaded."""
+        mi = self.mi
+        for shape, m0 in self.transforms.items():
+            m = m0.copy()
+            if shape in hidden:
+                m[1, 3] += 3.0
+            p[f"{shape}.to_world"] = mi.ScalarTransform4f(m.tolist())
+        for key in {k for k, _, _ in self.blocks.values()}:
+            verts = self.originals[key].copy()
+            for shape, (k, start, n) in self.blocks.items():
+                if k == key and shape in hidden:
+                    if shape in self.groups:
+                        verts[start:start + n] += np.array([0.0, 3.0, 0.0], np.float32)
+                    else:
+                        verts[start:start + n] = verts[start]
+            p[key] = mi.Float(verts.ravel())
+
     def _absorb(self, keys: list) -> None:
-        """After a recording, the first change of a light or sky *value* made each frozen function record
-        once more (Dr.Jit: "The number of opaque variables in the input changed from 42405 to 42469";
-        ~85 s on Device 1, on the first switch of lights, sky or mirrors alike, then never again). Rewriting
-        unchanged values does not set it off, nor does halving them: lights at 0 does. Make the changes a
-        viewer makes (lights and sky off, another sky map, then back) and replay after each, so the cost
-        lands in this recording instead of on the first switch."""
+        """After a recording, the first time a shape moves (an acceleration-structure rebuild) and the first
+        change of some values made every frozen function record once more (Dr.Jit: "The number of opaque
+        variables in the input changed from 43831 to 44727", 64 per rectangle moved for the first time;
+        ~85 s each on Device 1, then never again for that shape). Make those changes now (every light lifted
+        and put back, lights and sky off, another sky map, the flash moved) and replay every recording after
+        each, so the cost lands in this recording instead of on a later switch."""
         import drjit as dr
 
         mi = self.mi
@@ -562,52 +861,74 @@ class Resident:
             return
         source = self.sensor if self.sensor_input else self.scene
         before = sum(getattr(f, "n_recordings", 0) for f in self.frozen.values())
+        lights = {s for s in self.groups if s in self.transforms or s in self.blocks}
+        keys = sorted(self.frozen, key=str)  # every recording, older ones too: the scene's layout is shared
+        saved: dict[str, np.ndarray] = {}
         with ACTIVITY.doing("recording (settling: one value change)"):
             other = next(iter(sorted(getattr(self.envs, "__self__", None).envmaps)), None) \
                 if self.envs is not None and getattr(self.envs, "__self__", None) is not None else None
             for factor in (0.0, 1.0):
                 p = mi.traverse(self.scene)
-                for k in self.radiance:
-                    p[k] = self._radiance(k, self.look.lights * factor)
+                for k in self.light_class:
+                    p[k] = self._radiance(k, self._emitter_level(k, self.look) * factor)
                 if self.env_original is not None:
-                    p[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, float(self.look.env_scale) * factor)
+                    p[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, float(self.look.sky_level()) * factor)
                     if other is not None:  # another map's pixels, then the current sky's again
                         current = self.env_original if self.look.env == "original" else self.envs(self.look.env)
                         p[f"{ENV_ID}.data"] = mi.TensorXf(self.envs(other) if factor == 0.0 else current)
+                shift = np.eye(4)
+                shift[1, 3] = 1e-3 * (1.0 - factor)
+                # a moved transform: the flash (an acceleration-structure rebuild)
+                for k in [k for k in (self.k_flash,) if k is not None]:
+                    if factor == 0.0:
+                        saved[k] = np.array(p[k].matrix, dtype=np.float64).reshape(4, 4)
+                    p[k] = mi.ScalarTransform4f((shift @ saved[k]).tolist())  # shifted, then exactly back
+                if lights:  # every light lifted (or put down) once, then as the scene has it
+                    flipped = lights - self.look.hidden if factor == 0.0 else frozenset()
+                    self._place_shapes(p, (self.look.hidden - lights) | flipped | (
+                        (self.look.hidden & lights) if factor == 1.0 else frozenset()))
                 p.update()
                 for key in keys:
                     progress.FREEZE.begin(f"{self.name}|{self.mode}|{key[3]}|{key[0]}|{key[1]}x{key[2]}", calls=1,
                                           remember=False, score=self.score)
                     try:
-                        dr.eval(self.frozen[key](source, dr.opaque(mi.UInt32, 0)))
+                        dr.eval(self.frozen[key](*self.frozen_args[key], dr.opaque(mi.UInt32, 0)))
                     finally:
                         progress.FREEZE.end(False)
         after = sum(getattr(f, "n_recordings", 0) for f in self.frozen.values())
         print(f"[freeze] settle after a value change: {after - before} more recording(s)", flush=True)
 
-    def _record(self, spp: int, width: int, height: int, pass_name: str) -> None:
+    def _record(self, spp: int, width: int, height: int, pass_name: str, dual=None, sky=None) -> None:
         """Record the frozen render of one pass. The seed is an input rather than a constant, so one
         recording serves every seed (progressive viewers render the same camera again and again with new
         seeds); every input changes between frames, so all are recorded opaque rather than as literals."""
         import drjit as dr
 
-        key = (spp, width, height, pass_name)
+        key = (spp, width, height, pass_name) + (() if dual is None else ("dual", sky))
         if key in self.frozen:
             return
-        mi, integrator = self.mi, self.integrator(pass_name)
+        mi, integrator = self.mi, self.integrator(pass_name, sky)
         progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=2, score=self.score)
         ok = False
         with ACTIVITY.doing(f"recording {spp} spp {width}x{height}" + ("" if pass_name == "own" else f" {pass_name}")):
-            if self.sensor_input:
+            if dual is not None:  # scene and dual sensor are inputs: slot poses change between frames
+                frozen = dr.freeze(lambda scene, sn, sd, n=spp, it=integrator:
+                                   mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
+                                   backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
+                self.frozen_args[key] = (self.scene, dual)
+                self._settle(frozen, self.scene, dual)
+            elif self.sensor_input:
                 scene = self.scene
                 frozen = dr.freeze(lambda sn, sd, n=spp, it=integrator:
                                    mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
+                self.frozen_args[key] = (self.sensor,)
                 self._settle(frozen, self.sensor)
             else:
                 frozen = dr.freeze(lambda scene, sd, n=spp, it=integrator:
                                    mi.render(scene, integrator=it, spp=n, seed=sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
+                self.frozen_args[key] = (self.scene,)
                 self._settle(frozen, self.scene)
             self.frozen[key] = frozen  # listed by /v1/status only once both recordings are done
             ok = True
@@ -646,7 +967,7 @@ class Resident:
         follows a single camera, so those views still render one at a time.
         """
         follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
-        if len(cams) == 1 or follow:
+        if len(cams) == 1 or follow or look.band == 2:
             return [self.render(c, width, height, hfov_deg, spp, seed, pass_name, follow, look) for c in cams]
         if not self.parked or look != self.look:  # the batch sensor sees the scene as set here
             self._set_camera(cams[0], width, height, hfov_deg, False, look)
@@ -814,6 +1135,7 @@ class Renderer:
         # path_nocaustics with camera-assist modes (an older build of the plugin has none: active variants
         # that need it are hidden, and one-pass active variants keep a resident scene of their own)
         self.progress_log = progress.install()  # Dr.Jit's log feeds freeze-recording progress
+        self.has_rgb2nir = self._has_plugin({"type": "rgb2nir", "nested": {"type": "rgb", "value": [0.5, 0.5, 0.5]}})
         self.has_nocaustics = self._has_plugin({"type": "path_nocaustics", "assist": ASSIST_PREFIX,
                                                 "assist_mode": "exclude"})
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
@@ -824,6 +1146,11 @@ class Renderer:
         self.env_cache: dict[str, np.ndarray] = {}
         self.sun_deg = float(sun_deg)
         self.freeze_spp = int(freeze_spp)
+
+    def pool(self, scan: str) -> dict | None:
+        """The scene's perturbation pool (scenes/<scan>/perturbation_pool.json), if built."""
+        path = self.pack / "scenes" / scan / "perturbation_pool.json"
+        return json.loads(path.read_text()) if path.is_file() else None
 
     def env_image(self, name: str) -> np.ndarray:
         """An environment map of the --envmaps directory at ENV_RES (loaded once)."""
@@ -938,7 +1265,8 @@ class Renderer:
         with ACTIVITY.doing(f"loading {scan} {variant}"):
             loaded = Resident(self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
                               flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
-                              envs=self.env_image, freeze_spp=self.freeze_spp)
+                              envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
+                              pool=self.pool(scan))
         self.cache[rkey] = loaded
         return loaded
 
@@ -972,6 +1300,30 @@ class Renderer:
             return {"radiance": self._denoise(mode, np.asarray(arrays["radiance"], dtype=np.float32))}
         return self._on_main(mode, job)
 
+    @staticmethod
+    def pool_selection(pool: dict, mirrors: tuple) -> tuple[list[dict], list[dict]]:
+        """(mirrors, glass walls) of a pool a view's ``"mirrors"`` shows: a density's share of the mirrors
+        (density in robomituba's units, the pool holding ``density_max``'s worth), and the first glass walls by
+        rank, only those that leave the R2R graph whole unless ``glass_blocking``."""
+        density, glass, blocking = mirrors
+        n = min(len(pool["mirrors"]), int(round(len(pool["mirrors"]) * density / max(pool["density_max"], 1e-9))))
+        walls = [g for g in pool["glass"] if blocking or not g["splits_r2r"]][:glass]
+        return pool["mirrors"][:n], walls
+
+    def _pool_hidden(self, resident: Resident, mirrors: tuple | None) -> frozenset:
+        """Pool shapes to hide: all of them for the variant's own perturbation, else the ones the view's share
+        leaves out together with the dataset's own mirrors and glass walls."""
+        pool = resident.pool
+        if not pool:
+            if mirrors is not None:
+                raise ValueError("this scene has no perturbation pool (tools/build_perturbation_pool.py)")
+            return frozenset()
+        every = {m["id"] for m in pool["mirrors"]} | {g["id"] for g in pool["glass"]}
+        if mirrors is None:
+            return frozenset(every)
+        shown_m, shown_g = self.pool_selection(pool, mirrors)
+        return frozenset(every - {m["id"] for m in shown_m} - {g["id"] for g in shown_g}) | resident.dataset_perturbation
+
     def _check(self, view: dict) -> tuple:
         """Validate one view; returns (group key, camera_to_world)."""
         scan, variant = view["scan"], view["variant"]
@@ -997,28 +1349,57 @@ class Renderer:
             raise ValueError("lights / env scale out of range")
         if env_map != "original" and env_map not in self.envmaps:
             raise ValueError(f"unknown environment map {env_map!r} (have {sorted(self.envmaps)})")
-        look = (lights, env_map, env_scale, env_rot % 360.0)
+        bands, flash_band = str(view.get("bands", "rgb")), str(view.get("flash_band", "rgb"))
+        if bands not in ("rgb", "nir", "both") or flash_band not in ("rgb", "nir", "both"):
+            raise ValueError("bands and flash_band are 'rgb', 'nir' or 'both'")
+        if bands != "rgb" and not self.has_rgb2nir:
+            raise ValueError("near-infrared needs the rgb2nir plugin in this Mitsuba build (mitsuba/rgb2nir.cpp)")
+        nir = dict(NIR_DEFAULTS)
+        nir.update({k: float(v) for k, v in dict(view.get("nir") or {}).items() if k in NIR_DEFAULTS})
+        lighting = str(view.get("lighting", "all"))
+        if lighting not in LIGHTING:
+            raise ValueError(f"lighting must be one of {sorted(LIGHTING)}")
+        mirrors = view.get("mirrors")  # None: the variant's own; else a share of the scene's perturbation pool
+        if mirrors is not None:
+            mirrors = (float(dict(mirrors).get("density", 1.0)), int(dict(mirrors).get("glass", 0)),
+                       bool(dict(mirrors).get("glass_blocking", False)))
+            if not (0.0 <= mirrors[0] <= 100.0 and 0 <= mirrors[1] <= 64):
+                raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
+        look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
+                mirrors)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float):
         """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined)."""
         started = time.perf_counter()
-        scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot) = key
+        scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot, bands,
+                                                                        flash_band, nir, lighting, mirrors) = key
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
             rkey, passes, follow, hidden = self.plan(scan, variant, mode)
-            look = Look(hidden, lights, env, env_scale, env_rot)
             resident = self._resident(rkey, variant)
+            # lighting mode: light groups it leaves out are removed from the scene (hidden), not just dimmed
+            hidden = frozenset(hidden) | {s for s, g in resident.groups.items() if g not in LIGHTING[lighting]
+                                          and (s in resident.blocks or s in resident.transforms)}
+            hidden = hidden | self._pool_hidden(resident, mirrors)
+            # one look per band: visible (0) and pseudo near-infrared (1), the same recordings for both
+            flash = {"flash_rgb": flash_band in ("rgb", "both"), "flash_nir": flash_band in ("nir", "both")}
+            groups = LIGHTING[lighting]
+            if bands == "both" and resident.band_keys:  # one render, both bands (dual sensor)
+                looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups)}
+            else:  # one band per render
+                looks = {b: Look(hidden, lights, env, env_scale, env_rot, band=b, nir=nir, **flash, groups=groups)
+                         for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
             t0 = time.perf_counter()
             if len(cams) == 1:  # the pipelined path
-                handles = [resident.launch(cams[0], width, height, hfov, spp, seed, p, follow, look)
-                           for p in passes]
+                handles = {b: [resident.launch(cams[0], width, height, hfov, spp, seed, p, follow, look)
+                               for p in passes] for b, look in looks.items()}
             else:  # batch sensor: completes here
-                batch = [resident.render_many(cams, width, height, hfov, spp, seed, p, follow, look)
-                         for p in passes]
+                batch = {b: [resident.render_many(cams, width, height, hfov, spp, seed, p, follow, look)
+                             for p in passes] for b, look in looks.items()}
             launch_s = time.perf_counter() - t0
 
         def finish():
@@ -1026,19 +1407,24 @@ class Renderer:
                 t1 = time.perf_counter()
                 parts: dict[str, float] = {"queue_s": started - submitted, "launch_s": launch_s}
                 if len(cams) == 1:
-                    done = [resident.finish(h) for h in handles]
-                    per_resident = [[img] for img, _ in done]
-                    breakdowns = [b for _, b in done]
+                    done = {b: [resident.finish(h) for h in hs] for b, hs in handles.items()}
+                    per_band = {b: [[img] for img, _ in d] for b, d in done.items()}
+                    breakdowns = [bd for d in done.values() for _, bd in d]
                 else:
-                    per_resident, breakdowns = batch, [getattr(resident, "breakdown", None) or {}]
+                    per_band, breakdowns = batch, [getattr(resident, "breakdown", None) or {}]
+                if 2 in per_band:  # dual: visible slot left, near-infrared right, margins cropped
+                    wm, m = int(width) + 2 * DUAL_MARGIN, DUAL_MARGIN
+                    dual = per_band.pop(2)
+                    per_band[0] = [[v[:, m:m + int(width)] for v in views] for views in dual]
+                    per_band[1] = [[v[:, wm + m:wm + m + int(width)] for v in views] for views in dual]
                 for b in breakdowns:
                     for k, v in b.items():
                         parts[k] = parts.get(k, 0.0) + v
                 render_s = launch_s + time.perf_counter() - t1
-                return self._assemble(key, cams, per_resident, parts, render_s)
+                return self._assemble(key, cams, per_band, parts, render_s)
         return finish
 
-    def _assemble(self, key: tuple, cams: list, per_resident: list, parts: dict, render_s: float) -> tuple:
+    def _assemble(self, key: tuple, cams: list, per_band: dict, parts: dict, render_s: float) -> tuple:
         scan, variant, mode, width, height, hfov, spp, seed, denoise = key[:9]
         t1 = time.perf_counter()
         kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0}
@@ -1052,9 +1438,24 @@ class Renderer:
             }
         outs = []
         for i in range(len(cams)):
-            passes = [views[i] for views in per_resident]
+            out = {}
+            if 1 in per_band:  # near-infrared: the luminance of the band's (grey-material) render
+                passes = [views[i] for views in per_band[1]]
+                if mode == "rgb":
+                    rad = sum(p[:, :, :3] for p in passes)
+                    out["nir"] = (self._denoise(mode, rad) if denoise else rad) @ LUMA
+                else:
+                    split = [stokes.split_channels(p)[1:] for p in passes]
+                    n0, n1, n2, n3 = (sum(s[k] for s in split) for k in range(4))
+                    if denoise:
+                        n0, n1, n2 = self._denoise_stokes(mode, n0, n1, n2)
+                    out.update({f"nir_s{k}": v @ LUMA for k, v in enumerate((n0, n1, n2, n3))})
+            if 0 not in per_band:
+                outs.append(out)
+                continue
+            passes = [views[i] for views in per_band[0]]
             if mode == "rgb":
-                out = {"radiance": sum(p[:, :, :3] for p in passes)}
+                out["radiance"] = sum(p[:, :, :3] for p in passes)
                 if denoise:
                     out["radiance"] = self._denoise(mode, out["radiance"])
             else:
@@ -1066,7 +1467,7 @@ class Renderer:
                 if denoise:
                     s0, s1, s2 = self._denoise_stokes(mode, s0, s1, s2)
                     rgb = s0
-                out = {"rgb_src": rgb, "s0": s0, "s1": s1, "s2": s2, "s3": s3}
+                out.update({"rgb_src": rgb, "s0": s0, "s1": s1, "s2": s2, "s3": s3})
             outs.append(out)
         kernels.update(parts)
         kernels["split_s"] = time.perf_counter() - t1
@@ -1076,15 +1477,19 @@ class Renderer:
     def _finish(mode: str, out: dict, dtype, preview: bool = True) -> dict[str, np.ndarray]:
         """``preview=False`` skips the dataset preview recipe (about 40 ms at 512x384); the client then
         tonemaps the radiance itself (MatterSim.setPreviewEnabled)."""
+        result = {k: v.astype(dtype) for k, v in out.items() if k == "nir" or k.startswith("nir_s")}
         if mode == "rgb":
-            rad = out["radiance"]
-            result = {"radiance": rad.astype(dtype)}
-            if preview:
-                result["rgb"] = stokes.rgb_preview(rad, rad, np.zeros_like(rad), np.zeros_like(rad), percentile=0.995, blur=0.0)
+            if "radiance" in out:
+                rad = out["radiance"]
+                result["radiance"] = rad.astype(dtype)
+                if preview:
+                    result["rgb"] = stokes.rgb_preview(rad, rad, np.zeros_like(rad), np.zeros_like(rad),
+                                                       percentile=0.995, blur=0.0)
             return result
-        result = {k: out[k].astype(dtype) for k in ("s0", "s1", "s2", "s3")}
-        if preview:
-            result["rgb"] = stokes.rgb_preview(out["rgb_src"], out["s0"], out["s1"], out["s2"])
+        if "s0" in out:
+            result.update({k: out[k].astype(dtype) for k in ("s0", "s1", "s2", "s3")})
+            if preview:
+                result["rgb"] = stokes.rgb_preview(out["rgb_src"], out["s0"], out["s1"], out["s2"])
         return result
 
     def render_views(self, views: list[dict], dtype) -> tuple[list[dict[str, np.ndarray]], dict[str, float]]:
@@ -1171,7 +1576,8 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     return self._json(200, {
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,
                         "modes": renderer.variant_of, "path_nocaustics": renderer.has_nocaustics,
-                        "envmaps": sorted(renderer.envmaps),
+                        "envmaps": sorted(renderer.envmaps), "nir": renderer.has_rgb2nir,
+                        "nir_defaults": NIR_DEFAULTS,
                         "drjit_freeze": renderer.freeze, "spp_chunk": SPP_CHUNK,
                         "scans": {s: renderer.variants(s) for s in renderer.meta},
                         "resident": [list(k) + [round(r.load_s, 1)] for k, r, _ in renderer.served()],
@@ -1183,6 +1589,13 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     if parts[3] == "meta":
                         meta = dict(renderer.meta[scan])
                         meta["variants_available"] = renderer.variants(scan)
+                        pool = renderer.pool(scan)
+                        if pool:  # what a view's "mirrors" can show, and the R2R edges each glass wall blocks
+                            meta["perturbation_pool"] = {
+                                "density_max": pool["density_max"], "mirrors": len(pool["mirrors"]),
+                                "wall_source": pool["wall_source"],
+                                "glass": [{k: g[k] for k in ("id", "rank", "splits_r2r", "blocked_edges")}
+                                          for g in pool["glass"]]}
                         return self._json(200, meta)
                     if parts[3] == "connectivity":
                         body = (pack / "connectivity" / f"{scan}_connectivity.json").read_bytes()

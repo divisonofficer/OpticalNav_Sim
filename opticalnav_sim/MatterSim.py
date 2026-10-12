@@ -90,6 +90,11 @@ class Simulator:
         self.variant = "base"
         self.lights = 1.0  # indoor light level (setIndoorLights)
         self.env = {"map": "original", "scale": 1.0, "rotate_deg": 0.0}  # sky (setEnvironment)
+        self.bands = "rgb"  # setBands
+        self.lighting = "all"  # setLighting
+        self.mirrors = None  # setMirrors: None (the variant's own) or {"density", "glass", "glass_blocking"}
+        self.flash_band = "rgb"  # setFlashBand
+        self.nir = {}  # setNirScales (server defaults otherwise)
         self.renderMode = "polar"
         self.denoise = False
         self.preview = True
@@ -170,6 +175,55 @@ class Simulator:
         (newEpisode, teleport or makeAction, mid-episode too). The render server keeps one resident
         scene for both, so switching loads nothing; the first frame of each records its freeze."""
         self.setVariant("active_polar" if enabled else "perturbed")
+
+    def setBands(self, bands: str) -> None:
+        """'rgb' (default), 'nir' or 'both'. The near-infrared band renders the same scene with pseudo-NIR
+        materials (robomituba's pseudo_nir_albedo of each base colour) and per-class light levels
+        (setNirScales); ``state.nir_stokes`` then holds its linear Stokes S0..S3 as HxW images."""
+        if bands not in ("rgb", "nir", "both"):
+            raise ValueError("bands must be 'rgb', 'nir' or 'both'")
+        self.bands = bands
+
+    def setFlashBand(self, band: str) -> None:
+        """Which band the active polarized light emits in: 'rgb' (the dataset's active_polar), 'nir' or 'both'."""
+        if band not in ("rgb", "nir", "both"):
+            raise ValueError("flash band must be 'rgb', 'nir' or 'both'")
+        self.flash_band = band
+
+    def setNirScales(self, led: float | None = None, incandescent: float | None = None,
+                     daylight: float | None = None) -> None:
+        """Near-infrared radiance relative to visible, per light class (server defaults: LED 0,
+        incandescent 0.45, daylight 0.75, robomituba's NIR_PASSIVE_SCALE_POLICY)."""
+        for name, value in (("led", led), ("incandescent", incandescent), ("daylight", daylight)):
+            if value is not None:
+                self.nir[name] = float(value)
+
+    def setMirrors(self, density: float | None = None, glass: int = 0, glass_blocking: bool = False) -> None:
+        """Random mirrors and glass walls from the scene's perturbation pool instead of the variant's own:
+        ``density`` in robomituba's units (1 is its default, 0 none), ``glass`` glass walls. Glass walls
+        block the R2R edges they cross (navigableLocations leaves them out); only walls that leave a detour
+        are used unless ``glass_blocking``. ``density=None`` returns to the variant's own. From the next
+        render, without loading or recording."""
+        self.mirrors = None if density is None else {"density": float(density), "glass": int(glass),
+                                                     "glass_blocking": bool(glass_blocking)}
+
+    def blockedEdges(self, scan_id: str) -> set[tuple[str, str]]:
+        """R2R viewpoint pairs the current glass walls block (both orders)."""
+        if not self.mirrors or not self.mirrors.get("glass"):
+            return set()
+        scene, _ = self._split(scan_id)
+        pool = self._scene_meta(scene).get("perturbation_pool") or {}
+        walls = [g for g in pool.get("glass", []) if self.mirrors.get("glass_blocking") or not g["splits_r2r"]]
+        pairs = {tuple(e) for g in walls[: self.mirrors["glass"]] for e in g["blocked_edges"]}
+        return pairs | {(b, a) for a, b in pairs}
+
+    def setLighting(self, mode: str) -> None:
+        """'none' (no lights), 'fixtures' (Infinigen's own lamp and ceiling-light emitters) or 'all' (also the
+        room softboxes robomituba's importer added for even fill; the dataset's lighting). Lights a mode leaves
+        out are removed from the scene, not dimmed. From the next render, without recording."""
+        if mode not in ("none", "fixtures", "all"):
+            raise ValueError("lighting must be 'none', 'fixtures' or 'all'")
+        self.lighting = mode
 
     def setIndoorLights(self, level: float) -> None:
         """Scale every indoor light (the scene's area emitters; not the camera flash or the sky): 1 as built,
@@ -353,7 +407,9 @@ class Simulator:
     def _view(self, scene, variant, c2w, width, height, hfov_deg) -> dict:
         return {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": width, "height": height,
                 "hfov_deg": hfov_deg, "spp": self.spp, "seed": self.seed, "mode": self.renderMode,
-                "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env)}
+                "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env),
+                "bands": self.bands, "flash_band": self.flash_band, "nir": dict(self.nir), "lighting": self.lighting,
+                "mirrors": dict(self.mirrors) if self.mirrors is not None else None}
 
     def _set_heading_elevation(self, heading, elevation) -> None:
         for state, h, e in zip(self.states, heading, elevation):
@@ -379,9 +435,13 @@ class Simulator:
         for state in self.states:
             graph = self._graph(state.scanId)
             loc = state.location
+            blocked = self.blockedEdges(state.scanId)
             if state._free_position is None:
                 state.navigableLocations = graph.navigable(loc.ix, state.heading, state.elevation, hfov,
                                                            self.restrictedNavigation)
+                if blocked:  # glass walls in the way
+                    state.navigableLocations = [state.navigableLocations[0]] + [
+                        c for c in state.navigableLocations[1:] if (loc.viewpointId, c.viewpointId) not in blocked]
             else:
                 saved = graph.pos[loc.ix]
                 graph.pos[loc.ix] = state._free_position
@@ -411,7 +471,12 @@ class Simulator:
         results = self._client.render(views, self.stokesDtype)
         for state, out in zip(self.states, results):
             state.stokes = {k: out[k] for k in ("s0", "s1", "s2", "s3")} if "s0" in out else None
-            state.radiance = out["s0"] if "s0" in out else out["radiance"]
+            state.nir_stokes = {k: out[f"nir_{k}"] for k in ("s0", "s1", "s2", "s3")} if "nir_s0" in out else (
+                {"s0": out["nir"]} if "nir" in out else None)
+            state.radiance = out["s0"] if "s0" in out else out.get("radiance")
+            if state.radiance is None:  # near-infrared only: a grey preview of it
+                n = state.nir_stokes["s0"]
+                state.radiance = np.repeat(np.asarray(n, dtype=np.float32)[..., None], 3, axis=2)
             rgb = out["rgb"] if "rgb" in out else stokes.quick_preview(state.radiance)
             state.rgb = np.ascontiguousarray(rgb[:, :, ::-1])  # BGR, as MatterSim's cv::Mat
         self._frames += len(self.states)

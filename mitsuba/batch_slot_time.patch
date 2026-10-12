@@ -1,0 +1,18 @@
+93a94,96
+>         // slot_time: each child's rays carry their slot index added to the time, so a scene can tell the
+>         // children apart per ray (opticalnav_sim: slot 1 renders the near-infrared band of the same camera).
+>         m_slot_time = props.get<bool>("slot_time", false);
+146a150
+>         Float slot_time = m_slot_time ? time + Float(index) : time;
+148c152
+<             sensor->sample_ray(time, wavelength_sample, position_sample_2,
+---
+>             sensor->sample_ray(slot_time, wavelength_sample, position_sample_2,
+176a181
+>         Float slot_time = m_slot_time ? time + Float(index) : time;
+178c183
+<             time, wavelength_sample, position_sample_2, aperture_sample,
+---
+>             slot_time, wavelength_sample, position_sample_2, aperture_sample,
+289a295
+>     bool m_slot_time = false;

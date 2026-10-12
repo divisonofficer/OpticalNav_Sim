@@ -39,13 +39,21 @@ from . import MatterSim, frames, stokes, tonemap
 from .client import RenderClient
 
 PAGE = Path(__file__).with_name("gui.html")
-CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2")
+ACCUMULATED = ("s0", "s1", "s2", "nir_s0", "nir_s1", "nir_s2")  # summed over passes, shown as their mean
+CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")
 
 
 def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
     """uint8 RGB image of one channel; ``scale`` is the DoLP (and |S1/S0|, |S2/S0|) shown at full colour."""
     if channel == "rgb":
         return frame["rgb"]
+    if channel.startswith("nir"):
+        if "nir" not in frame:  # the near-infrared band is not being rendered: a dark pane
+            return np.full_like(frame["rgb"], 24)
+        if channel == "nir":
+            return frame["nir"]
+        n = frame["nir_derived"]
+        return stokes.dolp_rgb(n["dolp"], scale) if channel == "nir_dolp" else stokes.aolp_rgb(n["aolp_deg"], n["dolp"], scale)
     d = frame["derived"]
     if channel == "dolp":
         return stokes.dolp_rgb(d["dolp"], scale)
@@ -85,6 +93,7 @@ class Session:
         sim.setPreviewEnabled(False)  # the page tonemaps the running mean itself
         self.tones: dict[tuple[str, str], dict] = {}  # fixed display exposure per (scene, variant)
         self.envmaps: list[str] = []  # environment maps the render server offers (main sets them)
+        self.nir_available = False  # the render server has the rgb2nir plugin (main sets it)
         self.lock = threading.Lock()
         self.cv = threading.Condition()
         self.version = 0
@@ -198,6 +207,20 @@ class Session:
         if "lights" in settings:
             self.sim.setIndoorLights(float(settings["lights"]))
             restart = True
+        if "mirrors" in settings:  # None: the variant's own; else {"density", "glass", "glass_blocking"}
+            m = settings["mirrors"]
+            self.sim.setMirrors(None if m is None else m.get("density", 1.0), int((m or {}).get("glass", 0)),
+                                bool((m or {}).get("glass_blocking", False)))
+            restart = True
+        if "lighting" in settings:
+            self.sim.setLighting(str(settings["lighting"]))
+            restart = True
+        if "bands" in settings:
+            self.sim.setBands(str(settings["bands"]))
+            restart = True
+        if "flash_band" in settings:
+            self.sim.setFlashBand(str(settings["flash_band"]))
+            restart = True
         if {"env", "env_scale", "env_rotate_deg"} & set(settings):
             env = dict(self.sim.env)
             name = str(settings.get("env", env["map"]))
@@ -242,7 +265,9 @@ class Session:
         scene, variant = sim._split(st.scanId)
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
-                "denoise": False, "preview": False, "lights": sim.lights, "env": dict(sim.env)}
+                "denoise": False, "preview": False, "lights": sim.lights, "env": dict(sim.env),
+                "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting,
+                "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
         pos = st._free_position or (st.location.x, st.location.y)
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
             self.trail.append((pos[0], pos[1]))
@@ -319,14 +344,19 @@ class Session:
                 if seed != 0 or gen <= self.frame_meta.get("frame_gen", -1):
                     return
                 passes = 1
-                s0, s1, s2 = (np.asarray(out[k], dtype=np.float32) for k in ("s0", "s1", "s2"))
+                mean = {k: np.asarray(out[k], dtype=np.float32) for k in ACCUMULATED if k in out}
             else:
-                for k in ("s0", "s1", "s2"):
-                    a = np.asarray(out[k], dtype=np.float32)
-                    self.acc[k] = a.copy() if k not in self.acc else self.acc[k] + a
+                for k in ACCUMULATED:
+                    if k in out:
+                        a = np.asarray(out[k], dtype=np.float32)
+                        self.acc[k] = a.copy() if k not in self.acc else self.acc[k] + a
                 self.passes += 1
                 passes = self.passes
-                s0, s1, s2 = (self.acc[k] / passes for k in ("s0", "s1", "s2"))
+                mean = {k: self.acc[k] / passes for k in ACCUMULATED if k in self.acc}
+        nir = [mean.get(f"nir_s{k}") for k in range(3)]
+        if "s0" not in mean:  # near-infrared only: show it in the RGB pane too, grey
+            mean.update({f"s{k}": np.repeat(nir[k][..., None], 3, axis=2) for k in range(3)})
+        s0, s1, s2 = mean["s0"], mean["s1"], mean["s2"]
         if self.sim.denoise:
             # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
             # denoised 16 spp passes keeps just what every pass's denoiser agreed on, and smears detail)
@@ -336,7 +366,19 @@ class Session:
             except (ConnectionError, OSError, RuntimeError):
                 pass  # show the raw mean rather than nothing
         tone = self._tone(view["scan"], view["variant"], s0)
-        frame = {"rgb": tonemap.reinhard(s0, tone["exposure"], tone["white"]), "s0_luma": s0 @ stokes.LUMA,
+        extra = {}
+        if nir[0] is not None:
+            if self.sim.denoise:
+                try:
+                    den = self._client().denoise({f"s{k}": np.repeat(nir[k][..., None], 3, axis=2) for k in range(3)})
+                    nir = [den[f"s{k}"][..., 0] for k in range(3)]
+                except (ConnectionError, OSError, RuntimeError):
+                    pass
+            grey = np.repeat(nir[0][..., None], 3, axis=2)
+            nt = self._tone(view["scan"], view["variant"] + "|nir", grey, own_frame=True)
+            extra = {"nir": tonemap.reinhard(grey, nt["exposure"], nt["white"]),
+                     "nir_derived": stokes.derived_mono(nir[0], nir[1], nir[2])}
+        frame = {"rgb": tonemap.reinhard(s0, tone["exposure"], tone["white"]), "s0_luma": s0 @ stokes.LUMA, **extra,
                  "derived": stokes.derived(s0, s1, s2), "spp": passes * view["spp"], "passes": passes,
                  "variant": view["variant"], "wall_ms": 1000.0 * wall,
                  "server_ms": 1000.0 * float(timing.get("render_s", 0.0)),
@@ -359,11 +401,13 @@ class Session:
             self.version += 1
             self.cv.notify_all()
 
-    def _tone(self, scene: str, variant: str, radiance: np.ndarray) -> dict:
+    def _tone(self, scene: str, variant: str, radiance: np.ndarray, own_frame: bool = False) -> dict:
         """Fixed display exposure for a scene and variant: robomituba's scene-global extended Reinhard,
         from the pack's 1024 spp dataset frames, so brightness never jumps from frame to frame (a lamp or
         window entering the view). Without stored frames, the first frame rendered decides."""
         key = (scene, variant)
+        if key not in self.tones and own_frame:  # no dataset frames for this band: its first frame decides
+            self.tones[key] = tonemap.global_params([radiance])
         if key not in self.tones:
             try:
                 self.tones[key] = tonemap.scene_params(Path(self.sim.navGraphPath).parent / "scenes" / scene, variant)
@@ -388,6 +432,8 @@ class Session:
             out = {"scans": self.scans, "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
+                   "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
+                   "lighting": sim.lighting, "mirrors": sim.mirrors,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
@@ -772,6 +818,7 @@ def main() -> int:
         sim.setVariant(info["resident"][0][1])
     session = Session(sim, info["scans"], args.pass_spp, args.target_spp, args.turn_deg, args.pitch_deg, args.depth)
     session.envmaps = list(info.get("envmaps", []))
+    session.nir_available = bool(info.get("nir"))
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token))
     resident = [r[0] for r in info.get("resident", [])]
     print(f"[gui] http://{args.host}:{args.port}{'/?token=<token>' if args.token else ''}  render server {sim._client.url}  freeze={info.get('drjit_freeze')}  "

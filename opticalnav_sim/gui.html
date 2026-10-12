@@ -126,9 +126,13 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
         title="거울과 유리(M): perturbed와 base 전환. 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다.">거울 없음</button>
       <button type="button" id="flash" class="flash" hidden aria-pressed="false"
         title="카메라 앞 액티브 편광 조명(L). 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다.">조명 꺼짐</button>
-      <button type="button" id="lights" class="flash" aria-pressed="true"
-        title="실내 조명 전체(I). 씬의 발광체 밝기만 바꾸므로 다시 올리거나 freeze를 다시 기록하지 않습니다.">실내등 켜짐</button>
+      <label for="mirrorsrc" title="거울·유리벽: 변형(perturbed)의 데이터셋 배치, 또는 robomituba 배치 로직으로 미리 만든 후보 풀에서 밀도만큼(로드·freeze 재기록 없음)">거울 배치 <select id="mirrorsrc"><option value="dataset">데이터셋</option><option value="pool">랜덤 풀</option></select></label>
+      <label for="mdensity" title="robomituba 단위 밀도(1 = 기본)">밀도 <input type="range" id="mdensity" min="0" max="4" step="0.25" value="1"> <span id="mdensity-v">1</span></label>
+      <label for="mglass" title="유리벽 수(우회로가 남는 것만)">유리벽 <select id="mglass"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></label>
+      <label for="lighting" title="조명(I로 순환). 실내 조명은 Infinigen 원래 램프·천장등, 전역 조명은 로드 때 방마다 더한 소프트박스. 빠지는 조명은 끄는 대신 씬에서 지웁니다(freeze 재기록 없음).">조명 <select id="lighting"><option value="none">없음</option><option value="fixtures">실내 조명</option><option value="all">실내+전역 조명</option></select></label>
       <label for="env" title="창밖 하늘(환경맵). 픽셀만 바꿔 넣으므로 freeze를 다시 기록하지 않습니다.">하늘 <select id="env"></select></label>
+      <label for="bands" title="근적외선은 같은 씬을 의사 NIR 재질(RGB 기본색에서 계산)로 한 번 더 렌더합니다. freeze 기록은 같이 씁니다.">대역 <select id="bands"><option value="rgb">RGB</option><option value="both">RGB+NIR</option><option value="nir">NIR</option></select></label>
+      <label for="flashband" title="액티브 조명이 내는 대역">조명 대역 <select id="flashband"><option value="rgb">RGB</option><option value="nir">NIR</option><option value="both">둘 다</option></select></label>
       <label for="envrot" title="하늘을 수직축으로 돌립니다">회전 <input type="range" id="envrot" min="0" max="345" step="15" value="0"> <span id="envrot-v">0°</span></label>
       <label for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다.">패스 spp <select id="pass"></select></label>
       <label for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다.">목표 spp <select id="target"></select></label>
@@ -214,7 +218,8 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
 const $ = (id) => document.getElementById(id);
 const PASS = [1, 2, 4, 8, 16, 32, 64];
 const TARGET = [64, 128, 256, 512, 1024, 2048, 4096];
-const CHANNELS = [["rgb", "RGB"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"]];
+const CHANNELS = [["rgb", "RGB"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"],
+  ["nir", "NIR"], ["nir_dolp", "NIR DoLP"], ["nir_aolp", "NIR AoLP"]];
 const view = { a: "rgb", b: "dolp" };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let S = null, graph = null, poseKey = "";
@@ -251,6 +256,8 @@ function buildTabs() {
       b.setAttribute("aria-pressed", String(view[pane] === ch));
       b.addEventListener("click", () => {
         view[pane] = ch;
+        // a near-infrared pane needs the near-infrared band: turn it on alongside the visible one
+        if (ch.startsWith("nir") && S && S.nir_available && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
         box.querySelectorAll("button").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
         showImages(); renderLegends();
       });
@@ -472,7 +479,7 @@ function apply(st) {
   if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: startScene() }, "첫 프레임"); return; }  // GUI server restarted
   showError(S.error ? `렌더 실패: ${S.error}` + (/frozen|not permitted|record/.test(S.error)
     ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "") : "");
-  const key = JSON.stringify([S.scene, S.position, S.heading_deg, S.elevation_deg, S.height_m, S.viewpoint, S.candidates.length]);
+  const key = JSON.stringify([S.scene, S.position, S.heading_deg, S.elevation_deg, S.height_m, S.viewpoint, S.candidates.length, S.variant, S.bands]);
   if (key !== poseKey) {
     poseKey = key;
     drawCandidates(); renderReadout();
@@ -482,7 +489,7 @@ function apply(st) {
     $("badge").textContent = `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
     $("progress").style.width = `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
-  renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky();
+  renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors();
   if ($("auto").checked !== S.auto) $("auto").checked = S.auto;
 }
 
@@ -506,9 +513,7 @@ function renderFlash() {
   }
 }
 function renderSky() {
-  const lightsOn = (S.lights ?? 1) > 0, b = $("lights");
-  b.textContent = lightsOn ? "실내등 켜짐" : "실내등 꺼짐";
-  b.setAttribute("aria-pressed", String(lightsOn));
+  if (document.activeElement !== $("lighting") && $("lighting").value !== (S.lighting || "all")) $("lighting").value = S.lighting || "all";
   const env = S.env || { map: "original", scale: 1, rotate_deg: 0 };
   const names = ["original", ...(S.envmaps || []), "__off__"];
   const sel = $("env"), want = env.scale > 0 ? env.map : "__off__";
@@ -519,9 +524,28 @@ function renderSky() {
   if (document.activeElement !== $("envrot")) { $("envrot").value = String(Math.round(env.rotate_deg || 0)); }
   $("envrot-v").textContent = `${$("envrot").value}°`;
 }
-function toggleLights() {
-  const on = (S.lights ?? 1) > 0;
-  configure({ lights: on ? 0 : 1 }, on ? "실내등 끄기" : "실내등 켜기");
+function sendMirrors() {
+  if ($("mirrorsrc").value === "dataset") return configure({ mirrors: null }, "데이터셋 거울");
+  return configure({ mirrors: { density: Number($("mdensity").value), glass: Number($("mglass").value) } }, "거울 밀도");
+}
+function renderMirrors() {
+  const m = S.mirrors, pool = $("mirrorsrc").value === "pool";
+  if (document.activeElement !== $("mirrorsrc")) $("mirrorsrc").value = m ? "pool" : "dataset";
+  if (m && document.activeElement !== $("mdensity")) $("mdensity").value = String(m.density);
+  if (m && document.activeElement !== $("mglass")) $("mglass").value = String(m.glass);
+  $("mdensity-v").textContent = $("mdensity").value;
+  $("mdensity").disabled = $("mglass").disabled = !(m || pool);
+}
+function renderBands() {
+  const ok = !!S.nir_available;
+  $("bands").closest("label").hidden = !ok;
+  $("flashband").closest("label").hidden = !ok || !variantsHere().includes("active_polar");
+  if (document.activeElement !== $("bands") && $("bands").value !== S.bands) $("bands").value = S.bands || "rgb";
+  if (document.activeElement !== $("flashband") && $("flashband").value !== S.flash_band) $("flashband").value = S.flash_band || "rgb";
+}
+function toggleLights() {  // I: none -> fixtures -> all -> none
+  const order = ["none", "fixtures", "all"], next = order[(order.indexOf(S.lighting || "all") + 1) % 3];
+  configure({ lighting: next }, { none: "조명 없음", fixtures: "실내 조명", all: "실내+전역 조명" }[next]);
 }
 function toggleFlash() {
   if (!variantsHere().includes("active_polar")) return;
@@ -631,7 +655,9 @@ const GRAD = {
   s: "linear-gradient(90deg,#2166ac,#f7f7f7,#b2182b)",
 };
 function legendHtml(ch, sc) {
-  if (ch === "rgb") return "";
+  if (ch === "rgb" || ch === "nir") return "";
+  if (ch === "nir_dolp") ch = "dolp";
+  if (ch === "nir_aolp") ch = "aolp";
   if (ch === "dolp") return `<span>0</span><div class="legend-bar" style="background:${GRAD.dolp}"></div><span>DoLP ${sc}</span>`;
   if (ch === "aolp") return `<span>0°</span><div class="legend-bar" style="background:${GRAD.aolp}"></div><span>180° · 밝기 = DoLP/${sc}</span>`;
   return `<span>−${sc}</span><div class="legend-bar" style="background:${GRAD.s}"></div><span>+${sc}</span>`;
@@ -710,7 +736,13 @@ $("scale").addEventListener("input", () => { renderLegends(); showImages(); });
 $("scene").addEventListener("change", () => { const sc = $("scene").value; graph = null; send("/api/start", { scene: sc }, "씬 전환"); });
 $("flash").addEventListener("click", toggleFlash);
 $("mirrors").addEventListener("click", toggleMirrors);
-$("lights").addEventListener("click", toggleLights);
+$("lighting").addEventListener("change", () => configure({ lighting: $("lighting").value }, "조명 변경"));
+$("bands").addEventListener("change", () => configure({ bands: $("bands").value }, "대역 변경"));
+$("mirrorsrc").addEventListener("change", sendMirrors);
+$("mdensity").addEventListener("input", () => { $("mdensity-v").textContent = $("mdensity").value; });
+$("mdensity").addEventListener("change", sendMirrors);
+$("mglass").addEventListener("change", sendMirrors);
+$("flashband").addEventListener("change", () => configure({ flash_band: $("flashband").value }, "조명 대역 변경"));
 $("env").addEventListener("change", () => {
   const v = $("env").value;
   configure(v === "__off__" ? { env_scale: 0 } : { env: v, env_scale: 1 }, "하늘 변경");

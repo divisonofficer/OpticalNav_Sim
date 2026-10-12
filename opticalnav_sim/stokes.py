@@ -140,6 +140,17 @@ def signed_rgb(t: np.ndarray) -> np.ndarray:
     return np.where(t < 0, mid + (neg - mid) * -t, mid + (pos - mid) * t).astype(np.uint8)
 
 
+def derived_mono(l0: np.ndarray, l1: np.ndarray, l2: np.ndarray) -> dict[str, np.ndarray]:
+    """``derived`` for single-channel Stokes images (HxW), such as the near-infrared band."""
+    safe0 = np.maximum(l0, 1e-8)
+    return {
+        "dolp": np.clip(np.sqrt(np.maximum(0.0, l1 * l1 + l2 * l2)) / safe0, 0.0, 1.0),
+        "aolp_deg": np.degrees(np.mod(0.5 * np.arctan2(l2, l1), np.pi)),
+        "s1_over_s0": np.clip(np.where(np.isfinite(l1), l1, 0.0) / safe0, -1.0, 1.0),
+        "s2_over_s0": np.clip(np.where(np.isfinite(l2), l2, 0.0) / safe0, -1.0, 1.0),
+    }
+
+
 def derived(s0: np.ndarray, s1: np.ndarray, s2: np.ndarray) -> dict[str, np.ndarray]:
     """Luminance DoLP, AoLP (degrees, [0, 180)) and normalised S1/S0, S2/S0, as the dataset defines them."""
     l0, l1, l2 = s0 @ LUMA, s1 @ LUMA, s2 @ LUMA
