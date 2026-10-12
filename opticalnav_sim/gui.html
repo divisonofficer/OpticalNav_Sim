@@ -40,6 +40,8 @@ details.settings > summary { display: none; }
 .controls label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
 select { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 6px; font: inherit; max-width: 100%; }
 input[type=range], input[type=checkbox] { accent-color: var(--accent); }
+.flash { background: var(--panel-2); color: var(--muted); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+.flash[aria-pressed=true] { background: var(--warn); border-color: var(--warn); color: #241505; }
 select:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
 .views { min-width: 0; display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
@@ -119,7 +121,14 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
     <summary>설정</summary>
     <div class="controls">
       <label for="scene">씬 <select id="scene"></select></label>
-      <label for="variant">변형 <select id="variant"></select></label>
+      <button type="button" id="mirrors" class="flash" hidden aria-pressed="false"
+        title="거울과 유리(M): perturbed와 base 전환. 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다.">거울 없음</button>
+      <button type="button" id="flash" class="flash" hidden aria-pressed="false"
+        title="카메라 앞 액티브 편광 조명(L). 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다.">조명 꺼짐</button>
+      <button type="button" id="lights" class="flash" aria-pressed="true"
+        title="실내 조명 전체(I). 씬의 발광체 밝기만 바꾸므로 다시 올리거나 freeze를 다시 기록하지 않습니다.">실내등 켜짐</button>
+      <label for="env" title="창밖 하늘(환경맵). 픽셀만 바꿔 넣으므로 freeze를 다시 기록하지 않습니다.">하늘 <select id="env"></select></label>
+      <label for="envrot" title="하늘을 수직축으로 돌립니다">회전 <input type="range" id="envrot" min="0" max="345" step="15" value="0"> <span id="envrot-v">0°</span></label>
       <label for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다.">패스 spp <select id="pass"></select></label>
       <label for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다.">목표 spp <select id="target"></select></label>
       <label for="denoise" title="패스마다 적용합니다"><input type="checkbox" id="denoise"> 디노이저</label>
@@ -265,7 +274,6 @@ async function boot() {
   $("pad-turn-l").textContent = $("pad-turn-r").textContent = `${S.turn_deg}°`;
   const syncStep = () => document.querySelectorAll(".pad-step").forEach((e) => { e.textContent = `${$("step").value} m`; });
   syncStep(); $("step").addEventListener("change", syncStep);
-  fillVariants(first);
   apply(S);
   connect();
   setInterval(renderMonitor, 500);
@@ -312,7 +320,7 @@ function connect() {
   ws.onopen = () => {
     showError("");
     subscribe();
-    if (!S.started) send("/api/start", { scene: $("scene").value }, "첫 프레임");
+    if (!S.started) send("/api/start", { scene: startScene() }, "첫 프레임");
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data !== "string") return showPane(ev.data);
@@ -330,6 +338,13 @@ function connect() {
     showError("GUI 서버와 연결이 끊겼습니다. 다시 연결하는 중…");
     setTimeout(connect, 1000);
   };
+}
+// after a restart, start where the render server already has a scene loaded (a load costs 1–2 min), not
+// with whatever an old tab's menu still shows
+function startScene() {
+  const sc = (S && S.default_scene) || $("scene").value;
+  if ($("scene").value !== sc) $("scene").value = sc;
+  return sc;
 }
 function wsSend(obj) { if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(obj)); return true; } return false; }
 
@@ -437,7 +452,7 @@ function showError(text) { $("error").hidden = !text; $("error").textContent = t
 function apply(st) {
   if (!st || (S && st.version < S.version && st.started === S.started)) return;  // an older answer than we have
   S = st;
-  if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: $("scene").value }, "첫 프레임"); return; }  // GUI server restarted
+  if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: startScene() }, "첫 프레임"); return; }  // GUI server restarted
   showError(S.error ? `렌더 실패: ${S.error}` + (/frozen|not permitted|record/.test(S.error)
     ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "") : "");
   const key = JSON.stringify([S.scene, S.position, S.heading_deg, S.elevation_deg, S.height_m, S.viewpoint, S.candidates.length]);
@@ -450,12 +465,57 @@ function apply(st) {
     $("badge").textContent = `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
     $("progress").style.width = `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
-  renderStatus(); renderLegends(); renderMonitor();
+  renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky();
   if ($("auto").checked !== S.auto) $("auto").checked = S.auto;
-  if (S.frame_variant && $("variant").value !== S.frame_variant) fillVariants(S.scene);
 }
 
-function fillVariants(scene) { fillSelect($("variant"), S.scans[scene] || ["base"], S.variant); }
+
+// base, perturbed (base + mirrors and glass) and active_polar (perturbed + the camera's flash) share one
+// resident scene on the render server, so these switches edit memory and load nothing; only the first
+// use of each records its freeze. Mirrors off also turns the flash off (no dataset variant has the flash
+// without the mirrors).
+function variantsHere() { return (S && S.scans[S.scene]) || []; }
+function renderFlash() {
+  const vs = variantsHere(), mirrorsOn = S.variant === "perturbed" || S.variant === "active_polar";
+  const toggles = [
+    ["mirrors", vs.includes("base") && vs.includes("perturbed"), mirrorsOn, "거울 있음", "거울 없음"],
+    ["flash", vs.includes("active_polar") && vs.includes("perturbed"), S.variant === "active_polar", "조명 켜짐", "조명 꺼짐"],
+  ];
+  for (const [id, shown, on, onText, offText] of toggles) {
+    const b = $(id);
+    b.hidden = !shown;
+    b.textContent = on ? onText : offText;
+    b.setAttribute("aria-pressed", String(on));
+  }
+}
+function renderSky() {
+  const lightsOn = (S.lights ?? 1) > 0, b = $("lights");
+  b.textContent = lightsOn ? "실내등 켜짐" : "실내등 꺼짐";
+  b.setAttribute("aria-pressed", String(lightsOn));
+  const env = S.env || { map: "original", scale: 1, rotate_deg: 0 };
+  const names = ["original", ...(S.envmaps || []), "__off__"];
+  const sel = $("env"), want = env.scale > 0 ? env.map : "__off__";
+  if (sel.options.length !== names.length) {
+    sel.replaceChildren(...names.map((n) => new Option(n === "original" ? "원래 하늘" : n === "__off__" ? "끄기" : n, n)));
+  }
+  if (sel.value !== want) sel.value = want;
+  if (document.activeElement !== $("envrot")) { $("envrot").value = String(Math.round(env.rotate_deg || 0)); }
+  $("envrot-v").textContent = `${$("envrot").value}°`;
+}
+function toggleLights() {
+  const on = (S.lights ?? 1) > 0;
+  configure({ lights: on ? 0 : 1 }, on ? "실내등 끄기" : "실내등 켜기");
+}
+function toggleFlash() {
+  if (!variantsHere().includes("active_polar")) return;
+  const on = S.variant === "active_polar";
+  configure({ variant: on ? "perturbed" : "active_polar" }, on ? "조명 끄기" : "조명 켜기");
+}
+function toggleMirrors() {
+  if (!variantsHere().includes("base") || !variantsHere().includes("perturbed")) return;
+  const on = S.variant === "perturbed" || S.variant === "active_polar";
+  configure({ variant: on ? "base" : "perturbed" }, on ? "거울 빼기" : "거울 넣기");
+}
 async function loadGraph(scene) { if (!graph || graph.scene !== scene) graph = await api(`/api/graph?scene=${encodeURIComponent(scene)}`); }
 
 // --- drawing ---
@@ -626,8 +686,16 @@ document.querySelectorAll(".pad button").forEach((b) => b.addEventListener("clic
   else act(b.dataset.op, Number(b.dataset.v || 0));
 }));
 $("scale").addEventListener("input", () => { renderLegends(); showImages(); });
-$("scene").addEventListener("change", () => { const sc = $("scene").value; fillVariants(sc); graph = null; send("/api/start", { scene: sc }, "씬 전환"); });
-$("variant").addEventListener("change", () => configure({ variant: $("variant").value }, "변형 전환"));
+$("scene").addEventListener("change", () => { const sc = $("scene").value; graph = null; send("/api/start", { scene: sc }, "씬 전환"); });
+$("flash").addEventListener("click", toggleFlash);
+$("mirrors").addEventListener("click", toggleMirrors);
+$("lights").addEventListener("click", toggleLights);
+$("env").addEventListener("change", () => {
+  const v = $("env").value;
+  configure(v === "__off__" ? { env_scale: 0 } : { env: v, env_scale: 1 }, "하늘 변경");
+});
+$("envrot").addEventListener("input", () => { $("envrot-v").textContent = `${$("envrot").value}°`; });
+$("envrot").addEventListener("change", () => configure({ env_rotate_deg: Number($("envrot").value) }, "하늘 회전"));
 $("pass").addEventListener("change", () => configure({ pass_spp: Number($("pass").value) }, "패스 spp 변경"));
 $("target").addEventListener("change", () => configure({ target_spp: Number($("target").value) }, "목표 spp 변경"));
 $("denoise").addEventListener("change", () => configure({ denoise: $("denoise").checked }, "디노이저 전환"));
@@ -646,6 +714,9 @@ document.addEventListener("keydown", (ev) => {
   const key = k.length === 1 ? k.toLowerCase() : k;
   if (key in MOVE_KEYS) held.add(key);  // continuous while held; key repeats change nothing
   else if (key === "g") act("free_off");
+  else if (key === "l") toggleFlash();
+  else if (key === "m") toggleMirrors();
+  else if (key === "i") toggleLights();
   else if (k === "ArrowUp") act("forward");
   else if (k === "ArrowDown") act("about");
   else if (/^[1-9]$/.test(k)) { const c = S.candidates[Number(k) - 1]; if (c && !pending) act("move", c.index); }

@@ -189,14 +189,32 @@ def test_pipelined_executor_overlaps_neighbours():
     assert log.index("start b") < log.index("finish a") and log.index("finish b") < log.index("plain")
 
 
+def test_extra_shapes_finds_added_mirrors_only():
+    head = '<scene version="3.0.0">\n  <integrator type="path" />\n  <sensor type="perspective">\n    <float name="fov" value="{fov}" />\n  </sensor>\n'
+    wall = '  <shape type="obj" id="wall">\n    <string name="filename" value="w.obj" />\n  </shape>\n'
+    mirror = ('  <!--opticalnav-obj:{"id":"mirror_auto_001"}-->\n  <bsdf type="conductor" id="mirror_bsdf" />\n'
+              '  <shape type="cube" id="mirror_auto_001">\n    <ref id="mirror_bsdf" />\n  </shape>\n')
+    flash = '  <shape type="rectangle" id="camera_assist_light">\n    <bsdf type="null" />\n  </shape>\n'
+    base = head.format(fov=60) + wall + "</scene>"
+    perturbed = head.format(fov=90) + wall + mirror + "</scene>"
+    active = head.format(fov=90) + wall + mirror + flash + "</scene>"
+    assert server.extra_shapes(perturbed, base) == ("mirror_auto_001",)  # the sensor differs: ignored
+    assert server.extra_shapes(active, perturbed) == ()  # assist shapes are not scene content
+    assert server.extra_shapes(active, base) == ("mirror_auto_001",)
+    assert server.extra_shapes(perturbed, base.replace("w.obj", "v.obj")) is None  # anything else differs
+
+
 class FakeRenderer:
     pack = Path(".")
-    variant, has_nocaustics, freeze, cache = "fake", False, False, {}
+    variant, has_nocaustics, freeze, cache, envmaps = "fake", False, False, {}, {}
     variant_of = {"polar": "fake", "rgb": "fake_rgb"}
     meta = {"scene": {"variants": {"base": {}}}}
 
     def variants(self, scan):
         return ["base"]
+
+    def served(self):
+        return []
 
     def render_views(self, views, dtype):
         out = []

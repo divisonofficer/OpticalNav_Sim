@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
-from . import MatterSim, frames, stokes
+from . import MatterSim, frames, stokes, tonemap
 from .client import RenderClient
 
 PAGE = Path(__file__).with_name("gui.html")
@@ -83,6 +83,8 @@ class Session:
         self.depth = max(1, int(depth))
         sim.renderingEnabled = False  # MatterSim only tracks state; this session renders (see _view)
         sim.setPreviewEnabled(False)  # the page tonemaps the running mean itself
+        self.tones: dict[tuple[str, str], dict] = {}  # fixed display exposure per (scene, variant)
+        self.envmaps: list[str] = []  # environment maps the render server offers (main sets them)
         self.lock = threading.Lock()
         self.cv = threading.Condition()
         self.version = 0
@@ -119,6 +121,11 @@ class Session:
         if viewpoint is None:
             viewpoint = next(v for v, ok in zip(graph.ids, graph.included) if ok)
         h = self.sim.getState()[0].heading if heading is None and self.started else (heading or 0.0)
+        have = self.scans.get(scene, [])
+        if have and self.sim.variant not in have:  # e.g. the light was on and this scene has no active variant
+            nearer = {"active_polar": ["perturbed", "base"], "perturbed": ["base", "active_polar"],
+                      "base": ["perturbed", "active_polar"]}.get(self.sim.variant, [])
+            self.sim.setVariant(next((v for v in nearer if v in have), have[0]))
         self.trail = []
         self.sim.newEpisode([scene], [viewpoint], [h], [0.0])
         self._moved()
@@ -179,13 +186,25 @@ class Session:
         self._moved()
 
     def configure(self, settings: dict) -> None:
-        """Variant, pass spp, denoiser restart accumulation; target spp and auto only change when it stops."""
+        """Variant, lights, environment, pass spp, denoiser restart accumulation; target spp and auto only
+        change when it stops."""
         restart = False
         if "variant" in settings:
             scene = self.sim.getState()[0].scanId
             if settings["variant"] not in self.scans.get(scene, []):
                 raise ValueError(f"variant {settings['variant']!r} is not available for {scene}")
             self.sim.setVariant(settings["variant"])
+            restart = True
+        if "lights" in settings:
+            self.sim.setIndoorLights(float(settings["lights"]))
+            restart = True
+        if {"env", "env_scale", "env_rotate_deg"} & set(settings):
+            env = dict(self.sim.env)
+            name = str(settings.get("env", env["map"]))
+            if name != "original" and name not in self.envmaps:
+                raise ValueError(f"unknown environment map {name!r}")
+            self.sim.setEnvironment(name, float(settings.get("env_scale", env["scale"])),
+                                    float(settings.get("env_rotate_deg", env["rotate_deg"])))
             restart = True
         if "pass_spp" in settings:
             self.pass_spp = int(settings["pass_spp"])
@@ -223,7 +242,7 @@ class Session:
         scene, variant = sim._split(st.scanId)
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
-                "denoise": sim.denoise, "preview": False}
+                "denoise": sim.denoise, "preview": False, "lights": sim.lights, "env": dict(sim.env)}
         pos = st._free_position or (st.location.x, st.location.y)
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
             self.trail.append((pos[0], pos[1]))
@@ -308,7 +327,8 @@ class Session:
                 self.passes += 1
                 passes = self.passes
                 s0, s1, s2 = (self.acc[k] / passes for k in ("s0", "s1", "s2"))
-        frame = {"rgb": stokes.quick_preview(s0), "s0_luma": s0 @ stokes.LUMA,
+        tone = self._tone(view["scan"], view["variant"], s0)
+        frame = {"rgb": tonemap.reinhard(s0, tone["exposure"], tone["white"]), "s0_luma": s0 @ stokes.LUMA,
                  "derived": stokes.derived(s0, s1, s2), "spp": passes * view["spp"], "passes": passes,
                  "variant": view["variant"], "wall_ms": 1000.0 * wall,
                  "server_ms": 1000.0 * float(timing.get("render_s", 0.0)),
@@ -331,6 +351,18 @@ class Session:
             self.version += 1
             self.cv.notify_all()
 
+    def _tone(self, scene: str, variant: str, radiance: np.ndarray) -> dict:
+        """Fixed display exposure for a scene and variant: robomituba's scene-global extended Reinhard,
+        from the pack's 1024 spp dataset frames, so brightness never jumps from frame to frame (a lamp or
+        window entering the view). Without stored frames, the first frame rendered decides."""
+        key = (scene, variant)
+        if key not in self.tones:
+            try:
+                self.tones[key] = tonemap.scene_params(Path(self.sim.navGraphPath).parent / "scenes" / scene, variant)
+            except (OSError, ValueError, KeyError):
+                self.tones[key] = tonemap.global_params([radiance])
+        return self.tones[key]
+
     # --- what the page reads ---
     def wait(self, after: int, timeout: float) -> None:
         """Block until something changed after ``version`` ``after`` (long poll), or ``timeout``."""
@@ -347,6 +379,7 @@ class Session:
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             out = {"scans": self.scans, "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
+                   "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
@@ -715,8 +748,20 @@ def main() -> int:
         sim.setDatasetPath(args.server)
     sim.setNavGraphPath(str(args.pack / "connectivity"))
     sim.initialize()
-    info = sim._client.info()
+    waited = 0
+    while True:  # the render server may still be loading its --preload scene (it listens only after that)
+        try:
+            info = sim._client.info()
+            break
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            if waited % 30 == 0:
+                print(f"[gui] waiting for the render server at {sim._client.url} ({type(exc).__name__})", flush=True)
+            time.sleep(2)
+            waited += 2
+    if info.get("resident"):  # start on what the render server has loaded (pages start its first scene)
+        sim.setVariant(info["resident"][0][1])
     session = Session(sim, info["scans"], args.pass_spp, args.target_spp, args.turn_deg, args.pitch_deg, args.depth)
+    session.envmaps = list(info.get("envmaps", []))
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token))
     resident = [r[0] for r in info.get("resident", [])]
     print(f"[gui] http://{args.host}:{args.port}{'/?token=<token>' if args.token else ''}  render server {sim._client.url}  freeze={info.get('drjit_freeze')}  "

@@ -100,7 +100,7 @@ python -m opticalnav_sim.gui --pack packs/opticalnav-v0.2 --server http://127.0.
 
 The page has two camera panes, each showing RGB, DoLP, AoLP, S1/S0 or S2/S0 (one pane on a phone), a map of the graph, the Stokes values of the pixel under the mouse (or a tapped pixel), and a status bar for the viewer link, the render server, the loaded scene, the dr.freeze recording of the current settings, and the frame rate.
 
-* **Moving.** W/A/S/D move freely (forward, left, back, right by the step size), Q/E lower and raise the camera, and dragging with the right mouse button turns the head (a plain right-click turns to the clicked point). ←/→ turn 15°, R/F look up and down, ↑ or 1–9 move to a graph candidate, ↓ turns around, and G snaps back to the nearest graph viewpoint. Space pauses accumulation. On touch screens a 3×3 button pad replaces the keys, a horizontal swipe turns, and a double tap turns to that point. Clicking the map jumps to the nearest viewpoint. Free movement has no collision check.
+* **Moving.** W/A/S/D move freely (forward, left, back, right by the step size), Q/E lower and raise the camera, and dragging with the right mouse button turns the head (a plain right-click turns to the clicked point). ←/→ turn 15°, R/F look up and down, ↑ or 1–9 move to a graph candidate, ↓ turns around, and G snaps back to the nearest graph viewpoint. Space pauses accumulation. M (or the 거울 button in the settings) puts the mirrors and glass in or takes them out (`perturbed` or `base`). L (or the 조명 button) switches the camera's active polarized light on or off (`active_polar` or `perturbed`). Both switches stay on the loaded scene. On touch screens a 3×3 button pad replaces the keys, a horizontal swipe turns, and a double tap turns to that point. Clicking the map jumps to the nearest viewpoint. Free movement has no collision check.
 * **Rendering** runs on its own, like a game loop. Inputs only change the simulator state and are acknowledged at once. A background loop keeps `--depth` (default 2) passes of the newest camera in flight on the render server. Each pass is `--pass-spp` samples with its own seed; while the camera stays put, passes add up to a running mean until `--target-spp`, and the next input starts over. The seed is an input of the server's freeze recording, so one pass spp costs one recording however many passes run. The first frame for a pass spp records twice, about 150 s on Device 1 (see `Resident._settle`).
 * **One WebSocket** (`/ws`) carries everything: the server pushes the state on every change and the panes' JPEGs for every new frame, and the page sends inputs and probes. The HTTP routes (`/api/state`, `/api/action`, …) remain for scripts.
 * **Speed** on an RTX 5090 with a 16 spp pass: the page showed about 11.5 frames per second while accumulating, up from 6.3 when the page requested one pass at a time. The render server's main thread spends about 40–55 ms per view (camera update 15–30 ms, freeze replay ~23 ms) next to ~40 ms of GPU work, so views overlap only partly (88 → 72 ms per view with 1 → 3 requests in flight). S0 error against the dataset frame fell from 16.2% (1 pass) to 6.2% (8 passes) and 2.9% (64 passes), the same as one render of the same spp.
@@ -161,7 +161,7 @@ export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 
 **Real-time rendering** needs `dr.freeze` (Dr.Jit ≥ 1.0 with Mitsuba ≥ 3.6; this code also passes `auto_opaque`, present in Dr.Jit 1.2). Without it every frame re-traces the scene, about 50 s per polar frame.
 
-**Plugins for `active_polar`.** Scenes render through the robomituba fork of Mitsuba (`robomituba/modules/mitsuba3`): v3.7.1 plus the `polarized_area` emitter (commit `0b79cb01`, branch `stable`). Two-pass `active_polar` scenes also need the `path_nocaustics` integrator. In that tree it is still an uncommitted file (`src/integrators/path_nocaustics.cpp`, listed in `src/integrators/CMakeLists.txt`) and Device 1's current build does not contain it, so the server reports `path_nocaustics=False` and hides those variants. `base` and `perturbed` need neither plugin.
+**Plugins for `active_polar`.** Scenes render through the robomituba fork of Mitsuba (`robomituba/modules/mitsuba3`): v3.7.1 plus the `polarized_area` emitter (commit `0b79cb01`, branch `stable`). Two-pass `active_polar` scenes also need the `path_nocaustics` integrator. In that tree it is still an uncommitted file (`src/integrators/path_nocaustics.cpp`, listed in `src/integrators/CMakeLists.txt`), and the simulator needs its camera-assist options (`caustics`, `assist`, `assist_mode`). This repository keeps a copy with those options in `mitsuba/path_nocaustics.cpp`: copy it to `src/integrators/`, add `add_plugin(path_nocaustics path_nocaustics.cpp)` to that folder's `CMakeLists.txt`, and build. With them, one resident scene renders a variant with the flash and without it (see *Active light on and off*). A build without them reports `path_nocaustics=False` and hides those variants. `base` and `perturbed` need neither plugin. To add the plugin to an existing build, run `ninja path_nocaustics` in the build directory (about 30 s on Device 1, which has it since 2026-10-12).
 
 **Build** (once per host and Python version):
 
@@ -188,15 +188,15 @@ import mitsuba as mi, drjit as dr
 print(mi.__version__, dr.__version__, "freeze:", hasattr(dr, "freeze"))
 print([v for v in mi.variants() if v.startswith("cuda")])
 mi.set_variant("cuda_rgb_polarized")
-for plugin in ("polarized_area", "path_nocaustics"):
+for spec in ({"type": "polarized_area"}, {"type": "path_nocaustics", "assist": "camera_assist", "assist_mode": "exclude"}):
     try:
-        mi.load_dict({"type": plugin}); print(plugin, "ok")
+        mi.load_dict(spec); print(spec["type"], "ok")
     except Exception as exc:
-        print(plugin, "missing")
+        print(spec["type"], "missing")
 PY
 ```
 
-On Device 1 this prints `3.7.1 1.2.0 freeze: True`, the CUDA variants, `polarized_area ok` and `path_nocaustics missing`.
+On Device 1 this prints `3.7.1 1.2.0 freeze: True`, the CUDA variants, `polarized_area ok` and `path_nocaustics ok`.
 
 ### 3. Python packages
 
@@ -223,7 +223,7 @@ CUDA_VISIBLE_DEVICES=0 timeout 6h /usr/bin/python3.10 -u -m opticalnav_sim.serve
 ```
 
 * The start line should read `modes={'polar': 'cuda_rgb_polarized'} … freeze=True`.
-* **Expect waits.** Loading a scene takes about 100 s (`--preload`, or the first request for it). The first frame of each spp and resolution records the freeze twice, about 150 s. Later frames replay in tens of milliseconds. Every scene or variant switch with `--max-resident 1` pays the load and the recordings again. `GET /v1/status` (and the viewer's status bar) says which of these is running.
+* **Expect waits.** Loading a scene takes about 100 s (`--preload`, or the first request for it). The first frame of each spp and resolution records the freeze twice, about 150 s. Later frames replay in tens of milliseconds. With `--max-resident 1`, every scene switch pays the load and the recordings again. A variant switch within a scene does not reload (see *One resident scene for all three variants*); `base` and `perturbed` share their recordings. `GET /v1/status` (and the viewer's status bar) says which of these is running.
 * **GPU memory.** Use `--max-resident 1` when the GPU is shared. Freeze recordings failed twice when the card was nearly full, and a server whose recording failed fails every later render until it restarts.
 * **Shared machines.** Start servers under `timeout` so a forgotten one does not hold the GPU. Bind beyond localhost only with a token (`--host 0.0.0.0 --token …`). On WSL2, other machines reach the port only after Windows forwards it (`netsh interface portproxy add v4tov4 listenport=18780 connectaddress=<WSL IP> connectport=18780` and a firewall rule).
 
@@ -235,7 +235,7 @@ CUDA_VISIBLE_DEVICES=0 timeout 6h /usr/bin/python3.10 -u -m opticalnav_sim.serve
 | `libcuda.so` not found, or no CUDA device (WSL2) | `export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH` |
 | `no Mitsuba variant for polar mode` | the build lacks `cuda_rgb_polarized` / `cuda_ad_rgb_polarized`: enable it in `mitsuba.conf` and rebuild |
 | start line says `freeze=False` | Dr.Jit older than 1.0: every frame re-traces (~50 s polar); upgrade Mitsuba/Dr.Jit |
-| `active_polar` missing for new scenes, `path_nocaustics=False` | build the fork with `path_nocaustics.cpp` |
+| `active_polar` missing for new scenes, `path_nocaustics=False` | build the fork's `path_nocaustics.cpp` with the assist options (`ninja path_nocaustics`) |
 | `record(): … not permitted` or `error encountered while recording a frozen function` | a freeze recording failed, usually with GPU memory nearly full; restart the server, keep `--max-resident 1`, free the GPU |
 | the first frame takes minutes | a scene load or freeze recording; see `GET /v1/status` or the viewer's status bar |
 
@@ -257,7 +257,8 @@ Extensions:
 
 | Call | Purpose |
 |---|---|
-| `setVariant("base" \| "perturbed" \| "active_polar")` | Default optical variant. A scan id `<scene>__<variant>` overrides it per episode. |
+| `setVariant("base" \| "perturbed" \| "active_polar")` | Default optical variant. A scan id `<scene>__<variant>` overrides it per episode. It applies from the next render, mid-episode too. |
+| `setActiveLight(enabled)` | The camera-mounted active polarized light on (`active_polar`) or off (`perturbed`), from the next render. The server reuses the loaded scene, so switching reloads nothing. |
 | `setRenderMode("polar" \| "rgb")` | `polar` renders the dataset's Stokes sensor. `rgb` loads the same scene without the Stokes wrapper on a non-polarized variant, so it is faster and returns `state.radiance` only. |
 | `setDenoiser(True)` | Runs the OptiX AI denoiser on every frame. In polar mode it denoises the images behind linear polarizers at 0°, 45°, 90° and 135°, `(S0±S1)/2` and `(S0±S2)/2`, then recombines S0, S1 and S2; S3 stays as rendered. |
 | `setRenderSpp(n)`, `setRenderSeed(s)`, `setStokesDtype("float16" \| "float32")` | Noise and precision. Dataset frames used 1024 spp; the default is 64. |
@@ -279,6 +280,17 @@ Extensions:
 * **Variants.** `active_polar` follows the protocol each scene was rendered with, recorded in `scene.json` as `variants.active_polar.protocol`.
   * `active_polar_flash_nocaustics_v1` (the re-rendered scenes) is `perturbed` plus a flash-only pass, summed as linear Stokes. The flash pass uses a camera-aligned linearly polarized `polarized_area` emitter and the `path_nocaustics` integrator.
   * `rgb_stokes_12_active_polar_compact_flash_v2` (older scenes) is a single pass with the room lights and a camera-aligned area flash together. In that protocol the polarizer sits behind the emitter, so the flash is effectively unpolarized. This matches those scenes' training data.
+* **One resident scene for all three variants.** `perturbed.xml` is `base.xml` plus mirror and glass cubes (`mirror_auto_*`, `glass_auto_*`, 7–38 per scene) and their BSDFs, and nothing else differs. `active_polar` adds the camera-assist shapes: the flash rectangle, and in older scenes its polarizer. Older scenes' `active_polar.xml` is `perturbed.xml` plus those shapes, apart from the sensor that the server sets every frame. The server checks these relations when it plans a variant, and loads only the largest scene of a scan. `base` is that scene with the mirror and glass cubes collapsed to a point (degenerate triangles, so nothing hits them and they cast no shadow), restored from a copy for `perturbed`. Switching among the three edits GPU memory and loads nothing, so `--max-resident 1` keeps all three resident. `GET /v1/status` lists every variant that a resident scene serves.
+* **Indoor lights and sky.** A view may also carry `"lights"` (a factor on every indoor emitter's radiance; 0 is all off, and the camera flash is not affected) and `"env"` (`{"map": "original" | <name>, "scale", "rotate_deg"}`). At load, the scene's environment emitter (a `constant` sky, or a plain `envmap`) is replaced by an `envmap` at 1024x512 whose pixels reproduce the original. Maps are the `.exr`/`.hdr` files in `<pack>/envmaps` (or `--envmaps DIR`), resampled to that size, and `GET /v1/info` lists them as `envmaps`. A uniform envmap rendered the same as the constant sky (0.28% apart at 1024 spp on a test scene, within noise). In the MatterSim API these are `setIndoorLights(level)` and `setEnvironment(name, scale, rotate_deg)`. In the viewer they are the 실내등 button (I), the 하늘 menu, and its rotation slider.
+* **Nothing here records again.** Hidden mirrors (collapsed vertices), the flash's place, light radiance (opaque `srgb`/`uniform` values) and the envmap's pixels, scale and rotation are all scene parameters that a frozen replay reads. Each is written once as an opaque value before the first recording: a plain Python float for `scale` would be baked in as a literal and record again on its first change. On a test scene, 8 such changes in a row made 0 new recordings, and every frozen frame matched an unfrozen render of the changed scene exactly. Shapes cannot be hidden by instancing them instead: a frozen render cannot trace the nested call into a shape group.
+* **Active light on and off.** `path_nocaustics` renders the light passes with its assist options:
+  * *passive* (`caustics=true`, `assist_mode=exclude`) is `path` with the assist shapes ignored: rays pass through them without a bounce and their emitter is never counted. This is `perturbed`.
+  * *flash* (`assist_mode=only`) lights the scene with the flash alone, sampled directly, as the two-pass protocol's flash-only scene did. `active_polar` is passive plus flash for re-rendered scenes, and the scene's own integrator for older ones.
+  * Checked on a test scene at 4096 spp against two separate scenes: the flash pass is bit-identical, and the passive pass differs by 0.14% (another seed differs by 0.57%).
+  * Switching loads nothing and adds no GPU memory (21.4 GB in use with both recorded, on Device 1 with other processes holding about 8 GB). Each pass records its freeze once per spp and size (16 spp at 512x384: 187 s passive, 170 s flash). After that, alternating the variant on every frame took 151 ms per frame with the light off and 196 ms with it on (one request at a time, including the flash moving with the camera).
+  * With the light off, the assist shapes are shrunk to nothing once, so frames update only the camera. With it on, the flash follows the camera, which takes a whole-scene update each frame.
+  * Older scenes render every variant with the scene's own integrator, so on and off share one recording. Re-rendered scenes record their passive and flash passes together on the first frame of a spp and size: 255 s on Device 1 at 16 spp, 512x384, against 187 + 170 s one at a time. After that, alternating `perturbed` and `active_polar` frames took 260 ms and 402 ms.
+* **Known issue.** Switching to `base` (hiding the mirrors) is slow on the real scene. Alternating every frame, `base` frames took about 1 s each, and the first switch took 88 s. On the test scene, the same vertex edit replayed without recording. The cause is not yet known; the scene's acceleration structure being rebuilt, or a recording on the first change, are the suspects.
 
 ## Fidelity
 

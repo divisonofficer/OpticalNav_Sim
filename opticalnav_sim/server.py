@@ -29,11 +29,13 @@ import io
 import json
 import os
 import queue
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from concurrent.futures import Future
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -83,9 +85,9 @@ SPP_CHUNK = {"polar": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK", "64"
              "rgb": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK_RGB", "256")))}
 
 
-def rgb_scene_text(xml: Path) -> str:
+def rgb_scene_text(text: str) -> str:
     """Production Stokes scene -> plain radiance scene: its nested integrator replaces the stokes wrapper."""
-    root = ET.parse(xml).getroot()
+    root = ET.fromstring(text)
     integrator = root.find("./integrator")
     if integrator is not None and integrator.get("type") == "stokes":
         nested = integrator.find("./integrator")
@@ -95,18 +97,181 @@ def rgb_scene_text(xml: Path) -> str:
     return ET.tostring(root, encoding="unicode")
 
 
-class Resident:
-    """One loaded Mitsuba scene, driven only through mi.traverse() between renders."""
+ASSIST_PREFIX = "camera_assist"  # the flash rectangle (and the old protocol's polarizer) in front of the camera
+ASSIST_SHAPE = re.compile(r'\s*<shape type="rectangle" id="camera_assist_[a-z]+">.*?</shape>', re.S)
+SENSOR_BLOCK = re.compile(r"\s*<sensor\b.*?</sensor>", re.S)
+COMMENT = re.compile(r"\s*<!--.*?-->", re.S)
+TOP_ELEMENT = re.compile(r'\n  <(shape|bsdf|texture)\b([^>]*?)(?:/>|>.*?\n  </\1>)', re.S)
 
-    def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False):
+
+def extra_shapes(host: str, variant: str) -> tuple[str, ...] | None:
+    """Ids of the shapes a host scene file adds to a variant's, when that is all that differs (perturbed is
+    base plus mirror and glass cubes; the sensor, comments and camera-assist shapes aside). None when
+    the files differ in anything else."""
+    def norm(text: str) -> str:
+        return SENSOR_BLOCK.sub("", ASSIST_SHAPE.sub("", COMMENT.sub("", text)))
+
+    h, v = norm(host), norm(variant)
+    have = {m.group(0) for m in TOP_ELEMENT.finditer(v)}
+    added = [m for m in TOP_ELEMENT.finditer(h) if m.group(0) not in have]
+    for m in added:
+        h = h.replace(m.group(0), "", 1)
+    if h.split() != v.split():
+        return None
+    ids = []
+    for m in added:
+        if m.group(1) == "shape":
+            found = re.search(r'id="([^"]+)"', m.group(2))
+            if found is None:  # an unnamed shape cannot be looked up to hide
+                return None
+            ids.append(found.group(1))
+    return tuple(ids)
+
+
+def lit_scene_text(xml: Path, flash_xml: Path) -> str:
+    """Passive scene plus the camera-assist flash of its flash-only scene, so one resident scene renders
+    both passes of a two-pass active variant. The flash is sampled directly by the flash pass, so the
+    passive pass's emitter selection barely picks it (sampling_weight)."""
+    flash = "".join(m.group(0) for m in ASSIST_SHAPE.finditer(flash_xml.read_text()))
+    if not flash:
+        raise RuntimeError(f"{flash_xml}: no {ASSIST_PREFIX}_* shape")
+    flash = re.sub(r'(<emitter type="[a-z_]+">)', r'\1<float name="sampling_weight" value="0.001" />', flash)
+    text = xml.read_text()
+    end = text.rindex("</scene>")
+    return text[:end] + flash + "\n" + text[end:]
+
+
+ENV_RES = (1024, 512)  # every environment map is resampled to this, so swapping maps never re-records
+_BLANK_ENV: list[Path] = []
+
+
+def blank_env_file(mi) -> Path:
+    """An ENV_RES image file to create envmap emitters from (their pixels are written after loading)."""
+    if not _BLANK_ENV:
+        import tempfile
+
+        path = Path(tempfile.gettempdir()) / f"opticalnav_env_{ENV_RES[0]}x{ENV_RES[1]}.exr"
+        mi.Bitmap(np.ones((ENV_RES[1], ENV_RES[0], 3), np.float32)).write(str(path))
+        _BLANK_ENV.append(path)
+    return _BLANK_ENV[0]
+ENV_ID = "environment"
+ENV_EMITTER = re.compile(r'<emitter type="(constant|envmap)"\s*>(.*?)</emitter>', re.S)
+
+
+@dataclass(frozen=True)
+class Look:
+    """What a frame shows besides the camera and the variant's passes. All of it is scene data, changed in
+    GPU memory between frames, never part of a freeze recording."""
+    hidden: frozenset = frozenset()  # shape ids left out (base: perturbed's mirror and glass cubes)
+    lights: float = 1.0              # multiplier on every indoor emitter (the camera flash aside)
+    env: str = "original"            # environment map name, or the scene's own sky
+    env_scale: float = 1.0
+    env_rotate_deg: float = 0.0
+
+
+def env_data(mi, path: Path, scale: float = 1.0) -> np.ndarray:
+    """An HDR environment image as linear RGB float32 at ENV_RES (height x width x 3)."""
+    bitmap = mi.Bitmap(str(path)).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32, srgb_gamma=False)
+    return np.ascontiguousarray(np.array(bitmap.resample([ENV_RES[0], ENV_RES[1]]), dtype=np.float32) * scale)
+
+
+def controllable_env(mi, text: str, base: Path, blank: Path) -> tuple[str, np.ndarray | None]:
+    """Replace the scene's environment emitter (a constant sky, or an envmap) with an envmap at ENV_RES
+    under id ENV_ID, and return the image that reproduces the original. A constant becomes a uniform image
+    (the same radiance from every direction); a scaled envmap file becomes its resampled pixels times the
+    scale. Scenes with neither keep their text and get no environment control (None)."""
+    found = ENV_EMITTER.search(text)
+    if found is None:
+        return text, None
+    body = found.group(2)
+    if found.group(1) == "constant":
+        rgb = re.search(r'name="radiance" value="([^"]+)"', body)
+        value = [float(v) for v in re.split(r"[ ,]+", rgb.group(1).strip())] if rgb else [1.0]
+        original = np.empty((ENV_RES[1], ENV_RES[0], 3), np.float32)
+        original[...] = np.array(value * 3 if len(value) == 1 else value, np.float32)
+    else:
+        file = re.search(r'name="filename" value="([^"]+)"', body).group(1)
+        scale = re.search(r'name="scale" value="([^"]+)"', body)
+        if re.search(r'name="to_world"', body):
+            return text, None  # a rotated original is not reproduced; leave the scene as it is
+        original = env_data(mi, base / file, float(scale.group(1)) if scale else 1.0)
+    emitter = f'<emitter type="envmap" id="{ENV_ID}"><string name="filename" value="{blank}" /></emitter>'
+    return text[:found.start()] + emitter + text[found.end():], original
+
+
+def shape_vertices(mi, text: str, shape_id: str) -> np.ndarray:
+    """World-space vertex positions (N x 3) of one top-level shape of a scene file, loaded on its own: the
+    same plugin code the scene load runs, so the values match the loaded scene's bit for bit."""
+    found = re.search(rf'\n  <shape type="([a-z_]+)" id="{re.escape(shape_id)}">(.*?)\n  </shape>', text, re.S)
+    if found is None:
+        raise RuntimeError(f"shape {shape_id!r} not found in the scene file")
+    body = re.sub(r'<ref id="[^"]*"\s*/>|<bsdf\b.*?</bsdf>|<bsdf\b[^>]*/>', "", found.group(2), flags=re.S)
+    shape = mi.load_string(f'<shape version="3.0.0" type="{found.group(1)}">{body}<bsdf type="diffuse"/></shape>')
+    return np.array(mi.traverse(shape)["vertex_positions"], dtype=np.float32).reshape(-1, 3)
+
+
+def locate_blocks(meshes: dict, blocks: dict) -> dict:
+    """Where each vertex block sits among the scene's meshes: {name: (mesh key, first vertex, count)}.
+    The loader merges meshes that share a BSDF into one mesh by appending their vertices, so a shape's
+    vertices are one contiguous run in some mesh (its own, if nothing merged with it)."""
+    out = {}
+    for name, block in blocks.items():
+        for key, verts in meshes.items():
+            starts = np.flatnonzero(np.all(verts == block[0], axis=1))
+            hit = next((int(s) for s in starts if s + len(block) <= len(verts)
+                        and np.array_equal(verts[s:s + len(block)], block)), None)
+            if hit is not None:
+                out[name] = (key, hit, len(block))
+                break
+        else:
+            raise RuntimeError(f"shape {name!r}: its vertices were not found in the loaded scene")
+    return out
+
+
+def integrator_spec(xml: Path) -> dict:
+    """max_depth and Stokes reference axis of a scene file's integrator."""
+    text = xml.read_text()
+    start = text.find("<integrator")
+    head = text[start:text.find("<sensor", start)] if start >= 0 else ""
+    depth = re.search(r'name="max_depth" value="(-?\d+)"', head)
+    axis = re.search(r'name="reference_axis" x="([-\d.e]+)" y="([-\d.e]+)" z="([-\d.e]+)"', head)
+    return {"max_depth": int(depth.group(1)) if depth else 6,
+            "reference_axis": tuple(float(a) for a in axis.groups()) if axis else None}
+
+
+class Resident:
+    """One loaded Mitsuba scene, driven only through mi.traverse() between renders.
+
+    A scene with camera-assist shapes (an active variant's flash) renders several passes: "own" (the
+    scene's integrator), "passive" (the assist shapes ignored, as if absent: the lights-only image) and
+    "flash" (the flash as the only light, for two-pass active variants). The passes need
+    path_nocaustics's assist modes; switching the flash on or off then reuses the loaded scene.
+
+    Shapes a variant lacks (base has none of perturbed's mirror and glass cubes; ``hideable``) are hidden by
+    collapsing their vertices to one point, which leaves only degenerate triangles that no ray or shadow
+    meets, and restored from a copy: a variant switch edits memory and loads nothing.
+
+    The rest of a frame's Look is scene data too: the indoor emitters' radiance (scaled from their loaded
+    values) and the environment (an envmap at ENV_RES standing in for the scene's own sky, whose pixels,
+    scale and rotation change in place). Each is written once as an opaque value before the first
+    recording, so later changes replay the same recording."""
+
+    def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
+                 flash_xml: Path | None = None, hideable=(), envs=None):
         self.mi, self.mode = mi, mode
         started = time.time()
+        text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
         if mode == "rgb":
-            mi.Thread.thread().file_resolver().prepend(str(xml.parent))  # assets are relative to the XML
-            self.scene = mi.load_string(rgb_scene_text(xml))
-        else:
-            self.scene = mi.load_file(str(xml))
+            text = rgb_scene_text(text)
+        text, self.env_original = controllable_env(mi, text, xml.parent, blank_env_file(mi))
+        mi.Thread.thread().file_resolver().prepend(str(xml.parent))  # assets are relative to the XML
+        self.scene = mi.load_string(text)
         self.load_s = time.time() - started
+        self.envs = envs  # name -> environment image at ENV_RES (Renderer.env_image)
+        self.depth = {"own": integrator_spec(xml), "passive": integrator_spec(xml)}
+        if flash_xml is not None:
+            self.depth["flash"] = integrator_spec(flash_xml)
+        self.integrators: dict[str, object] = {}
         keys = list(mi.traverse(self.scene).keys())
         self.k_to_world = next(k for k in keys if k.endswith("sensor.to_world"))
         self.k_fov = next(k for k in keys if k.endswith("sensor.x_fov"))
@@ -117,90 +282,197 @@ class Resident:
         if flash is not None and self.k_flash is None:
             raise RuntimeError(f"{xml}: flash scene has no camera_assist_light transform")
         # Camera-only updates traverse just the sensor: traversing and updating the whole scene (thousands
-        # of textures and meshes) cost ~46 ms per frame on Device 1. A flash scene also moves its flash, so
-        # it keeps the whole-scene path.
+        # of textures and meshes) cost ~46 ms per frame on Device 1. A frame with the flash on also moves
+        # the flash, so it takes the whole-scene path; with the flash off the assist shapes are parked once.
         self.sensor = self.scene.sensors()[0]
         sensor_keys = set(mi.traverse(self.sensor).keys())
         self.ks_size = "film.size" if "film.size" in sensor_keys else None
         self.size = self.fov = None
+        self.pose = None  # (camera, size, fov, follow, look) last written to the scene
+        self.parked = self.k_flash is None  # assist shapes out of the way (tiny), or none
+        self.look = Look()  # what the scene shows now
+        self.blocks: dict = {}  # shape id -> (mesh key, first vertex, count) in the loaded (merged) meshes
+        self.originals: dict[str, np.ndarray] = {}  # vertex positions (N x 3) of the meshes holding them
+        if hideable:
+            t = time.time()
+            source = xml.read_text()
+            params = mi.traverse(self.scene)
+            meshes = {k: np.array(params[k], dtype=np.float32).reshape(-1, 3)
+                      for k in keys if k.endswith(".vertex_positions")}
+            self.blocks = locate_blocks(meshes, {s: shape_vertices(mi, source, s) for s in sorted(hideable)})
+            self.originals = {key: meshes[key] for key, _, _ in self.blocks.values()}
+            del meshes, params
+            print(f"[resident] {len(self.blocks)} hideable shapes in {len(self.originals)} meshes "
+                  f"({sum(len(v) for v in self.originals.values())} vertices kept, {time.time() - t:.1f} s)", flush=True)
+        # Indoor emitters: every emitter radiance but the camera flash's. Written back once (opaque) here.
+        import drjit as dr
+
+        params = mi.traverse(self.scene)
+        self.radiance = {k: dr.detach(params[k]) for k in keys
+                         if k.endswith("emitter.radiance.value") and not k.startswith(ASSIST_PREFIX)}
+        for k, v in self.radiance.items():
+            params[k] = type(v)(v)
+        if self.env_original is not None:
+            params[f"{ENV_ID}.data"] = mi.TensorXf(self.env_original)
+            params[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, 1.0)
+            params[f"{ENV_ID}.to_world"] = mi.ScalarTransform4f()
+        params.update()
+        del params
+        print(f"[resident] {len(self.radiance)} indoor emitters, environment "
+              f"{'controllable' if self.env_original is not None else 'fixed'}", flush=True)
         # dr.freeze records the render once per (spp, film size, seed) and replays its kernels, like
         # the production renderer on Device 1; without it every frame re-traces the scene.
         self.freeze = freeze
-        self.sensor_input = FREEZE_INPUT == "sensor" and flash is None
+        self.sensor_input = FREEZE_INPUT == "sensor" and self.k_flash is None
         self.frozen: dict[tuple, object] = {}
         self.batch_sensors: dict[tuple, object] = {}
 
-    def render(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int) -> np.ndarray:
-        img, self.breakdown = self.finish(self.launch(c2w, width, height, hfov_deg, spp, seed))
+    def integrator(self, name: str):
+        """None for the scene's own integrator, else path_nocaustics in an assist mode."""
+        if name == "own":
+            return None
+        if name not in self.integrators:
+            spec = self.depth[name]
+            inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "assist": ASSIST_PREFIX,
+                     "assist_mode": "exclude" if name == "passive" else "only", "caustics": name == "passive"}
+            if self.mode != "rgb":
+                inner = {"type": "stokes", "integrator": inner}
+                if spec["reference_axis"] is not None:
+                    inner["reference_axis"] = self.mi.ScalarVector3f(*spec["reference_axis"])
+            self.integrators[name] = self.mi.load_dict(inner)
+        return self.integrators[name]
+
+    def render(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int,
+               pass_name: str = "own", follow: bool | None = None, look: Look = Look()) -> np.ndarray:
+        img, self.breakdown = self.finish(self.launch(c2w, width, height, hfov_deg, spp, seed, pass_name, follow,
+                                                      look))
         return img
 
-    def launch(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int) -> tuple:
-        """Set the camera and queue the render on the GPU. Returns a handle for ``finish``, which waits for
-        the GPU and reads the image back, so the caller can queue the next view in between (CUDA runs
-        the queued kernels in order)."""
+    def _set_camera(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, follow: bool,
+                    look: Look = Look()) -> dict:
+        """Write the camera, the assist shapes and the Look into the scene, unless already there."""
         mi = self.mi
+        pose = (np.asarray(c2w, dtype=np.float64).tobytes(), int(width), int(height), float(hfov_deg), follow, look)
+        if pose == self.pose:
+            return {"traverse_s": 0.0, "update_s": 0.0}
         t0 = time.perf_counter()
         origin, target, up = frames.lookat(c2w)
-        look = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
-        if self.flash is None:
+        camera = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
+        if not follow and self.parked and look == self.look:
             p = mi.traverse(self.sensor)  # fresh map: a frozen replay swaps the variables an old map holds
             t1 = time.perf_counter()
-            p["to_world"] = look
+            p["to_world"] = camera
             if self.fov != float(hfov_deg):
                 p["x_fov"] = float(hfov_deg)
-                self.fov = float(hfov_deg)
             if self.ks_size is not None and self.size != (int(width), int(height)):
                 p[self.ks_size] = mi.ScalarVector2u(int(width), int(height))
-                self.size = (int(width), int(height))
-            p.update()
-            t2 = time.perf_counter()
         else:
             p = mi.traverse(self.scene)
             t1 = time.perf_counter()
-            p[self.k_to_world] = look
+            p[self.k_to_world] = camera
             p[self.k_fov] = float(hfov_deg)
             if self.k_size is not None:
                 p[self.k_size] = mi.ScalarVector2u(int(width), int(height))
-            d = float(self.flash["distance_m"])
-            p[self.k_flash] = mi.ScalarTransform4f(flash_matrix(c2w, self.flash["size_world"], d).tolist())
-            if self.k_polarizer is not None:
-                p[self.k_polarizer] = mi.ScalarTransform4f(flash_matrix(
-                    c2w, self.flash["size_world"], d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0)).tolist())
-            p.update()
-            t2 = time.perf_counter()
-        breakdown = {"traverse_s": t1 - t0, "update_s": t2 - t1}
+            if self.k_flash is not None:
+                # following: the flash rides 0.2 m ahead of the camera; parked: shrunk to nothing, so the
+                # passive pass (which skips assist shapes anyway) is not shadowed by a stale flash
+                size = self.flash["size_world"] if follow else (1e-6, 1e-6)
+                d = float(self.flash["distance_m"])
+                p[self.k_flash] = mi.ScalarTransform4f(flash_matrix(c2w, size, d).tolist())
+                if self.k_polarizer is not None:
+                    p[self.k_polarizer] = mi.ScalarTransform4f(flash_matrix(
+                        c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0)).tolist())
+                self.parked = not follow
+            self._write_look(p, look)
+        p.update()
+        self.fov, self.size, self.pose = float(hfov_deg), (int(width), int(height)), pose
+        return {"traverse_s": t1 - t0, "update_s": time.perf_counter() - t1}
+
+    def _write_look(self, p, look: Look) -> None:
+        """Hidden shapes, indoor light level and environment: only what differs from the scene's Look."""
+        import drjit as dr
+
+        mi, now = self.mi, self.look
+        for key in {self.blocks[s][0] for s in look.hidden ^ now.hidden}:
+            verts = self.originals[key].copy()
+            for shape in look.hidden:
+                k, start, n = self.blocks[shape]
+                if k == key:  # every vertex onto the first: degenerate triangles, never hit
+                    verts[start:start + n] = verts[start]
+            p[key] = mi.Float(verts.ravel())
+        if look.lights != now.lights:
+            for k, v in self.radiance.items():
+                p[k] = v * float(look.lights)
+        if self.env_original is not None:
+            if look.env != now.env:
+                p[f"{ENV_ID}.data"] = mi.TensorXf(self.env_original if look.env == "original" else self.envs(look.env))
+            if look.env_scale != now.env_scale:
+                p[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, float(look.env_scale))
+            if look.env_rotate_deg != now.env_rotate_deg:
+                p[f"{ENV_ID}.to_world"] = mi.ScalarTransform4f().rotate([0, 1, 0], float(look.env_rotate_deg))
+        elif (look.env, look.env_scale, look.env_rotate_deg) != ("original", 1.0, 0.0):
+            raise ValueError("this scene's environment cannot be changed (no constant sky or plain envmap)")
+        self.look = look
+
+    def launch(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int,
+               pass_name: str = "own", follow: bool | None = None, look: Look = Look()) -> tuple:
+        """Set the camera and queue the render on the GPU. Returns a handle for ``finish``, which waits for
+        the GPU and reads the image back, so the caller can queue the next view in between (CUDA runs
+        the queued kernels in order). ``follow``: keep the flash at the camera (default: when the scene
+        has one); ``look``: hidden shapes, lights and environment. Every pass of one frame passes the same values."""
+        mi = self.mi
+        follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
+        breakdown = self._set_camera(c2w, width, height, hfov_deg, follow, look)
+        integrator = self.integrator(pass_name)
         if not self.freeze:
             # passes of at most SPP_CHUNK samples, averaged by sample count
             total, done, acc, i = int(spp), 0, None, 0
             while done < total:
                 n = min(SPP_CHUNK[self.mode], total - done)
-                img = np.array(mi.render(self.scene, spp=n, seed=int(seed) + 104729 * i), dtype=np.float64) * n
+                img = np.array(mi.render(self.scene, integrator=integrator, spp=n, seed=int(seed) + 104729 * i),
+                               dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
             return (acc / total).astype(np.float32), breakdown
         import drjit as dr
 
-        key = (int(spp), int(width), int(height))
+        key = (int(spp), int(width), int(height), pass_name)
+        t2 = time.perf_counter()
         if key not in self.frozen:  # spp and film size are baked into each recording
-            # the seed is an input rather than a constant, so one recording serves every seed
-            # (progressive viewers render the same camera again and again with new seeds); every input
-            # changes between frames, so all are recorded opaque rather than as literals
-            with ACTIVITY.doing(f"recording {spp} spp {width}x{height}"):
-                if self.sensor_input:
-                    scene = self.scene
-                    frozen = dr.freeze(lambda sn, sd, n=int(spp): mi.render(scene, sensor=sn, spp=n, seed=sd),
-                                       backend=dr.JitBackend.CUDA, auto_opaque=False)
-                    self._settle(frozen, self.sensor)
-                else:
-                    frozen = dr.freeze(lambda scene, sd, n=int(spp): mi.render(scene, spp=n, seed=sd),
-                                       backend=dr.JitBackend.CUDA, auto_opaque=False)
-                    self._settle(frozen, self.scene)
-                self.frozen[key] = frozen  # listed by /v1/status only once both recordings are done
+            # A two-pass scene records its passive and flash passes together, so switching the light on
+            # later replays at once instead of stopping to record. The flash's place and the hidden
+            # shapes are scene data, not part of a recording.
+            for name in (("passive", "flash") if "flash" in self.depth and pass_name != "own" else (pass_name,)):
+                self._record(int(spp), int(width), int(height), name)
             t2 = time.perf_counter()
         source = self.sensor if self.sensor_input else self.scene
         img = self.frozen[key](source, dr.opaque(mi.UInt32, int(seed)))  # replays, launching the kernels
         breakdown["replay_s"] = time.perf_counter() - t2
         return img, breakdown
+
+    def _record(self, spp: int, width: int, height: int, pass_name: str) -> None:
+        """Record the frozen render of one pass. The seed is an input rather than a constant, so one
+        recording serves every seed (progressive viewers render the same camera again and again with new
+        seeds); every input changes between frames, so all are recorded opaque rather than as literals."""
+        import drjit as dr
+
+        key = (spp, width, height, pass_name)
+        if key in self.frozen:
+            return
+        mi, integrator = self.mi, self.integrator(pass_name)
+        with ACTIVITY.doing(f"recording {spp} spp {width}x{height}" + ("" if pass_name == "own" else f" {pass_name}")):
+            if self.sensor_input:
+                scene = self.scene
+                frozen = dr.freeze(lambda sn, sd, n=spp, it=integrator:
+                                   mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
+                                   backend=dr.JitBackend.CUDA, auto_opaque=False)
+                self._settle(frozen, self.sensor)
+            else:
+                frozen = dr.freeze(lambda scene, sd, n=spp, it=integrator:
+                                   mi.render(scene, integrator=it, spp=n, seed=sd),
+                                   backend=dr.JitBackend.CUDA, auto_opaque=False)
+                self._settle(frozen, self.scene)
+            self.frozen[key] = frozen  # listed by /v1/status only once both recordings are done
 
     def finish(self, handle: tuple) -> tuple[np.ndarray, dict]:
         img, breakdown = handle
@@ -225,16 +497,21 @@ class Resident:
             dr.eval(frozen(*args, dr.opaque(self.mi.UInt32, 0)))
 
 
-    def render_many(self, cams: list, width: int, height: int, hfov_deg: float, spp: int, seed: int) -> list:
+    def render_many(self, cams: list, width: int, height: int, hfov_deg: float, spp: int, seed: int,
+                    pass_name: str = "own", follow: bool | None = None, look: Look = Look()) -> list:
         """K views in one render call through a resident ``batch`` sensor.
 
         Tracing the scene (materials, lights, geometry) dominates a call and does not depend on the
         cameras, so one call for K views pays it once. The camera-aligned flash of an active scene
         follows a single camera, so those views still render one at a time.
         """
-        if len(cams) == 1 or self.flash is not None:
-            return [self.render(c, width, height, hfov_deg, spp, seed) for c in cams]
+        follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
+        if len(cams) == 1 or follow:
+            return [self.render(c, width, height, hfov_deg, spp, seed, pass_name, follow, look) for c in cams]
+        if not self.parked or look != self.look:  # the batch sensor sees the scene as set here
+            self._set_camera(cams[0], width, height, hfov_deg, False, look)
         mi, k = self.mi, len(cams)
+        integrator = self.integrator(pass_name)
         looks = []
         for c in cams:
             origin, target, up = frames.lookat(c)
@@ -257,20 +534,21 @@ class Resident:
             total, done, acc, i = int(spp), 0, None, 0
             while done < total:
                 n = min(per_pass, total - done)
-                img = np.array(mi.render(self.scene, sensor=sensor, spp=n, seed=int(seed) + 104729 * i),
-                               dtype=np.float64) * n
+                img = np.array(mi.render(self.scene, sensor=sensor, integrator=integrator, spp=n,
+                                         seed=int(seed) + 104729 * i), dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
             img = (acc / total).astype(np.float32)
         else:
             import drjit as dr
 
-            fkey = ("batch",) + key + (int(spp),)
+            fkey = ("batch",) + key + (int(spp), pass_name)
             if fkey not in self.frozen:
                 # the sensor and seed are arguments, not closure values: a frozen replay only sees updated
                 # slot poses on objects it receives as inputs (production keeps its batch sensor inside the scene)
                 self.frozen[fkey] = dr.freeze(
-                    lambda scene, sn, sd, n=int(spp): mi.render(scene, sensor=sn, spp=n, seed=sd),
+                    lambda scene, sn, sd, n=int(spp), it=integrator:
+                    mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
                     backend=dr.JitBackend.CUDA, auto_opaque=False)
                 self._settle(self.frozen[fkey], self.scene, sensor)
             img = np.array(self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed))))
@@ -364,7 +642,8 @@ class Renderer:
     """Mitsuba work runs on the main thread (see MainThreadExecutor); one process serialises its renders."""
 
     def __init__(self, pack: Path, variant: str | None, max_resident: int, freeze: str = "auto",
-                 rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False):
+                 rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
+                 envmap_dir: Path | None = None):
         import drjit as dr
         import mitsuba as mi
 
@@ -388,14 +667,30 @@ class Renderer:
         self.executor = MainThreadExecutor()
         self.max_resident = max(1, max_resident)
         self.meta = {p.parent.name: json.loads(p.read_text()) for p in sorted((pack / "scenes").glob("*/scene.json"))}
-        self.cache: OrderedDict[tuple[str, str, str], list[Resident]] = OrderedDict()
+        # resident scenes by (scan, xml, flash_xml, mode); a variant renders on one of them (see plan)
+        self.cache: OrderedDict[tuple, Resident] = OrderedDict()
+        self.plans: dict[tuple[str, str, str], tuple] = {}
         self.denoisers: dict[tuple[str, int, int], object] = {}
-        self.has_nocaustics = self._has_plugin("path_nocaustics")
+        # path_nocaustics with camera-assist modes (an older build of the plugin has none: active variants
+        # that need it are hidden, and one-pass active variants keep a resident scene of their own)
+        self.has_nocaustics = self._has_plugin({"type": "path_nocaustics", "assist": ASSIST_PREFIX,
+                                                "assist_mode": "exclude"})
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
+        # environment maps a view may ask for by name (file stem): <pack>/envmaps unless --envmaps says otherwise
+        folder = Path(envmap_dir) if envmap_dir else pack / "envmaps"
+        self.envmaps = {f.stem: f for f in sorted(folder.glob("*")) if f.suffix.lower() in (".exr", ".hdr")} \
+            if folder.is_dir() else {}
+        self.env_cache: dict[str, np.ndarray] = {}
 
-    def _has_plugin(self, name: str) -> bool:
+    def env_image(self, name: str) -> np.ndarray:
+        """An environment map of the --envmaps directory at ENV_RES (loaded once)."""
+        if name not in self.env_cache:
+            self.env_cache[name] = env_data(self.mi, self.envmaps[name])
+        return self.env_cache[name]
+
+    def _has_plugin(self, spec: dict) -> bool:
         try:
-            self.mi.load_dict({"type": name})
+            self.mi.load_dict(spec)
             return True
         except Exception:  # noqa: BLE001 - absent plugin raises a variant-specific error type
             return False
@@ -412,16 +707,74 @@ class Renderer:
         return self.executor.submit(job).result()
 
     def preload(self, scan: str, variant: str, mode: str = "polar") -> float:
-        return sum(r.load_s for r in self._on_main(mode, self._resident, scan, variant, mode))
+        return self._on_main(mode, lambda: self._resident(self.plan(scan, variant, mode)[0], variant).load_s)
 
-    def _resident(self, scan: str, variant: str, mode: str) -> list[Resident]:
+    def plan(self, scan: str, variant: str, mode: str) -> tuple[tuple, tuple[str, ...], bool, frozenset]:
+        """(resident scene key, passes, flash follows the camera, hidden shape ids) for one variant.
+
+        One resident scene per scan hosts every variant it can: the active variant's scene (the one with
+        a flash; needs path_nocaustics) or else perturbed's. A variant whose scene file is the host's minus
+        some shapes renders on the host with those shapes hidden: base is perturbed without its mirror and
+        glass cubes, perturbed is the active scene without its flash. On an active host the "passive" pass
+        ignores the flash, and a two-pass active variant adds a "flash" pass. Switching among them edits
+        memory and loads nothing; each pass records its freeze once per spp and size."""
         key = (scan, variant, mode)
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        spec = self.meta[scan]["variants"][variant]
+        if key in self.plans:
+            return self.plans[key]
+        variants = self.meta[scan]["variants"]
+        spec = variants[variant]
         if spec.get("flash_xml") and not self.has_nocaustics:
             raise ValueError(f"variant {variant!r} needs the path_nocaustics integrator, absent from this Mitsuba build")
+        lit_name = next((name for name, v in variants.items() if v.get("flash")), None)
+        usable = lit_name is not None and (self.has_nocaustics or not variants[lit_name].get("flash_xml"))
+        host_name = lit_name if usable else "perturbed" if "perturbed" in variants else None
+        hidden = self._hidden(scan, variant, host_name) if host_name is not None else None
+        if hidden is not None:
+            host = variants[host_name]
+            rkey = (scan, host["xml"], host.get("flash_xml"), mode)
+            two_pass = bool(host.get("flash_xml"))
+            # Two-pass: "passive" ignores the flash (it sits at the camera when the light is on) and "flash"
+            # adds it. One pass: the scene's own integrator for all variants, the flash and its polarizer
+            # shrunk to nothing while the light is off, so on and off share one freeze recording.
+            if variant == host_name and host.get("flash"):
+                plan = (rkey, ("passive", "flash") if two_pass else ("own",), True, frozenset())
+            else:
+                plan = (rkey, ("passive",) if two_pass else ("own",), False, frozenset(hidden))
+        else:
+            plan = ((scan, spec["xml"], None, mode), ("own",), bool(spec.get("flash")), frozenset())
+        self.plans[key] = plan
+        return plan
+
+    def _hidden(self, scan: str, variant: str, host_name: str) -> tuple[str, ...] | None:
+        """Shape ids to hide on the host's scene to get this variant's, or None when it is not the host's
+        scene minus some shapes (see plan)."""
+        variants = self.meta[scan]["variants"]
+        spec, host = variants[variant], variants[host_name]
+        if variant == host_name:
+            return ()
+        if spec.get("flash"):
+            return None
+        if spec["xml"] == host["xml"]:  # two-pass: the active variant's passive scene file
+            return ()
+        base = self.pack / "scenes" / scan
+        return extra_shapes((base / host["xml"]).read_text(), (base / spec["xml"]).read_text())
+
+    def served(self) -> list[tuple[tuple, Resident, tuple]]:
+        """((scan, variant, mode), resident scene, passes) for every variant a resident scene renders."""
+        cache, plans = dict(self.cache), list(self.plans.items())
+        return [(key, cache[plan[0]], plan[1]) for key, plan in plans if plan[0] in cache]
+
+    @staticmethod
+    def recorded(resident: Resident, passes: tuple) -> list:
+        """[spp, width, height] of the single-view freeze recordings that cover every pass."""
+        sizes = {f[:3] for f in list(resident.frozen) if f[0] != "batch"}
+        return sorted(list(s) for s in sizes if all(s + (p,) in resident.frozen for p in passes))
+
+    def _resident(self, rkey: tuple, variant: str) -> Resident:
+        if rkey in self.cache:
+            self.cache.move_to_end(rkey)
+            return self.cache[rkey]
+        scan, xml, flash_xml, mode = rkey
         while len(self.cache) >= self.max_resident:
             self.cache.popitem(last=False)
             gc.collect()
@@ -430,13 +783,20 @@ class Renderer:
             # variant switch loaded, with another process holding 8.8 GB) and freeze recordings fail
             self.dr.flush_malloc_cache()
         base = self.pack / "scenes" / scan  # XML asset paths are relative to this directory
+        # the flash of the active variant this scene file carries (or, two-pass, takes from flash_xml)
+        flash = next((v["flash"] for v in self.meta[scan]["variants"].values()
+                      if v.get("flash") and v["xml"] == xml and v.get("flash_xml") == flash_xml), None)
+        hideable = set()  # shapes some variant on this scene leaves out (plans also feed /v1/status)
+        for other in self.variants(scan):
+            with contextlib.suppress(Exception):
+                plan = self.plan(scan, other, mode)
+                if plan[0] == rkey:
+                    hideable |= plan[3]
         with ACTIVITY.doing(f"loading {scan} {variant}"):
-            if spec.get("flash_xml"):  # two passes: passive scene + flash-only scene, summed
-                loaded = [Resident(self.mi, base / spec["xml"], mode, freeze=self.freeze),
-                          Resident(self.mi, base / spec["flash_xml"], mode, flash=spec["flash"], freeze=self.freeze)]
-            else:  # one pass; an older active scene carries its flash, which follows the camera
-                loaded = [Resident(self.mi, base / spec["xml"], mode, flash=spec.get("flash"), freeze=self.freeze)]
-        self.cache[key] = loaded
+            loaded = Resident(self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
+                              flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
+                              envs=self.env_image)
+        self.cache[rkey] = loaded
         return loaded
 
     def _denoise(self, mode: str, img: np.ndarray) -> np.ndarray:
@@ -465,23 +825,36 @@ class Renderer:
             raise ValueError("width/height/spp/hfov_deg out of range")
         if not np.all(np.isfinite(c2w)):
             raise ValueError("camera_to_world must be finite")
-        return (scan, variant, mode, width, height, hfov, spp, seed, denoise), c2w
+        lights = float(view.get("lights", 1.0))
+        env = view.get("env") or {}
+        env = {"map": env} if isinstance(env, str) else dict(env)
+        env_map, env_scale, env_rot = str(env.get("map", "original")), float(env.get("scale", 1.0)), float(env.get("rotate_deg", 0.0))
+        if not (0.0 <= lights <= 1e3 and 0.0 <= env_scale <= 1e3 and np.isfinite(env_rot)):
+            raise ValueError("lights / env scale out of range")
+        if env_map != "original" and env_map not in self.envmaps:
+            raise ValueError(f"unknown environment map {env_map!r} (have {sorted(self.envmaps)})")
+        look = (lights, env_map, env_scale, env_rot % 360.0)
+        return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float):
         """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined)."""
         started = time.perf_counter()
-        scan, variant, mode, width, height, hfov, spp, seed, denoise = key
+        scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot) = key
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
-            residents = self._resident(scan, variant, mode)
+            rkey, passes, follow, hidden = self.plan(scan, variant, mode)
+            look = Look(hidden, lights, env, env_scale, env_rot)
+            resident = self._resident(rkey, variant)
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
             t0 = time.perf_counter()
             if len(cams) == 1:  # the pipelined path
-                handles = [r.launch(cams[0], width, height, hfov, spp, seed) for r in residents]
+                handles = [resident.launch(cams[0], width, height, hfov, spp, seed, p, follow, look)
+                           for p in passes]
             else:  # batch sensor: completes here
-                batch = [r.render_many(cams, width, height, hfov, spp, seed) for r in residents]
+                batch = [resident.render_many(cams, width, height, hfov, spp, seed, p, follow, look)
+                         for p in passes]
             launch_s = time.perf_counter() - t0
 
         def finish():
@@ -489,11 +862,11 @@ class Renderer:
                 t1 = time.perf_counter()
                 parts: dict[str, float] = {"queue_s": started - submitted, "launch_s": launch_s}
                 if len(cams) == 1:
-                    done = [r.finish(h) for r, h in zip(residents, handles)]
+                    done = [resident.finish(h) for h in handles]
                     per_resident = [[img] for img, _ in done]
                     breakdowns = [b for _, b in done]
                 else:
-                    per_resident, breakdowns = batch, [getattr(r, "breakdown", None) or {} for r in residents]
+                    per_resident, breakdowns = batch, [getattr(resident, "breakdown", None) or {}]
                 for b in breakdowns:
                     for k, v in b.items():
                         parts[k] = parts.get(k, 0.0) + v
@@ -502,7 +875,7 @@ class Renderer:
         return finish
 
     def _assemble(self, key: tuple, cams: list, per_resident: list, parts: dict, render_s: float) -> tuple:
-        scan, variant, mode, width, height, hfov, spp, seed, denoise = key
+        scan, variant, mode, width, height, hfov, spp, seed, denoise = key[:9]
         t1 = time.perf_counter()
         kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0}
         if self.kernel_history:
@@ -623,20 +996,21 @@ def make_handler(renderer: Renderer, token: str | None = None):
             parts = [p for p in self.path.split("?")[0].split("/") if p]
             try:
                 if parts == ["v1", "status"]:  # cheap; answers while a render, load or recording runs
-                    resident = list(renderer.cache.items())
+                    served = renderer.served()
                     return self._json(200, {
                         "activity": ACTIVITY.snapshot(), "freeze": renderer.freeze,
-                        "resident": [list(k) for k, _ in resident],
-                        # freeze recordings per resident scene: [spp, width, height] of each single-view recording
-                        "recorded": {"|".join(k): sorted({tuple(f) for r in rs for f in r.frozen if f[0] != "batch"})
-                                     for k, rs in resident}})
+                        # every variant a resident scene renders (an active variant and its flash-off twin share one)
+                        "resident": [list(k) for k, _, _ in served],
+                        # freeze recordings per variant: [spp, width, height] recorded for all its passes
+                        "recorded": {"|".join(k): renderer.recorded(r, passes) for k, r, passes in served}})
                 if parts == ["v1", "info"]:
                     return self._json(200, {
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,
                         "modes": renderer.variant_of, "path_nocaustics": renderer.has_nocaustics,
+                        "envmaps": sorted(renderer.envmaps),
                         "drjit_freeze": renderer.freeze, "spp_chunk": SPP_CHUNK,
                         "scans": {s: renderer.variants(s) for s in renderer.meta},
-                        "resident": [list(k) + [round(sum(r.load_s for r in v), 1)] for k, v in renderer.cache.items()],
+                        "resident": [list(k) + [round(r.load_s, 1)] for k, r, _ in renderer.served()],
                     })
                 if parts == ["v1", "scans"]:
                     return self._json(200, sorted(renderer.meta))
@@ -700,6 +1074,8 @@ def main() -> int:
     ap.add_argument("--preload", action="append", default=[], help="SCAN[:VARIANT[:MODE]] to load at start (repeatable)")
     ap.add_argument("--freeze", choices=["auto", "on", "off"], default="auto",
                     help="replay renders with dr.freeze (auto: when this Dr.Jit has it)")
+    ap.add_argument("--envmaps", type=Path, default=None,
+                    help="folder of .exr/.hdr environment maps a view may name (default: <pack>/envmaps)")
     ap.add_argument("--kernel-history", action="store_true",
                     help="record per-kernel codegen/compile/GPU times (X-Render-Timing gpu_s etc.). Reading them "
                          "synchronises the GPU every view, so views no longer overlap; use it for measurements")
@@ -712,7 +1088,7 @@ def main() -> int:
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
     renderer = Renderer(Path(args.pack).resolve(), args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
-                        kernel_history=args.kernel_history)
+                        kernel_history=args.kernel_history, envmap_dir=args.envmaps)
     for item in args.preload:
         parts = item.split(":")
         scan, variant, mode = parts[0], (parts[1:2] or ["base"])[0], (parts[2:3] or [modes[0]])[0]

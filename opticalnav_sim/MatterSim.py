@@ -88,6 +88,8 @@ class Simulator:
         self.cacheSize = 200
         self.randomSeed = 1
         self.variant = "base"
+        self.lights = 1.0  # indoor light level (setIndoorLights)
+        self.env = {"map": "original", "scale": 1.0, "rotate_deg": 0.0}  # sky (setEnvironment)
         self.renderMode = "polar"
         self.denoise = False
         self.preview = True
@@ -161,6 +163,24 @@ class Simulator:
         """Default optical variant: 'base', 'perturbed' or 'active_polar'. A scan id
         ``<scene>__<variant>`` overrides it per episode."""
         self.variant = str(variant)
+
+    def setActiveLight(self, enabled: bool) -> None:
+        """Switch the camera-mounted active polarized light: on renders 'active_polar', off renders
+        'perturbed' (the same scene and lights without it). Takes effect from the next render
+        (newEpisode, teleport or makeAction, mid-episode too). The render server keeps one resident
+        scene for both, so switching loads nothing; the first frame of each records its freeze."""
+        self.setVariant("active_polar" if enabled else "perturbed")
+
+    def setIndoorLights(self, level: float) -> None:
+        """Scale every indoor light (the scene's area emitters; not the camera flash or the sky): 1 as built,
+        0 all off. From the next render; the server changes the loaded scene in place, without recording."""
+        self.lights = float(level)
+
+    def setEnvironment(self, name: str = "original", scale: float = 1.0, rotate_deg: float = 0.0) -> None:
+        """The sky seen through windows: 'original' (the scene's own) or an environment map the render server
+        offers (``GET /v1/info`` "envmaps"; files in the pack's envmaps folder), times ``scale``, turned
+        ``rotate_deg`` about the vertical. From the next render, without recording."""
+        self.env = {"map": str(name), "scale": float(scale), "rotate_deg": float(rotate_deg)}
 
     def setRenderSpp(self, spp: int) -> None:
         """Samples per pixel per frame (dataset renders used 1024)."""
@@ -333,7 +353,7 @@ class Simulator:
     def _view(self, scene, variant, c2w, width, height, hfov_deg) -> dict:
         return {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": width, "height": height,
                 "hfov_deg": hfov_deg, "spp": self.spp, "seed": self.seed, "mode": self.renderMode,
-                "denoise": self.denoise, "preview": self.preview}
+                "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env)}
 
     def _set_heading_elevation(self, heading, elevation) -> None:
         for state, h, e in zip(self.states, heading, elevation):
@@ -386,6 +406,7 @@ class Simulator:
             else:
                 c2w = frames.camera_at_position(state._free_position, state.heading, state.elevation, mount)
             state.camera_to_world = c2w
+            state.variant = variant  # setVariant / setActiveLight apply from the next render
             views.append(self._view(scene, variant, c2w, self.width, self.height, hfov))
         results = self._client.render(views, self.stokesDtype)
         for state, out in zip(self.states, results):
