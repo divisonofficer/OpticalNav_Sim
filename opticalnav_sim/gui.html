@@ -53,6 +53,8 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-
 .tabs button[aria-pressed=true] { background: var(--rule); color: var(--ink); }
 .scale { display: flex; align-items: center; gap: 6px; color: var(--muted); font: 12px var(--mono); }
 .scale input { width: 110px; }
+.pane-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.scale .ev-v { min-width: 4.5em; }
 .frame { position: relative; background: #000; border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; aspect-ratio: 4 / 3; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
 .cands { position: absolute; inset: 0; pointer-events: none; }
@@ -149,7 +151,10 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
       <div class="pane" id="pane-a">
         <div class="pane-head">
           <div class="tabs" role="group" aria-label="왼쪽 화면 채널" data-pane="a"></div>
-          <label class="scale" for="scale">범위 <input type="range" id="scale" min="0.05" max="1" step="0.05" value="0.2"> <span id="scale-v">0.20</span></label>
+          <div class="pane-tools">
+            <label class="scale" for="scale">범위 <input type="range" id="scale" min="0.05" max="1" step="0.05" value="0.2"> <span id="scale-v">0.20</span></label>
+            <label class="scale" for="ev-rgb" title="RGB 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다">RGB 노출 <input type="range" id="ev-rgb" min="-4" max="4" step="0.25" value="0"> <span class="ev-v" id="ev-rgb-v">0 EV</span></label>
+          </div>
         </div>
         <div class="frame" id="frame-a">
           <img id="img-a" alt="현재 시점">
@@ -162,6 +167,10 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
       <div class="pane" id="pane-b">
         <div class="pane-head">
           <div class="tabs" role="group" aria-label="오른쪽 화면 채널" data-pane="b"></div>
+          <div class="pane-tools">
+            <label class="scale" for="ev-nir" title="NIR 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다">NIR 노출 <input type="range" id="ev-nir" min="-4" max="4" step="0.25" value="0"> <span class="ev-v" id="ev-nir-v">0 EV</span></label>
+            <button type="button" id="refit" class="flash" title="지금 화면의 밝은 부분에 맞춰 RGB와 NIR의 노출 기준점을 다시 잡고, 노출 조절을 0으로 돌립니다">자동 노출</button>
+          </div>
         </div>
         <div class="frame" id="frame-b"><img id="img-b" alt="현재 시점의 두 번째 채널"></div>
         <div class="legend" id="legend-b"></div>
@@ -384,7 +393,8 @@ function showPane(buf) {
 }
 function subscribe() {
   const showB = getComputedStyle($("pane-b")).display !== "none";
-  wsSend({ type: "subscribe", panes: { a: view.a, b: showB ? view.b : null }, scale: Number($("scale").value) });
+  wsSend({ type: "subscribe", panes: { a: view.a, b: showB ? view.b : null }, scale: Number($("scale").value),
+           ev: { rgb: Number($("ev-rgb").value), nir: Number($("ev-nir").value) } });
 }
 const WHAT = { start: "첫 프레임", forward: "이동", move: "이동", turn: "회전", about: "뒤로 돌기", pitch: "고개 돌리기",
   goto: "지도 이동", configure: "설정 변경", fly: "자유 이동", free_off: "그래프로 복귀" };
@@ -733,6 +743,24 @@ document.querySelectorAll(".pad button").forEach((b) => b.addEventListener("clic
   else act(b.dataset.op, Number(b.dataset.v || 0));
 }));
 $("scale").addEventListener("input", () => { renderLegends(); showImages(); });
+// exposure per band: applied when the server sends a pane (no render), remembered in this browser
+function showEv(band) {
+  const v = Number($(`ev-${band}`).value);
+  $(`ev-${band}-v`).textContent = `${v > 0 ? "+" : ""}${v} EV`;
+  try { localStorage.setItem(`opticalnav-ev-${band}`, String(v)); } catch (e) { /* storage blocked: not remembered */ }
+}
+for (const band of ["rgb", "nir"]) {
+  try {
+    const saved = localStorage.getItem(`opticalnav-ev-${band}`);
+    if (saved !== null && Number.isFinite(Number(saved))) $(`ev-${band}`).value = saved;
+  } catch (e) { /* storage blocked: start at 0 */ }
+  showEv(band);
+  $(`ev-${band}`).addEventListener("input", () => { showEv(band); showImages(); });
+}
+$("refit").addEventListener("click", () => configure({ refit_tone: true }, "노출 맞춤").then(() => {
+  for (const band of ["rgb", "nir"]) { $(`ev-${band}`).value = 0; showEv(band); }
+  showImages();
+}));
 $("scene").addEventListener("change", () => { const sc = $("scene").value; graph = null; send("/api/start", { scene: sc }, "씬 전환"); });
 $("flash").addEventListener("click", toggleFlash);
 $("mirrors").addEventListener("click", toggleMirrors);

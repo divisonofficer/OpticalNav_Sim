@@ -27,7 +27,8 @@ Per-band scale (:monosp:`bandscale`)
 
 A lookup is near-infrared when ``band`` is set or the ray's time is 0.5 or more (a ``batch`` sensor
 with ``slot_time``: its second slot), so one render holds both bands side by side, each light at its
-own level in each band, without changing any parameter between them.
+own level in each band, without changing any parameter between them. In RGBN variants
+(``cuda_rgbn_polarized``) a lookup scales R, G and B by ``rgb`` and the near-infrared lane by ``nir``.
  */
 template <typename Float, typename Spectrum>
 class BandScale final : public Texture<Float, Spectrum> {
@@ -57,7 +58,13 @@ public:
 
     UnpolarizedSpectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
-        return m_nested->eval(si, active) * factor(si, active);
+        if constexpr (is_rgbn_v<Spectrum>) {  // both bands at once: each lane at its band's level
+            Float f_rgb = m_rgb->eval_1(si, active);
+            return m_nested->eval(si, active) *
+                   UnpolarizedSpectrum(f_rgb, f_rgb, f_rgb, m_nir->eval_1(si, active));
+        } else {
+            return m_nested->eval(si, active) * factor(si, active);
+        }
     }
 
     Color3f eval_3(const SurfaceInteraction3f &si, Mask active) const override {

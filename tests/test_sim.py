@@ -298,6 +298,12 @@ def test_gui_session_and_routes():
     for ch in gui.CHANNELS:
         assert session.image(st["frame_id"], ch, 0.2)[:2] == b"\xff\xd8"  # JPEG
     assert session.probe(st["frame_id"], 999, -5)["x"] == 63
+    # exposure: a page's EV offset darkens the pane it is sent; a refit fits the tone to the frame on screen
+    frame = dict(session._frame(st["frame_id"]))
+    dark, plain = session._tonemapped(frame, "rgb", -2.0), session._tonemapped(frame, "rgb", 0.0)
+    assert dark.mean() <= plain.mean() and session.image(st["frame_id"], "rgb", 0.2, {"rgb": -2.0})[:2] == b"\xff\xd8"
+    session.configure({"refit_tone": True})
+    assert session.tones[(frame["scan"], frame["variant"])] == gui.tonemap.global_params([frame["s0"]])
 
     httpd = gui.ThreadingHTTPServer(("127.0.0.1", 0), gui.make_handler(session))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -495,8 +501,51 @@ def test_generated_episodes_follow_the_support_graph():
         generate(graph, 4, seed=3, min_m=0.5, max_m=1.0)[0]["path_nodes"]  # the seed fixes the draw
 
 
+def test_compact_assets_rewrites_textures_and_obj_shapes():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from compact_assets import rewrite
+
+    text = ('  <shape type="obj" id="cup">\n    <string name="filename" value="assets/a_cup.obj" />\n'
+            '    <bsdf type="diffuse"><texture name="reflectance" type="bitmap">'
+            '<string name="filename" value="assets/x_base_color.png" /></texture></bsdf>\n  </shape>\n'
+            '  <shape type="obj" id="kept">\n    <string name="filename" value="assets/b_bad.obj" />\n  </shape>\n'
+            '  <shape type="ply" id="light">\n    <string name="filename" value="/tmp/rect.ply" />\n  </shape>\n')
+    out = rewrite(text, {"assets/x_base_color.png": "assets/tex_1.png"}, {"assets/a_cup.obj": "assets/mesh_2.ply"})
+    assert '<shape type="ply" id="cup">\n    <string name="filename" value="assets/mesh_2.ply" />' in out
+    assert 'value="assets/tex_1.png"' in out and "x_base_color" not in out
+    assert '<shape type="obj" id="kept">\n    <string name="filename" value="assets/b_bad.obj" />' in out  # failed: stays OBJ
+    assert 'value="/tmp/rect.ply"' in out  # files outside assets/ are not the pack's
+    assert rewrite(out, {"assets/tex_1.png": "assets/tex_1.png"}, {}) == out  # a second run changes nothing
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             fn()
             print(f"ok {name}")
+
+
+class SpawnClient(FakeClient):
+    """A scene packed without a navigation graph: no connectivity, spawn points in scene.json."""
+
+    def connectivity(self, scan):
+        raise AssertionError("a spawn-only scene has no connectivity to fetch")
+
+    def meta(self, scan):
+        return {"camera": {"mount": MOUNT}, "graph": None,
+                "spawn": [{"position": [1.0, -2.0, 1.5], "heading_deg": 90.0}, {"position": [3.0, 0.0, 1.5]}]}
+
+
+def test_spawn_points_stand_in_for_a_missing_graph():
+    sim = MatterSim.Simulator()
+    sim.setCameraResolution(64, 48)
+    sim.initialize()
+    sim._client = SpawnClient([])
+    graph = sim._graph("scene")
+    assert graph.ids == ["spawn_0", "spawn_1"] and graph.adjacent == [[], []]
+    assert math.isclose(graph.headings[0], math.pi / 2) and graph.headings[1] == 0.0
+    sim.newEpisode(["scene"], ["spawn_1"], [0.0], [0.0])
+    st = sim.getState()[0]
+    assert (st.location.x, st.location.y) == (3.0, 0.0) and [c.viewpointId for c in st.navigableLocations] == ["spawn_1"]
+    sim.teleport(["scene"], [[1.2, -2.1, 1.4]], [0.0], [0.0])  # free movement snaps to the nearest spawn id
+    assert sim.getState()[0].location.viewpointId == "spawn_0"

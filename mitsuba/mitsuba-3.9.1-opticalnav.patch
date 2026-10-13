@@ -1,0 +1,2159 @@
+diff --git a/include/mitsuba/core/spectrum.h b/include/mitsuba/core/spectrum.h
+index a8f5fc9..b1b264b 100644
+--- a/include/mitsuba/core/spectrum.h
++++ b/include/mitsuba/core/spectrum.h
+@@ -19,6 +19,10 @@ struct Color : dr::StaticArrayImpl<Value_, Size_, false, Color<Value_, Size_>> {
+     /// Helper alias used to implement type promotion rules
+     template <typename T> using ReplaceValue = Color<T, Size_>;
+ 
++    /* An RGBN colour (4 lanes) is a spectrum, not a vector: never a matrix-vector product with a 4x4
++       Mueller matrix (MuellerMatrix<Color4> * Color4 scales every entry per lane, as with 3 lanes) */
++    static constexpr bool IsVector = Size_ != 4;
++
+     using ArrayType = Color;
+     using MaskType = dr::Mask<Value_, Size_>;
+ 
+@@ -441,6 +445,46 @@ template <typename Float> Float luminance(const Color<Float, 3> &c) {
+     return c[0] * F(0.212671f) + c[1] * F(0.715160f) + c[2] * F(0.072169f);
+ }
+ 
++/// RGBN: the luminance of the RGB lanes
++template <typename Float> Float luminance(const Color<Float, 4> &c) {
++    return luminance(Color<Float, 3>(c[0], c[1], c[2]));
++}
++
++/// The RGB lanes of a colour (RGBN: without its near-infrared lane)
++template <typename Float, size_t N> Color<Float, 3> rgb_lanes(const Color<Float, N> &c) {
++    static_assert(N == 3 || N == 4, "rgb_lanes(): an RGB or RGBN colour");
++    if constexpr (N == 3)
++        return c;
++    else
++        return Color<Float, 3>(c[0], c[1], c[2]);
++}
++
++/**
++ * \brief The pseudo near-infrared reflectance of a linear RGB reflectance:
++ * ``dot(max(c, 1 - c), [0.229, 0.587, 0.114])`` of ``c = clip(rgb, 0, 1)``
++ * (robomituba's ``pseudo_nir_albedo``).
++ */
++template <typename Float> Float pseudo_nir(const Color<Float, 3> &rgb) {
++    using F = dr::scalar_t<Float>;
++    Color<Float, 3> c = dr::clip(rgb, F(0.f), F(1.f));
++    Color<Float, 3> m = dr::maximum(c, F(1.f) - c);
++    return m[0] * F(0.229f) + m[1] * F(0.587f) + m[2] * F(0.114f);
++}
++
++/**
++ * \brief A linear RGB colour in an RGB-mode colour type: RGB as it is; RGBN
++ * with a near-infrared lane, ``nir`` when given, else the colour's luminance
++ * (an emitter's radiance, or any colour without a near-infrared value of its
++ * own: reflectances get theirs from the ``rgb2nir`` texture).
++ */
++template <typename Color_, typename Float>
++Color_ rgb_to_color(const Color<Float, 3> &rgb) {
++    if constexpr (dr::size_v<Color_> == 4)
++        return Color_(rgb[0], rgb[1], rgb[2], luminance(rgb));
++    else
++        return Color_(rgb);
++}
++
+ /**
+  * Importance sample a "importance spectrum" that concentrates the computation
+  * on wavelengths that are relevant for rendering of RGB data
+diff --git a/include/mitsuba/core/traits.h b/include/mitsuba/core/traits.h
+index 55f0ade..d637186 100644
+--- a/include/mitsuba/core/traits.h
++++ b/include/mitsuba/core/traits.h
+@@ -21,6 +21,7 @@ struct spectrum_traits<Color<Float, 1>> {
+     using Unpolarized                        = Color<Float, 1>;
+     static constexpr bool is_monochromatic   = true;
+     static constexpr bool is_rgb             = false;
++    static constexpr bool is_rgbn            = false;
+     static constexpr bool is_spectral        = false;
+     static constexpr bool is_polarized       = false;
+ };
+@@ -32,6 +33,22 @@ struct spectrum_traits<Color<Float, 3>> {
+     using Unpolarized                        = Color<Float, 3>;
+     static constexpr bool is_monochromatic   = false;
+     static constexpr bool is_rgb             = true;
++    static constexpr bool is_rgbn            = false;
++    static constexpr bool is_spectral        = false;
++    static constexpr bool is_polarized       = false;
++};
++
++/* RGBN: linear RGB plus a near-infrared lane, each carried through the same path (each with its own
++   Mueller matrix in polarized variants). It is an RGB mode (is_rgb) for everything that reads colours as
++   RGB; is_rgbn marks the places that make or read the fourth lane. */
++template <typename Float>
++struct spectrum_traits<Color<Float, 4>> {
++    using Scalar                             = Color<dr::scalar_t<Float>, 4>;
++    using Wavelength                         = Color<Float, 0>;
++    using Unpolarized                        = Color<Float, 4>;
++    static constexpr bool is_monochromatic   = false;
++    static constexpr bool is_rgb             = true;
++    static constexpr bool is_rgbn            = true;
+     static constexpr bool is_spectral        = false;
+     static constexpr bool is_polarized       = false;
+ };
+@@ -43,6 +60,7 @@ struct spectrum_traits<Spectrum<Float, Size>> {
+     using Unpolarized                        = Spectrum<Float, Size>;
+     static constexpr bool is_monochromatic   = false;
+     static constexpr bool is_rgb             = false;
++    static constexpr bool is_rgbn            = false;
+     static constexpr bool is_spectral        = true;
+     static constexpr bool is_polarized       = false;
+ };
+@@ -72,6 +90,7 @@ NAMESPACE_END(detail)
+ 
+ template <typename T> constexpr bool is_monochromatic_v = detail::spectrum_traits<T>::is_monochromatic;
+ template <typename T> constexpr bool is_rgb_v = detail::spectrum_traits<T>::is_rgb;
++template <typename T> constexpr bool is_rgbn_v = detail::spectrum_traits<T>::is_rgbn;
+ template <typename T> constexpr bool is_spectral_v = detail::spectrum_traits<T>::is_spectral;
+ template <typename T> constexpr bool is_polarized_v = detail::spectrum_traits<T>::is_polarized;
+ template <typename T> using scalar_spectrum_t = typename detail::spectrum_traits<T>::Scalar;
+diff --git a/include/mitsuba/render/imageblock.h b/include/mitsuba/render/imageblock.h
+index 283277a..4b7d740 100644
+--- a/include/mitsuba/render/imageblock.h
++++ b/include/mitsuba/render/imageblock.h
+@@ -188,7 +188,7 @@ public:
+         else if constexpr (is_monochromatic_v<Spectrum>)
+             rgb = spec_u.x();
+         else
+-            rgb = spec_u;
++            rgb = rgb_lanes(spec_u);  // RGBN: the film keeps R, G, B (the near-infrared lane: Stokes AOVs)
+ 
+         Float values[5] = { rgb.x(), rgb.y(), rgb.z(), 0, 0 };
+ 
+diff --git a/include/mitsuba/render/ior.h b/include/mitsuba/render/ior.h
+index d361f4d..b13230b 100644
+--- a/include/mitsuba/render/ior.h
++++ b/include/mitsuba/render/ior.h
+@@ -97,6 +97,29 @@ inline float lookup_ior(const Properties &props, const std::string &param_name,
+     }
+ }
+ 
++/**
++ * \brief Mean of a tabulated spectrum over the near-infrared band (800-900 nm, as far as the data
++ * reaches; else its longest-wavelength value): the near-infrared lane of an RGBN colour made from
++ * spectral data, such as a conductor's complex index of refraction.
++ */
++inline double spectrum_list_nir(const std::vector<double> &wavelengths, const std::vector<double> &values) {
++    double sum = 0.0;
++    size_t count = 0;
++    for (size_t i = 0; i < wavelengths.size(); ++i) {
++        if (wavelengths[i] >= 800.0 && wavelengths[i] <= 900.0) {
++            sum += values[i];
++            ++count;
++        }
++    }
++    if (count > 0)
++        return sum / (double) count;
++    size_t last = 0;
++    for (size_t i = 1; i < wavelengths.size(); ++i)
++        if (wavelengths[i] > wavelengths[last])
++            last = i;
++    return values.empty() ? 0.0 : values[last];
++}
++
+ template <typename Spectrum, typename Texture>
+ ref<Texture> ior_from_file(std::string_view filename) {
+     using Float = double;
+@@ -120,6 +143,8 @@ ref<Texture> ior_from_file(std::string_view filename) {
+             props.set_plugin_name("srgb");
+             props.set("color", color);
+             props.set("unbounded", true);
++            if (is_rgbn_v<Spectrum>)  // the near-infrared lane from the data itself
++                props.set("nir", spectrum_list_nir(wavelengths, values));
+         }
+     }
+ 
+diff --git a/include/mitsuba/render/sunsky.h b/include/mitsuba/render/sunsky.h
+index 741f4cc..9207e22 100644
+--- a/include/mitsuba/render/sunsky.h
++++ b/include/mitsuba/render/sunsky.h
+@@ -566,7 +566,9 @@ protected:
+         if constexpr (!is_spectral_v<Spectrum>) {
+             DRJIT_MARK_USED(wavelengths);
+             USpecUInt32 idx = dr::zeros<USpecUInt32>();
+-            if constexpr (is_rgb_v<Spectrum>)
++            if constexpr (is_rgbn_v<Spectrum>)
++                idx = {0, 1, 2, 0};  // no near-infrared data: the red channel's
++            else if constexpr (is_rgb_v<Spectrum>)
+                 idx = {0, 1, 2};
+             else
+                 idx = USpecUInt32(0);
+diff --git a/resources/mitsuba.conf.template b/resources/mitsuba.conf.template
+index f525fc7..a698c80 100644
+--- a/resources/mitsuba.conf.template
++++ b/resources/mitsuba.conf.template
+@@ -309,6 +309,11 @@
+         "spectrum": "Color<Float, 3>"
+     },
+ 
++    "cuda_rgbn_polarized": {
++        "float": "dr::CUDAArray<float>",
++        "spectrum": "MuellerMatrix<Color<Float, 4>>"
++    },
++
+     "cuda_rgb_polarized": {
+         "float": "dr::CUDAArray<float>",
+         "spectrum": "MuellerMatrix<Color<Float, 3>>"
+diff --git a/src/bsdfs/CMakeLists.txt b/src/bsdfs/CMakeLists.txt
+index 968476a..8aefeb9 100644
+--- a/src/bsdfs/CMakeLists.txt
++++ b/src/bsdfs/CMakeLists.txt
+@@ -20,6 +20,7 @@ add_plugin(polarizer            polarizer.cpp)
+ add_plugin(retarder             retarder.cpp)
+ add_plugin(circular             circular.cpp)
+ add_plugin(measured_polarized   measured_polarized.cpp)
++add_plugin(measured_polarized_rgb measured_polarized_rgb.cpp)
+ add_plugin(pplastic             pplastic.cpp)
+ add_plugin(principled           principled.cpp)
+ add_plugin(principledthin       principledthin.cpp)
+diff --git a/src/bsdfs/hair.cpp b/src/bsdfs/hair.cpp
+index 90bd5b5..91b13f4 100755
+--- a/src/bsdfs/hair.cpp
++++ b/src/bsdfs/hair.cpp
+@@ -756,8 +756,8 @@ private:
+                 ScalarColor3f eumelanin_sigma_a(EUMELANIN_SIGMA_A);
+                 ScalarColor3f pheomelanin_sigma_a(PHEOMELANIN_SIGMA_A);
+ 
+-                return m_eumelanin * Color3f(eumelanin_sigma_a) +
+-                       m_pheomelanin * Color3f(pheomelanin_sigma_a);
++                return rgb_to_color<UnpolarizedSpectrum>(m_eumelanin * Color3f(eumelanin_sigma_a) +
++                                                         m_pheomelanin * Color3f(pheomelanin_sigma_a));
+             } else {
+                 // TODO: Use a measured spectral response of pigmentation(s)
+                 // rather than the RGB upsampling scheme.
+diff --git a/src/bsdfs/measured_polarized.cpp b/src/bsdfs/measured_polarized.cpp
+index e0fa23b..632b5ec 100644
+--- a/src/bsdfs/measured_polarized.cpp
++++ b/src/bsdfs/measured_polarized.cpp
+@@ -39,6 +39,12 @@ Measured polarized material (:monosp:`measured_polarized`)
+      A value of -1 means the full spectrally-varying pBRDF will be used.
+      (Default: -1, i.e. all wavelengths.)
+ 
++ * - albedo_scale
++   - |texture| or |rgb|
++   - Optional asset albedo multiplier applied to the measured pBRDF response.
++     Spatial textures are evaluated at the surface interaction and clamped to
++     ``[0, 1]``. (Default: 1)
++
+ This plugin allows rendering of polarized materials (pBRDFs) acquired as part of
+ "Image-Based Acquisition and Modeling of Polarimetric Reflectance" by Baek et al.
+ 2020 (:cite:`Baek2020Image`). The required files for each material can
+@@ -111,11 +117,14 @@ public:
+     using Interpolator = Marginal2D<Float, 4, true>;
+ 
+     MeasuredPolarized(const Properties &props) : Base(props) {
+-        m_flags = BSDFFlags::GlossyReflection | BSDFFlags::FrontSide;
+-        m_components.push_back(m_flags);
+-
+         m_alpha_sample = props.get<ScalarFloat>("alpha_sample", 0.1f);
+         m_wavelength = props.get<ScalarFloat>("wavelength", -1.f);
++        m_albedo_scale = props.get_texture<Texture>("albedo_scale", 1.f);
++
++        m_flags = BSDFFlags::GlossyReflection | BSDFFlags::FrontSide;
++        if (m_albedo_scale->is_spatially_varying())
++            m_flags = m_flags | BSDFFlags::NeedsDifferentials;
++        m_components.push_back(m_flags);
+ 
+         if (!is_spectral_v<Spectrum> && m_wavelength == -1.f)
+             Throw("In non-spectral modes, the measured polarized plugin can only render a specific wavelength specified by the `wavelength` parameter.");
+@@ -155,8 +164,8 @@ public:
+             Throw("Invalid file structure: %s", tf->to_string());
+         }
+ 
+-        ScalarFloat wavelengths[5];
+-        for (size_t i = 0; i < 5; ++i) {
++        ScalarFloat *wavelengths = new ScalarFloat[wvls.shape[0]];
++        for (size_t i = 0; i < wvls.shape[0]; ++i) {
+             wavelengths[i] = ScalarFloat(((uint16_t *) wvls.data)[i]);
+         }
+ 
+@@ -318,6 +327,10 @@ public:
+             value = dr::maximum(0.f, value);
+         }
+ 
++        auto albedo_scale = m_albedo_scale->eval(si, active);
++        albedo_scale = dr::minimum(dr::maximum(albedo_scale, 0.f), 1.f);
++        value *= albedo_scale;
++
+         return (value * cos_theta_o) & active;
+     }
+ 
+@@ -397,10 +410,11 @@ private:
+     std::string m_name;
+     ScalarFloat m_wavelength;
+     ScalarFloat m_alpha_sample;
++    ref<Texture> m_albedo_scale;
+     Interpolator  m_interpolator;
+ 
+-    MI_TRAVERSE_CB(Base, m_interpolator)
++    MI_TRAVERSE_CB(Base, m_interpolator, m_albedo_scale)
+ };
+ 
+ MI_EXPORT_PLUGIN(MeasuredPolarized)
+-NAMESPACE_END(mitsuba)
++NAMESPACE_END(mitsuba)
+\ No newline at end of file
+diff --git a/src/bsdfs/measured_polarized_rgb.cpp b/src/bsdfs/measured_polarized_rgb.cpp
+new file mode 100755
+index 0000000..7b89646
+--- /dev/null
++++ b/src/bsdfs/measured_polarized_rgb.cpp
+@@ -0,0 +1,369 @@
++#include <mitsuba/core/properties.h>
++#include <mitsuba/core/warp.h>
++#include <mitsuba/core/fresolver.h>
++#include <mitsuba/core/tensor.h>
++#include <mitsuba/core/distr_2d.h>
++#include <mitsuba/render/bsdf.h>
++#include <mitsuba/render/fresnel.h>
++#include <mitsuba/render/texture.h>
++#include <mitsuba/render/microfacet.h>
++
++/* Set the weight for cosine hemisphere sampling in relation to GGX sampling.
++   Set to 1.0 in order to fully fall back to cosine sampling. */
++#define COSINE_HEMISPHERE_PDF_WEIGHT 0.1f
++
++NAMESPACE_BEGIN(mitsuba)
++
++/**!
++
++.. _bsdf-measured_polarized_rgb:
++
++Channel-split RGB measured material (:monosp:`measured_polarized_rgb`)
++---------------------------------------------------------------------
++
++.. pluginparameters::
++
++ * - filename_r / filename_g / filename_b
++   - |string|
++   - Filenames of the three single-band pBRDF slices (e.g. 614 / 542 / 446 nm)
++     used to reconstruct the red, green and blue channels.
++
++ * - alpha_sample
++   - |float|
++   - Roughness used for the internal GGX importance-sampling routine.
++     (Default: 0.1)
++
++ * - albedo_scale
++   - |texture| or |rgb|
++   - Optional asset albedo multiplier applied to the measured RGB response.
++     Spatial textures are evaluated at the surface interaction and clamped to
++     ``[0, 1]``. (Default: 1)
++
++This is an RGB-reconstruction companion to :ref:`measured_polarized
++<bsdf-measured_polarized>`.  The HPBRDF-2025 dataset stores many narrow spectral
++bands; rendering the full spectrally-varying pBRDF is memory heavy (~200 MB per
++band).  To produce a colour image cheaply, three single-band slices are picked
++to stand in for R/G/B and evaluated together in **one** render pass.
++
++Unlike the previous 3-pass approach (render once per band, then collapse each
++pass to a luminance scalar), this plugin keeps the three band reflectances as
++distinct channels, so ordinary (non-measured) materials in the same scene keep
++their real colour instead of collapsing to grey.
++
++Each ``filename_*`` points at a ``channels/{material}/{wavelength}.pbrdf`` file
++with the same tensor layout as :ref:`measured_polarized
++<bsdf-measured_polarized>` but with a single entry in its ``wvls`` field.  Only
++the unpolarised ``M[0,0]`` element is used (this BSDF is meant for the
++non-polarised path/RGB pass).
++
++Behaviour by variant:
++
++* **RGB variants** (``*_rgb``): channel ``c`` is returned directly as the
++  reflectance of band ``c``. RGBN variants add the bands' luminance as the
++  near-infrared lane.
++* **Spectral variants** (``*_spectral`` / ``*_spectral_polarized``): each sampled
++  wavelength is mapped to the nearest of the three bands, reconstructing a
++  piecewise-constant 3-band spectrum that the film integrates back to RGB.
++
++.. code-tab:: xml
++
++    <bsdf type="measured_polarized_rgb">
++        <string name="filename_r" value=".../channels/white_billiard/614.pbrdf"/>
++        <string name="filename_g" value=".../channels/white_billiard/542.pbrdf"/>
++        <string name="filename_b" value=".../channels/white_billiard/446.pbrdf"/>
++        <float name="alpha_sample" value="0.1"/>
++    </bsdf>
++*/
++template <typename Float, typename Spectrum>
++class MeasuredPolarizedRGB final : public BSDF<Float, Spectrum> {
++public:
++    MI_IMPORT_BASE(BSDF, m_flags, m_components)
++    MI_IMPORT_TYPES(Texture, MicrofacetDistribution)
++
++    using Interpolator = Marginal2D<Float, 4, true>;
++
++    MeasuredPolarizedRGB(const Properties &props) : Base(props) {
++        m_alpha_sample = props.get<ScalarFloat>("alpha_sample", 0.1f);
++        m_albedo_scale = props.get_texture<Texture>("albedo_scale", 1.f);
++
++        m_flags = BSDFFlags::GlossyReflection | BSDFFlags::FrontSide;
++        if (m_albedo_scale->is_spatially_varying())
++            m_flags = m_flags | BSDFFlags::NeedsDifferentials;
++        m_components.push_back(m_flags);
++
++        // Band order is fixed: index 0 = red, 1 = green, 2 = blue. The nominal
++        // wavelengths are read back from each file's `wvls` field.
++        const char *keys[3] = { "filename_r", "filename_g", "filename_b" };
++        load_channel(props.get<std::string_view>(keys[0]), m_interp_r, m_band_r, m_name_r);
++        load_channel(props.get<std::string_view>(keys[1]), m_interp_g, m_band_g, m_name_g);
++        load_channel(props.get<std::string_view>(keys[2]), m_interp_b, m_band_b, m_name_b);
++    }
++
++    void traverse(TraversalCallback *cb) override {
++        cb->put("albedo_scale", m_albedo_scale, ParamFlags::Differentiable);
++    }
++
++    void load_channel(std::string_view filename, Interpolator &interp,
++                      ScalarFloat &band_nm, std::string &name) {
++        auto fs = file_resolver();
++        fs::path file_path = fs->resolve(filename);
++        name = file_path.filename().string();
++
++        ref<TensorFile> tf = new TensorFile(file_path);
++
++        auto theta_h = tf->field("theta_h");
++        auto theta_d = tf->field("theta_d");
++        auto phi_d   = tf->field("phi_d");
++        auto wvls    = tf->field("wvls");
++        auto pbrdf   = tf->field("M");
++
++        if (!(theta_h.shape.size() == 2 &&
++              theta_h.dtype == sj::Type::Float32 &&
++
++              theta_d.shape.size() == 2 &&
++              theta_d.dtype == sj::Type::Float32 &&
++
++              phi_d.shape.size() == 2 &&
++              phi_d.dtype == sj::Type::Float32 &&
++
++              wvls.shape.size() == 1 &&
++              wvls.dtype == sj::Type::UInt16 &&
++
++              pbrdf.dtype == sj::Type::Float32 &&
++              pbrdf.shape.size() == 6 &&
++              pbrdf.shape[0] == phi_d.shape[1] &&
++              pbrdf.shape[1] == theta_d.shape[1] &&
++              pbrdf.shape[2] == theta_h.shape[1] &&
++              pbrdf.shape[3] == wvls.shape[0]) &&
++              pbrdf.shape[4] == 4 &&
++              pbrdf.shape[5] == 4) {
++            Throw("Invalid file structure: %s", tf->to_string());
++        }
++
++        ScalarFloat *wavelengths = new ScalarFloat[wvls.shape[0]];
++        for (size_t i = 0; i < wvls.shape[0]; ++i)
++            wavelengths[i] = ScalarFloat(((uint16_t *) wvls.data)[i]);
++        band_nm = wavelengths[0];
++
++        interp = Interpolator(
++            (ScalarFloat *) pbrdf.data,
++            ScalarVector2u(4, 4),
++            {{ (uint32_t) phi_d.shape[1],
++               (uint32_t) theta_d.shape[1],
++               (uint32_t) theta_h.shape[1],
++               (uint32_t) wvls.shape[0] }},
++            {{ (const ScalarFloat *) phi_d.data,
++               (const ScalarFloat *) theta_d.data,
++               (const ScalarFloat *) theta_h.data,
++               (const ScalarFloat *) wavelengths }},
++            false, false
++        );
++    }
++
++    std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
++                                             const SurfaceInteraction3f &si,
++                                             Float sample1,
++                                             const Point2f &sample2,
++                                             Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::BSDFSample, active);
++
++        Float cos_theta_i = Frame3f::cos_theta(si.wi);
++        active &= cos_theta_i > 0.f;
++
++        BSDFSample3f bs = dr::zeros<BSDFSample3f>();
++        if (unlikely(dr::none_or<false>(active) || !ctx.is_enabled(BSDFFlags::GlossyReflection)))
++            return { bs, 0.f };
++
++        MicrofacetDistribution distr(MicrofacetType::GGX,
++                                     m_alpha_sample, m_alpha_sample, true);
++
++        Float lobe_pdf_diffuse = COSINE_HEMISPHERE_PDF_WEIGHT;
++        Mask sample_diffuse    = active && sample1 < lobe_pdf_diffuse,
++             sample_microfacet = active && !sample_diffuse;
++
++        Vector3f wo_diffuse    = warp::square_to_cosine_hemisphere(sample2);
++        auto [m, unused] = distr.sample(si.wi, sample2);
++        Vector3f wo_microfacet = reflect(si.wi, m);
++
++        bs.wo[sample_diffuse]    = wo_diffuse;
++        bs.wo[sample_microfacet] = wo_microfacet;
++
++        bs.pdf = pdf(ctx, si, bs.wo, active);
++
++        bs.sampled_component = 0;
++        bs.sampled_type = +BSDFFlags::GlossyReflection;
++        bs.eta = 1.f;
++
++        Spectrum value = eval(ctx, si, bs.wo, active);
++        return { bs, dr::select(active && bs.pdf > 0, value / bs.pdf, 0.f) };
++    }
++
++    Spectrum eval(const BSDFContext &ctx, const SurfaceInteraction3f &si,
++                  const Vector3f &wo, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::BSDFEvaluate, active);
++
++        Float cos_theta_i = Frame3f::cos_theta(si.wi),
++              cos_theta_o = Frame3f::cos_theta(wo);
++        active &= (cos_theta_i > 0.f && cos_theta_o > 0.f);
++
++        if (unlikely(dr::none_or<false>(active) || !ctx.is_enabled(BSDFFlags::GlossyReflection)))
++            return 0.f;
++
++        /* Mirror the coordinate handling of `measured_polarized`: bring both
++           directions into the standard frame and obtain the isotropic
++           Rusinkiewicz parameterization. */
++        Vector3f wo_hat = ctx.mode == TransportMode::Radiance ? wo : si.wi,
++                 wi_hat = ctx.mode == TransportMode::Radiance ? si.wi : wo;
++
++        Float phi_std = phi(wi_hat);
++        Vector3f wo_std = rotate_vector(wo_hat, Vector3f(0, 0, 1), -phi_std),
++                 wi_std = rotate_vector(wi_hat, Vector3f(0, 0, 1), -phi_std);
++
++        auto [phi_d, theta_h, theta_d] = directions_to_rusinkiewicz(wo_std, wi_std);
++
++        // Evaluate the unpolarised M[0,0] reflectance of each band.
++        Float r = eval_band(m_interp_r, m_band_r, phi_d, theta_d, theta_h, active);
++        Float g = eval_band(m_interp_g, m_band_g, phi_d, theta_d, theta_h, active);
++        Float b = eval_band(m_interp_b, m_band_b, phi_d, theta_d, theta_h, active);
++
++        UnpolarizedSpectrum intensity(0.f);
++        if constexpr (is_spectral_v<Spectrum>) {
++            // Map each sampled wavelength to its nearest band. Boundaries are the
++            // midpoints between band centres (446/542/614 -> 494, 578).
++            ScalarFloat mid_bg = 0.5f * (m_band_b + m_band_g),
++                        mid_gr = 0.5f * (m_band_g + m_band_r);
++            for (size_t k = 0; k < dr::size_v<UnpolarizedSpectrum>; ++k) {
++                Float wl = si.wavelengths[k];
++                intensity[k] = dr::select(wl < mid_bg, b,
++                               dr::select(wl < mid_gr, g, r));
++            }
++        } else if constexpr (dr::size_v<UnpolarizedSpectrum> == 3) {
++            intensity[0] = r;
++            intensity[1] = g;
++            intensity[2] = b;
++        } else if constexpr (is_rgbn_v<Spectrum>) {
++            // no near-infrared band in the data: the bands' luminance, as the RGB variant's
++            // near-infrared slot gives (the luminance of its R, G, B result)
++            intensity[0] = r;
++            intensity[1] = g;
++            intensity[2] = b;
++            intensity[3] = luminance(Color3f(r, g, b));
++        } else {
++            // Monochrome fallback: average the three bands.
++            intensity = (r + g + b) * (1.f / 3.f);
++        }
++
++        auto albedo_scale = m_albedo_scale->eval(si, active);
++        albedo_scale = dr::minimum(dr::maximum(albedo_scale, 0.f), 1.f);
++        intensity *= albedo_scale;
++
++        Spectrum value;
++        if constexpr (is_polarized_v<Spectrum>) {
++            // Non-polarised (depolarising) response: intensity in the (0,0)
++            // Mueller element, everything else zero.
++            value = dr::zeros<Spectrum>();
++            value(0, 0) = intensity;
++        } else {
++            value = intensity;
++        }
++
++        return (value * cos_theta_o) & active;
++    }
++
++    Float pdf(const BSDFContext &ctx, const SurfaceInteraction3f &si,
++              const Vector3f &wo, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::BSDFEvaluate, active);
++
++        if (unlikely(dr::none_or<false>(active) || !ctx.is_enabled(BSDFFlags::GlossyReflection)))
++            return 0.f;
++
++        Float cos_theta_i = Frame3f::cos_theta(si.wi),
++              cos_theta_o = Frame3f::cos_theta(wo);
++
++        MicrofacetDistribution distr(MicrofacetType::GGX,
++                                     m_alpha_sample, m_alpha_sample, true);
++
++        Vector3f H = dr::normalize(wo + si.wi);
++
++        Float pdf_diffuse = warp::square_to_cosine_hemisphere_pdf(wo);
++        Float pdf_microfacet = distr.pdf(si.wi, H) / (4.f * dr::dot(wo, H));
++
++        Float pdf = 0.f;
++        pdf += pdf_diffuse * COSINE_HEMISPHERE_PDF_WEIGHT;
++        pdf += pdf_microfacet * (1.f - COSINE_HEMISPHERE_PDF_WEIGHT);
++
++        return dr::select(cos_theta_i > 0.f && cos_theta_o > 0.f, pdf, 0.f);
++    }
++
++    std::string to_string() const override {
++        std::ostringstream oss;
++        oss << "MeasuredPolarizedRGB[" << std::endl
++            << "  filename_r = " << m_name_r << " (" << m_band_r << " nm)" << std::endl
++            << "  filename_g = " << m_name_g << " (" << m_band_g << " nm)" << std::endl
++            << "  filename_b = " << m_name_b << " (" << m_band_b << " nm)" << std::endl
++            << "]";
++        return oss.str();
++    }
++
++private:
++    Float eval_band(const Interpolator &interp, ScalarFloat band_nm,
++                    const Float &phi_d, const Float &theta_d, const Float &theta_h,
++                    Mask active) const {
++        Float params[4] = { phi_d, theta_d, theta_h, Float(band_nm) };
++        // Point2f(0,0) selects the (0,0) Mueller element = unpolarised intensity.
++        Float v = interp.eval(Point2f(0.f, 0.f), params, active);
++        // Invalid configurations are encoded as NaNs in the dataset.
++        dr::masked(v, dr::isnan(v)) = 0.f;
++        return dr::maximum(0.f, v);
++    }
++
++    template <typename Vector3,
++              typename Value = dr::value_t<Vector3>>
++    Value phi(const Vector3 &v) const {
++        Value p = dr::atan2(v.y(), v.x());
++        dr::masked(p, p < 0) += 2.f * dr::Pi<Float>;
++        return p;
++    }
++
++    template <typename Vector3, typename Value = dr::value_t<Vector3>>
++    MI_INLINE
++    Vector3 rotate_vector(const Vector3 &v, const Vector3 &axis_, Value angle) const {
++        Vector3 axis = dr::normalize(axis_);
++        auto [sin_angle, cos_angle] = dr::sincos(angle);
++        return v * cos_angle + axis * dr::dot(v, axis) * (1.f - cos_angle) + sin_angle * dr::cross(axis, v);
++    }
++
++    template <typename Vector3, typename Value = dr::value_t<Vector3>>
++    MI_INLINE
++    std::tuple<Value, Value, Value> directions_to_rusinkiewicz(const Vector3 &i, const Vector3 &o) const {
++        Vector3 h = dr::normalize(i + o);
++
++        Vector3 n(0, 0, 1);
++        Vector3 b = dr::normalize(dr::cross(n, h)),
++                t = dr::normalize(dr::cross(b, h));
++
++        Value td = dr::safe_acos(dr::dot(h, i)),
++              th = dr::safe_acos(dr::dot(n, h));
++
++        Vector3 i_prj = dr::normalize(i - dr::dot(i, h) * h);
++        Value cos_phi_d = dr::clip(dr::dot(t, i_prj), -1.f, 1.f),
++              sin_phi_d = dr::clip(dr::dot(b, i_prj), -1.f, 1.f);
++
++        Value pd = dr::atan2(sin_phi_d, cos_phi_d);
++
++        return std::make_tuple(pd, th, td);
++    }
++
++    MI_DECLARE_CLASS(MeasuredPolarizedRGB)
++private:
++    std::string m_name_r, m_name_g, m_name_b;
++    ScalarFloat m_band_r, m_band_g, m_band_b;
++    ScalarFloat m_alpha_sample;
++    ref<Texture> m_albedo_scale;
++    Interpolator m_interp_r, m_interp_g, m_interp_b;
++
++    MI_TRAVERSE_CB(Base, m_interp_r, m_interp_g, m_interp_b, m_albedo_scale)
++};
++
++MI_EXPORT_PLUGIN(MeasuredPolarizedRGB)
++NAMESPACE_END(mitsuba)
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 23ebc9b..5642d25 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -97,7 +97,9 @@ if (MI_ENABLE_JIT)
+   target_link_libraries(mitsuba-core PUBLIC drjit-core)
+ endif()
+ 
+-if (MI_ENABLE_AUTODIFF)
++# src/render/integrator.cpp calls dr::backward_from() in every variant, so a build of JIT variants
++# without an _ad_ one links drjit-extra as well
++if (MI_ENABLE_AUTODIFF OR MI_ENABLE_JIT)
+   target_link_libraries(mitsuba-core PUBLIC drjit-extra)
+ endif()
+ 
+diff --git a/src/emitters/CMakeLists.txt b/src/emitters/CMakeLists.txt
+index 2735f0f..aafbf02 100644
+--- a/src/emitters/CMakeLists.txt
++++ b/src/emitters/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ set(MI_PLUGIN_PREFIX "emitters")
+ 
+ add_plugin(area            area.cpp)
++ add_plugin(polarized_area  polarized_area.cpp)
+ add_plugin(point           point.cpp)
+ add_plugin(constant        constant.cpp)
+ add_plugin(envmap          envmap.cpp)
+diff --git a/src/emitters/envmap.cpp b/src/emitters/envmap.cpp
+index 2170cfd..8811e3d 100644
+--- a/src/emitters/envmap.cpp
++++ b/src/emitters/envmap.cpp
+@@ -586,6 +586,8 @@ protected:
+ 
+             if constexpr (is_monochromatic_v<Spectrum>)
+                 return dr::head<1>(v_rgb) * m_scale;
++            else if constexpr (is_rgbn_v<Spectrum>)  // near-infrared lane: the luminance (sky_nir scales it)
++                return rgb_to_color<UnpolarizedSpectrum>(v_rgb) * m_scale;
+             else
+                 return v_rgb * m_scale;
+         }
+diff --git a/src/emitters/polarized_area.cpp b/src/emitters/polarized_area.cpp
+new file mode 100644
+index 0000000..03574cd
+--- /dev/null
++++ b/src/emitters/polarized_area.cpp
+@@ -0,0 +1,312 @@
++#include <mitsuba/core/properties.h>
++#include <mitsuba/core/warp.h>
++#include <mitsuba/core/spectrum.h>
++#include <mitsuba/render/emitter.h>
++#include <mitsuba/render/mueller.h>
++#include <mitsuba/render/medium.h>
++#include <mitsuba/render/shape.h>
++#include <mitsuba/render/texture.h>
++#include <drjit/traversable_base.h>
++
++NAMESPACE_BEGIN(mitsuba)
++
++/**!
++
++.. _emitter-area:
++
++Area light (:monosp:`area`)
++---------------------------
++
++.. pluginparameters::
++
++ * - radiance
++   - |spectrum| or |texture|
++   - Specifies the emitted radiance in units of power per unit area per unit steradian.
++   - |exposed|, |differentiable|
++
++This plugin implements an area light, i.e. a light source that emits
++diffuse illumination from the exterior of an arbitrary shape.
++Since the emission profile of an area light is completely diffuse, it
++has the same apparent brightness regardless of the observer's viewing
++direction. Furthermore, since it occupies a nonzero amount of space, an
++area light generally causes scene objects to cast soft shadows.
++
++To create an area light source, simply instantiate the desired
++emitter shape and specify an :monosp:`area` instance as its child:
++
++.. tabs::
++    .. code-tab:: xml
++        :name: sphere-light
++
++        <shape type="sphere">
++            <emitter type="area">
++                <rgb name="radiance" value="1.0"/>
++            </emitter>
++        </shape>
++
++    .. code-tab:: python
++
++        'type': 'sphere',
++        'emitter': {
++            'type': 'area',
++            'radiance': {
++                'type': 'rgb',
++                'value': 1.0,
++            }
++        }
++
++ */
++
++template <typename Float, typename Spectrum>
++class PolarizedAreaLight final : public Emitter<Float, Spectrum> {
++public:
++    MI_IMPORT_BASE(Emitter, m_flags, m_shape, m_medium)
++    MI_IMPORT_TYPES(Scene, Shape, Texture)
++
++    PolarizedAreaLight(const Properties &props) : Base(props) {
++        if (props.has_property("to_world"))
++            Throw("Found a 'to_world' transformation -- this is not allowed. "
++                  "The area light inherits this transformation from its parent "
++                  "shape.");
++
++        m_radiance = props.get_emissive_texture<Texture>("radiance", 1.f);
++        m_theta = props.get_unbounded_texture<Texture>("theta", 0.f);
++
++        m_flags = +EmitterFlags::Surface;
++        if (m_radiance->is_spatially_varying())
++            m_flags |= +EmitterFlags::SpatiallyVarying;
++    }
++
++    void traverse(TraversalCallback *cb) override {
++        Base::traverse(cb);
++        cb->put("radiance", m_radiance, ParamFlags::Differentiable);
++        cb->put("theta", m_theta, ParamFlags::Differentiable | ParamFlags::Discontinuous);
++    }
++
++    /// Emit linearly polarized light at a constant angle in Mitsuba's canonical
++    /// Stokes frame for the emission direction. Defining the axis by projecting
++    /// a fixed surface-tangent vector made the apparent AoLP vary strongly across
++    /// large, nearby emitters (and introduced a visible half-panel boundary).
++    Spectrum polarize(const SurfaceInteraction3f &si,
++                      const UnpolarizedSpectrum &rad, Mask active) const {
++        if constexpr (is_polarized_v<Spectrum>) {
++            using Vector3fS = Vector<UnpolarizedSpectrum, 3>;
++            UnpolarizedSpectrum theta = dr::deg_to_rad(m_theta->eval(si, active));
++            auto [sin_theta, cos_theta] = dr::sincos(theta);
++            Spectrum M = mueller::linear_polarizer(1.f);
++            Vector3fS forward = si.wi;
++            Vector3fS canonical = mueller::stokes_basis(forward);
++            Vector3fS canonical_ortho = dr::cross(forward, canonical);
++            Vector3fS polarization_basis =
++                cos_theta * canonical + sin_theta * canonical_ortho;
++            M = mueller::rotate_mueller_basis_collinear(
++                    M, forward, polarization_basis, canonical);
++            // This emitter represents an already-polarized source, not an
++            // unpolarized source viewed through a lossy polarizer. Compensate
++            // the ideal polarizer's 1/2 throughput so radiance denotes S0.
++            M *= mueller::absorber(2.f * rad);
++            return si.to_world_mueller(M, si.wi, si.wi);
++        } else {
++            return depolarizer<Spectrum>(rad);
++        }
++    }
++
++    Spectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
++
++        auto result = polarize(si, m_radiance->eval(si, active), active) &
++                      (Frame3f::cos_theta(si.wi) > 0.f);
++
++        return result;
++    }
++
++    std::pair<Ray3f, Spectrum> sample_ray(Float time, Float wavelength_sample,
++                                          const Point2f &sample2, const Point2f &sample3,
++                                          Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleRay, active);
++
++        // 1. Sample spatial component
++        auto [ps, pos_weight] = sample_position(time, sample2, active);
++
++        // 2. Sample directional component
++        Vector3f local = warp::square_to_cosine_hemisphere(sample3);
++
++        // 3. Sample spectral component
++        SurfaceInteraction3f si(ps, dr::zeros<Wavelength>());
++        auto [wavelength, wav_weight] =
++            sample_wavelengths(si, wavelength_sample, active);
++        si.time = time;
++        si.wavelengths = wavelength;
++
++        // Note: some terms cancelled out with `warp::square_to_cosine_hemisphere_pdf`.
++        Spectrum weight = pos_weight * wav_weight * dr::Pi<ScalarFloat>;
++
++        return { si.spawn_ray(si.to_world(local)),
++                 depolarizer<Spectrum>(weight) };
++    }
++
++    std::pair<DirectionSample3f, Spectrum>
++    sample_direction(const Interaction3f &it, const Point2f &sample, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleDirection, active);
++
++        if constexpr (drjit::is_jit_v<Float>) {
++            if (!m_shape)
++                return { dr::zeros<DirectionSample3f>(), 0.f };
++        } else {
++            Assert(m_shape, "Can't sample from an area emitter without an "
++                            "associated Shape.");
++        }
++
++        DirectionSample3f ds;
++        SurfaceInteraction3f si;
++
++        // One of two very different strategies is used depending on 'm_radiance'
++        if (likely(!m_radiance->is_spatially_varying())) {
++            // Texture is uniform, try to importance sample the shape wrt. solid angle at 'it'
++            ds = m_shape->sample_direction(it, sample, active);
++            active &= dr::dot(ds.d, ds.n) < 0.f && (ds.pdf != 0.f);
++
++            si = SurfaceInteraction3f(ds, it.wavelengths);
++        } else {
++            // Importance sample the texture, then map onto the shape
++            auto [uv, pdf] = m_radiance->sample_position(sample, active);
++            active &= (pdf != 0.f);
++
++            si = m_shape->eval_parameterization(uv, +RayFlags::All, active);
++            si.wavelengths = it.wavelengths;
++            active &= si.is_valid();
++
++            ds.p = si.p;
++            ds.n = si.n;
++            ds.uv = si.uv;
++            ds.time = it.time;
++            ds.delta = false;
++            ds.d = ds.p - it.p;
++
++            Float dist_squared = dr::squared_norm(ds.d);
++            ds.dist = dr::sqrt(dist_squared);
++            ds.d /= ds.dist;
++
++            Float dp = dr::dot(ds.d, ds.n);
++            active &= dp < 0.f;
++            ds.pdf = dr::select(active, pdf / dr::norm(dr::cross(si.dp_du, si.dp_dv)) *
++                                        dist_squared / -dp, 0.f);
++        }
++
++        si.wi = si.to_local(-ds.d);
++        UnpolarizedSpectrum spec = m_radiance->eval(si, active) / ds.pdf;
++        ds.emitter = this;
++        return { ds, polarize(si, spec, active) & active };
++    }
++
++    Float pdf_direction(const Interaction3f &it, const DirectionSample3f &ds,
++                        Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
++        Float dp = dr::dot(ds.d, ds.n);
++        active &= dp < 0.f;
++
++        if constexpr (drjit::is_jit_v<Float>) {
++            if (!m_shape)
++                return 0.f;
++        } else {
++            Assert(m_shape,
++                   "The area emitter without has no associated Shape!");
++        }
++
++        Float value;
++        if (!m_radiance->is_spatially_varying()) {
++            value = m_shape->pdf_direction(it, ds, active);
++        } else {
++            // This surface intersection would be nice to avoid..
++            SurfaceInteraction3f si = m_shape->eval_parameterization(ds.uv, +RayFlags::dPdUV, active);
++            active &= si.is_valid();
++
++            value = m_radiance->pdf_position(ds.uv, active) * dr::square(ds.dist) /
++                    (dr::norm(dr::cross(si.dp_du, si.dp_dv)) * -dp);
++        }
++
++        return dr::select(active, value, 0.f);
++    }
++
++    Spectrum eval_direction(const Interaction3f &it,
++                            const DirectionSample3f &ds,
++                            Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
++        Float dp = dr::dot(ds.d, ds.n);
++        active &= dp < 0.f;
++
++        SurfaceInteraction3f si(ds, it.wavelengths);
++        si.wi = si.to_local(-ds.d);
++        UnpolarizedSpectrum spec = m_radiance->eval(si, active);
++        return dr::select(active, polarize(si, spec, active), 0.f);
++    }
++
++    std::pair<PositionSample3f, Float>
++    sample_position(Float time, const Point2f &sample,
++                    Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::EndpointSamplePosition, active);
++
++        if constexpr (drjit::is_jit_v<Float>) {
++            if (!m_shape)
++                return { dr::zeros<PositionSample3f>(), 0.f };
++        } else {
++            Assert(m_shape, "Cannot sample from an area emitter without an "
++                            "associated Shape.");
++        }
++
++        // Two strategies to sample the spatial component based on 'm_radiance'
++        PositionSample3f ps;
++        if (!m_radiance->is_spatially_varying()) {
++            // Radiance not spatially varying, use area-based sampling of shape
++            ps = m_shape->sample_position(time, sample, active);
++        } else {
++            // Importance sample texture
++            auto [uv, pdf] = m_radiance->sample_position(sample, active);
++            active &= (pdf != 0.f);
++
++            auto si = m_shape->eval_parameterization(uv, +RayFlags::All, active);
++            active &= si.is_valid();
++            pdf /= dr::norm(dr::cross(si.dp_du, si.dp_dv));
++
++            ps = si;
++            ps.pdf = pdf;
++            ps.delta = false;
++        }
++
++        Float weight = dr::select(active && ps.pdf > 0.f, dr::rcp(ps.pdf), Float(0.f));
++        return { ps, weight };
++    }
++
++    std::pair<Wavelength, Spectrum>
++    sample_wavelengths(const SurfaceInteraction3f &si, Float sample,
++                       Mask active) const override {
++        return m_radiance->sample_spectrum(
++            si, math::sample_shifted<Wavelength>(sample), active);
++    }
++
++    ScalarBoundingBox3f bbox() const override { return m_shape->bbox(); }
++
++    std::string to_string() const override {
++        std::ostringstream oss;
++        oss << "PolarizedAreaLight[" << std::endl
++            << "  radiance = " << string::indent(m_radiance) << "," << std::endl
++            << "  surface_area = ";
++        if (m_shape) oss << m_shape->surface_area();
++        else         oss << "  <no shape attached!>";
++        oss << "," << std::endl;
++        if (m_medium) oss << string::indent(m_medium);
++        else         oss << "  <no medium attached!>";
++        oss << std::endl << "]";
++        return oss.str();
++    }
++
++    MI_DECLARE_CLASS(PolarizedAreaLight)
++private:
++    ref<Texture> m_radiance;
++    ref<Texture> m_theta;
++
++    MI_TRAVERSE_CB(Base, m_radiance, m_theta)
++};
++
++MI_EXPORT_PLUGIN(PolarizedAreaLight)
++NAMESPACE_END(mitsuba)
+diff --git a/src/integrators/CMakeLists.txt b/src/integrators/CMakeLists.txt
+index 20b49e6..c32c842 100644
+--- a/src/integrators/CMakeLists.txt
++++ b/src/integrators/CMakeLists.txt
+@@ -5,6 +5,7 @@ add_plugin(depth      depth.cpp)
+ add_plugin(direct     direct.cpp)
+ add_plugin(moment     moment.cpp)
+ add_plugin(path       path.cpp)
++add_plugin(path_nocaustics path_nocaustics.cpp)
+ add_plugin(ptracer    ptracer.cpp)
+ add_plugin(stokes     stokes.cpp)
+ add_plugin(volpath    volpath.cpp)
+diff --git a/src/integrators/aov.cpp b/src/integrators/aov.cpp
+index b871ae3..fd0d4e1 100644
+--- a/src/integrators/aov.cpp
++++ b/src/integrators/aov.cpp
+@@ -221,7 +221,7 @@ public:
+             if constexpr (is_monochromatic_v<Spectrum>)
+                 return spec_u.x();
+             else if constexpr (is_rgb_v<Spectrum>)
+-                return spec_u;
++                return rgb_lanes(spec_u);
+             else {
+                 static_assert(is_spectral_v<Spectrum>);
+                 /// Note: this assumes that sensor used sample_rgb_spectrum() to generate 'ray.wavelengths'
+diff --git a/src/integrators/moment.cpp b/src/integrators/moment.cpp
+index bc145f5..2f73110 100644
+--- a/src/integrators/moment.cpp
++++ b/src/integrators/moment.cpp
+@@ -89,7 +89,7 @@ public:
+             if constexpr (is_monochromatic_v<Spectrum>) {
+                 xyz = spec_u.x();
+             } else if constexpr (is_rgb_v<Spectrum>) {
+-                xyz = srgb_to_xyz(spec_u, active);
++                xyz = srgb_to_xyz(rgb_lanes(spec_u), active);
+             } else {
+                 static_assert(is_spectral_v<Spectrum>);
+                 /// Note: this assumes that sensor used sample_rgb_spectrum() to generate 'ray.wavelengths'
+diff --git a/src/integrators/path_nocaustics.cpp b/src/integrators/path_nocaustics.cpp
+new file mode 100755
+index 0000000..a54e1e7
+--- /dev/null
++++ b/src/integrators/path_nocaustics.cpp
+@@ -0,0 +1,502 @@
++#include <mitsuba/core/ray.h>
++#include <mitsuba/core/properties.h>
++#include <mitsuba/core/string.h>
++#include <mitsuba/render/bsdf.h>
++#include <mitsuba/render/emitter.h>
++#include <mitsuba/render/integrator.h>
++#include <mitsuba/render/records.h>
++
++NAMESPACE_BEGIN(mitsuba)
++
++/**!
++
++.. _integrator-path_nocaustics:
++
++Path tracer without caustics (:monosp:`path_nocaustics`)
++--------------------------------------------------------
++
++Identical to :monosp:`path`, except that emitter contributions reaching the
++light through a *near-specular* bounce are discarded once the path has already
++scattered off a rough surface. This is the "caustics off" option of production
++renderers: diffuse -> mirror/glass -> small light paths cannot be sampled
++efficiently by a unidirectional path tracer and appear as fireflies, whereas
++camera-side specular chains (seeing through glass, seeing a lit wall in a
++mirror, seeing the light's reflection) are kept.
++
++A bounce is near-specular when its sampled lobe is delta/null, or when the
++BSDF pdf of the direction exceeds ``specular_pdf_threshold`` (sr^-1). The same
++classification is applied to emitter sampling and to BSDF-sampled emitter hits,
++so both MIS strategies drop the same set of paths.
++
++.. pluginparameters::
++
++ * - max_depth, rr_depth, hide_emitters
++   - as :monosp:`path`
++ * - specular_pdf_threshold
++   - |float|
++   - Solid-angle pdf above which a bounce counts as near-specular. The GGX peak
++     pdf is about 1/(4 pi alpha^2), so the default 20 covers alpha below ~0.06.
++     (Default: 20)
++ * - caustics
++   - |bool|
++   - Keep caustic paths, so the integrator behaves exactly like :monosp:`path`
++     (apart from the camera-assist options below). (Default: false)
++ * - assist, assist_mode
++   - |string|
++   - Camera-assist shapes are the shapes whose id starts with ``assist`` (for
++     example ``camera_assist`` matches ``camera_assist_light`` and
++     ``camera_assist_polarizer``). With ``assist_mode`` = ``exclude`` the path
++     ignores them: rays pass through them without a bounce and their emitter
++     is never counted, as if they were not in the scene. With ``only``, the
++     emitter on an assist shape is the only light: other emitters (including
++     the environment) are ignored, and it is sampled directly, as if it were
++     the scene's single emitter. ``all`` (the default) changes nothing. This
++     lets one resident scene render a passive pass and a flash-only pass.
++ * - sky_nir
++   - |float|
++   - Factor on light from the environment emitter in the near-infrared: its lane in RGBN variants,
++     otherwise along rays whose time is 0.5 or more (the near-infrared slot of a ``batch`` sensor with
++     ``slot_time``). Daylight's near-infrared share.
++     (Default: 1)
++ */
++
++template <typename Float, typename Spectrum>
++class PathNoCausticsIntegrator : public MonteCarloIntegrator<Float, Spectrum> {
++public:
++    MI_IMPORT_BASE(MonteCarloIntegrator, m_max_depth, m_rr_depth, m_hide_emitters)
++    MI_IMPORT_TYPES(Scene, Sampler, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr, Shape, ShapePtr)
++
++    enum class AssistMode { All, Only, Exclude };
++
++    PathNoCausticsIntegrator(const Properties &props) : Base(props) {
++        m_specular_pdf_threshold = props.get<ScalarFloat>("specular_pdf_threshold", 20.f);
++        m_caustics = props.get<bool>("caustics", false);
++        m_sky_nir = props.get<ScalarFloat>("sky_nir", 1.f);
++        m_assist = std::string(props.get<std::string_view>("assist", ""));
++        std::string mode(props.get<std::string_view>("assist_mode", "all"));
++        if (mode == "all")
++            m_assist_mode = AssistMode::All;
++        else if (mode == "only")
++            m_assist_mode = AssistMode::Only;
++        else if (mode == "exclude")
++            m_assist_mode = AssistMode::Exclude;
++        else
++            Throw("path_nocaustics: 'assist_mode' must be all, only or exclude (got \"%s\")", mode);
++        if (m_assist_mode != AssistMode::All && m_assist.empty())
++            Throw("path_nocaustics: 'assist_mode' %s needs an 'assist' shape id prefix", mode);
++    }
++
++    std::pair<Spectrum, Bool> sample(const Scene *scene,
++                                     Sampler *sampler,
++                                     const RayDifferential3f &ray_,
++                                     const Medium * /* medium */,
++                                     Float * /* aovs */,
++                                     Bool active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
++
++        if (unlikely(m_max_depth == 0))
++            return { 0.f, false };
++
++        // --------------------- Configure loop state ----------------------
++
++        Ray3f ray                     = Ray3f(ray_);
++        Spectrum throughput           = 1.f;
++        Spectrum result               = 0.f;
++        Float eta                     = 1.f;
++        PreliminaryIntersection3f pi  = dr::zeros<PreliminaryIntersection3f>();
++        UInt32 depth                  = 0;
++
++        // Camera-assist shapes (see 'assist'): a few scalar compares per call
++        std::vector<const Shape *> assist_shapes;
++        const Emitter *assist_emitter = nullptr;
++        if (m_assist_mode != AssistMode::All) {
++            for (const auto &shape : scene->shapes()) {
++                if (!string::starts_with(shape->id(), m_assist))
++                    continue;
++                assist_shapes.push_back(shape.get());
++                if (shape->emitter())
++                    assist_emitter = shape->emitter();
++            }
++            if (m_assist_mode == AssistMode::Only && !assist_emitter)
++                Throw("path_nocaustics: no emitter on a shape whose id starts with \"%s\"", m_assist);
++        }
++
++        auto is_assist = [&assist_shapes](const ShapePtr &shape) {
++            Mask hit = false;
++            for (const Shape *s : assist_shapes)
++                hit |= (shape == ShapePtr(s));
++            return hit;
++        };
++
++        // 'exclude': continue the ray through assist shapes as if they were absent (no bounce is counted).
++        // Each one is flat, so a ray crosses it at most once.
++        auto skip_assist = [&](Ray3f &ray, PreliminaryIntersection3f &pi, Mask active) {
++            for (size_t i = 0; i < assist_shapes.size(); ++i) {
++                Mask hit = active && pi.is_valid() && is_assist(pi.shape);
++                if (dr::none_or<false>(hit))
++                    break;
++                SurfaceInteraction3f si = pi.compute_surface_interaction(ray, +RayFlags::Minimal, hit);
++                Ray3f next = si.spawn_ray(ray.d);
++                PreliminaryIntersection3f pi_next =
++                    scene->ray_intersect_preliminary(next, false, false, 0, 0, hit);
++                dr::masked(ray, hit) = next;
++                dr::masked(pi, hit) = pi_next;
++            }
++        };
++
++        // If m_hide_emitters == false, the environment emitter will be visible
++        // ('only' ignores every emitter but the assist one, the environment included)
++        Mask valid_ray = !m_hide_emitters && (scene->environment() != nullptr) &&
++                         (m_assist_mode != AssistMode::Only);
++
++        // Variables caching information from the previous bounce
++        Interaction3f prev_si         = dr::zeros<Interaction3f>();
++        Float         prev_bsdf_pdf   = 1.f;
++        Bool          prev_bsdf_delta = true;
++        BSDFContext   bsdf_ctx;
++
++        /* Set up a Dr.Jit loop. This optimizes away to a normal loop in scalar
++           mode, and it generates either a megakernel (default) or
++           wavefront-style renderer in JIT variants. This can be controlled by
++           passing the '-W' command line flag to the mitsuba binary or
++           enabling/disabling the JitFlag.LoopRecord bit in Dr.Jit.
++        */
++        struct LoopState {
++            Ray3f ray;
++            PreliminaryIntersection3f pi;
++            Spectrum throughput;
++            Spectrum result;
++            Float eta;
++            UInt32 depth;
++            Mask valid_ray;
++            Interaction3f prev_si;
++            Float prev_bsdf_pdf;
++            Bool prev_bsdf_delta;
++            Bool rough_seen;
++            Bool prev_caustic;
++            Bool active;
++            Sampler* sampler;
++
++            DRJIT_STRUCT(LoopState, ray, pi, throughput, result, eta, depth, \
++                valid_ray, prev_si, prev_bsdf_pdf, prev_bsdf_delta,
++                rough_seen, prev_caustic, active, sampler)
++        } ls = {
++            ray,
++            pi,
++            throughput,
++            result,
++            eta,
++            depth,
++            valid_ray,
++            prev_si,
++            prev_bsdf_pdf,
++            prev_bsdf_delta,
++            /* rough_seen   = */ Bool(false),
++            /* prev_caustic = */ Bool(false),
++            active,
++            sampler
++        };
++
++        // First bounce is usually coherent - don't reorder threads
++        ls.pi = scene->ray_intersect_preliminary(ls.ray,
++                                                 /* coherent = */ true,
++                                                 /* reorder = */ false,
++                                                 /* reorder_hint = */ 0,
++                                                 /* reorder_hint_bits = */ 0,
++                                                 ls.active);
++        if (m_assist_mode == AssistMode::Exclude)
++            skip_assist(ls.ray, ls.pi, ls.active);
++
++        // ---------------------- Hide area emitters ----------------------
++
++        /* dr::any_or() checks for active entries in the provided boolean
++           array. JIT/Megakernel modes can't do this test efficiently as
++           each Monte Carlo sample runs independently. In this case,
++           dr::any_or<..>() returns the template argument (true) which means
++           that the 'if' statement is always conservatively taken. */
++
++        if (m_hide_emitters && dr::any_or<true>(ls.depth == 0u)) {
++            // Did we hit an area emitter? If so, skip all area emitters along this ray
++            Mask skip_emitters = ls.pi.is_valid() &&
++                                 (ls.pi.shape->emitter() != nullptr) &&
++                                 ls.active;
++
++            if (dr::any_or<true>(skip_emitters)) {
++                SurfaceInteraction3f si = ls.pi.compute_surface_interaction(
++                    ls.ray, +RayFlags::Minimal, skip_emitters);
++                Ray3f ray = si.spawn_ray(ls.ray.d);
++                PreliminaryIntersection3f pi_after_skip =
++                    Base::skip_area_emitters(scene, ray, true, skip_emitters);
++                dr::masked(ls.pi, skip_emitters) = pi_after_skip;
++            }
++        }
++
++        dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
++            [](const LoopState& ls) { return ls.active; },
++            [this, scene, bsdf_ctx, &skip_assist, assist_emitter](LoopState& ls) {
++
++            /* dr::while_loop implicitly masks all code in the loop using the
++               'active' flag, so there is no need to pass it to every function */
++
++            // Fill out all information of the interaction
++            SurfaceInteraction3f si =
++                ls.pi.compute_surface_interaction(ls.ray, +RayFlags::All);
++
++            // ---------------------- Direct emission ----------------------
++
++            if (dr::any_or<true>(si.emitter(scene) != nullptr)) {
++                DirectionSample3f ds(scene, si, ls.prev_si);
++                Float em_pdf = 0.f;
++
++                // 'only': the assist emitter alone counts, with its own pdf (no emitter-selection pmf)
++                Mask counted = true;
++                if (m_assist_mode == AssistMode::Only)
++                    counted = ds.emitter == EmitterPtr(assist_emitter);
++
++                if (dr::any_or<true>(!ls.prev_bsdf_delta)) {
++                    if (m_assist_mode == AssistMode::Only)
++                        em_pdf = assist_emitter->pdf_direction(ls.prev_si, ds,
++                                                               !ls.prev_bsdf_delta && counted);
++                    else
++                        em_pdf = scene->pdf_emitter_direction(ls.prev_si, ds,
++                                                              !ls.prev_bsdf_delta);
++                }
++
++                // Compute MIS weight for emitter sample from previous bounce
++                Float mis_bsdf = mis_weight(ls.prev_bsdf_pdf, em_pdf);
++
++                // Accumulate, being careful with polarization (see spec_fma)
++                // Reached through a near-specular bounce after a rough one: a caustic.
++                Mask hit_active = (ls.prev_bsdf_pdf > 0.f) && counted;
++                if (!m_caustics)
++                    hit_active &= !ls.prev_caustic;
++                // the environment: daylight's near-infrared share in the near-infrared lane (RGBN) or slot
++                ls.result = spec_fma(
++                    ls.throughput,
++                    sky_nir(ds.emitter->eval(si, hit_active) * mis_bsdf, !si.is_valid(), ls.ray.time),
++                    ls.result);
++            }
++
++            // Continue tracing the path at this point?
++            Bool active_next = (ls.depth + 1 < m_max_depth) && si.is_valid();
++
++            if (dr::none_or<false>(active_next)) {
++                ls.active = active_next;
++                ls.valid_ray |= (si.emitter(scene) != nullptr) && !m_hide_emitters;
++                return; // early exit for scalar mode
++            }
++
++            BSDFPtr bsdf = si.bsdf(ls.ray);
++
++            // ---------------------- Emitter sampling ----------------------
++
++            // Perform emitter sampling?
++            Mask active_em = active_next && has_flag(bsdf->flags(), BSDFFlags::Smooth);
++
++            DirectionSample3f ds = dr::zeros<DirectionSample3f>();
++            Spectrum em_weight = dr::zeros<Spectrum>();
++            Vector3f wo = dr::zeros<Vector3f>();
++
++            if (dr::any_or<true>(active_em)) {
++                // Sample the emitter
++                if (m_assist_mode == AssistMode::Only) {
++                    // as Scene::sample_emitter_direction would with the assist emitter as its only one
++                    std::tie(ds, em_weight) = assist_emitter->sample_direction(
++                        si, ls.sampler->next_2d(), active_em);
++                    active_em &= (ds.pdf != 0.f);
++                    if (dr::any_or<true>(active_em)) {
++                        Mask occluded = scene->ray_test(si.spawn_ray_to(ds.p), active_em);
++                        dr::masked(em_weight, occluded) = 0.f;
++                        dr::masked(ds.pdf, occluded) = 0.f;
++                    }
++                } else {
++                    std::tie(ds, em_weight) = scene->sample_emitter_direction(
++                        si, ls.sampler->next_2d(), true, active_em);
++                    if (m_assist_mode == AssistMode::Exclude)
++                        active_em &= ds.emitter != EmitterPtr(assist_emitter);
++                    if (m_sky_nir != 1.f && scene->environment() != nullptr)
++                        em_weight = sky_nir(em_weight, ds.emitter == EmitterPtr(scene->environment()), si.time);
++                }
++                active_em &= (ds.pdf != 0.f);
++
++                /* Given the detached emitter sample, recompute its contribution
++                   with AD to enable light source optimization. */
++                if (dr::grad_enabled(si.p)) {
++                    ds.d = dr::normalize(ds.p - si.p);
++                    Spectrum em_val = scene->eval_emitter_direction(si, ds, active_em);
++                    em_weight = dr::select(ds.pdf != 0, em_val / ds.pdf, 0);
++                }
++
++                wo = si.to_local(ds.d);
++            }
++
++            // ------ Evaluate BSDF * cos(theta) and sample direction -------
++
++            Float sample_1 = ls.sampler->next_1d();
++            Point2f sample_2 = ls.sampler->next_2d();
++
++            auto [bsdf_val, bsdf_pdf, bsdf_sample, bsdf_weight]
++                = bsdf->eval_pdf_sample(bsdf_ctx, si, wo, sample_1, sample_2);
++
++            // --------------- Emitter sampling contribution ----------------
++
++            // Emitter sample through a near-specular lobe after a rough bounce.
++            if (!m_caustics)
++                active_em &= !(ls.rough_seen && (bsdf_pdf > m_specular_pdf_threshold));
++
++            if (dr::any_or<true>(active_em)) {
++                bsdf_val = si.to_world_mueller(bsdf_val, -wo, si.wi);
++
++                // Compute the MIS weight
++                Float mis_em =
++                    dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
++
++                // Accumulate, being careful with polarization (see spec_fma)
++                ls.result[active_em] = spec_fma(
++                    ls.throughput, bsdf_val * em_weight * mis_em, ls.result);
++            }
++
++            // ---------------------- BSDF sampling ----------------------
++
++            bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi);
++
++            ls.ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
++
++            /* When the path tracer is differentiated, we must be careful that
++               the generated Monte Carlo samples are detached (i.e. don't track
++               derivatives) to avoid bias resulting from the combination of moving
++               samples and discontinuous visibility. We need to re-evaluate the
++               BSDF differentiably with the detached sample in that case. */
++            if (dr::grad_enabled(ls.ray)) {
++                ls.ray = dr::detach<true>(ls.ray);
++
++                // Recompute 'wo' to propagate derivatives to cosine term
++                Vector3f wo_2 = si.to_local(ls.ray.d);
++                auto [bsdf_val_2, bsdf_pdf_2] = bsdf->eval_pdf(bsdf_ctx, si, wo_2, ls.active);
++                bsdf_weight[bsdf_pdf_2 > 0.f] = bsdf_val_2 / dr::detach(bsdf_pdf_2);
++            }
++
++            // ------ Update loop variables based on current interaction ------
++
++            ls.throughput *= bsdf_weight;
++            ls.eta *= bsdf_sample.eta;
++            ls.valid_ray |= ls.active && si.is_valid() &&
++                         !has_flag(bsdf_sample.sampled_type, BSDFFlags::Null);
++
++            // Information about the current vertex needed by the next iteration
++            ls.prev_si = Interaction3f(si);
++            ls.prev_bsdf_pdf = bsdf_sample.pdf;
++            ls.prev_bsdf_delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
++
++            Mask near_specular =
++                has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta) ||
++                has_flag(bsdf_sample.sampled_type, BSDFFlags::Null) ||
++                (bsdf_sample.pdf > m_specular_pdf_threshold);
++            ls.prev_caustic = near_specular && ls.rough_seen;
++            ls.rough_seen |= !near_specular;
++
++            // -------------------- Stopping criterion ---------------------
++
++            dr::masked(ls.depth, si.is_valid()) += 1;
++
++            Float throughput_max = dr::max(unpolarized_spectrum(ls.throughput));
++
++            Float rr_prob = dr::minimum(throughput_max * dr::square(ls.eta), .95f);
++            Mask rr_active = ls.depth >= m_rr_depth,
++                 rr_continue = ls.sampler->next_1d() < rr_prob;
++
++            /* Differentiable variants of the renderer require the russian
++               roulette sampling weight to be detached to avoid bias. This is a
++               no-op in non-differentiable variants. */
++            ls.throughput[rr_active] *= dr::rcp(dr::detach(rr_prob));
++
++            ls.active = active_next && (!rr_active || rr_continue) &&
++                        (throughput_max != 0.f);
++
++            // Reorder threads based on the shape they hit
++            ls.pi = scene->ray_intersect_preliminary(ls.ray,
++                                                     /* coherent = */ false,
++                                                     /* reorder = */ jit_flag(JitFlag::LoopRecord),
++                                                     /* reorder_hint = */ 0,
++                                                     /* reorder_hint_bits = */ 0,
++                                                     ls.active);
++            if (m_assist_mode == AssistMode::Exclude)
++                skip_assist(ls.ray, ls.pi, ls.active);
++        });
++
++        return {
++            /* spec  = */ dr::select(ls.valid_ray, ls.result, 0.f),
++            /* valid = */ ls.valid_ray
++        };
++    }
++
++    //! @}
++    // =============================================================
++
++    std::string to_string() const override {
++        return tfm::format("PathNoCausticsIntegrator[\n"
++            "  max_depth = %u,\n"
++            "  rr_depth = %u,\n"
++            "  specular_pdf_threshold = %f,\n"
++            "  caustics = %s,\n"
++            "  assist = \"%s\" (%s)\n"
++            "]", m_max_depth, m_rr_depth, m_specular_pdf_threshold, m_caustics,
++            m_assist, m_assist_mode == AssistMode::Only ? "only"
++                      : m_assist_mode == AssistMode::Exclude ? "exclude" : "all");
++    }
++
++    /**
++     * \brief Light from the environment (where ``sky``) at daylight's near-infrared share: in RGBN
++     * variants on the near-infrared lane, otherwise on rays of a dual render's near-infrared slot (time
++     * 0.5 or more).
++     */
++    Spectrum sky_nir(const Spectrum &value, Mask sky, Float time) const {
++        if (m_sky_nir == 1.f)
++            return value;
++        if constexpr (is_rgbn_v<Spectrum>) {
++            UnpolarizedSpectrum f(1.f, 1.f, 1.f, dr::select(sky, m_sky_nir, 1.f));
++            Spectrum out = value;
++            if constexpr (is_polarized_v<Spectrum>) {
++                for (size_t i = 0; i < 4; ++i)
++                    for (size_t j = 0; j < 4; ++j)
++                        out.entry(i, j) *= f;
++            } else {
++                out *= f;
++            }
++            return out;
++        } else {
++            return value * dr::select(sky && (time > .5f), m_sky_nir, 1.f);
++        }
++    }
++
++    /// Compute a multiple importance sampling weight using the power heuristic
++    Float mis_weight(Float pdf_a, Float pdf_b) const {
++        pdf_a *= pdf_a;
++        pdf_b *= pdf_b;
++        Float w = pdf_a / (pdf_a + pdf_b);
++        return dr::detach<true>(dr::select(dr::isfinite(w), w, 0.f));
++    }
++
++    /**
++     * \brief Perform a Mueller matrix multiplication in polarized modes, and a
++     * fused multiply-add otherwise.
++     */
++    Spectrum spec_fma(const Spectrum &a, const Spectrum &b,
++                      const Spectrum &c) const {
++        if constexpr (is_polarized_v<Spectrum>)
++            return a * b + c;
++        else
++            return dr::fmadd(a, b, c);
++    }
++
++    ScalarFloat m_specular_pdf_threshold;
++    bool m_caustics;
++    ScalarFloat m_sky_nir;
++    std::string m_assist;
++    AssistMode m_assist_mode;
++
++    MI_DECLARE_CLASS(PathNoCausticsIntegrator)
++};
++
++MI_EXPORT_PLUGIN(PathNoCausticsIntegrator)
++NAMESPACE_END(mitsuba)
+diff --git a/src/integrators/stokes.cpp b/src/integrators/stokes.cpp
+index 026f736..86b7d84 100644
+--- a/src/integrators/stokes.cpp
++++ b/src/integrators/stokes.cpp
+@@ -72,6 +72,17 @@ public:
+     StokesIntegrator(const Properties &props) : Base(props) {
+         if constexpr (!is_polarized_v<Spectrum>)
+             Throw("This integrator should only be used in polarized mode!");
++        // A batch sensor owns multiple child cameras, so its transform alone
++        // cannot identify the child's image-up frame.  An explicit shared
++        // world axis preserves K=1-equivalent S1/S2 orientation for upright
++        // yaw-only K-heading strips.
++        m_has_reference_axis = props.has_property("reference_axis");
++        if (m_has_reference_axis) {
++            m_reference_axis = props.get<ScalarVector3f>("reference_axis");
++            if (dr::norm(m_reference_axis) == 0.f)
++                Throw("The Stokes integrator's 'reference_axis' must be non-zero!");
++            m_reference_axis = dr::normalize(m_reference_axis);
++        }
+         for (auto &prop : props.objects()) {
+             Base *integrator = prop.try_get<Base>();
+             if (!integrator)
+@@ -93,7 +104,7 @@ public:
+                                      Mask active) const override {
+         MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
+ 
+-        auto [spec, mask] = m_integrator->sample(scene, sampler, ray, medium, aovs + 12, active);
++        auto [spec, mask] = m_integrator->sample(scene, sampler, ray, medium, aovs + 4 * Lanes, active);
+ 
+         if constexpr (is_polarized_v<Spectrum>) {
+             // Need sensor information
+@@ -105,28 +116,35 @@ public:
+                with the implicit Stokes frame used for the ray direction. Apply
+                one last rotation here s.t. it aligns with the sensor's x-axis. */
+             Vector3f current_basis = mueller::stokes_basis(-ray.d);
+-            Vector3f vertical = m_sensor->world_transform() * Vector3f(0.f, 1.f, 0.f);
++            Vector3f vertical = m_has_reference_axis
++                ? Vector3f(m_reference_axis)
++                : m_sensor->world_transform() * Vector3f(0.f, 1.f, 0.f);
+             Vector3f target_basis = dr::cross(ray.d, vertical);
+             spec = mueller::rotate_stokes_basis(-ray.d,
+                                                  current_basis,
+                                                  target_basis) * spec;
+ 
+             for (int i = 0; i < 4; ++i) {
+-                Color3f rgb;
+-                if constexpr (is_monochromatic_v<Spectrum>) {
+-                    rgb = spec.entry(i, 0).x();
+-                } else if constexpr (is_rgb_v<Spectrum>) {
+-                    rgb = spec.entry(i, 0);
++                if constexpr (is_rgbn_v<Spectrum>) {  // R, G, B and near-infrared, each its own Stokes vector
++                    UnpolarizedSpectrum c = spec.entry(i, 0);
++                    *aovs++ = c[0]; *aovs++ = c[1]; *aovs++ = c[2]; *aovs++ = c[3];
+                 } else {
+-                    static_assert(is_spectral_v<Spectrum>);
+-                    /// Note: this assumes that sensor used sample_rgb_spectrum() to generate 'ray.wavelengths'
+-                    auto pdf = pdf_rgb_spectrum(ray.wavelengths);
+-                    UnpolarizedSpectrum _spec =
+-                        spec.entry(i, 0) * dr::select(pdf != 0.f, dr::rcp(pdf), 0.f);
+-                    rgb = spectrum_to_srgb(_spec, ray.wavelengths, active);
++                    Color3f rgb;
++                    if constexpr (is_monochromatic_v<Spectrum>) {
++                        rgb = spec.entry(i, 0).x();
++                    } else if constexpr (is_rgb_v<Spectrum>) {
++                        rgb = spec.entry(i, 0);
++                    } else {
++                        static_assert(is_spectral_v<Spectrum>);
++                        /// Note: this assumes that sensor used sample_rgb_spectrum() to generate 'ray.wavelengths'
++                        auto pdf = pdf_rgb_spectrum(ray.wavelengths);
++                        UnpolarizedSpectrum _spec =
++                            spec.entry(i, 0) * dr::select(pdf != 0.f, dr::rcp(pdf), 0.f);
++                        rgb = spectrum_to_srgb(_spec, ray.wavelengths, active);
++                    }
++
++                    *aovs++ = rgb.r(); *aovs++ = rgb.g(); *aovs++ = rgb.b();
+                 }
+-
+-                *aovs++ = rgb.r(); *aovs++ = rgb.g(); *aovs++ = rgb.b();
+             }
+         }
+ 
+@@ -148,11 +166,14 @@ public:
+     std::vector<std::string> aov_names() const override {
+         std::vector<std::string> result = m_integrator->aov_names();
+         for (int i = 0; i < 4; ++i)
+-            for (int j = 0; j < 3; ++j)
+-                result.insert(result.begin() + 3*i + j, "S" + std::to_string(i) + "." + ("RGB"[j]));
++            for (int j = 0; j < Lanes; ++j)
++                result.insert(result.begin() + Lanes*i + j, "S" + std::to_string(i) + "." + ("RGBN"[j]));
+         return result;
+     }
+ 
++    /// Channels per Stokes component: R, G, B (and N, the near-infrared lane, in RGBN variants)
++    static constexpr int Lanes = is_rgbn_v<Spectrum> ? 4 : 3;
++
+     void traverse(TraversalCallback *cb) override {
+         cb->put("integrator", m_integrator, ParamFlags::Differentiable);
+     }
+@@ -161,6 +182,8 @@ public:
+ private:
+     Sensor *m_sensor;
+     ref<Base> m_integrator;
++    bool m_has_reference_axis = false;
++    ScalarVector3f m_reference_axis = ScalarVector3f(0.f, 1.f, 0.f);
+ 
+     MI_TRAVERSE_CB(Base, m_integrator)
+ };
+diff --git a/src/render/imageblock.cpp b/src/render/imageblock.cpp
+index 6efb094..a73b741 100644
+--- a/src/render/imageblock.cpp
++++ b/src/render/imageblock.cpp
+@@ -197,9 +197,17 @@ MI_VARIANT void ImageBlock<Float, Spectrum>::put(const Point2f &pos,
+     ScopedPhase sp(ProfilerPhase::ImageBlockPut);
+     constexpr bool JIT = dr::is_jit_v<Float>;
+ 
++    // Never splat a non-finite transport sample. A single NaN otherwise
++    // contaminates the complete reconstruction-filter footprint (e.g. a 5x5
++    // block with the Gaussian filter) and every Stokes AOV. Keep this guard in
++    // JIT builds as well; warn_invalid only controls logging.
++    Mask finite_valid = true;
++    for (uint32_t k = 0; k < m_channel_count; ++k)
++        finite_valid &= dr::isfinite(values[k]);
++
+     // Check if all sample values are valid
+     if (m_warn_negative || m_warn_invalid) {
+-        Mask is_valid = true;
++        Mask is_valid = finite_valid;
+ 
+         if (m_warn_negative) {
+             for (uint32_t k = 0; k < m_channel_count; ++k)
+@@ -222,6 +230,7 @@ MI_VARIANT void ImageBlock<Float, Spectrum>::put(const Point2f &pos,
+             Log(Warn, "%s", oss.str());
+         }
+     }
++    active &= finite_valid;
+ 
+     // ===================================================================
+     //  Fast special case for the box filter
+diff --git a/src/render/integrator.cpp b/src/render/integrator.cpp
+index beec8fd..2673d52 100644
+--- a/src/render/integrator.cpp
++++ b/src/render/integrator.cpp
+@@ -501,7 +501,7 @@ SamplingIntegrator<Float, Spectrum>::render_sample(const Scene *scene,
+         else if constexpr (is_monochromatic_v<Spectrum>)
+             rgb = spec_u.x();
+         else
+-            rgb = spec_u;
++            rgb = rgb_lanes(spec_u);  // RGBN: the film keeps R, G, B (the near-infrared lane: Stokes AOVs)
+ 
+         aovs[0] = rgb.x();
+         aovs[1] = rgb.y();
+diff --git a/src/render/mesh.cpp b/src/render/mesh.cpp
+index 5343ac3..2de8b96 100644
+--- a/src/render/mesh.cpp
++++ b/src/render/mesh.cpp
+@@ -1749,6 +1749,8 @@ Mesh<Float, Spectrum>::eval_attribute(std::string_view name,
+         auto result = interpolate_attribute<3, false>(attr.type, attr.buf, si, active);
+         if constexpr (is_monochromatic_v<Spectrum>)
+             return luminance(result);
++        else if constexpr (is_rgbn_v<Spectrum>)  // vertex colours: RGB, near-infrared lane their luminance
++            return rgb_to_color<UnpolarizedSpectrum>(result);
+         else
+             return result;
+     } else {
+diff --git a/src/render/scene_optix.inl b/src/render/scene_optix.inl
+index 40765d9..c6488dc 100644
+--- a/src/render/scene_optix.inl
++++ b/src/render/scene_optix.inl
+@@ -367,8 +367,30 @@ static void optix_rebuild_accel(
+         // lives in the scene state (sized once, index-aligned with
+         // scene->shapegroups()); a dirty group is rebuilt and its freeze-visible
+         // handles refreshed.
+-        build_gas(s.context, sd.blases, sd.top_blases, s.accel,
+-                  s.compact_accel);
++        //
++        // After the first build, only a top-level BLAS holding a changed shape
++        // is rebuilt: moving one small shape (a light that follows the camera)
++        // no longer rebuilds every mesh of the scene (~40 ms a move on a large
++        // scene). The BLASes are the same kinds in the same order every time.
++        if (s.accel.gas.size() != sd.top_blases.size()) {
++            build_gas(s.context, sd.blases, sd.top_blases, s.accel,
++                      s.compact_accel);
++        } else {
++            for (size_t k = 0; k < sd.top_blases.size(); ++k) {
++                bool changed = false;
++                for (const ShapeIR &g : sd.blases[sd.top_blases[k]].geoms)
++                    changed |= static_cast<const Shape<Float, Spectrum> *>(g.ctx)->dirty();
++                if (!changed)
++                    continue;
++                MiOptixAccelData one;
++                build_gas(s.context, sd.blases, { sd.top_blases[k] }, one,
++                          s.compact_accel);
++                if (s.accel.gas[k].buffer)
++                    jit_free(s.accel.gas[k].buffer);
++                s.accel.gas[k] = one.gas[0];
++                one.gas.clear();  // now owned by s.accel
++            }
++        }
+         auto &shapegroups = scene->shapegroups();
+         for (size_t i = 0; i < shapegroups.size(); ++i) {
+             auto &sg = shapegroups[i];
+diff --git a/src/sensors/batch.cpp b/src/sensors/batch.cpp
+index e5be060..70901f9 100644
+--- a/src/sensors/batch.cpp
++++ b/src/sensors/batch.cpp
+@@ -91,6 +91,9 @@ public:
+     MI_IMPORT_TYPES(Shape, SensorPtr)
+ 
+     BatchSensor(const Properties &props) : Base(props) {
++        // slot_time: each child's rays carry their slot index added to the time, so a scene can tell the
++        // children apart per ray (opticalnav_sim: slot 1 renders the near-infrared band of the same camera).
++        m_slot_time = props.get<bool>("slot_time", false);
+         for (auto &prop : props.objects()) {
+             if (Base *sensor = prop.try_get<Base>()) {
+                 m_sensors.push_back(sensor);
+@@ -144,8 +147,9 @@ public:
+ 
+         Point2f position_sample_2(idx_f - Float(idx_u), position_sample.y());
+ 
++        Float slot_time = m_slot_time ? time + Float(index) : time;
+         auto [ray, spec] =
+-            sensor->sample_ray(time, wavelength_sample, position_sample_2,
++            sensor->sample_ray(slot_time, wavelength_sample, position_sample_2,
+                                aperture_sample, active);
+ 
+         /* The `m_last_index` variable **needs** to be updated after the
+@@ -174,8 +178,9 @@ public:
+ 
+         Point2f position_sample_2(idx_f - Float(idx_u), position_sample.y());
+ 
++        Float slot_time = m_slot_time ? time + Float(index) : time;
+         auto [ray, spec] = sensor->sample_ray_differential(
+-            time, wavelength_sample, position_sample_2, aperture_sample,
++            slot_time, wavelength_sample, position_sample_2, aperture_sample,
+             active);
+ 
+         /* The `m_last_index` variable **needs** to be updated after the
+@@ -272,12 +277,14 @@ public:
+ 
+     void traverse(TraversalCallback *cb) override {
+         Base::traverse(cb);
+-        std::string id;
+-        for(size_t i = 0; i < m_sensors.size(); i++) {
+-            id = m_sensors.at(i)->id();
+-            if (id.empty() || string::starts_with(id, "_unnamed_"))
+-                id = "sensor" + std::to_string(i);
+-            cb->put(id, m_sensors.at(i), ParamFlags::NonDifferentiable);
++        // Keep the public names independent of the source child IDs.  The
++        // resident K-heading renderer binds these slots once and then updates
++        // only their transforms between strips.
++        for (size_t i = 0; i < m_sensors.size(); ++i) {
++            cb->put(
++                "slot_" + std::to_string(i), m_sensors.at(i),
++                ParamFlags::NonDifferentiable
++            );
+         }
+     }
+ 
+@@ -294,6 +301,8 @@ public:
+         });
+ 
+         dr::traverse_1_fn_ro(m_sensors_dr, payload, fn);
++        // m_last_index too: a JIT variable a frozen replay would otherwise reference stale
++        dr::traverse_1_fn_ro(m_last_index, payload, fn);
+         for(size_t i = 0; i < m_sensors.size(); i++) {
+             m_sensors[i]->traverse_1_cb_ro(payload, fn);
+         }
+@@ -312,6 +321,8 @@ public:
+         });
+ 
+         dr::traverse_1_fn_rw(m_sensors_dr, payload, fn);
++        // m_last_index too: a JIT variable a frozen replay would otherwise reference stale
++        dr::traverse_1_fn_rw(m_last_index, payload, fn);
+         for(size_t i = 0; i < m_sensors.size(); i++) {
+             m_sensors[i]->traverse_1_cb_rw(payload, fn);
+         }
+@@ -322,8 +333,10 @@ public:
+ private:
+     std::vector<ref<Shape>> m_shapes;
+     std::vector<ref<Base>> m_sensors;
++    bool m_slot_time = false;
+     DynamicBuffer<SensorPtr> m_sensors_dr;
+     mutable UInt32 m_last_index;
++
+ };
+ 
+ MI_EXPORT_PLUGIN(BatchSensor)
+diff --git a/src/spectra/srgb.cpp b/src/spectra/srgb.cpp
+index a415930..2bf59b1 100644
+--- a/src/spectra/srgb.cpp
++++ b/src/spectra/srgb.cpp
+@@ -58,6 +58,9 @@ public:
+ 
+         if constexpr (is_spectral_v<Spectrum>)
+             m_value = srgb_model_fetch(color);
++        else if constexpr (is_rgbn_v<Spectrum>)  // near-infrared lane: ``nir`` if given, else the luminance
++            m_value = UnpolarizedSpectrum(color[0], color[1], color[2],
++                                          props.get<ScalarFloat>("nir", luminance(color)));
+         else if constexpr (is_rgb_v<Spectrum>)
+             m_value = color;
+         else
+@@ -87,6 +90,8 @@ public:
+         MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
+         if constexpr (is_monochromatic_v<Spectrum>)
+             return Color3f(m_value[0]);
++        else if constexpr (is_rgbn_v<Spectrum>)
++            return rgb_lanes(m_value);
+         else
+             return m_value;
+     }
+@@ -117,6 +122,8 @@ public:
+     Float mean() const override {
+         if constexpr (is_spectral_v<Spectrum>)
+             return dr::mean(srgb_model_mean(m_value));
++        else if constexpr (is_rgbn_v<Spectrum>)  // as the RGB variant's (sampling weights stay the same)
++            return dr::mean(dr::mean(rgb_lanes(m_value)));
+         else
+             return dr::mean(dr::mean(m_value));
+     }
+@@ -142,7 +149,7 @@ protected:
+      * Depending on the compiled variant, this plugin either stores coefficients
+      * for a spectral upsampling model, or a plain RGB/monochromatic value.
+      */
+-    static constexpr size_t ChannelCount = is_monochromatic_v<Spectrum> ? 1 : 3;
++    static constexpr size_t ChannelCount = is_monochromatic_v<Spectrum> ? 1 : (is_rgbn_v<Spectrum> ? 4 : 3);
+ 
+     Color<Float, ChannelCount> m_value;
+ 
+diff --git a/src/textures/CMakeLists.txt b/src/textures/CMakeLists.txt
+index 972a6a9..7899752 100644
+--- a/src/textures/CMakeLists.txt
++++ b/src/textures/CMakeLists.txt
+@@ -4,5 +4,7 @@ add_plugin(bitmap         bitmap.cpp)
+ add_plugin(checkerboard   checkerboard.cpp)
+ add_plugin(mesh_attribute mesh_attribute.cpp)
+ add_plugin(volume         volume.cpp)
++add_plugin(rgb2nir        rgb2nir.cpp)
++add_plugin(bandscale      bandscale.cpp)
+ 
+ set(MI_PLUGIN_TARGETS "${MI_PLUGIN_TARGETS}" PARENT_SCOPE)
+diff --git a/src/textures/bandscale.cpp b/src/textures/bandscale.cpp
+new file mode 100755
+index 0000000..1c3a2ef
+--- /dev/null
++++ b/src/textures/bandscale.cpp
+@@ -0,0 +1,105 @@
++#include <mitsuba/render/texture.h>
++#include <mitsuba/render/interaction.h>
++#include <mitsuba/core/properties.h>
++
++NAMESPACE_BEGIN(mitsuba)
++
++/**!
++
++.. _texture-bandscale:
++
++Per-band scale (:monosp:`bandscale`)
++------------------------------------
++
++.. pluginparameters::
++
++ * - nested
++   - |spectrum| or |texture|
++   - The value it scales, an emitter's radiance (read as an emissive spectrum unless ``emissive`` is
++     false, when it is a reflectance).
++ * - rgb, nir
++   - |float| or |texture|
++   - Factors for the visible and the near-infrared band. Shared ``uniform`` textures let one parameter
++     set a whole class of lights (LED, incandescent) at once. (Default: 1 and 0)
++ * - band
++   - |float| or |texture|
++   - Above 0.5: every lookup is near-infrared (as :monosp:`rgb2nir`'s ``band``). (Default: 0)
++
++A lookup is near-infrared when ``band`` is set or the ray's time is 0.5 or more (a ``batch`` sensor
++with ``slot_time``: its second slot), so one render holds both bands side by side, each light at its
++own level in each band, without changing any parameter between them. In RGBN variants
++(``cuda_rgbn_polarized``) a lookup scales R, G and B by ``rgb`` and the near-infrared lane by ``nir``.
++ */
++template <typename Float, typename Spectrum>
++class BandScale final : public Texture<Float, Spectrum> {
++public:
++    MI_IMPORT_TYPES(Texture)
++
++    BandScale(const Properties &props) : Texture(props) {
++        // an emitter's radiance: colours above 1 are allowed (an emissive spectrum, not a reflectance)
++        m_nested = props.get<bool>("emissive", true) ? props.get_emissive_texture<Texture>("nested")
++                                                     : props.get_texture<Texture>("nested");
++        m_rgb = props.get_texture<Texture>("rgb", 1.f);
++        m_nir = props.get_texture<Texture>("nir", 0.f);
++        m_band = props.get_texture<Texture>("band", 0.f);
++    }
++
++    void traverse(TraversalCallback *cb) override {
++        cb->put("nested", m_nested, ParamFlags::Differentiable);
++        cb->put("rgb", m_rgb, ParamFlags::NonDifferentiable);
++        cb->put("nir", m_nir, ParamFlags::NonDifferentiable);
++        cb->put("band", m_band, ParamFlags::NonDifferentiable);
++    }
++
++    Float factor(const SurfaceInteraction3f &si, Mask active) const {
++        Mask nir = (m_band->eval_1(si, active) > .5f) || (si.time > .5f);
++        return dr::select(nir, m_nir->eval_1(si, active), m_rgb->eval_1(si, active));
++    }
++
++    UnpolarizedSpectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
++        if constexpr (is_rgbn_v<Spectrum>) {  // both bands at once: each lane at its band's level
++            Float f_rgb = m_rgb->eval_1(si, active);
++            return m_nested->eval(si, active) *
++                   UnpolarizedSpectrum(f_rgb, f_rgb, f_rgb, m_nir->eval_1(si, active));
++        } else {
++            return m_nested->eval(si, active) * factor(si, active);
++        }
++    }
++
++    Color3f eval_3(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
++        return m_nested->eval_3(si, active) * factor(si, active);
++    }
++
++    Float eval_1(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
++        return m_nested->eval_1(si, active) * factor(si, active);
++    }
++
++    Float mean() const override { return m_nested->mean(); }
++    ScalarVector2i resolution() const override { return m_nested->resolution(); }
++    bool is_spatially_varying() const override { return m_nested->is_spatially_varying(); }
++
++    std::string to_string() const override {
++        std::ostringstream oss;
++        oss << "BandScale[" << std::endl
++            << "  nested = " << string::indent(m_nested) << "," << std::endl
++            << "  rgb = " << string::indent(m_rgb) << "," << std::endl
++            << "  nir = " << string::indent(m_nir) << std::endl
++            << "]";
++        return oss.str();
++    }
++
++    MI_DECLARE_CLASS(BandScale)
++protected:
++    ref<Texture> m_nested;
++    ref<Texture> m_rgb;
++    ref<Texture> m_nir;
++    ref<Texture> m_band;
++
++    MI_TRAVERSE_CB(Texture, m_nested, m_rgb, m_nir, m_band)
++};
++
++MI_EXPORT_PLUGIN(BandScale)
++NAMESPACE_END(mitsuba)
+diff --git a/src/textures/bitmap.cpp b/src/textures/bitmap.cpp
+index 4489423..a8d1875 100644
+--- a/src/textures/bitmap.cpp
++++ b/src/textures/bitmap.cpp
+@@ -513,6 +513,8 @@ public:
+                 return interpolate_1(si, active);
+             else if constexpr (is_spectral_v<Spectrum>)
+                 return interpolate_spectral(si, active);
++            else if constexpr (is_rgbn_v<Spectrum>)  // near-infrared lane: the luminance (see rgb2nir)
++                return rgb_to_color<UnpolarizedSpectrum>(interpolate_3(si, active));
+             else
+                 return interpolate_3(si, active);
+         }
+diff --git a/src/textures/rgb2nir.cpp b/src/textures/rgb2nir.cpp
+new file mode 100755
+index 0000000..bc377e5
+--- /dev/null
++++ b/src/textures/rgb2nir.cpp
+@@ -0,0 +1,98 @@
++#include <mitsuba/render/texture.h>
++#include <mitsuba/render/interaction.h>
++#include <mitsuba/core/properties.h>
++
++NAMESPACE_BEGIN(mitsuba)
++
++/**!
++
++.. _texture-rgb2nir:
++
++RGB or pseudo near-infrared reflectance (:monosp:`rgb2nir`)
++-----------------------------------------------------------
++
++.. pluginparameters::
++
++ * - nested
++   - |spectrum| or |texture|
++   - The visible (linear RGB) reflectance it wraps, typically a base color.
++ * - band
++   - |float| or |texture|
++   - 0: return ``nested`` unchanged. 1: return the pseudo near-infrared reflectance
++     ``dot(max(c, 1 - c), [0.229, 0.587, 0.114])`` of ``c = clip(nested, 0, 1)`` in every channel
++     (robomituba's ``pseudo_nir_albedo``, used for its Infinigen, HSSD and ABO corpora).
++     Give every wrapper a reference to one shared ``uniform`` texture, so that one parameter switches
++     a whole scene between the visible and the near-infrared band. (Default: 0)
++     A ray whose time is 0.5 or more (a ``batch`` sensor with ``slot_time``: its second slot) also gets
++     the near-infrared reflectance, so one render can hold both bands side by side. In RGBN variants
++     (``cuda_rgbn_polarized``) the lookup returns both at once: R, G, B and the near-infrared lane.
++
++The switch is a value read at render time, so a frozen render serves both bands without recording
++again, and no second set of textures is loaded: the near-infrared reflectance is computed per lookup.
++ */
++template <typename Float, typename Spectrum>
++class RGBToNIR final : public Texture<Float, Spectrum> {
++public:
++    MI_IMPORT_TYPES(Texture)
++
++    RGBToNIR(const Properties &props) : Texture(props) {
++        m_nested = props.get_texture<Texture>("nested");
++        m_band = props.get_texture<Texture>("band", 0.f);
++    }
++
++    void traverse(TraversalCallback *cb) override {
++        cb->put("nested", m_nested, ParamFlags::Differentiable);
++        cb->put("band", m_band, ParamFlags::NonDifferentiable);
++    }
++
++    UnpolarizedSpectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
++        UnpolarizedSpectrum value = m_nested->eval(si, active);
++        if constexpr (is_rgbn_v<Spectrum>) {  // both bands at once: the near-infrared lane
++            Color3f rgb = rgb_lanes(value);
++            return UnpolarizedSpectrum(rgb[0], rgb[1], rgb[2], pseudo_nir(rgb));
++        } else if constexpr (is_rgb_v<Spectrum>) {
++            Mask nir = (m_band->eval_1(si, active) > .5f) || (si.time > .5f);
++            Float n = pseudo_nir(Color3f(value));  // mitsuba::pseudo_nir (spectrum.h)
++            return dr::select(nir, UnpolarizedSpectrum(n), value);
++        } else {
++            return value;  // spectral and monochrome variants: unchanged
++        }
++    }
++
++    Color3f eval_3(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
++        Color3f value = m_nested->eval_3(si, active);
++        Mask nir = (m_band->eval_1(si, active) > .5f) || (si.time > .5f);
++        return dr::select(nir, Color3f(pseudo_nir(value)), value);
++    }
++
++    Float eval_1(const SurfaceInteraction3f &si, Mask active) const override {
++        MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
++        Mask nir = (m_band->eval_1(si, active) > .5f) || (si.time > .5f);
++        return dr::select(nir, pseudo_nir(m_nested->eval_3(si, active)), m_nested->eval_1(si, active));
++    }
++
++    Float mean() const override { return m_nested->mean(); }
++    ScalarVector2i resolution() const override { return m_nested->resolution(); }
++    bool is_spatially_varying() const override { return m_nested->is_spatially_varying(); }
++
++    std::string to_string() const override {
++        std::ostringstream oss;
++        oss << "RGBToNIR[" << std::endl
++            << "  nested = " << string::indent(m_nested) << "," << std::endl
++            << "  band = " << string::indent(m_band) << std::endl
++            << "]";
++        return oss.str();
++    }
++
++    MI_DECLARE_CLASS(RGBToNIR)
++protected:
++    ref<Texture> m_nested;
++    ref<Texture> m_band;
++
++    MI_TRAVERSE_CB(Texture, m_nested, m_band)
++};
++
++MI_EXPORT_PLUGIN(RGBToNIR)
++NAMESPACE_END(mitsuba)
+diff --git a/src/volumes/grid.cpp b/src/volumes/grid.cpp
+index 2a666e1..20ea5ac 100644
+--- a/src/volumes/grid.cpp
++++ b/src/volumes/grid.cpp
+@@ -356,6 +356,8 @@ public:
+                 else { // 3 channels
+                     if constexpr (is_spectral_v<Spectrum>)
+                         return interpolate_spectral(it, active);
++                    else if constexpr (is_rgbn_v<Spectrum>)
++                        return rgb_to_color<UnpolarizedSpectrum>(interpolate_3(it, active));
+                     else
+                         return interpolate_3(it, active);
+                 }

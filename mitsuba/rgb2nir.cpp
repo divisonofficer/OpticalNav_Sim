@@ -24,7 +24,8 @@ RGB or pseudo near-infrared reflectance (:monosp:`rgb2nir`)
      Give every wrapper a reference to one shared ``uniform`` texture, so that one parameter switches
      a whole scene between the visible and the near-infrared band. (Default: 0)
      A ray whose time is 0.5 or more (a ``batch`` sensor with ``slot_time``: its second slot) also gets
-     the near-infrared reflectance, so one render can hold both bands side by side.
+     the near-infrared reflectance, so one render can hold both bands side by side. In RGBN variants
+     (``cuda_rgbn_polarized``) the lookup returns both at once: R, G, B and the near-infrared lane.
 
 The switch is a value read at render time, so a frozen render serves both bands without recording
 again, and no second set of textures is loaded: the near-infrared reflectance is computed per lookup.
@@ -44,18 +45,15 @@ public:
         cb->put("band", m_band, ParamFlags::NonDifferentiable);
     }
 
-    static Float pseudo_nir(const Color3f &rgb) {
-        Color3f c = dr::clip(rgb, 0.f, 1.f);
-        Color3f m = dr::maximum(c, 1.f - c);
-        return 0.229f * m.x() + 0.587f * m.y() + 0.114f * m.z();
-    }
-
     UnpolarizedSpectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::TextureEvaluate, active);
         UnpolarizedSpectrum value = m_nested->eval(si, active);
-        if constexpr (is_rgb_v<Spectrum>) {
+        if constexpr (is_rgbn_v<Spectrum>) {  // both bands at once: the near-infrared lane
+            Color3f rgb = rgb_lanes(value);
+            return UnpolarizedSpectrum(rgb[0], rgb[1], rgb[2], pseudo_nir(rgb));
+        } else if constexpr (is_rgb_v<Spectrum>) {
             Mask nir = (m_band->eval_1(si, active) > .5f) || (si.time > .5f);
-            Float n = pseudo_nir(Color3f(value));
+            Float n = pseudo_nir(Color3f(value));  // mitsuba::pseudo_nir (spectrum.h)
             return dr::select(nir, UnpolarizedSpectrum(n), value);
         } else {
             return value;  // spectral and monochrome variants: unchanged

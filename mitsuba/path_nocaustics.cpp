@@ -54,8 +54,9 @@ so both MIS strategies drop the same set of paths.
      lets one resident scene render a passive pass and a flash-only pass.
  * - sky_nir
    - |float|
-   - Factor on light from the environment emitter along rays whose time is 0.5 or more: the
-     near-infrared slot of a ``batch`` sensor with ``slot_time`` (daylight's near-infrared share).
+   - Factor on light from the environment emitter in the near-infrared: its lane in RGBN variants,
+     otherwise along rays whose time is 0.5 or more (the near-infrared slot of a ``batch`` sensor with
+     ``slot_time``). Daylight's near-infrared share.
      (Default: 1)
  */
 
@@ -269,11 +270,10 @@ public:
                 Mask hit_active = (ls.prev_bsdf_pdf > 0.f) && counted;
                 if (!m_caustics)
                     hit_active &= !ls.prev_caustic;
-                // the environment in the near-infrared slot: daylight's near-infrared share
-                Float sky = dr::select(!si.is_valid() && (ls.ray.time > .5f), m_sky_nir, 1.f);
+                // the environment: daylight's near-infrared share in the near-infrared lane (RGBN) or slot
                 ls.result = spec_fma(
                     ls.throughput,
-                    ds.emitter->eval(si, hit_active) * (mis_bsdf * sky),
+                    sky_nir(ds.emitter->eval(si, hit_active) * mis_bsdf, !si.is_valid(), ls.ray.time),
                     ls.result);
             }
 
@@ -314,10 +314,8 @@ public:
                         si, ls.sampler->next_2d(), true, active_em);
                     if (m_assist_mode == AssistMode::Exclude)
                         active_em &= ds.emitter != EmitterPtr(assist_emitter);
-                    if (m_sky_nir != 1.f && scene->environment() != nullptr) {
-                        Mask to_sky = (ds.emitter == EmitterPtr(scene->environment())) && (si.time > .5f);
-                        dr::masked(em_weight, to_sky) = em_weight * m_sky_nir;
-                    }
+                    if (m_sky_nir != 1.f && scene->environment() != nullptr)
+                        em_weight = sky_nir(em_weight, ds.emitter == EmitterPtr(scene->environment()), si.time);
                 }
                 active_em &= (ds.pdf != 0.f);
 
@@ -445,6 +443,30 @@ public:
             "]", m_max_depth, m_rr_depth, m_specular_pdf_threshold, m_caustics,
             m_assist, m_assist_mode == AssistMode::Only ? "only"
                       : m_assist_mode == AssistMode::Exclude ? "exclude" : "all");
+    }
+
+    /**
+     * \brief Light from the environment (where ``sky``) at daylight's near-infrared share: in RGBN
+     * variants on the near-infrared lane, otherwise on rays of a dual render's near-infrared slot (time
+     * 0.5 or more).
+     */
+    Spectrum sky_nir(const Spectrum &value, Mask sky, Float time) const {
+        if (m_sky_nir == 1.f)
+            return value;
+        if constexpr (is_rgbn_v<Spectrum>) {
+            UnpolarizedSpectrum f(1.f, 1.f, 1.f, dr::select(sky, m_sky_nir, 1.f));
+            Spectrum out = value;
+            if constexpr (is_polarized_v<Spectrum>) {
+                for (size_t i = 0; i < 4; ++i)
+                    for (size_t j = 0; j < 4; ++j)
+                        out.entry(i, j) *= f;
+            } else {
+                out *= f;
+            }
+            return out;
+        } else {
+            return value * dr::select(sky && (time > .5f), m_sky_nir, 1.f);
+        }
     }
 
     /// Compute a multiple importance sampling weight using the power heuristic

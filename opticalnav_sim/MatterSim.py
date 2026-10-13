@@ -288,6 +288,9 @@ class Simulator:
             local = Path(self.navGraphPath) / f"{scene}_connectivity.json" if self.navGraphPath else None
             if local is not None and local.is_file():
                 self._graphs[scene] = NavGraph.load(self.navGraphPath, scene)
+            elif self._scene_meta(scene).get("spawn") and not self._scene_meta(scene).get("graph"):
+                # packed without a navigation graph: start at its spawn points and move freely
+                self._graphs[scene] = NavGraph.from_spawn(scene, self._scene_meta(scene)["spawn"])
             else:
                 self._graphs[scene] = NavGraph.from_connectivity(scene, self._client.connectivity(scene))
         return self._graphs[scene]

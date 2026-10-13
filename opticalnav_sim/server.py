@@ -81,7 +81,10 @@ MAX_SPP = 8192
 MAX_VIEWS = 64
 MAX_BODY = 1 << 20
 MAX_DENOISE_BODY = 256 << 20  # a few 2048x2048 float32 Stokes images
-MODE_VARIANTS = {"polar": ("cuda_rgb_polarized", "cuda_ad_rgb_polarized"), "rgb": ("cuda_rgb", "cuda_ad_rgb")}
+# polar: cuda_rgbn_polarized first (R, G, B and near-infrared lanes in one path, each with its own Mueller
+# matrix: both bands in one render); --variant cuda_rgb_polarized keeps the dual-sensor render instead
+MODE_VARIANTS = {"polar": ("cuda_rgbn_polarized", "cuda_rgb_polarized", "cuda_ad_rgb_polarized"),
+                 "rgb": ("cuda_rgb", "cuda_ad_rgb")}
 # Without dr.freeze, high spp is rendered in passes of at most this many samples (wavefront memory);
 # a polarized path carries Mueller matrices, so its passes are smaller.
 # What a frozen render takes as input. "scene": the whole scene, so Dr.Jit walks every texture and mesh
@@ -217,6 +220,54 @@ def band_lights_text(text: str, classes: dict[str, str], groups: dict[str, str])
 
 
 _UNIT_RECT: list[Path] = []
+
+
+_TAG = re.compile(r'<!--.*?-->|<(/?)([A-Za-z_][\w.:-]*)((?:[^>"]|"[^"]*")*?)(/?)>', re.S)
+_REF_ID = re.compile(r'<ref\b[^>]*\bid="([^"]+)"')
+_ATTR_ID = re.compile(r'\bid="([^"]+)"')
+
+
+def strip_unreferenced(text: str, keep=()) -> tuple[str, int]:
+    """Drop top-level <bsdf> and <texture> elements nothing refers to (no <ref id=...> outside the dropped
+    ones), until none is left: Mitsuba loads every top-level object, and Dr.Jit traces every registered
+    BSDF into a render's material call, dead or not. A Device 1 apartment's base.xml carries 562 shared
+    BSDFs that no shape uses (its shapes have inline ones): ~3/4 of a recording's tracing and codegen, and
+    1724 textures loaded for nothing. ``keep``: ids the server looks up by itself. Returns (text, count)."""
+    spans, depth, open_ = [], 0, None
+    for m in _TAG.finditer(text):
+        if m.group(0).startswith("<!--"):
+            continue
+        closing, name, attrs, self_closing = m.groups()
+        if closing:
+            depth -= 1
+            if depth == 1 and open_ is not None and open_[1] == name:
+                spans.append((open_[0], m.end(), open_[2]))
+                open_ = None
+            continue
+        if depth == 1 and name in ("bsdf", "texture"):
+            found = _ATTR_ID.search(attrs)
+            if self_closing:
+                spans.append((m.start(), m.end(), found.group(1) if found else None))
+            else:
+                open_ = (m.start(), name, found.group(1) if found else None)
+        if not self_closing:
+            depth += 1
+
+    def without(removed: set) -> str:
+        out, last = [], 0
+        for i in sorted(removed, key=lambda i: spans[i][0]):
+            out.append(text[last:spans[i][0]])
+            last = spans[i][1]
+        return "".join(out) + text[last:]
+
+    keep, removed = set(keep), set()
+    while True:  # an element only a dropped one referred to goes too
+        refs = set(_REF_ID.findall(without(removed)))
+        dead = {i for i, (_, _, sid) in enumerate(spans)
+                if i not in removed and sid is not None and sid not in refs and sid not in keep}
+        if not dead:
+            return without(removed), len(removed)
+        removed |= dead
 
 
 def unit_rectangle_ply() -> Path:
@@ -476,6 +527,8 @@ class Resident:
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
                  pool: dict | None = None):
         self.mi, self.mode = mi, mode
+        # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
+        self.rgbn = "_rgbn" in mi.variant()
         started = time.time()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
         if mode == "rgb":
@@ -497,6 +550,11 @@ class Resident:
         if nir:  # base colours behind one visible / near-infrared switch (rgb2nir), lights per band (bandscale)
             text = band_lights_text(nir_scene_text(text), self.classes, self.groups)
         text, self.env_original = controllable_env(mi, text, xml.parent, blank_env_file(mi))
+        if not os.environ.get("OPTICALNAV_KEEP_UNREFERENCED"):  # after every transform: they add referenced ids
+            size = len(text)
+            text, dropped = strip_unreferenced(text, keep={NIR_BAND_ID, *BAND_UNIFORMS})
+            print(f"[resident] {dropped} unreferenced top-level bsdf/texture elements left out "
+                  f"({(size - len(text)) / 1e6:.1f} MB of scene text)", flush=True)
         mi.Thread.thread().file_resolver().prepend(str(xml.parent))  # assets are relative to the XML
         self.name = f"{xml.parent.name}/{xml.name}" + (f"+{flash_xml.name}" if flash_xml is not None else "")
         self.score = progress.scene_score(text)  # sizes the recording-time estimate before any history
@@ -521,8 +579,10 @@ class Resident:
             raise RuntimeError(f"{xml}: flash scene has no camera_assist_light transform")
         # Camera-only updates traverse just the sensor: traversing and updating the whole scene (thousands
         # of textures and meshes) cost ~46 ms per frame on Device 1. A frame with the flash on also moves
-        # the flash, so it takes the whole-scene path; with the flash off the assist shapes are parked once.
+        # the flash, written through the assist shapes alone (see _write_assist); a frame that changes the
+        # Look takes the whole-scene path; with the flash off the assist shapes are parked once.
         self.sensor = self.scene.sensors()[0]
+        self.assist_shapes = {s.id(): s for s in self.scene.shapes() if s.id().startswith(ASSIST_PREFIX)}
         sensor_keys = set(mi.traverse(self.sensor).keys())
         self.ks_size = "film.size" if "film.size" in sensor_keys else None
         self.size = self.fov = None
@@ -626,6 +686,22 @@ class Resident:
             self.integrators[(name, sky)] = self.mi.load_dict(inner)
         return self.integrators[(name, sky)]
 
+    def pass_integrators(self, pass_name: str, sky: float | None = None) -> tuple:
+        """The integrators a pass renders and adds up: "active" is the passive and the flash pass in one
+        call (one frozen replay a frame instead of two: Dr.Jit walks the scene's inputs once per replay)."""
+        names = ("passive", "flash") if pass_name == "active" else (pass_name,)
+        return tuple(self.integrator(n, sky) for n in names)
+
+    def render_passes(self, scene, sensor, integrators: tuple, spp: int, seed):
+        """The sum of one render per integrator (same sensor, spp and seed). A two-pass frame is linear in
+        its passes (active = passive + flash, a Stokes sum), so the sum is the frame."""
+        mi = self.mi
+        img = None
+        for it in integrators:
+            one = mi.render(scene, sensor=sensor if sensor is not None else 0, integrator=it, spp=spp, seed=seed)
+            img = one if img is None else img + one
+        return img
+
     def dual_sensor(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int = 1):
         """A batch sensor of two copies of the camera, the second's rays at time 1 (slot_time): the visible
         band left, the near-infrared band right (rgb2nir, bandscale and sky_nir read the ray's time), in one
@@ -693,10 +769,11 @@ class Resident:
         if self.ks_size is not None and self.size != (int(width), int(height)):
             ps[self.ks_size] = mi.ScalarVector2u(int(width), int(height))
         ps.update()
-        if not follow and self.parked and look == self.look:
-            p = None
-        else:
-            p = mi.traverse(self.scene)
+        t2 = time.perf_counter()
+        if not (not follow and self.parked and look == self.look):
+            # a Look change writes through the whole scene's parameters; a frame that only moves the flash
+            # writes the assist shapes alone (the whole-scene traverse was ~46 ms of every moving frame)
+            p = mi.traverse(self.scene) if look != self.look else None
             if self.k_flash is not None:
                 # following: the flash rides 0.2 m ahead of the camera. Parked: with bandscale lights it is
                 # dark (its uniforms) and lifted 3 m at full size, as removed lights are; without them it
@@ -707,16 +784,37 @@ class Resident:
                 d = float(self.flash["distance_m"])
                 up = np.eye(4)
                 up[1, 3] = 3.0 if lift else 0.0
-                p[self.k_flash] = mi.ScalarTransform4f((up @ flash_matrix(c2w, size, d)).tolist())
+                writes = {self.k_flash: up @ flash_matrix(c2w, size, d)}
                 if self.k_polarizer is not None:
-                    p[self.k_polarizer] = mi.ScalarTransform4f((up @ flash_matrix(
-                        c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0))).tolist())
+                    writes[self.k_polarizer] = up @ flash_matrix(
+                        c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0))
+                self._write_assist(p, writes)
                 self.parked = not follow
-            self._write_look(p, look)
-            p.update()
-            self._evaluate_transforms(p)
+            if p is not None:
+                self._write_look(p, look)
+                p.update()
+                self._evaluate_transforms(p)
         self.fov, self.size, self.pose = float(hfov_deg), (int(width), int(height)), pose
-        return {"traverse_s": t1 - t0, "update_s": time.perf_counter() - t1}
+        return {"traverse_s": t1 - t0, "update_s": t2 - t1, "scene_update_s": time.perf_counter() - t2}
+
+    def _write_assist(self, p, writes: dict) -> None:
+        """Write the assist shapes' transforms: into ``p`` (the whole scene's parameters, updated by the
+        caller), or, without it, through each shape's own parameters and then the scene, whose update
+        rebuilds only the small acceleration structure they are in (the Mitsuba build's selective GAS
+        rebuild; before it, every move rebuilt every mesh of the scene, ~40 ms on Device 1)."""
+        import drjit as dr
+
+        mi = self.mi
+        if p is not None:
+            for k, m in writes.items():
+                p[k] = mi.ScalarTransform4f(m.tolist())
+            return
+        for k, m in writes.items():
+            ps = mi.traverse(self.assist_shapes[k[:-len(".to_world")]])
+            ps["to_world"] = mi.ScalarTransform4f(m.tolist())
+            ps.update()
+            dr.make_opaque(ps["to_world"])  # evaluated, as _evaluate_transforms would
+        self.scene.parameters_changed([])
 
     def _evaluate_transforms(self, p) -> None:
         """Evaluate every shape and environment transform in place. A transform written from the host (a
@@ -813,20 +911,21 @@ class Resident:
         mi = self.mi
         follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
         breakdown = self._set_camera(c2w, width, height, hfov_deg, follow, look)
-        # both bands at once: the dual sensor, the near-infrared slot's sky at daylight's share
+        # both bands at once: the near-infrared lane of an RGBN variant, else the dual sensor; the sky in the
+        # near-infrared at daylight's share either way
         fs = self.freeze_spp
         per_call = fs if self.freeze and fs and int(spp) > fs and int(spp) % fs == 0 else int(spp)  # see below
-        dual = self.dual_sensor(c2w, width, height, hfov_deg, per_call) if look.band == 2 else None
-        sky = dict(look.nir).get("daylight", self.sky_nir) if dual is not None else None
-        integrator = self.integrator(pass_name, sky)
+        both = look.band == 2 or self.rgbn
+        dual = self.dual_sensor(c2w, width, height, hfov_deg, per_call) if both and not self.rgbn else None
+        sky = dict(look.nir).get("daylight", self.sky_nir) if both else None
         if not self.freeze:
             # passes of at most SPP_CHUNK samples, averaged by sample count
+            its = self.pass_integrators(pass_name, sky)
             total, done, acc, i = int(spp), 0, None, 0
             while done < total:
                 n = min(SPP_CHUNK[self.mode], total - done)
-                img = np.array(mi.render(self.scene, sensor=dual if dual is not None else self.sensor,
-                                         integrator=integrator, spp=n, seed=int(seed) + 104729 * i),
-                               dtype=np.float64) * n
+                img = np.array(self.render_passes(self.scene, dual if dual is not None else self.sensor, its, n,
+                                                  int(seed) + 104729 * i), dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
             return (acc / total).astype(np.float32), breakdown
@@ -835,7 +934,7 @@ class Resident:
         spp, repeats = int(spp), 1
         if self.freeze_spp and spp > self.freeze_spp and spp % self.freeze_spp == 0:
             spp, repeats = self.freeze_spp, spp // self.freeze_spp
-        tail = () if dual is None else ("dual", sky)
+        tail = ("dual", sky) if dual is not None else ("rgbn", sky) if self.rgbn else ()
         key = (spp, int(width), int(height), pass_name) + tail
         t2 = time.perf_counter()
         if key not in self.frozen:  # spp and film size are baked into each recording
@@ -843,14 +942,15 @@ class Resident:
             # just its arguments: the dual sensor made on the first two-band frame changed every recording
             # made before it ("number of elements in the input changed from 181902 to 181905") and each
             # recorded again. Made with the first recording at this size, it is there for all of them.
-            if self.band_keys and dual is None:
+            if self.band_keys and dual is None and not self.rgbn:
                 self.dual_sensor(c2w, width, height, hfov_deg, spp)
-            # A two-pass scene records its passive and flash passes together, so switching the light on
-            # later replays at once instead of stopping to record. The flash's place and the hidden
-            # shapes are scene data, not part of a recording.
-            names = ("passive", "flash") if "flash" in self.depth and pass_name != "own" else (pass_name,)
+            # A two-pass scene records the light on ("active": passive + flash in one recording) and off
+            # ("passive") together, so switching the light later replays at once instead of stopping to
+            # record. The flash's place and the hidden shapes are scene data, not part of a recording.
+            names = ("active", "passive") if "flash" in self.depth and pass_name != "own" else ()
+            names += (pass_name,) if pass_name not in names else ()  # a pass asked for alone ("flash")
             for name in names:
-                self._prepare_inputs(dual if dual is not None else self.sensor, self.integrator(name, sky))
+                self._prepare_inputs(dual if dual is not None else self.sensor, self.pass_integrators(name, sky)[0])
                 self._record(spp, int(width), int(height), name, dual, sky)
             self._absorb([(spp, int(width), int(height), n) + tail for n in names])
             t2 = time.perf_counter()
@@ -946,29 +1046,26 @@ class Resident:
         seeds); every input changes between frames, so all are recorded opaque rather than as literals."""
         import drjit as dr
 
-        key = (spp, width, height, pass_name) + (() if dual is None else ("dual", sky))
+        key = (spp, width, height, pass_name) + (("dual", sky) if dual is not None else ("rgbn", sky) if self.rgbn else ())
         if key in self.frozen:
             return
-        mi, integrator = self.mi, self.integrator(pass_name, sky)
+        mi, its = self.mi, self.pass_integrators(pass_name, sky)
         progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=2, score=self.score)
         ok = False
         with ACTIVITY.doing(f"recording {spp} spp {width}x{height}" + ("" if pass_name == "own" else f" {pass_name}")):
             if dual is not None:  # scene and dual sensor are inputs: slot poses change between frames
-                frozen = dr.freeze(lambda scene, sn, sd, n=spp, it=integrator:
-                                   mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
+                frozen = dr.freeze(lambda scene, sn, sd, n=spp, its=its: self.render_passes(scene, sn, its, n, sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
                 self.frozen_args[key] = (self.scene, dual)
                 self._settle(frozen, self.scene, dual)
             elif self.sensor_input:
                 scene = self.scene
-                frozen = dr.freeze(lambda sn, sd, n=spp, it=integrator:
-                                   mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
+                frozen = dr.freeze(lambda sn, sd, n=spp, its=its: self.render_passes(scene, sn, its, n, sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
                 self.frozen_args[key] = (self.sensor,)
                 self._settle(frozen, self.sensor)
             else:
-                frozen = dr.freeze(lambda scene, sd, n=spp, it=integrator:
-                                   mi.render(scene, integrator=it, spp=n, seed=sd),
+                frozen = dr.freeze(lambda scene, sd, n=spp, its=its: self.render_passes(scene, None, its, n, sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
                 self.frozen_args[key] = (self.scene,)
                 self._settle(frozen, self.scene)
@@ -1295,8 +1392,9 @@ class Renderer:
     @staticmethod
     def recorded(resident: Resident, passes: tuple) -> list:
         """[spp, width, height] of the single-view freeze recordings that cover every pass."""
-        sizes = {f[:3] for f in list(resident.frozen) if f[0] != "batch"}
-        return sorted(list(s) for s in sizes if all(s + (p,) in resident.frozen for p in passes))
+        keys = [f for f in list(resident.frozen) if f[0] != "batch"]
+        run = ("active",) if tuple(passes) == ("passive", "flash") else tuple(passes)
+        return sorted(list(s) for s in {f[:3] for f in keys} if all(any(f[:4] == s + (p,) for f in keys) for p in run))
 
     def _resident(self, rkey: tuple, variant: str) -> Resident:
         if rkey in self.cache:
@@ -1345,17 +1443,25 @@ class Renderer:
         return (i0 + i90 + i45 + i135) / 2, i0 - i90, i45 - i135
 
     def denoise_images(self, arrays: dict) -> dict:
-        """OptiX-denoise finished images (``s0``, ``s1``, ``s2`` or ``radiance``, HxWx3): a progressive
-        viewer accumulates raw passes and denoises the running mean, rather than averaging denoised passes,
-        which keeps only what every pass's denoiser agreed on and smears detail."""
-        mode = "polar" if "s0" in arrays else "rgb"
+        """OptiX-denoise finished images (``s0``, ``s1``, ``s2`` or ``radiance``, HxWx3, and/or the
+        near-infrared ``nir_s0``, ``nir_s1``, ``nir_s2``, HxW): a progressive viewer accumulates raw passes
+        and denoises the running mean, rather than averaging denoised passes, which keeps only what every
+        pass's denoiser agreed on and smears detail. Both bands in one call: one trip to the main thread."""
+        mode = "polar" if "s0" in arrays or "nir_s0" in arrays else "rgb"
         mode = mode if mode in self.variant_of else next(iter(self.variant_of))
 
         def job():
+            out = {}
             if "s0" in arrays:
                 s0, s1, s2 = (np.asarray(arrays[k], dtype=np.float32) for k in ("s0", "s1", "s2"))
-                return dict(zip(("s0", "s1", "s2"), self._denoise_stokes(mode, s0, s1, s2)))
-            return {"radiance": self._denoise(mode, np.asarray(arrays["radiance"], dtype=np.float32))}
+                out.update(zip(("s0", "s1", "s2"), self._denoise_stokes(mode, s0, s1, s2)))
+            if "nir_s0" in arrays:  # grey: denoised as three equal channels
+                grey = [np.repeat(np.asarray(arrays[f"nir_s{k}"], dtype=np.float32)[..., None], 3, axis=2)
+                        for k in range(3)]
+                out.update({f"nir_s{k}": v[..., 0] for k, v in enumerate(self._denoise_stokes(mode, *grey))})
+            if "radiance" in arrays:
+                out["radiance"] = self._denoise(mode, np.asarray(arrays["radiance"], dtype=np.float32))
+            return out
         return self._on_main(mode, job)
 
     @staticmethod
@@ -1446,7 +1552,9 @@ class Renderer:
             flash = {"flash_rgb": follow and flash_band in ("rgb", "both"),
                      "flash_nir": follow and flash_band in ("nir", "both")}
             groups = LIGHTING[lighting]
-            if bands == "both" and resident.band_keys:  # one render, both bands (dual sensor)
+            if resident.band_keys and (bands == "both" or resident.rgbn):
+                # one render, both bands: the RGBN variant's lanes (whichever bands are asked: the same render
+                # serves all three), else the dual sensor
                 looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups)}
             else:  # one band per render
                 looks = {b: Look(hidden, lights, env, env_scale, env_rot, band=b, nir=nir, **flash, groups=groups)
@@ -1455,8 +1563,12 @@ class Renderer:
                 self.dr.kernel_history()  # discard kernels launched before this call
             t0 = time.perf_counter()
             if len(cams) == 1:  # the pipelined path
+                # a two-pass frame (active = passive + flash, a linear Stokes sum) is one "active" render call
+                run = ("active",) if passes == ("passive", "flash") else passes
                 handles = {b: [resident.launch(cams[0], width, height, hfov, spp, seed, p, follow, look)
-                               for p in passes] for b, look in looks.items()}
+                               for p in run] for b, look in looks.items()}
+                if len(run) > 1:  # added on the GPU, read back once
+                    handles = {b: [self._sum_handles(hs)] for b, hs in handles.items()}
             else:  # batch sensor: completes here
                 batch = {b: [resident.render_many(cams, width, height, hfov, spp, seed, p, follow, look)
                              for p in passes] for b, look in looks.items()}
@@ -1472,7 +1584,14 @@ class Renderer:
                     breakdowns = [bd for d in done.values() for _, bd in d]
                 else:
                     per_band, breakdowns = batch, [getattr(resident, "breakdown", None) or {}]
-                if 2 in per_band:  # dual: visible slot left, near-infrared right, margins cropped
+                if resident.rgbn:  # R, G, B and near-infrared lanes: the RGB layout, per band asked for
+                    rendered, per_band = per_band, {}
+                    for b, views in rendered.items():
+                        for want in ((0, 1) if b == 2 else (b,)):
+                            if want == 0 and bands == "nir" or want == 1 and bands == "rgb":
+                                continue
+                            per_band[want] = [[stokes.rgbn_band(v, want) for v in vs] for vs in views]
+                elif 2 in per_band:  # dual: visible slot left, near-infrared right, margins cropped
                     wm, m = int(width) + 2 * DUAL_MARGIN, DUAL_MARGIN
                     dual = per_band.pop(2)
                     per_band[0] = [[v[:, m:m + int(width)] for v in views] for views in dual]
@@ -1483,6 +1602,17 @@ class Renderer:
                 render_s = launch_s + time.perf_counter() - t1
                 return self._assemble(key, cams, per_band, parts, render_s)
         return finish
+
+    @staticmethod
+    def _sum_handles(handles: list) -> tuple:
+        """One handle for several passes of a view: their images added (lazily, on the GPU when frozen) and
+        their timings summed. The film's colour channels are S0, so the sum's are the summed S0 too."""
+        img, breakdown = handles[0][0], dict(handles[0][1])
+        for other, parts in handles[1:]:
+            img = img + other
+            for k, v in parts.items():
+                breakdown[k] = breakdown.get(k, 0.0) + v
+        return img, breakdown
 
     def _assemble(self, key: tuple, cams: list, per_band: dict, parts: dict, render_s: float) -> tuple:
         scan, variant, mode, width, height, hfov, spp, seed, denoise = key[:9]
@@ -1534,10 +1664,13 @@ class Renderer:
         return outs, kernels, render_s, time.perf_counter() - t1
 
     @staticmethod
-    def _finish(mode: str, out: dict, dtype, preview: bool = True) -> dict[str, np.ndarray]:
+    def _finish(mode: str, out: dict, dtype, preview: bool = True, s3: bool = True) -> dict[str, np.ndarray]:
         """``preview=False`` skips the dataset preview recipe (about 40 ms at 512x384); the client then
-        tonemaps the radiance itself (MatterSim.setPreviewEnabled)."""
-        result = {k: v.astype(dtype) for k, v in out.items() if k == "nir" or k.startswith("nir_s")}
+        tonemaps the radiance itself (MatterSim.setPreviewEnabled). ``s3=False`` leaves S3 (circular
+        polarization, which a viewer does not show) out of the reply: a quarter less to encode and send."""
+        stokes_keys = ("s0", "s1", "s2", "s3") if s3 else ("s0", "s1", "s2")
+        result = {k: v.astype(dtype) for k, v in out.items()
+                  if k == "nir" or (k.startswith("nir_s") and (s3 or k != "nir_s3"))}
         if mode == "rgb":
             if "radiance" in out:
                 rad = out["radiance"]
@@ -1547,7 +1680,7 @@ class Renderer:
                                                        percentile=0.995, blur=0.0)
             return result
         if "s0" in out:
-            result.update({k: out[k].astype(dtype) for k in ("s0", "s1", "s2", "s3")})
+            result.update({k: out[k].astype(dtype) for k in stokes_keys})
             if preview:
                 result["rgb"] = stokes.rgb_preview(out["rgb_src"], out["s0"], out["s1"], out["s2"])
         return result
@@ -1566,7 +1699,8 @@ class Renderer:
             outs, kernels, render_s, denoise_s = self.executor.submit_pipelined(
                 self._start, key, [c for _, c in checked[i:j]], time.perf_counter()).result()
             t0 = time.perf_counter()
-            results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)))
+            results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)),
+                                        bool(views[i + n].get("s3", True)))
                            for n, out in enumerate(outs))
             timing = {"render_s": render_s, "denoise_s": denoise_s if key[8] else 0.0,
                       "post_s": time.perf_counter() - t0, **kernels, "calls": 1,
@@ -1658,23 +1792,28 @@ def make_handler(renderer: Renderer, token: str | None = None):
                                           for g in pool["glass"]]}
                         return self._json(200, meta)
                     if parts[3] == "connectivity":
-                        body = (pack / "connectivity" / f"{scan}_connectivity.json").read_bytes()
-                        return self._send(200, body)
+                        path = pack / "connectivity" / f"{scan}_connectivity.json"
+                        if not path.is_file():  # packed without a navigation graph (scene.json "spawn")
+                            return self._json(404, {"error": f"{scan} has no navigation graph"})
+                        return self._send(200, path.read_bytes())
                 self._json(404, {"error": f"no route {self.path}"})
             except Exception as exc:  # noqa: BLE001 - report, keep serving
                 self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
         def _denoise_post(self):
-            """NPZ in (s0, s1, s2 or radiance; float16/32 HxWx3), the same arrays denoised out (float32)."""
+            """NPZ in (s0, s1, s2 or radiance, float16/32 HxWx3; nir_s0..2 HxW), the same arrays denoised out
+            (float16 when every input is, else float32)."""
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= MAX_DENOISE_BODY:
                     raise ValueError(f"request body must be 1..{MAX_DENOISE_BODY} bytes")
                 npz = np.load(io.BytesIO(self.rfile.read(length)))
                 started = time.perf_counter()
-                out = renderer.denoise_images({k: npz[k] for k in npz.files})
+                arrays = {k: npz[k] for k in npz.files}
+                out = renderer.denoise_images(arrays)
+                dtype = np.float16 if all(v.dtype == np.float16 for v in arrays.values()) else np.float32
                 buf = io.BytesIO()
-                np.savez(buf, **{k: np.asarray(v, dtype=np.float32) for k, v in out.items()})
+                np.savez(buf, **{k: np.asarray(v, dtype=dtype) for k, v in out.items()})
                 self._send(200, buf.getvalue(), "application/octet-stream",
                            {"X-Render-Seconds": f"{time.perf_counter() - started:.4f}"})
             except (KeyError, ValueError, TypeError, OSError) as exc:

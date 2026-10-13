@@ -94,12 +94,14 @@ class RenderClient:
 
     def denoise(self, images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """OptiX-denoise finished images on the render server: ``s0``, ``s1``, ``s2`` (polar; S3 is left
-        alone) or ``radiance``, each HxWx3. Denoise an accumulated mean, not each pass before averaging."""
+        alone) or ``radiance``, each HxWx3, and/or the near-infrared ``nir_s0``, ``nir_s1``, ``nir_s2``
+        (HxW), all in one call. Denoise an accumulated mean, not each pass before averaging. Sent and
+        returned as float16; returned as float32."""
         buf = io.BytesIO()
         np.savez(buf, **{k: np.asarray(v, dtype=np.float16) for k, v in images.items()})
         data, _ = self._request("POST", "/v1/denoise", buf.getvalue(), "application/octet-stream")
         npz = np.load(io.BytesIO(data))
-        return {k: npz[k] for k in npz.files}
+        return {k: npz[k].astype(np.float32) for k in npz.files}
 
     def close(self) -> None:
         if self._conn is not None:

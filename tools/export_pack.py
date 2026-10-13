@@ -87,7 +87,8 @@ def main() -> int:
     done = [0]
 
     def one(scene: str) -> tuple[str, dict]:
-        members = [f"scenes/{scene}", f"connectivity/{scene}_connectivity.json"]
+        members = [f"scenes/{scene}"] + [m for m in (f"connectivity/{scene}_connectivity.json",)
+                                         if (pack / m).is_file()]  # graph-less staged scenes have none
         dst = out / "scenes" / f"{scene}.tar.zst"
         raw = tree_bytes([pack / m for m in members])
         t = time.time()

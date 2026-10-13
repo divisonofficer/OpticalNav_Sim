@@ -42,6 +42,17 @@ class NavGraph:
         return cls(scan, ids, pos, inc, adj)
 
     @classmethod
+    def from_spawn(cls, scan: str, spawn: list[dict]) -> "NavGraph":
+        """A scene packed without a navigation graph: its spawn points (scene.json ``spawn``: position
+        [x, y, z] in the connectivity frame, heading_deg) as viewpoints with no edges, so an episode can
+        start there and move freely (MatterSim.teleport)."""
+        graph = cls(scan, [f"spawn_{i}" for i in range(len(spawn))],
+                    [tuple(float(v) for v in s["position"]) for s in spawn], [True] * len(spawn),
+                    [[] for _ in spawn])
+        graph.headings = [math.radians(float(s.get("heading_deg", 0.0))) for s in spawn]
+        return graph
+
+    @classmethod
     def load(cls, connectivity_dir: str | Path, scan: str) -> "NavGraph":
         path = Path(connectivity_dir) / f"{scan}_connectivity.json"
         return cls.from_connectivity(scan, json.loads(path.read_text()))

@@ -34,8 +34,13 @@ from pathlib import Path
 
 
 def r2r_graph(pack: Path, scene: str) -> tuple[dict, dict[str, tuple[float, float]], list[tuple[str, str, str]]]:
-    """The pack's R2R graph in the authoring frame: (graph json for the generator, node xy, edges)."""
-    conn = json.loads((pack / "connectivity" / f"{scene}_connectivity.json").read_text())
+    """The pack's R2R graph in the authoring frame: (graph json for the generator, node xy, edges).
+    Empty for a scene packed without a graph (staged without rendering): mirrors then only avoid doors and
+    windows, and no glass wall is placed."""
+    path = pack / "connectivity" / f"{scene}_connectivity.json"
+    if not path.is_file():
+        return {"nodes": [], "edges": []}, {}, []
+    conn = json.loads(path.read_text())
     pos = {r["image_id"]: (float(r["pose"][3]), -float(r["pose"][7])) for r in conn if r.get("included", True)}
     edges, seen = [], set()
     for r in conn:
@@ -65,7 +70,22 @@ def cube_xml(obj: dict, bsdf_id: str, mounted: bool) -> str:
             f'    </transform>\n    <ref id="{bsdf_id}" />\n  </shape>')
 
 
-def build(pack: Path, scene: str, robomituba: Path, density: float, glass_max: int, seed: int, mounted: bool) -> dict:
+def mirror_bsdf(sid: str, i: int, roughness: float, kind: str) -> tuple[str, float | None]:
+    """A pool mirror's own BSDF, a millionth apart from every other (see build). ``conductor`` is a smooth
+    silver mirror; ``roughconductor`` keeps robomituba's per-mirror roughness, as the dataset renders did."""
+    eps = 1e-6 * (i + 1)
+    if kind == "conductor":
+        v = f"{1.0 - eps:.7f}"
+        return (f'  <bsdf type="twosided" id="pool_bsdf_{sid}"><bsdf type="conductor">'
+                f'<string name="material" value="Ag" /><rgb name="specular_reflectance" value="{v} {v} {v}" />'
+                f'</bsdf></bsdf>'), None
+    alpha = roughness + eps
+    return (f'  <bsdf type="twosided" id="pool_bsdf_{sid}"><bsdf type="roughconductor">'
+            f'<string name="material" value="Ag" /><float name="alpha" value="{alpha:.7f}" /></bsdf></bsdf>'), alpha
+
+
+def build(pack: Path, scene: str, robomituba: Path, density: float, glass_max: int, seed: int, mounted: bool,
+          mirror_kind: str = "roughconductor") -> dict:
     sys.path.insert(0, str(robomituba / "modules" / "navigation_dataset" / "src"))
     from navigation_dataset import optical_perturbation as op  # noqa: PLC0415
     from navigation_dataset.object_footprint import object_footprint  # noqa: PLC0415
@@ -100,10 +120,9 @@ def build(pack: Path, scene: str, robomituba: Path, density: float, glass_max: i
     out_m, out_g = [], []
     for i, (rank, m) in enumerate(zip(ranks, mirrors)):
         sid = "pool_" + m["id"]
-        alpha = float((m.get("material_params") or {}).get("roughness", 0.0)) + 1e-6 * (i + 1)
-        bsdfs.append(f'  <bsdf type="twosided" id="pool_bsdf_{sid}"><bsdf type="roughconductor">'
-                     f'<string name="material" value="Ag" /><float name="alpha" value="{alpha:.7f}" /></bsdf></bsdf>')
-        out_m.append({"id": sid, "rank": rank, "geometry": m["geometry"], "roughness": alpha,
+        xml, alpha = mirror_bsdf(sid, i, float((m.get("material_params") or {}).get("roughness", 0.0)), mirror_kind)
+        bsdfs.append(xml)
+        out_m.append({"id": sid, "rank": rank, "geometry": m["geometry"], "roughness": alpha, "bsdf": mirror_kind,
                       "xml": cube_xml(dict(m, id=sid), f"pool_bsdf_{sid}", mounted)})
     nodes_xy = {n: xy for n, xy in pos.items()}
     base_parts = op._num_components(set(pos), [(a, b) for _, a, b in edges])
@@ -128,7 +147,8 @@ def build(pack: Path, scene: str, robomituba: Path, density: float, glass_max: i
     return {"version": "opticalnav-sim-perturbation-pool-v1", "scene": scene,
             "r2r_components": [parts_before, parts_after],
             "source": "robomituba navigation_dataset.optical_perturbation", "seed": seed, "density_max": density,
-            "glass_max": glass_max, "wall_source": wall_source, "mounted": mounted,
+            "glass_max": glass_max, "wall_source": wall_source, "mounted": mounted, "mirror_bsdf": mirror_kind,
+            "graph": bool(pos),
             "mirrors": sorted(out_m, key=lambda m: m["rank"]), "glass": out_g, "bsdf_xml": "\n".join(bsdfs)}
 
 
@@ -141,12 +161,16 @@ def main() -> int:
     ap.add_argument("--glass", type=int, default=6, help="most glass walls in the pool")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mounted", action="store_true", help="mount mirrors at base_height_m (the dataset does not)")
+    ap.add_argument("--mirror-bsdf", choices=["conductor", "roughconductor"], default="roughconductor",
+                    help="roughconductor (default): robomituba's per-mirror roughness; conductor: smooth Ag mirrors, "
+                         "as opticalnav-sim-v1 packs use")
     args = ap.parse_args()
     pack = args.pack.resolve()
     scenes = args.scene or sorted(p.parent.name for p in (pack / "scenes").glob("*/scene.json"))
     for scene in scenes:
         try:
-            pool = build(pack, scene, args.robomituba, args.density, args.glass, args.seed, args.mounted)
+            pool = build(pack, scene, args.robomituba, args.density, args.glass, args.seed, args.mounted,
+                         args.mirror_bsdf)
         except (OSError, KeyError, ValueError) as exc:
             print(f"[skip] {scene}: {type(exc).__name__}: {exc}")
             continue

@@ -44,12 +44,13 @@ CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")
 
 
 def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
-    """uint8 RGB image of one channel; ``scale`` is the DoLP (and |S1/S0|, |S2/S0|) shown at full colour."""
+    """uint8 RGB image of one channel; ``scale`` is the DoLP (and |S1/S0|, |S2/S0|) shown at full colour.
+    ``rgb`` and ``nir`` are the tonemapped images Session.image puts in the frame."""
     if channel == "rgb":
         return frame["rgb"]
     if channel.startswith("nir"):
-        if "nir" not in frame:  # the near-infrared band is not being rendered: a dark pane
-            return np.full_like(frame["rgb"], 24)
+        if "nir_grey" not in frame:  # the near-infrared band is not being rendered: a dark pane
+            return np.full(frame["s0_luma"].shape + (3,), 24, np.uint8)
         if channel == "nir":
             return frame["nir"]
         n = frame["nir_derived"]
@@ -129,6 +130,8 @@ class Session:
         graph = self.sim._graph(scene)
         if viewpoint is None:
             viewpoint = next(v for v, ok in zip(graph.ids, graph.included) if ok)
+        if heading is None and getattr(graph, "headings", None):  # a spawn point's own heading
+            heading = graph.headings[graph.index(viewpoint)]
         h = self.sim.getState()[0].heading if heading is None and self.started else (heading or 0.0)
         have = self.scans.get(scene, [])
         if have and self.sim.variant not in have:  # e.g. the light was on and this scene has no active variant
@@ -232,6 +235,8 @@ class Session:
         if "pass_spp" in settings:
             self.pass_spp = int(settings["pass_spp"])
             restart = True
+        if settings.get("refit_tone"):  # display only: nothing renders again
+            self.refit_tone()
         if "denoise" in settings:
             self.sim.setDenoiser(bool(settings["denoise"]))
             restart = True
@@ -265,7 +270,7 @@ class Session:
         scene, variant = sim._split(st.scanId)
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
-                "denoise": False, "preview": False, "lights": sim.lights, "env": dict(sim.env),
+                "denoise": False, "preview": False, "s3": False, "lights": sim.lights, "env": dict(sim.env),
                 "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting,
                 "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
         pos = st._free_position or (st.location.x, st.location.y)
@@ -324,7 +329,7 @@ class Session:
         started = time.perf_counter()
         try:
             client = self._client()
-            out = client.render([dict(view, seed=int(seed))], "float32")[0]
+            out = client.render([dict(view, seed=int(seed))], "float16")[0]  # half the bytes; summed in float32
             timing = dict(getattr(client, "last_timing", {}) or {})
         except Exception as exc:  # noqa: BLE001 - shown on the page; the next input retries
             with self.cv:
@@ -354,31 +359,28 @@ class Session:
                 passes = self.passes
                 mean = {k: self.acc[k] / passes for k in ACCUMULATED if k in self.acc}
         nir = [mean.get(f"nir_s{k}") for k in range(3)]
+        if self.sim.denoise:
+            # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
+            # denoised 16 spp passes keeps just what every pass's denoiser agreed on, and smears detail).
+            # Both bands in one request: one trip, queued once behind the render server's passes.
+            images = {k: mean[k] for k in ("s0", "s1", "s2") if k in mean}
+            if nir[0] is not None:
+                images.update({f"nir_s{k}": nir[k] for k in range(3)})
+            try:
+                den = self._client().denoise(images)
+                mean.update({k: den[k] for k in ("s0", "s1", "s2") if k in den})
+                if nir[0] is not None:
+                    nir = [den[f"nir_s{k}"] for k in range(3)]
+            except (ConnectionError, OSError, RuntimeError):
+                pass  # show the raw mean rather than nothing
         if "s0" not in mean:  # near-infrared only: show it in the RGB pane too, grey
             mean.update({f"s{k}": np.repeat(nir[k][..., None], 3, axis=2) for k in range(3)})
         s0, s1, s2 = mean["s0"], mean["s1"], mean["s2"]
-        if self.sim.denoise:
-            # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
-            # denoised 16 spp passes keeps just what every pass's denoiser agreed on, and smears detail)
-            try:
-                den = self._client().denoise({"s0": s0, "s1": s1, "s2": s2})
-                s0, s1, s2 = den["s0"], den["s1"], den["s2"]
-            except (ConnectionError, OSError, RuntimeError):
-                pass  # show the raw mean rather than nothing
-        tone = self._tone(view["scan"], view["variant"], s0)
         extra = {}
         if nir[0] is not None:
-            if self.sim.denoise:
-                try:
-                    den = self._client().denoise({f"s{k}": np.repeat(nir[k][..., None], 3, axis=2) for k in range(3)})
-                    nir = [den[f"s{k}"][..., 0] for k in range(3)]
-                except (ConnectionError, OSError, RuntimeError):
-                    pass
-            grey = np.repeat(nir[0][..., None], 3, axis=2)
-            nt = self._tone(view["scan"], view["variant"] + "|nir", grey, own_frame=True)
-            extra = {"nir": tonemap.reinhard(grey, nt["exposure"], nt["white"]),
-                     "nir_derived": stokes.derived_mono(nir[0], nir[1], nir[2])}
-        frame = {"rgb": tonemap.reinhard(s0, tone["exposure"], tone["white"]), "s0_luma": s0 @ stokes.LUMA, **extra,
+            extra = {"nir_grey": nir[0], "nir_derived": stokes.derived_mono(nir[0], nir[1], nir[2])}
+        # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
+        frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
                  "derived": stokes.derived(s0, s1, s2), "spp": passes * view["spp"], "passes": passes,
                  "variant": view["variant"], "wall_ms": 1000.0 * wall,
                  "server_ms": 1000.0 * float(timing.get("render_s", 0.0)),
@@ -525,8 +527,37 @@ class Session:
                 raise TimeoutError("not idle")
             self.wait(st["version"], end - time.time())
 
-    def image(self, frame_id: int, channel: str, scale: float) -> bytes:
-        return jpeg(channel_image(self._frame(frame_id), channel, scale))
+    def image(self, frame_id: int, channel: str, scale: float, ev: dict | None = None) -> bytes:
+        """A pane's JPEG. ``ev``: the page's exposure offset per band ({"rgb": stops, "nir": stops}), on top of
+        the scene's tone fit, so a page brightens or darkens what it shows without rendering again."""
+        frame = self._frame(frame_id)
+        if channel in ("rgb", "nir") and (channel == "rgb" or "nir_grey" in frame):
+            frame = dict(frame)
+            frame[channel] = self._tonemapped(frame, channel, float((ev or {}).get(channel, 0.0)))
+        return jpeg(channel_image(frame, channel, scale))
+
+    def _tonemapped(self, frame: dict, band: str, ev: float) -> np.ndarray:
+        """Extended Reinhard at the band's tone fit (see _tone), its exposure shifted by ``ev`` stops."""
+        if band == "rgb":
+            radiance, key = frame["s0"], (frame["scan"], frame["variant"])
+        else:
+            radiance, key = np.repeat(frame["nir_grey"][..., None], 3, axis=2), (frame["scan"], frame["variant"] + "|nir")
+        tone = self._tone(key[0], key[1], radiance, own_frame=band == "nir")
+        return tonemap.reinhard(radiance, tone["exposure"] * 2.0 ** ev, tone["white"])
+
+    def refit_tone(self) -> None:
+        """Fit both bands' tone to the frame on screen now (instead of the dataset frames, or the band's first
+        frame): its exposure puts that frame's own bright percentile at white."""
+        with self.cv:
+            if not self.frame_meta:
+                raise ValueError("no frame to fit the exposure to yet")
+            frame = self.frames[self.frame_meta["frame_id"]]
+            self.tones[(frame["scan"], frame["variant"])] = tonemap.global_params([frame["s0"]])
+            if "nir_grey" in frame:
+                grey = np.repeat(frame["nir_grey"][..., None], 3, axis=2)
+                self.tones[(frame["scan"], frame["variant"] + "|nir")] = tonemap.global_params([grey])
+            self.version += 1
+            self.cv.notify_all()
 
     def probe(self, frame_id: int, x: int, y: int) -> dict:
         f = self._frame(frame_id)
@@ -664,7 +695,8 @@ def make_handler(session: Session, token: str | None = None):
                     channel = parts[3][:-4]
                     if channel not in CHANNELS:
                         raise KeyError(channel)
-                    body = session.image(int(parts[2]), channel, float(q.get("scale", 0.2)))
+                    body = session.image(int(parts[2]), channel, float(q.get("scale", 0.2)),
+                                         {"rgb": float(q.get("ev_rgb", 0.0)), "nir": float(q.get("ev_nir", 0.0))})
                     return self._send(200, body, "image/jpeg")
                 self._json(404, {"error": f"no route {url.path}"})
             except KeyError as exc:
@@ -712,7 +744,7 @@ def make_handler(session: Session, token: str | None = None):
             self.end_headers()
             self.close_connection = True
             ws = WebSocket(self.rfile, self.wfile)
-            sub = {"panes": {"a": "rgb", "b": "dolp"}, "scale": 0.2, "dirty": True}
+            sub = {"panes": {"a": "rgb", "b": "dolp"}, "scale": 0.2, "ev": {}, "dirty": True}
             alive = threading.Event()
             alive.set()
 
@@ -733,7 +765,7 @@ def make_handler(session: Session, token: str | None = None):
                                 ch = sub["panes"].get(pane)
                                 if ch in CHANNELS:
                                     try:
-                                        img = session.image(frame_id, ch, float(sub["scale"]))
+                                        img = session.image(frame_id, ch, float(sub["scale"]), sub["ev"])
                                     except KeyError:  # already replaced by a newer frame
                                         break
                                     ws.send(frame_id.to_bytes(4, "big") + bytes([i]) + img, opcode=0x2)
@@ -763,6 +795,7 @@ def make_handler(session: Session, token: str | None = None):
                     elif kind == "subscribe":
                         sub["panes"] = dict(msg.get("panes") or sub["panes"])
                         sub["scale"] = float(msg.get("scale", sub["scale"]))
+                        sub["ev"] = {k: float(v) for k, v in dict(msg.get("ev") or {}).items() if k in ("rgb", "nir")}
                         sub["dirty"] = True
                         with session.cv:  # wake the sender to resend this frame's panes
                             session.version += 1

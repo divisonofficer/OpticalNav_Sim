@@ -23,6 +23,20 @@ def split_channels(image: np.ndarray) -> tuple[np.ndarray, ...]:
     return (rgb,) + tuple(np.asarray(image[:, :, off + 3 * k:off + 3 * k + 3], dtype=np.float32) for k in range(4))
 
 
+def rgbn_band(image: np.ndarray, band: int) -> np.ndarray:
+    """An RGBN Stokes film (cuda_rgbn_polarized: 19 or 20 channels, R, G, B[, A] then S0..S3 as R, G, B, N)
+    in the RGB layout split_channels reads: band 0 its R, G, B lanes; band 1 its near-infrared lane in all
+    three channels (so the luminance of a channel triple is the near-infrared value: LUMA sums to 1)."""
+    off = {19: 3, 20: 4}[image.shape[2]]
+    lanes = [image[:, :, off + 4 * k: off + 4 * k + 4] for k in range(4)]
+    if band == 0:
+        parts = [image[:, :, :off]] + [s[:, :, :3] for s in lanes]
+    else:
+        parts = [np.repeat(lanes[0][:, :, 3:4], 3, axis=2), image[:, :, 3:off]] + \
+                [np.repeat(s[:, :, 3:4], 3, axis=2) for s in lanes]
+    return np.concatenate(parts, axis=2)
+
+
 def _srgb(a: np.ndarray) -> np.ndarray:
     a = np.clip(a, 0.0, None)
     return np.where(a <= 0.0031308, 12.92 * a, 1.055 * np.power(a, 1.0 / 2.4) - 0.055)
