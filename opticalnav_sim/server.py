@@ -515,6 +515,8 @@ class Resident:
         self.flash = flash
         self.k_flash = next((k for k in keys if k.startswith("camera_assist_light") and k.endswith("to_world")), None)
         self.k_polarizer = next((k for k in keys if k.startswith("camera_assist_polarizer") and k.endswith("to_world")), None)
+        # transforms a frame may write (flash, lights kept as rectangles, environment): see _evaluate_transforms
+        self.k_transforms = [k for k in keys if k.endswith(".to_world") and k != self.k_to_world]
         if flash is not None and self.k_flash is None:
             raise RuntimeError(f"{xml}: flash scene has no camera_assist_light transform")
         # Camera-only updates traverse just the sensor: traversing and updating the whole scene (thousands
@@ -582,6 +584,7 @@ class Resident:
             params[f"{ENV_ID}.scale"] = dr.opaque(mi.Float, 1.0)
             params[f"{ENV_ID}.to_world"] = mi.ScalarTransform4f()
         params.update()
+        self._evaluate_transforms(params)
         del params
         counts = {c: list(self.light_class.values()).count(c) for c in sorted(set(self.light_class.values()))}
         print(f"[resident] {len(self.light_class)} indoor emitters {counts}, environment "
@@ -623,11 +626,13 @@ class Resident:
             self.integrators[(name, sky)] = self.mi.load_dict(inner)
         return self.integrators[(name, sky)]
 
-    def dual_sensor(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float):
+    def dual_sensor(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int = 1):
         """A batch sensor of two copies of the camera, the second's rays at time 1 (slot_time): the visible
         band left, the near-infrared band right (rgb2nir, bandscale and sky_nir read the ray's time), in one
         render. Each slot has DUAL_MARGIN extra pixels a side (field of view widened to match), cropped off
         afterwards, so the reconstruction filter does not blend the two bands at the seam."""
+        import drjit as dr
+
         mi = self.mi
         key = (int(width), int(height), round(float(hfov_deg), 6))
         if key not in self.dual_sensors:
@@ -638,6 +643,14 @@ class Resident:
                 "type": "batch", "slot_time": True, "slot0": dict(slot), "slot1": dict(slot),
                 "film": {"type": "hdrfilm", "width": 2 * wm, "height": int(height)},
                 "sampler": {"type": "independent", "sample_count": 1}})
+            # Every frozen render sees this sensor (registry), and its first render filled two things that
+            # start empty: the slot of each ray last sampled (m_last_index) and the film's storage. That
+            # changed every recording's inputs and each recorded again. Filled here as a render fills them:
+            # one sample_ray at a render's wavefront size, the film prepared for the integrator's channels.
+            sensor = self.dual_sensors[key]
+            zero = dr.zeros(mi.Float, 2 * wm * int(height) * int(spp))
+            dr.eval(sensor.sample_ray(zero, zero, mi.Point2f(zero, zero), mi.Point2f(zero, zero)))
+            sensor.film().prepare(self.integrator("own").aov_names())
         sensor = self.dual_sensors[key]
         pose = np.asarray(c2w, dtype=np.float64).tobytes()
         if self.dual_pose.get(key) != pose:
@@ -647,6 +660,8 @@ class Resident:
             for k in [k for k in p.keys() if k.endswith("to_world")]:
                 p[k] = camera
             p.update()
+            for k in [k for k in p.keys() if k.endswith("to_world")]:  # one input layout (_evaluate_transforms)
+                dr.make_opaque(p[k])
             self.dual_pose[key] = pose
         return sensor
 
@@ -683,19 +698,36 @@ class Resident:
         else:
             p = mi.traverse(self.scene)
             if self.k_flash is not None:
-                # following: the flash rides 0.2 m ahead of the camera; parked: shrunk to nothing, so the
-                # passive pass (which skips assist shapes anyway) is not shadowed by a stale flash
-                size = self.flash["size_world"] if follow else (1e-6, 1e-6)
+                # following: the flash rides 0.2 m ahead of the camera. Parked: with bandscale lights it is
+                # dark (its uniforms) and lifted 3 m at full size, as removed lights are; without them it
+                # shrinks to nothing, as before. Either write is evaluated after the update (see
+                # _evaluate_transforms), so moving it never changes the frozen render's inputs.
+                lift = not follow and bool(self.band_keys)
+                size = self.flash["size_world"] if follow or lift else (1e-6, 1e-6)
                 d = float(self.flash["distance_m"])
-                p[self.k_flash] = mi.ScalarTransform4f(flash_matrix(c2w, size, d).tolist())
+                up = np.eye(4)
+                up[1, 3] = 3.0 if lift else 0.0
+                p[self.k_flash] = mi.ScalarTransform4f((up @ flash_matrix(c2w, size, d)).tolist())
                 if self.k_polarizer is not None:
-                    p[self.k_polarizer] = mi.ScalarTransform4f(flash_matrix(
-                        c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0)).tolist())
+                    p[self.k_polarizer] = mi.ScalarTransform4f((up @ flash_matrix(
+                        c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0))).tolist())
                 self.parked = not follow
             self._write_look(p, look)
             p.update()
+            self._evaluate_transforms(p)
         self.fov, self.size, self.pose = float(hfov_deg), (int(width), int(height)), pose
         return {"traverse_s": t1 - t0, "update_s": time.perf_counter() - t1}
+
+    def _evaluate_transforms(self, p) -> None:
+        """Evaluate every shape and environment transform in place. A transform written from the host (a
+        ScalarTransform4f) stays a literal until a render evaluates it, so a frame that moved the flash and
+        one that did not gave the frozen render two input layouts (the flash rectangle's matrix and inverse:
+        64 opaque variables, 43627 vs 43691 on Device 1), and each recording recorded once more on the
+        first frame of the other kind. Evaluated right after the write, it always has one layout."""
+        import drjit as dr
+
+        for k in self.k_transforms:
+            dr.make_opaque(p[k])
 
     def _radiance(self, key: str, level: float):
         """An indoor emitter's loaded radiance times ``level``, as a new opaque value: an evaluated variable
@@ -782,7 +814,9 @@ class Resident:
         follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
         breakdown = self._set_camera(c2w, width, height, hfov_deg, follow, look)
         # both bands at once: the dual sensor, the near-infrared slot's sky at daylight's share
-        dual = self.dual_sensor(c2w, width, height, hfov_deg) if look.band == 2 else None
+        fs = self.freeze_spp
+        per_call = fs if self.freeze and fs and int(spp) > fs and int(spp) % fs == 0 else int(spp)  # see below
+        dual = self.dual_sensor(c2w, width, height, hfov_deg, per_call) if look.band == 2 else None
         sky = dict(look.nir).get("daylight", self.sky_nir) if dual is not None else None
         integrator = self.integrator(pass_name, sky)
         if not self.freeze:
@@ -805,11 +839,18 @@ class Resident:
         key = (spp, int(width), int(height), pass_name) + tail
         t2 = time.perf_counter()
         if key not in self.frozen:  # spp and film size are baked into each recording
+            # A frozen render's inputs include every live sensor, shape and emitter (Dr.Jit's registry), not
+            # just its arguments: the dual sensor made on the first two-band frame changed every recording
+            # made before it ("number of elements in the input changed from 181902 to 181905") and each
+            # recorded again. Made with the first recording at this size, it is there for all of them.
+            if self.band_keys and dual is None:
+                self.dual_sensor(c2w, width, height, hfov_deg, spp)
             # A two-pass scene records its passive and flash passes together, so switching the light on
             # later replays at once instead of stopping to record. The flash's place and the hidden
             # shapes are scene data, not part of a recording.
             names = ("passive", "flash") if "flash" in self.depth and pass_name != "own" else (pass_name,)
             for name in names:
+                self._prepare_inputs(dual if dual is not None else self.sensor, self.integrator(name, sky))
                 self._record(spp, int(width), int(height), name, dual, sky)
             self._absorb([(spp, int(width), int(height), n) + tail for n in names])
             t2 = time.perf_counter()
@@ -888,6 +929,7 @@ class Resident:
                     self._place_shapes(p, (self.look.hidden - lights) | flipped | (
                         (self.look.hidden & lights) if factor == 1.0 else frozenset()))
                 p.update()
+                self._evaluate_transforms(p)
                 for key in keys:
                     progress.FREEZE.begin(f"{self.name}|{self.mode}|{key[3]}|{key[0]}|{key[1]}x{key[2]}", calls=1,
                                           remember=False, score=self.score)
@@ -946,11 +988,26 @@ class Resident:
         out = np.array(img)
         return out, {**breakdown, "wait_s": t1 - t0, "readback_s": time.perf_counter() - t1}
 
+    def _prepare_inputs(self, sensor, integrator) -> None:
+        """Put the scene and ``sensor`` in the state a render leaves them in, before recording with them.
+        A frozen render's first call evaluates its literal inputs (every shape, emitter and sensor of the
+        scene: Dr.Jit's registry) and its render prepares the film's storage, so its second call saw other
+        inputs and recorded the whole render again (79 s, then 71 s on Device 1). A frozen function that
+        only takes the scene and the sensor evaluates the same inputs in a moment."""
+        import drjit as dr
+
+        mi = self.mi
+        integrator = integrator if integrator is not None else self.scene.integrator()
+        sensor.film().prepare(integrator.aov_names())
+        if getattr(self, "_touch", None) is None:
+            self._touch = dr.freeze(lambda scene, sn: dr.zeros(mi.Float, 1), backend=dr.JitBackend.CUDA,
+                                    auto_opaque=False)
+        dr.eval(self._touch(self.scene, sensor))
+
     def _settle(self, frozen, *args) -> None:
-        """Record, then replay once. The second call of a new recording records again (measured on
-        Device 1: 79 s, then 71 s, then 0.1 s, with the same or a new seed; pre-seeding the sensor's
-        sampler did not prevent it), most likely because the first render leaves scene state such as the
-        sampler and film in a new layout. Paying both now keeps later frames at replay speed."""
+        """Record, then replay once. The second call used to record the render again (79 s, then 71 s on
+        Device 1: the first call had evaluated its inputs, see _prepare_inputs); it now replays, and still
+        catches anything else a first render leaves different, here rather than on a viewer's next frame."""
         import drjit as dr
 
         for _ in range(2):
@@ -1011,6 +1068,7 @@ class Resident:
                     lambda scene, sn, sd, n=int(spp), it=integrator:
                     mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
                     backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
+                self._prepare_inputs(sensor, integrator)
                 self._settle(self.frozen[fkey], self.scene, sensor)
             img = np.array(self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed))))
         w = int(width)
@@ -1384,7 +1442,9 @@ class Renderer:
                                           and (s in resident.blocks or s in resident.transforms)}
             hidden = hidden | self._pool_hidden(resident, mirrors)
             # one look per band: visible (0) and pseudo near-infrared (1), the same recordings for both
-            flash = {"flash_rgb": flash_band in ("rgb", "both"), "flash_nir": flash_band in ("nir", "both")}
+            # the flash emits only for the active variant (elsewhere it is parked, dark)
+            flash = {"flash_rgb": follow and flash_band in ("rgb", "both"),
+                     "flash_nir": follow and flash_band in ("nir", "both")}
             groups = LIGHTING[lighting]
             if bands == "both" and resident.band_keys:  # one render, both bands (dual sensor)
                 looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups)}
@@ -1568,7 +1628,7 @@ def make_handler(renderer: Renderer, token: str | None = None):
                         "resident": [list(k) for k, _, _ in served],
                         # freeze recordings per variant: [spp, width, height] recorded for all its passes
                         "recorded": {"|".join(k): renderer.recorded(r, passes) for k, r, passes in served},
-                        # freeze recordings made so far by the resident scenes (each new spp/size records twice);
+                        # freeze recordings made so far by the resident scenes (one per new spp, size and pass);
                         # a change that should replay leaves it unchanged
                         "recordings": sum(getattr(f, "n_recordings", 0) for r in list(renderer.cache.values())
                                           for f in list(r.frozen.values()))})
