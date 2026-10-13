@@ -467,6 +467,42 @@ packs/<name>/
 
 Assets are hard links by default, so a pack costs no extra disk on the same filesystem. Use `--link copy` to produce a pack you can ship. Annotations follow R2R: `scan`, `path`, `heading`, `distance`, `instructions` and `path_id`, plus `episode_id`, `goal_node` and `actions`. Episodes come from the dataset's support-graph episodes with consecutive duplicate nodes removed.
 
+Then compact the assets with `tools/compact_assets.py`. It needs Mitsuba, and a second run changes nothing. It makes two changes:
+
+* **Textures.** Each texture is renamed by its content hash, so identical images become one file. Materials that now name the same files load as one object: Mitsuba's loader merges equal nodes, and the meshes sharing a material merge too.
+* **Meshes.** Each OBJ is converted to a binary PLY by Mitsuba's own OBJ loader. Each PLY is loaded back and checked against the OBJ: positions, faces and UVs must match exactly, normals within 1e-6.
+
+New files go next to the hard links and the old ones are unlinked, so the robomituba project is never touched.
+
+```bash
+python tools/compact_assets.py --pack packs/opticalnav-v0.2 [--scene SCENE ...] [--keep-unused]
+```
+
+Results on `infinigen_apartment_natural_v1_20268504` (perturbed, unused materials left out, Mitsuba 3.7):
+
+| | Before | After |
+|---|---|---|
+| Texture files | 2,951 | 916 |
+| Mesh files | 576 OBJ, 3.07 GB | 575 PLY, 0.92 GB |
+| Scene folder | 3.2 GB | 1.0 GB |
+| Distinct BSDFs | 487 | 194 |
+| Meshes after merging | 487 | 194 |
+| Load from local disk | 14.5 s | 3.1 s |
+| First render, tracing | 11.8 s | 2.4 s |
+
+The image matches the original within Monte Carlo noise.
+
+On the render server (Mitsuba 3.9.1, `cuda_rgbn_polarized`, active_polar, 4 spp at 512x384, unused materials left out), measured on the same scene:
+
+| | Before | After |
+|---|---|---|
+| Load | 84–87 s | 5.4 s (local disk) |
+| Active recording | 11.6 s | 8.2 s |
+| Passive recording | 3.3 s | 1.1 s |
+| Frame | 45.6 ms | 39.2 ms |
+
+Loading from a network share costs far more than any of this: 116 s instead of 3.1 s on the `/jarvis` CIFS mount. Keep packs the server loads on a local disk.
+
 ### Sharing packs
 
 A pack is too large for git (71 GB, 60,740 files, mostly text OBJ meshes), so the code travels through GitHub and the scenes through a shared folder, one compressed archive per scene.
