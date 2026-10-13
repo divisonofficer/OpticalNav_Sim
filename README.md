@@ -15,9 +15,13 @@ A Matterport3DSimulator-compatible Python API for OpticalNav indoor scenes. Ever
 
 ## Demo
 
+[![Browser viewer (October 2026): walking, switching bands and views, the camera light and the mirrors](docs/media/viewer_2026.gif)](docs/media/viewer_2026.mp4)
+
+The browser viewer (October 2026 layout) on an RTX 5090, in a base-only scene (`sim_apt_22572521_vanilla_r2`) with its synthetic mirror and flash variants, RGB and NIR in one render. It walks a few steps and turns, then lets the passes accumulate. Next the second pane switches to NIR DoLP, NIR AoLP and RGB S1/S0. Finally the camera light (L) and the mirrors (M) go off and on again. Click the preview for the 28 s recording. *Viewer tools and render options* describes the controls.
+
 [![Browser viewer: walking an R2R path, accumulating to 1024 spp, switching polarization channels](docs/media/viewer.gif)](docs/media/viewer.mp4)
 
-The browser viewer on an RTX 5090. Each move renders one 16 spp pass. While the camera stays put, passes accumulate up to 1024 spp. The second pane switches between DoLP, AoLP, S1/S0 and S2/S0, and the side panel shows the graph map and per-pixel Stokes values. Click the preview for the 40 s recording. It was made before W/A/S/D free movement was added.
+The earlier viewer layout on an RTX 5090. Each move renders one 16 spp pass. While the camera stays put, passes accumulate up to 1024 spp. The second pane switches between DoLP, AoLP, S1/S0 and S2/S0, and the side panel shows the graph map and per-pixel Stokes values. Click the preview for the 40 s recording. It was made before W/A/S/D free movement was added.
 
 [![An R2R episode rendered live: RGB, DoLP, AoLP and the path on the graph](docs/media/episode_polar.gif)](docs/media/episode_polar.mp4)
 
@@ -32,6 +36,19 @@ pip install gdown                       # and: apt install zstd
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --list
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504
 ```
+
+**Simulator scenes:** `opticalnav-sim-v1`, 2 staged scenes, 1.1 GB (2.1 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn).
+
+* Both scenes are base variant only, with spawn points but no navigation graph.
+* `sim_apt_22572521_vanilla_r2` has 2048 px walls, floors and ceilings.
+* Other textures in both scenes are capped at 512 px, not the dataset's 128.
+* Serve both packs together with a repeated `--pack`.
+
+```bash
+python tools/fetch_pack.py --from https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn --out packs/opticalnav-sim-v1
+```
+
+Packs fetched before `tools/compact_assets.py` existed still load, but slowly. `fetch_pack.py` compacts the scenes it downloads, and the render server compacts any unconverted scene when it starts (`compact_assets.py --if-needed`).
 
 **0. Build Mitsuba 3 on the GPU host** (once). The server needs the RGB polarized CUDA variants and `dr.freeze` (Mitsuba ≥ 3.6, Dr.Jit ≥ 1.0). *Environment setup* has the details, the plugins `active_polar` needs, and a check script.
 
@@ -53,6 +70,8 @@ python3.10 -c "import mitsuba as mi, drjit as dr; mi.set_variant('cuda_rgb_polar
 PYTHONPATH=<mitsuba-build>/python python3.10 -m opticalnav_sim.server \
     --pack packs/opticalnav-v0.2 --port 18770 --preload infinigen_apartment_natural_v1_20268504
 ```
+
+Repeat `--pack` to serve several packs at once (for example `--pack packs/opticalnav-v0.2 --pack packs/opticalnav-sim-v1`). Scenes not yet compacted are compacted once at start (`--no-compact` skips that; see *Viewer tools and render options*).
 
 **2. Install the client.** It needs only Python 3.8+ and numpy. Point it at the server.
 
@@ -98,9 +117,19 @@ python -m opticalnav_sim.gui --pack packs/opticalnav-v0.2 --server http://127.0.
 # open http://127.0.0.1:18780 (from another machine or a phone: ssh -L 18780:127.0.0.1:18780 <host>)
 ```
 
-The page has two camera panes, each showing RGB, DoLP, AoLP, S1/S0 or S2/S0 (one pane on a phone), a map of the graph, the Stokes values of the pixel under the mouse (or a tapped pixel), and a status bar for the viewer link, the render server, the loaded scene, the dr.freeze recording of the current settings, and the frame rate. Each band has an exposure slider (RGB 노출, NIR 노출, ±4 EV), and 자동 노출 fits both bands' tone to the frame on screen (the near-infrared band has no dataset frames, so its tone otherwise comes from its first frame). Exposure applies when a pane is sent, so it renders nothing.
+![The viewer: control cards, two panes, map with the room plan, info tabs, status bar](docs/media/viewer_2026_overview.jpg)
 
-* **Moving.** W/A/S/D move freely (forward, left, back, right by the step size), Q/E lower and raise the camera, and dragging with the right mouse button turns the head (a plain right-click turns to the clicked point). ←/→ turn 15°, R/F look up and down, ↑ or 1–9 move to a graph candidate, ↓ turns around, and G snaps back to the nearest graph viewpoint. Space pauses accumulation. M (or the 거울 button in the settings) puts the mirrors and glass in or takes them out (`perturbed` or `base`). L (or the 조명 button) switches the camera's active polarized light on or off (`active_polar` or `perturbed`). Both switches stay on the loaded scene. On touch screens a 3×3 button pad replaces the keys, a horizontal swipe turns, and a double tap turns to that point. Clicking the map jumps to the nearest viewpoint. Free movement has no collision check.
+The page fits the window.
+
+* **Control cards** (Scene, Render, Lighting, Mirrors · Motion, View · Exposure). Switches toggle settings, and step sliders set the numeric ones (pass and target spp, path depth, flash size, glass walls, speed).
+* **Two camera panes.** Each has band tabs (RGB, R, G, B, NIR) and view tabs (영상, DoLP, AoLP, S1/S0, S2/S0), plus buttons to save the JPEG, overlay a thirds grid or go full screen. A phone shows one pane.
+* **Map.** The graph, drawn over the scene's room plan when the pack has one.
+* **Info tabs.** Camera rig, current state, pixel Stokes values, and scene info.
+* **Status bar.** Pass timing split into GPU, server CPU, queue, transfer and viewer, plus the Mitsuba version, the variant and the scene's pack.
+* **Help.** `?` (or 도움말) opens all keys in a modal.
+* **Exposure.** Each band has an exposure slider (RGB 노출, NIR 노출, ±4 EV). 자동 노출 fits both bands' tone to the frame on screen; the near-infrared band has no dataset frames, so otherwise its tone comes from its first frame. Exposure is applied when a pane is sent, so it renders nothing.
+
+* **Moving.** W/A/S/D move freely (forward, left, back, right by the step size), Q/E lower and raise the camera, and dragging with the right mouse button turns the head (a plain right-click turns to the clicked point). ←/→ turn 15°, R/F look up and down, ↑ or 1–9 move to a graph candidate, ↓ turns around, and G snaps back to the nearest graph viewpoint. Space pauses accumulation. M (or the 거울 switch) puts the mirrors and glass in or takes them out (`perturbed` or `base`). L (or the 플래시 switch) switches the camera's active polarized light on or off (`active_polar` or `perturbed`). Both switches stay on the loaded scene. On touch screens a 3×3 button pad replaces the keys, a horizontal swipe turns, and a double tap turns to that point. Clicking the map jumps to the nearest viewpoint. Free movement has no collision check.
 * **Rendering** runs on its own, like a game loop. Inputs only change the simulator state and are acknowledged at once. A background loop keeps `--depth` (default 2) passes of the newest camera in flight on the render server. Each pass is `--pass-spp` samples with its own seed; while the camera stays put, passes add up to a running mean until `--target-spp`, and the next input starts over. The seed is an input of the server's freeze recording, so one pass spp costs one recording however many passes run. The first frame for a pass spp records once per pass, about 90–100 s each on Device 1 (see `Resident._prepare_inputs`).
 * **One WebSocket** (`/ws`) carries everything: the server pushes the state on every change and the panes' JPEGs for every new frame, and the page sends inputs and probes. The HTTP routes (`/api/state`, `/api/action`, …) remain for scripts.
 * **Speed** on an RTX 5090 with a 16 spp pass: the page showed about 11.5 frames per second while accumulating, up from 6.3 when the page requested one pass at a time. The render server's main thread spends about 40–55 ms per view (camera update 15–30 ms, freeze replay ~23 ms) next to ~40 ms of GPU work, so views overlap only partly (88 → 72 ms per view with 1 → 3 requests in flight). S0 error against the dataset frame fell from 16.2% (1 pass) to 6.2% (8 passes) and 2.9% (64 passes), the same as one render of the same spp.
@@ -135,6 +164,64 @@ python tools/replay_episode.py --pack packs/opticalnav-v0.2 --server http://127.
 * **Graph.** The support graph (`scenes/<scene>/navigation_support_graph.json`, copied into the pack by `build_pack.py`) is a state machine of support pose × 24 headings. Its transitions are `turn_left` / `turn_right` (15°) and `move_forward` (0.25 m along collision-checked lanes). Every generated step is one of those transitions (checked: 0 invalid in 20 episodes), and the episode, timestep and extras fields match the dataset's.
 * **Routes.** A start state and a goal state are drawn under `--seed` with lane distance in `[--min-m, --max-m]`, then joined by the fewest-action route. `--goal-heading arrive` stops on arrival instead of turning to a drawn heading. robomituba chooses routes differently (blueprint routes, `global_room_length_balance_v1`; 76 of 80 dataset episodes checked were 1–60% longer than the fewest-action route). Its blueprint fields (`blueprint_id`, `pair_signature`, ...) are absent, and `metadata.episode_selection_policy` is `opticalnav_sim_fewest_actions_v1`.
 * **Speed.** 20 episodes (43–260 steps) took 0.4 s; rendering one 216-frame episode at 64 spp took 87 s on an RTX 5090.
+
+## Viewer tools and render options
+
+Most of these are per-view settings: the API takes them in a view, `MatterSim` has a setter for each, and the viewer has a control. Changing one reloads nothing. Settings marked *records once* make a new dr.freeze recording the first time they are used (a few seconds); every other change only writes values into the resident scene.
+
+**Camera rig editor** (카메라 리그 tab, `setCameraOffset`, `setFlashOffset`). A three.js view of the observer (a disc and arrow on the floor), the camera and its frustum, and the flash rectangle. Wireframes mark the dataset positions. The axes follow Blender: X right, Y forward, Z up.
+
+* Click to select the camera or the flash, then drag a gizmo arrow.
+* `G` grabs the selection: it follows the mouse, `X`/`Y`/`Z` lock an axis, and typed digits move it that many metres. Click or Enter confirms; right click or Esc cancels.
+* `Alt+G` puts the selection back. `1`/`3`/`7` show the rig from the front, the right and the top.
+
+Offsets are `[right, up, forward]` in the observer's level frame, so a pitched camera moves the same way. Raising the camera tilts the view down, as the dataset rig does. The flash moves with the camera and keeps facing its view. The render follows the drag.
+
+[![Rig editor: grabbing the flash along X, then up along Z; the DoLP pane changes with it](docs/media/rig_editor.gif)](docs/media/rig_editor.mp4)
+
+<img src="docs/media/tab_rig.png" alt="Camera rig tab" width="300"> <img src="docs/media/tab_scene.png" alt="Scene info tab" width="300">
+
+**Scene info tab.** Shows what the resident scene holds: shapes and meshes, triangles and vertices, distinct BSDFs and image textures, lights by group, and the lamp parts that glow. It also shows the emitter sampling weights, the mirror pool, the freeze recordings and the GPU memory, which under WSL is the whole device. It refreshes every 5 s from `GET /v1/scans/<scan>/stats`.
+
+**Room plans.** When a scene has a `room_map.json` (robomituba `tools/infinigen/export_room_map.py`, schema `robomituba.room_map.v1`), the map draws its rooms under the graph: one colour per room type, the room's name, ■ for a door and ○ for an open passage. The viewer reads the file from the pack, else from the project the pack was built from.
+
+**Lamps glow from the lamp.** robomituba's importer turns each Infinigen lamp light into a flat 0.6 × 0.08 × 0.6 m box at a desk or floor lamp's top, or into a 0.6 m square under a ceiling light. The server now moves each light's power (radiance × emitting area) onto the lamp's own glowing part when it loads the scene:
+
+* desk and floor lamps: the shade;
+* ceiling lights: every non-metal part.
+
+The lit parts stay in the scene's lights (group `fixture`, same light class), so lighting modes darken them rather than removing them. `OPTICALNAV_BOX_LIGHTS=1` keeps the boxes. Lamps left dark ("꺼진 램프", `setLamps`) glow the same way, at the power of the scene's own lamp lights.
+
+![Lamps: the importer's boxes before, glowing shades now](docs/media/lamps_before_after.jpg)
+
+**Emitter sampling by power.** Next-event estimation picks an area emitter in proportion to its power, not uniformly (Mitsuba's default). Weights average 1, so the environment keeps its share. This is unbiased and cut grain by about 10% in a 33-light apartment. `OPTICALNAV_UNIFORM_EMITTERS=1` turns it off.
+
+**Near-infrared reflectance range** (NIR 반사율, `setNirRange`, view `nir_range`). robomituba's pseudo-NIR albedo `dot(max(c, 1 − c), luma)` lies between 0.5 (mid grey) and 1 (black or white), so every surface reflects at least half the near-infrared. That keeps paths alive and makes NIR noisier than RGB. `rgb2nir` now maps the value linearly onto `[low, high]`, set through two shared uniforms at render time with no recording. 0.5–1.0, the default, is the dataset's formula. At 0.1–0.5 NIR grain fell 43% and outliers 26% (64 spp).
+
+![NIR reflectance range 0.5–1.0 (dataset) and 0.1–0.5, same view and exposure](docs/media/nir_range.jpg)
+
+**Split active pass** (split switch, `setActiveSplit`, view `active_split`; *records once*). With the camera light on, the passive and flash passes render on one path. This is `path_nocaustics` `assist_mode=split`: the scene's lights as the passive pass sees them, plus the flash's own emitter sample at each bounce (never caustics). The image is the same as two paths: at 1024 spp the means agreed within 0.1% in RGB and NIR on `20263004` and `sim_apt_22572521_vanilla_r2`. GPU time per 16 spp frame fell from 143 to 101 ms and from 127 to 84 ms. It is on by default.
+
+**Diagnostics** (*records once*).
+
+* **경로 깊이** (`setMaxDepth`) caps every path. 1 shows emitters only, 2 adds direct light, and each step above adds one indirect bounce. Use it to find the bounce where noise or outliers start: mirrors need 3 or more.
+* **caustic off** (`setCaustics(False)`) makes the lights' passes drop caustics, as the flash pass always does. It removes the outliers of diffuse → mirror, glass or glossy → light paths, and with them that light, including sky light through glass windows.
+
+**Base-only scenes.** A scene packed with only its `base` variant gets `perturbed` (its mirror pool at robomituba density 1, from `tools/build_perturbation_pool.py`) and `active_polar` (the dataset's flash: 0.12 × 0.08 m, 0.2 m behind the camera, polarized, two-pass) on the same resident scene. Their scene meta marks them as `variants_synthetic`. A scene with dataset mirrors but no flash gets only the flash.
+
+**Several packs, compacted at start.** `--pack` can be repeated, for the render server and the viewer. A scene name that appears in two packs is served from the first. Scene meta carries `scene_dir`, so a viewer on the same machine finds every scene's tone frames and room plan. At start the server compacts each scene that still needs it (`tools/compact_assets.py --if-needed`, one child process per scene) before serving it. `compact_assets` locks a scene (`<scene>/.compact.lock`), so a scene another process is compacting is skipped. `--no-compact` serves scenes as they are, and `--compact-skip SCAN` leaves out one.
+
+**What did not speed rendering up** (`infinigen_apartment_natural_v1_20268504`, 16 spp RGB + NIR with the split active pass, measured with nothing else on the GPU):
+
+| change | triangles | distinct BSDFs | GPU per frame | GPU memory (rendering) | image |
+|---|---|---|---|---|---|
+| dataset scene | 12.17 M | 215 | 97 ms | 7.4 GB | — |
+| heavy meshes decimated (`tools/decimate_meshes.py`, 71 units ≥ 50k triangles to 10%) | 3.48 M | 215 | 88–90 ms | 3.9 GB | mean +0.08%, sofa folds smoother |
+| materials folded into atlases (`tools/atlas_materials.py`) | 12.17 M | 47 | 100 ms | 11.9–13.3 GB | mean within 0.02% |
+
+* **Triangles.** OptiX ray traversal grows roughly with the logarithm of the triangle count, so cutting triangles by 72% saved 9% of the frame. It still halves the GPU memory.
+* **Materials.** Folding them saved per-render tracing and code generation (Mitsuba 3.7), which dr.freeze replay no longer pays. It cost 4–5 GB for the float atlas pages and doubled the load time.
+* **Textures.** Mitsuba keeps bitmaps as float32 RGB on the GPU, so a 4096² map costs about 200 MB. On `sim_apt_22572521_vanilla_r2` (41 structure maps, 623 others) GPU memory while rendering was 14.2 GB with 4096 structure maps and 128 px for the rest. With 2048 and 512 it was 9.3 GB, with no change in frame time (78–79 ms).
 
 ## Environment setup
 
