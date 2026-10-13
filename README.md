@@ -503,6 +503,31 @@ On the render server (Mitsuba 3.9.1, `cuda_rgbn_polarized`, active_polar, 4 spp 
 
 Loading from a network share costs far more than any of this: 116 s instead of 3.1 s on the `/jarvis` CIFS mount. Keep packs the server loads on a local disk.
 
+**Decimating a built scene.** robomituba reduces meshes at import (Blender, before the texture bake). Scenes built without that can be reduced afterwards with `tools/decimate_meshes.py`, after compaction. It needs `pip install pymeshlab xatlas`.
+
+```bash
+python tools/decimate_meshes.py --pack packs/opticalnav-v0.2 --scene SCENE [--ratio R] [--dry-run] [--keep-unused]
+```
+
+* **Policy.** robomituba's `ir_semantic_lod_v1` ladder:
+  * Meshes under 50k triangles are kept.
+  * Larger meshes keep at most 30% of their triangles, 10% from 250k, 3% from 1M and 1% from 5M.
+  * Glass, mirror and metal shapes keep at least 60%; emitters are left alone.
+* **How a mesh is reduced** depends on how its material reads the UVs:
+  * Continuous UV atlas: texture-aware quadric collapse, so the existing textures still fit.
+  * One UV island per triangle: Infinigen bakes some objects that way. The welded geometry is collapsed, xatlas lays out a new atlas, and each texture is baked again from the closest point of the original surface. The normal map is dropped.
+  * No texture: only the geometry is reduced.
+* **Checks.** Each mesh is measured against its source: surface distance under 1% of its size, and UV shift under 2 texels. A mesh over the limits is retried at twice the fraction, then kept.
+* **Records.** `scene.json` records every mesh under `mesh_decimation`.
+
+On `infinigen_apartment_natural_v1_20268504`:
+
+* 76 of 77 meshes over 50k triangles were reduced: 34 kept their atlas, 25 were re-baked and 17 had no texture.
+* Triangles went from 9.0 M to 2.8 M, and the scene folder from 949 MB to 384 MB.
+* Renders match within Monte Carlo noise.
+
+The geometry no longer matches the dataset's reference frames exactly.
+
 ### Sharing packs
 
 A pack is too large for git (71 GB, 60,740 files, mostly text OBJ meshes), so the code travels through GitHub and the scenes through a shared folder, one compressed archive per scene.

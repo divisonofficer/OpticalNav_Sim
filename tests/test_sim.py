@@ -518,6 +518,39 @@ def test_compact_assets_rewrites_textures_and_obj_shapes():
     assert rewrite(out, {"assets/tex_1.png": "assets/tex_1.png"}, {}) == out  # a second run changes nothing
 
 
+def test_decimation_policy_and_crease_normals():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import decimate_meshes as dm
+
+    assert dm.ladder(100_000) == 0.30 and dm.ladder(300_000) == 0.10 and dm.ladder(2_000_000) == 0.03
+    assert dm.ladder(5_000) == 0.30 and dm.ladder(10_000) == 0.30 and math.isclose(dm.ladder(7_000_000), 0.01)
+    text = ('\n  <shape type="ply" id="cup">\n    <string name="filename" value="assets/a.ply" />'
+            '<bsdf type="pplastic"/>\n  </shape>'
+            '\n  <shape type="ply" id="glass">\n    <string name="filename" value="assets/b.ply" />'
+            '<bsdf type="dielectric"/>\n  </shape>'
+            '\n  <shape type="ply" id="lamp">\n    <string name="filename" value="assets/b.ply" />'
+            '<emitter type="area"/>\n  </shape>')
+    assert dm.shape_roles(text) == {"assets/a.ply": "plain", "assets/b.ply": "emitter"}  # most protected wins
+    # a 90-degree edge stays sharp, a shallow fold is smoothed across
+    square = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], float)
+    sharp = dm.crease_normals(np.vstack([square, [[1, 0, 1]]]), np.array([[0, 1, 2], [1, 4, 0]]))
+    assert np.allclose(sharp[:3], [0, 0, 1]) and np.allclose(sharp[3:], [0, -1, 0])
+    fold = dm.crease_normals(square + [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0.2]], np.array([[0, 1, 2], [1, 3, 2]]))
+    assert np.allclose(fold[1], fold[3]) and fold[1][2] < 1.0 and np.allclose(fold[0], [0, 0, 1])
+    # a re-baked shape names its new mesh and textures and loses its normal map; other shapes are untouched
+    body = ('\n    <string name="filename" value="assets/m.ply" />\n    <bsdf type="twosided"><bsdf type="normalmap">'
+            '<texture name="normalmap" type="bitmap"><string name="filename" value="assets/n.png" /></texture>'
+            '<bsdf type="pplastic"><texture name="diffuse_reflectance" type="bitmap">'
+            '<string name="filename" value="assets/c.png" /></texture></bsdf></bsdf></bsdf>')
+    assert dm.material(body) == (("assets/c.png",), True)
+    row = {"ref": "assets/m.ply", "kind": "rebaked", "textures": {"assets/c.png": "assets/tex_new.png"}}
+    out = dm.rewrite_shape(body, "assets/mesh_new.ply", row)
+    assert 'value="assets/mesh_new.ply"' in out and 'value="assets/tex_new.png"' in out
+    assert "normalmap" not in out and '<bsdf type="twosided"><bsdf type="pplastic">' in out
+    kept = dm.rewrite_shape(body, "assets/mesh_new.ply", {**row, "kind": "atlas_kept", "textures": {}})
+    assert "normalmap" in kept and 'value="assets/c.png"' in kept
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
