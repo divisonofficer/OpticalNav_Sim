@@ -81,6 +81,14 @@ MAX_SPP = 8192
 MAX_VIEWS = 64
 MAX_BODY = 1 << 20
 MAX_DENOISE_BODY = 256 << 20  # a few 2048x2048 float32 Stokes images
+# POST /v1/render with "format": "raw" answers with this: 8 bytes little-endian header length, a JSON header
+# [[name, numpy dtype str, shape, offset, nbytes], ...], then the arrays' bytes at those offsets
+# path_nocaustics' specular_pdf_threshold (sr^-1) for the flash pass: a bounce whose BSDF pdf exceeds it counts as
+# near-specular, and light reaching the flash through one after a rough bounce is left out (no caustics). 20 (its
+# default, GGX alpha below ~0.06) is the dataset's; lower values also leave out glossy surfaces (alpha up to ~0.2
+# at 2), whose diffuse -> glossy -> small flash paths were the bright outliers left with the flash on.
+FLASH_PDF = 20.0
+RAW_ARRAYS_TYPE = "application/x-opticalnav-arrays"
 # polar: cuda_rgbn_polarized first (R, G, B and near-infrared lanes in one path, each with its own Mueller
 # matrix: both bands in one render); --variant cuda_rgb_polarized keeps the dual-sensor render instead
 MODE_VARIANTS = {"polar": ("cuda_rgbn_polarized", "cuda_rgb_polarized", "cuda_ad_rgb_polarized"),
@@ -139,6 +147,68 @@ def extra_shapes(host: str, variant: str) -> tuple[str, ...] | None:
     return tuple(ids)
 
 
+def upgrade_flash_text(text: str, polarizer_angle_deg: float) -> tuple[str, bool]:
+    """An old one-pass active scene (rgb_stokes_12_active_polar_compact_flash_v2) with the flash of the current
+    protocol (active_polar_flash_nocaustics_v1): the flash rectangle's ``area`` emitter becomes ``polarized_area``
+    (linearly polarized at ``polarizer_angle_deg``, radiance = S0), and the ``polarizer`` rectangle goes. That
+    rectangle sat 1 cm behind the light, on the side it never emits, so the old flash was unpolarized (DoLP of
+    its reflection in a mirror ~0, PC_OPTICALNAV_RENDER). Rendered as two passes (a flash pass without caustics),
+    the light's fireflies drop as in the current protocol (4236 -> 29 on its worst view). Returns (text, changed)."""
+    light = re.search(rf'\n  <shape type="[a-z_]+" id="{ASSIST_PREFIX}_light">.*?\n  </shape>', text, re.S)
+    if light is None or '<emitter type="area">' not in light.group(0):
+        return text, False
+    shape = light.group(0).replace('<emitter type="area">', f'<emitter type="polarized_area">\n      '
+                                   f'<float name="theta" value="{float(polarizer_angle_deg):.4f}" />', 1)
+    text = text[:light.start()] + shape + text[light.end():]
+    text = re.sub(rf'\n  <shape type="[a-z_]+" id="{ASSIST_PREFIX}_polarizer">.*?\n  </shape>', "", text, flags=re.S)
+    return text, True
+
+
+# the dataset's camera flash (active_polar_flash_nocaustics_v1): what a scene packed without an active variant gets
+SYNTHETIC_FLASH = {"distance_m": 0.2, "size_world": [0.12, 0.08], "radiance": 2500.0, "emitter": "polarized_area",
+                   "polarizer_angle_deg": 0.0, "synthetic": True}
+SYNTHETIC_POOL_SHARE = (1.0, 0, False)  # a synthetic perturbed variant's mirrors: robomituba's density 1, no glass
+
+
+def synthesize_variants(meta: dict, has_pool: bool, has_nocaustics: bool) -> list[str]:
+    """Give a scene packed with its base variant alone the variants the viewer switches among, on the same scene
+    file (so on the same resident scene): "perturbed" shows its perturbation pool's share at density 1
+    (needs tools/build_perturbation_pool.py), "active_polar" adds the dataset's camera flash (SYNTHETIC_FLASH,
+    two passes: needs path_nocaustics) on top of that. Marked ``"synthetic"``; returns the names added."""
+    variants = meta.get("variants") or {}
+    base = variants.get("base")
+    if base is None:
+        return []
+    added = []
+    if "perturbed" not in variants and has_pool:
+        variants["perturbed"] = {"xml": base["xml"], "synthetic": "perturbation pool",
+                                 "pool_share": list(SYNTHETIC_POOL_SHARE)}
+        added.append("perturbed")
+    if not any(v.get("flash") for v in variants.values()) and has_nocaustics and "active_polar" not in variants:
+        lit = variants.get("perturbed", base)  # the active variant is the perturbed one plus the flash
+        variants["active_polar"] = {"xml": lit["xml"], "synthetic": "camera flash", "flash": dict(SYNTHETIC_FLASH),
+                                    "protocol": "active_polar_flash_nocaustics_v1", "passes": 2,
+                                    "pool_share": lit.get("pool_share")}
+        added.append("active_polar")
+    if added:
+        meta["variants_synthetic"] = added
+    return added
+
+
+def flash_scene_text(text: str, flash: dict) -> str:
+    """``text`` with the camera flash rectangle (as an active_polar_flash.xml carries it, placed by every frame)
+    before ``</scene>``; the passive pass's emitter sampling barely picks it, as in lit_scene_text."""
+    half = [float(v) * 0.5 for v in flash["size_world"]]
+    r = float(flash["radiance"])
+    shape = (f'\n  <shape type="rectangle" id="{ASSIST_PREFIX}_light">\n    <transform name="to_world">\n      <matrix value="'
+             f'{half[0]} 0 0 0 0 {half[1]} 0 0 0 0 -1 {float(flash["distance_m"])} 0 0 0 1" />\n    </transform>\n'
+             f'    <bsdf type="null" />\n    <emitter type="{flash.get("emitter") or "polarized_area"}">'
+             f'<float name="sampling_weight" value="0.001" />\n      <rgb name="radiance" value="{r},{r},{r}" />\n'
+             f'      <float name="theta" value="{float(flash.get("polarizer_angle_deg") or 0.0):.4f}" />\n    </emitter>\n  </shape>')
+    end = text.rindex("</scene>")
+    return text[:end] + shape + "\n" + text[end:]
+
+
 def lit_scene_text(xml: Path, flash_xml: Path) -> str:
     """Passive scene plus the camera-assist flash of its flash-only scene, so one resident scene renders
     both passes of a two-pass active variant. The flash is sampled directly by the flash pass, so the
@@ -165,7 +235,8 @@ def nir_scene_text(text: str) -> str:
     the loaded scene renders the visible or the pseudo near-infrared band (robomituba's pseudo_nir_albedo,
     computed per lookup: no second set of textures)."""
     slots = "|".join(NIR_SLOTS)
-    band = f'<ref name="band" id="{NIR_BAND_ID}" />'
+    # the shared switch, and the shared range the pseudo near-infrared reflectance is mapped onto (Look.nir_range)
+    band = f'<ref name="band" id="{NIR_BAND_ID}" /><ref name="low" id="nir_low" /><ref name="high" id="nir_high" />'
     text = re.sub(rf'<texture name="({slots})" type="([a-z_]+)">(.*?)</texture>',
                   lambda m: (f'<texture name="{m.group(1)}" type="rgb2nir"><texture name="nested" type="{m.group(2)}">'
                              f'{m.group(3)}</texture>{band}</texture>'), text, flags=re.S)
@@ -179,10 +250,12 @@ def nir_scene_text(text: str) -> str:
 
 
 LIGHTING = {"none": (), "fixtures": ("fixture",), "all": ("fixture", "fill")}  # light groups kept per mode
+LIGHT_GROUPS = ("fixture", "fill", "lamp")  # lamp: lights added to lamps the scene left dark (lamp_lights_text)
 
 
 BAND_UNIFORMS = ("light_rgb_fixture", "light_rgb_fill", "light_nir_fixture_led", "light_nir_fixture_incandescent",
-                 "light_nir_fill_led", "light_nir_fill_incandescent", "flash_rgb", "flash_nir", "nir_band")
+                 "light_nir_fill_led", "light_nir_fill_incandescent", "flash_rgb", "flash_nir", "nir_band",
+                 "light_rgb_lamp", "light_nir_lamp_led", "light_nir_lamp_incandescent", "nir_low", "nir_high")
 
 
 def uniform_tag(name: str) -> float:
@@ -296,6 +369,191 @@ def lights_as_meshes(text: str, ids) -> str:
     return text
 
 
+_LAMP = re.compile(r"^(\w*(?:Lamp|CeilingLight|Sconce|Chandelier)\w*)Factory")
+_SPAWN = re.compile(r"_(\d+)_\.spawn_asset_(\d+)$")
+
+
+def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, list[str]]:
+    """Lamps glow from their own parts instead of from boxes. Infinigen spawns a light (``PointLampFactory``) with
+    only some of its lamps; robomituba's importer turns those into a flat emitter cube (0.6 x 0.6 x 0.08 m) at a
+    desk or floor lamp's top and a 0.6 m square under a ceiling light, and the other lamps stay dark. A lamp is
+    lit when a light shares its factory seed and spawn id (``DeskLampFactory_<seed>_.spawn_asset_<n>`` and
+    ``light_.._PointLampFactory_<seed>_.spawn_asset_<n>``).
+
+    * A lit lamp (``lit``): its light's power (radiance x emitting area) moves to the lamp's glowing part and the
+      box goes: a desk or floor lamp's shade, every non-metal part of a ceiling light or chandelier. Labelled
+      ``light:fixture:<lamp>``, so it stays in the scene's own lights (group "fixture", lighting modes) with the
+      box's class. The boxes stuck out of the shades as glowing slabs and turned every lamp into a square.
+    * A dark lamp: its shade gets an area emitter at the power of the scene's lamp lights of the same kind (desk,
+      floor, ...; else their mean), group ``lamp`` (dark unless a view asks for it).
+
+    A shade is, of the lamp's parts that are not metal, the one whose bottom is highest (the shade sits on the
+    stand). A light hidden inside the shade, as first tried, reached the room only through paths that bounced
+    into the shade and hit it by chance: fireflies over every wall (464 vs 49 bright outliers in a 256 spp view).
+    A glowing part is sampled directly from everywhere. ``mesh_info(shape_type, filename)`` gives a part's
+    (surface area, lowest y in its own frame): both sides of a shell emit. Without it, only a dark lamp with one
+    non-metal part is lit (a cylinder from the lamp's recorded size standing in for its area) and lit lamps keep
+    their boxes. Returns (text, the ids of the parts that now emit)."""
+    raw: dict[str, str] = {}  # note id -> the note as written, to drop a replaced box's note
+    notes = []
+    for note in re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", text):
+        try:
+            obj = json.loads(note)
+        except ValueError:
+            continue
+        notes.append(obj)
+        if obj.get("id"):
+            raw[obj["id"]] = note
+    shapes = {m.group(2): m for m in re.finditer(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>', text, re.S)}
+    lights = {_SPAWN.search(o["id"]).groups(): o for o in notes
+              if o.get("is_emitter") and o.get("id") and _SPAWN.search(o["id"])}
+    lamps = [o for o in notes if not o.get("is_emitter") and _LAMP.match(str(o.get("label", "")))
+             and o.get("id") and _SPAWN.search(o["id"])]
+
+    def light_power(light: dict) -> float | None:
+        """Emitted power / pi of an importer's light box: radiance x its emitting area."""
+        if not light.get("emitter_radiance"):
+            return None
+        sx, sy, sz = (float(v) for v in (light.get("geometry") or {}).get("size_m") or [0.6, 0.08, 0.6])
+        rad = float(np.mean(light["emitter_radiance"])) * float(light.get("emitter_intensity") or 1.0)
+        kind = shapes[light["id"]].group(1) if light["id"] in shapes else "cube"
+        return rad * (sx * sz if kind in ("rectangle", "disk") else 2 * (sx * sz + sx * sy + sy * sz))
+
+    power: dict[str, list[float]] = {}
+    for o in lamps:  # the scene's own lamp lights, per kind
+        light = lights.get(_SPAWN.search(o["id"]).groups())
+        if light is not None and light_power(light) is not None:
+            power.setdefault(_LAMP.match(o["label"]).group(1), []).append(light_power(light))
+    every = [p for ps in power.values() for p in ps]
+    default = float(np.mean(every)) if every else 2.0 * 0.912
+    edits, added, xml, gone = [], [], [], []
+    for o in lamps:
+        kind = _LAMP.match(o["label"]).group(1)
+        light = lights.get(_SPAWN.search(o["id"]).groups())
+        if light is not None and not (lit and mesh_info is not None and light["id"] in shapes):
+            continue
+        ceiling = "Ceiling" in kind or "Chandelier" in kind
+        parts = [m for sid, m in shapes.items() if sid == o["id"] or sid.startswith(o["id"] + "__part_")]
+        shades = [m for m in parts if "conductor" not in m.group(3) and "<emitter" not in m.group(3)]
+        info = {}
+        for m in shades:
+            found = re.search(r'<string name="filename" value="([^"]+)"', m.group(3))
+            if mesh_info is not None and found:
+                with contextlib.suppress(Exception):
+                    info[m.group(2)] = tuple(float(v) for v in mesh_info(m.group(1), found.group(1)))
+        height = float(((o.get("geometry") or {}).get("size_m") or [0, 0.5, 0])[1])
+        if light is not None and ceiling:  # a ceiling light's fixture glows whole
+            shades = [m for m in shades if m.group(2) in info]
+        elif len(shades) > 1 or light is not None:  # the shade: the highest bottom, a quarter of the lamp up at least
+            shades = sorted((m for m in shades if m.group(2) in info and info[m.group(2)][1] > 0.25 * height),
+                            key=lambda m: info[m.group(2)][1])[-1:]
+        if not shades or (light is None and len(shades) != 1):  # no telling which part glows: as it was
+            continue
+        area = sum(info.get(m.group(2), (0.0, 0.0))[0] for m in shades)
+        if not area:  # a cylinder of the lamp's width, a third of its height, both sides
+            g = o.get("geometry") or {}
+            sx, sy, sz = (float(v) for v in g.get("size_m") or [0.2, 0.5, 0.2])
+            area = 2 * math.pi * 0.5 * min(sx, sz) * sy / 3 * 2
+        own = light_power(light) if light is not None else None
+        rad = (own if own is not None else float(np.mean(power.get(kind) or [default]))) / max(area, 1e-4)
+        for shade in shades:
+            sid = shade.group(2)
+            edits.append((shade.end(3), f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
+                                        f'\n    </emitter>'))
+            note = {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+                    "emitter_intensity": 1.0, "emitter_shape": "lamp_part" if ceiling else "lamp_shade",
+                    "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
+                    "metadata": {"lamp": o["id"], "glowing_area_m2": round(area, 4), "replaces": (light or {}).get("id"),
+                                 "added_by": "opticalnav_sim lamp_lights_text"},
+                    "geometry": o.get("geometry")}
+            xml.append(f'\n  <!--opticalnav-obj:{json.dumps(note)}-->')
+            added.append(sid)
+        if light is not None:
+            gone.append(light["id"])
+    for at, emitter in sorted(edits, reverse=True):  # from the end, so earlier offsets hold
+        text = text[:at] + emitter + text[at:]
+    for lid in gone:  # the replaced boxes, and their notes (light_groups / light_classes read the notes)
+        text = re.sub(rf'\n  <shape type="[a-z_]+" id="{re.escape(lid)}">.*?\n  </shape>', "", text, count=1, flags=re.S)
+        text = text.replace(f"<!--opticalnav-obj:{raw[lid]}-->", "", 1)
+    if xml:
+        end = text.rindex("</scene>")
+        text = text[:end] + "".join(xml) + "\n" + text[end:]
+    return text, added
+
+
+def scene_stats(mi, scene, text: str) -> dict:
+    """What a loaded scene holds, for the viewer's scene tab: shapes, meshes, triangles, distinct BSDFs, image
+    textures, emitters, and the scene text's size."""
+    import drjit as dr
+
+    shapes = scene.shapes()
+    meshes = [sh for sh in shapes if sh.is_mesh()]
+    try:
+        bsdfs = len(np.unique(np.array(dr.reinterpret_array(mi.UInt32, scene.shapes_dr().bsdf()))))
+    except Exception:  # noqa: BLE001 - a scalar variant has no pointer arrays
+        bsdfs = None
+    return {"shapes": len(shapes), "meshes": len(meshes), "triangles": int(sum(m.face_count() for m in meshes)),
+            "vertices": int(sum(m.vertex_count() for m in meshes)), "bsdfs": bsdfs,
+            "textures": len(set(re.findall(r'<texture\b[^>]*\btype="bitmap"[^>]*>\s*<string name="filename" value="([^"]+)"',
+                                           text))),
+            "emitters": len(scene.emitters()), "text_mb": round(len(text) / 1e6, 2)}
+
+
+def gpu_memory() -> list[dict]:
+    """Every GPU's memory in use (MB; all processes: WSL's nvidia-smi lists no per-process use)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.strip().splitlines():
+        index, name, used, total = (v.strip() for v in line.split(","))
+        rows.append({"index": int(index), "name": name, "used_mb": int(used), "total_mb": int(total)})
+    return rows
+
+
+def emitter_radiance(text: str) -> dict[str, float]:
+    """Shape id -> mean radiance of its area emitter, as the scene file gives it."""
+    out = {}
+    for m in re.finditer(r'<shape type="[a-z_]+" id="([^"]+)">(.*?)</shape>', text, re.S):
+        e = re.search(r'<emitter type="[a-z_]+">(.*?)</emitter>', m.group(2), re.S)
+        r = re.search(r'name="radiance" value="([^"]+)"', e.group(1)) if e else None
+        if r:
+            with contextlib.suppress(ValueError):
+                out[m.group(1)] = float(np.mean([float(v) for v in re.split(r"[ ,]+", r.group(1).strip())]))
+    return out
+
+
+def emitter_power_weights(mi, scene, radiance: dict[str, float]) -> dict[str, float]:
+    """Pick the area emitters for next-event estimation in proportion to their power (radiance x area) instead of
+    uniformly (Mitsuba's default, every ``sampling_weight`` 1): with 20-30 lights through an apartment, most
+    light samples went to dim or distant ones and the rare one that met a bright lamp nearby was a speck. Unbiased
+    (the pdf follows the weights). Weights average 1, so the environment (weight 1) keeps its share; a weight is
+    at least 5% of the mean (no light starves); an emitter set otherwise (the flash: 0.001) keeps its own. Set
+    once before any freeze recording. Returns parameter key -> weight."""
+    import drjit as dr
+
+    params = mi.traverse(scene)
+    power = {}
+    for shape in scene.shapes():
+        if shape.emitter() is None or shape.id() not in radiance:
+            continue
+        key = f"{shape.id()}.emitter.sampling_weight"
+        if key in params and float(params[key]) == 1.0:
+            power[key] = radiance[shape.id()] * float(dr.ravel(shape.surface_area())[0])
+    if len(power) < 2:
+        return {}
+    mean = float(np.mean(list(power.values())))
+    weights = {k: max(p, 0.05 * mean) / mean for k, p in power.items()}
+    for k, w in weights.items():
+        params[k] = w
+    params.update()
+    return weights
+
+
 def light_groups(text: str) -> dict[str, str]:
     """Shape id -> 'fixture' (Infinigen's own lights, converted to emitter cubes or ceiling panels at their
     lamp and ceiling-light meshes) or 'fill' (room softboxes robomituba's importer synthesizes to light rooms
@@ -308,6 +566,9 @@ def light_groups(text: str) -> dict[str, str]:
             continue
         if obj.get("is_emitter"):
             meta = obj.get("metadata") or {}
+            if str(obj.get("label", "")).startswith("light:lamp:"):  # added to a dark lamp (lamp_lights_text)
+                out[obj["id"]] = "lamp"
+                continue
             fill = str(obj.get("label", "")).startswith("light:softbox") or meta.get("softbox_proxy") or meta.get("synthesized")
             out[obj["id"]] = "fill" if fill else "fixture"
     return out
@@ -324,7 +585,10 @@ def light_classes(text: str) -> dict[str, str]:
         except ValueError:
             continue
         if obj.get("is_emitter"):
-            bulb = str(obj.get("label", "")).startswith("light:PointLampFactory") and not obj.get("emitter_shape")
+            label = str(obj.get("label", ""))
+            bulb = label.startswith("light:PointLampFactory") and not obj.get("emitter_shape")
+            if label.startswith(("light:lamp:", "light:fixture:")):  # a lamp's glowing part: a bulb, unless a ceiling lamp
+                bulb = "Ceiling" not in label and "Chandelier" not in label
             out[obj["id"]] = "incandescent" if bulb else "led"
     return out
 
@@ -361,6 +625,13 @@ class Look:
     flash_rgb: bool = True           # the camera flash emits in the visible band
     flash_nir: bool = False          # ... and in the near-infrared band
     groups: tuple = ("fixture", "fill")  # light groups on (lighting mode); the others are dark and removed
+    flash_scale: float = 1.0         # the flash's side x this, its radiance / this^2: the same power (fewer fireflies)
+    flash_pdf: float = 20.0          # the flash pass's near-specular cut (path_nocaustics specular_pdf_threshold)
+    max_depth: int = 0               # path length cap of every pass (Mitsuba's max_depth); 0: the scene's own
+    caustics: bool = True            # the lights' passes keep caustics (light reaching an emitter past a near-specular bounce)
+    split: bool = False              # the active pass as one path_nocaustics "split" path, not a passive and a flash path
+    nir_range: tuple = (0.5, 1.0)    # pseudo near-infrared reflectance mapped onto this (rgb2nir low, high): 0.5..1 as is
+    flash_offset: tuple = (0.0, 0.0, 0.0)  # the flash moved this far (m): right, up, forward of the level view
 
     def light_level(self, light_class: str) -> float:
         """Indoor emitter radiance factor for a light class in this band (scenes without bandscale lights)."""
@@ -374,12 +645,14 @@ class Look:
     def uniforms(self) -> dict[str, float]:
         """Values of the shared per-band light levels (band_lights_text)."""
         nir, out = dict(self.nir), {}
-        for g in ("fixture", "fill"):
+        for g in LIGHT_GROUPS:
             on = self.lights if g in self.groups else 0.0
             out[f"light_rgb_{g}"] = on
             for c in ("led", "incandescent"):
                 out[f"light_nir_{g}_{c}"] = on * nir.get(c, 0.0)
-        out.update(flash_rgb=float(self.flash_rgb), flash_nir=float(self.flash_nir), nir_band=float(self.band == 1))
+        power = 1.0 / (self.flash_scale * self.flash_scale)  # a larger flash at the same power
+        out.update(flash_rgb=float(self.flash_rgb) * power, flash_nir=float(self.flash_nir) * power,
+                   nir_band=float(self.band == 1), nir_low=float(self.nir_range[0]), nir_high=float(self.nir_range[1]))
         return out
 
 
@@ -470,9 +743,14 @@ def shape_vertices(mi, text: str, shape_id: str) -> np.ndarray:
     found = re.search(rf'\n  <shape type="([a-z_]+)" id="{re.escape(shape_id)}">(.*?)\n  </shape>', text, re.S)
     if found is None:
         raise RuntimeError(f"shape {shape_id!r} not found in the scene file")
-    # geometry only: materials, emitters and references to other objects stay out of a shape loaded alone
-    body = re.sub(r'<ref\b[^>]*/>|<bsdf\b.*?</bsdf>|<bsdf\b[^>]*/>|<emitter\b.*?</emitter>', "", found.group(2),
-                  flags=re.S)
+    # geometry only: materials, emitters and references to other objects stay out of a shape loaded alone.
+    # BSDFs nest (twosided > normalmap > pplastic): remove the innermost ones until none is left
+    body = re.sub(r'<ref\b[^>]*/>|<bsdf\b[^>]*/>|<emitter\b.*?</emitter>', "", found.group(2), flags=re.S)
+    while True:
+        stripped = re.sub(r'<bsdf\b(?:(?!<bsdf\b).)*?</bsdf>', "", body, flags=re.S)
+        if stripped == body:
+            break
+        body = stripped
     shape = mi.load_string(f'<shape version="3.0.0" type="{found.group(1)}">{body}<bsdf type="diffuse"/></shape>')
     return np.array(mi.traverse(shape)["vertex_positions"], dtype=np.float32).reshape(-1, 3)
 
@@ -525,16 +803,32 @@ class Resident:
 
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
-                 pool: dict | None = None):
+                 pool: dict | None = None, upgrade_flash: bool = False):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
         started = time.time()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
+        self.upgraded_flash = False  # an old one-pass flash rendered as the current protocol (upgrade_flash_text)
+        if flash is not None and flash.get("synthetic") and flash_xml is None:
+            # a scene packed without an active variant: the dataset's flash added, rendered as the current protocol
+            text, self.upgraded_flash = flash_scene_text(text, flash), True
+        elif upgrade_flash and flash is not None and flash_xml is None:
+            text, self.upgraded_flash = upgrade_flash_text(text, float(flash.get("polarizer_angle_deg") or 0.0))
         if mode == "rgb":
             text = rgb_scene_text(text)
+        base_dir = xml.parent  # dark lamps' shades glow (group "lamp", dark by default)
+
+        def mesh_info(kind: str, filename: str) -> tuple[float, float]:
+            mesh = mi.load_dict({"type": kind, "filename": str(base_dir / filename)})
+            return float(dr.ravel(mesh.surface_area())[0]), float(mesh.bbox().min.y)
+
+        import drjit as dr
+        # OPTICALNAV_BOX_LIGHTS=1: lit lamps keep the importer's boxes (the earlier look, for comparisons)
+        text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"))
+        radiance = emitter_radiance(text)  # before the band transforms wrap them
         self.classes = light_classes(text)  # shape id -> 'led' | 'incandescent'
-        self.groups = light_groups(text)  # shape id -> 'fixture' | 'fill' (lighting modes remove whole groups)
+        self.groups = light_groups(text)  # shape id -> 'fixture' | 'fill' | 'lamp' (lighting modes remove whole groups)
         text = lights_as_meshes(text, self.groups)
         hideable = set(hideable) | {s for s in self.groups if re.search(rf'<shape type="[a-z_]+" id="{re.escape(s)}">', text)}
         # the scene's own perturbation (the dataset's mirrors and glass walls), hidden when a pool is used
@@ -560,11 +854,17 @@ class Resident:
         self.score = progress.scene_score(text)  # sizes the recording-time estimate before any history
         with progress.watch_load(mi, text, self.name):
             self.scene = mi.load_string(text)
+        # OPTICALNAV_UNIFORM_EMITTERS=1: Mitsuba's default, every emitter picked as often (for comparisons)
+        self.emitter_weights = {} if os.environ.get("OPTICALNAV_UNIFORM_EMITTERS") else \
+            emitter_power_weights(mi, self.scene, radiance)
         self.load_s = time.time() - started
+        self.stats = scene_stats(mi, self.scene, text)  # the viewer's scene tab
         self.envs = envs  # name -> environment image at ENV_RES (Renderer.env_image)
         self.depth = {"own": integrator_spec(xml), "passive": integrator_spec(xml)}
         if flash_xml is not None:
             self.depth["flash"] = integrator_spec(flash_xml)
+        elif self.upgraded_flash:  # the flash pass of an upgraded one-pass scene: its own integrator's depth
+            self.depth["flash"] = integrator_spec(xml)
         self.integrators: dict[str, object] = {}
         keys = list(mi.traverse(self.scene).keys())
         self.k_to_world = next(k for k in keys if k.endswith("sensor.to_world"))
@@ -647,7 +947,10 @@ class Resident:
         self._evaluate_transforms(params)
         del params
         counts = {c: list(self.light_class.values()).count(c) for c in sorted(set(self.light_class.values()))}
-        print(f"[resident] {len(self.light_class)} indoor emitters {counts}, environment "
+        lamp_parts = sum(1 for sid in self.lamp_lights if self.groups.get(sid) == "lamp")
+        print(f"[resident] {len(self.light_class)} indoor emitters {counts} ({len(self.lamp_lights) - lamp_parts} lit "
+              f"lamps' parts in place of boxes, {lamp_parts} dark lamps' shades in group 'lamp'), "
+              f"{len(self.emitter_weights)} emitters weighted by power, environment "
               f"{'controllable' if self.env_original is not None else 'fixed'}, "
               f"near-infrared {'on' if self.k_band else 'off'}", flush=True)
         # dr.freeze records the render once per (spp, film size, seed) and replays its kernels, like
@@ -663,33 +966,63 @@ class Resident:
         self.dual_pose: dict[tuple, bytes] = {}
         self.frozen_args: dict[tuple, tuple] = {}  # recording key -> its inputs before the seed
         self.sky_nir = NIR_DEFAULTS["daylight"]
+        self.flash_pdf = FLASH_PDF  # the flash pass's near-specular cut, set per launch from the view's Look
+        self.max_depth = 0  # path length cap of every pass, set per launch (Look.max_depth); 0: the scene's own
+        self.caustics = True  # the passive and own passes keep caustics, set per launch (Look.caustics)
+        self.split = False  # the active pass on one path (Look.split), set per launch
 
     def integrator(self, name: str, sky: float | None = None):
         """path_nocaustics in an assist mode (or, for "own", as plain path: caustics kept, every emitter),
         with ``sky`` (default: daylight's near-infrared share) on the sky seen by a dual render's
         near-infrared slot. Without bandscale lights, "own" is the scene's own integrator (None)."""
-        if name == "own" and not self.band_keys:
+        if name == "own" and not self.band_keys and not self.max_depth and self.caustics:
             return None
         sky = self.sky_nir if sky is None else float(sky)
-        if (name, sky) not in self.integrators:
-            spec = self.depth[name]
+        # the flash's near-specular cut (Look.flash_pdf); split cuts the flash's paths with it too
+        pdf = float(self.flash_pdf) if name in ("flash", "split") else None
+        key = (name, sky, pdf, self.max_depth, self.caustics)
+        if key not in self.integrators:
+            spec = dict(self.depth["passive" if name == "split" else name])
+            if name == "split":  # one path long enough for both passes
+                spec["max_depth"] = max(spec["max_depth"], self.depth["flash"]["max_depth"])
+            if self.max_depth:  # a viewer's diagnostic: 1 emitters seen directly, 2 direct light, 3+ indirect bounces
+                spec["max_depth"] = int(self.max_depth)
             if name == "own":
-                inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "caustics": True}
+                inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "caustics": self.caustics}
+            elif name == "split":  # passive's emitters (caustics as asked) and the flash's own sample (never caustics)
+                inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "assist": ASSIST_PREFIX,
+                         "assist_mode": "split", "caustics": self.caustics}
             else:
                 inner = {"type": "path_nocaustics", "max_depth": spec["max_depth"], "assist": ASSIST_PREFIX,
-                         "assist_mode": "exclude" if name == "passive" else "only", "caustics": name == "passive"}
+                         "assist_mode": "exclude" if name == "passive" else "only",
+                         "caustics": name == "passive" and self.caustics}
             inner["sky_nir"] = sky
+            if pdf is not None:
+                inner["specular_pdf_threshold"] = pdf
             if self.mode != "rgb":
                 inner = {"type": "stokes", "integrator": inner}
                 if spec["reference_axis"] is not None:
                     inner["reference_axis"] = self.mi.ScalarVector3f(*spec["reference_axis"])
-            self.integrators[(name, sky)] = self.mi.load_dict(inner)
-        return self.integrators[(name, sky)]
+            self.integrators[key] = self.mi.load_dict(inner)
+        return self.integrators[key]
+
+    def _key(self, spp: int, width: int, height: int, pass_name: str, dual, sky) -> tuple:
+        """A recording's key: what is baked into it (spp, film size, the integrators and their settings)."""
+        tail = ("dual", sky) if dual is not None else ("rgbn", sky) if self.rgbn else ()
+        if pass_name in ("active", "flash") and self.flash_pdf != FLASH_PDF:
+            tail += ("flash_pdf", float(self.flash_pdf))
+        if self.max_depth:
+            tail += ("max_depth", int(self.max_depth))
+        if not self.caustics and pass_name != "flash":
+            tail += ("no_caustics",)
+        if pass_name == "active" and self.split:
+            tail += ("split",)
+        return (int(spp), int(width), int(height), pass_name) + tail
 
     def pass_integrators(self, pass_name: str, sky: float | None = None) -> tuple:
         """The integrators a pass renders and adds up: "active" is the passive and the flash pass in one
         call (one frozen replay a frame instead of two: Dr.Jit walks the scene's inputs once per replay)."""
-        names = ("passive", "flash") if pass_name == "active" else (pass_name,)
+        names = (("split",) if self.split else ("passive", "flash")) if pass_name == "active" else (pass_name,)
         return tuple(self.integrator(n, sky) for n in names)
 
     def render_passes(self, scene, sensor, integrators: tuple, spp: int, seed):
@@ -733,11 +1066,13 @@ class Resident:
             origin, target, up = frames.lookat(c2w)
             camera = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
             p = mi.traverse(sensor)
+            first = key not in self.dual_pose
             for k in [k for k in p.keys() if k.endswith("to_world")]:
                 p[k] = camera
-            p.update()
-            for k in [k for k in p.keys() if k.endswith("to_world")]:  # one input layout (_evaluate_transforms)
-                dr.make_opaque(p[k])
+            if first:
+                p.update()
+            for k in [k for k in p.keys() if k.endswith("to_world")]:  # one input layout (_evaluate_transforms);
+                dr.make_opaque(p[k])  # later moves skip parameters_changed: it waits for the GPU (_camera_only)
             self.dual_pose[key] = pose
         return sensor
 
@@ -764,23 +1099,35 @@ class Resident:
         ps = mi.traverse(self.sensor)  # fresh map: a frozen replay swaps the variables an old map holds
         t1 = time.perf_counter()
         ps["to_world"] = camera
+        lens = self.fov != float(hfov_deg) or (self.ks_size is not None and self.size != (int(width), int(height)))
         if self.fov != float(hfov_deg):  # only when changed: a Python float rewritten every frame is a new input
             ps["x_fov"] = float(hfov_deg)
         if self.ks_size is not None and self.size != (int(width), int(height)):
             ps[self.ks_size] = mi.ScalarVector2u(int(width), int(height))
-        ps.update()
+        if lens or self.pose is None:
+            ps.update()
+        else:
+            # A camera move only: the value written, evaluated, and no parameters_changed. The perspective sensor's
+            # parameters_changed reassigns its to_world field, whose scalar copy is read back from the GPU
+            # (field::operator=, dr::slice): it waited for every pass still on the GPU, so a frame's camera write
+            # never overlapped the previous frame's rendering (GPU 61 ms + CPU 58 ms per 16 spp pass, in series).
+            # Rays are made from the value alone (sample_ray), so the image is the same (5e-4 on a test scene).
+            self._camera_only(ps)
         t2 = time.perf_counter()
         if not (not follow and self.parked and look == self.look):
             # a Look change writes through the whole scene's parameters; a frame that only moves the flash
             # writes the assist shapes alone (the whole-scene traverse was ~46 ms of every moving frame)
             p = mi.traverse(self.scene) if look != self.look else None
             if self.k_flash is not None:
-                # following: the flash rides 0.2 m ahead of the camera. Parked: with bandscale lights it is
+                # following: the flash rides 0.2 m behind the camera, facing its view. Parked: with bandscale lights it is
                 # dark (its uniforms) and lifted 3 m at full size, as removed lights are; without them it
                 # shrinks to nothing, as before. Either write is evaluated after the update (see
                 # _evaluate_transforms), so moving it never changes the frozen render's inputs.
                 lift = not follow and bool(self.band_keys)
-                size = self.flash["size_world"] if follow or lift else (1e-6, 1e-6)
+                # PC_OPTICALNAV_RENDER's ablation (worst view, 1024 spp): the dataset's 0.12 x 0.08 m flash left 4414
+                # bright outliers; the same power from 2x and 3x the side, 408 and 19 (look.flash_scale)
+                k = float(look.flash_scale) if follow else 1.0
+                size = [s * k for s in self.flash["size_world"]] if follow or lift else (1e-6, 1e-6)
                 d = float(self.flash["distance_m"])
                 up = np.eye(4)
                 up[1, 3] = 3.0 if lift else 0.0
@@ -788,6 +1135,9 @@ class Resident:
                 if self.k_polarizer is not None:
                     writes[self.k_polarizer] = up @ flash_matrix(
                         c2w, size, d + 0.01, float(self.flash.get("polarizer_angle_deg") or 0.0))
+                if follow and any(look.flash_offset):  # off the camera's axis (the viewer's rig editor), still facing its view
+                    for k in writes:
+                        writes[k][:3, 3] += level_offset(c2w, look.flash_offset)
                 self._write_assist(p, writes)
                 self.parked = not follow
             if p is not None:
@@ -815,6 +1165,12 @@ class Resident:
             ps.update()
             dr.make_opaque(ps["to_world"])  # evaluated, as _evaluate_transforms would
         self.scene.parameters_changed([])
+
+    def _camera_only(self, ps) -> None:
+        """A sensor's new to_world, evaluated in place, without the sensor's parameters_changed (see _set_camera)."""
+        import drjit as dr
+
+        dr.make_opaque(ps["to_world"])
 
     def _evaluate_transforms(self, p) -> None:
         """Evaluate every shape and environment transform in place. A transform written from the host (a
@@ -851,7 +1207,7 @@ class Resident:
 
     @staticmethod
     def _flash_level(look: Look) -> float:
-        return float(look.flash_nir if look.band == 1 else look.flash_rgb)
+        return float(look.flash_nir if look.band == 1 else look.flash_rgb) / (look.flash_scale * look.flash_scale)
 
     def _write_look(self, p, look: Look) -> None:
         """Hidden shapes, indoor light level and environment: only what differs from the scene's Look."""
@@ -911,6 +1267,10 @@ class Resident:
         mi = self.mi
         follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
         breakdown = self._set_camera(c2w, width, height, hfov_deg, follow, look)
+        self.flash_pdf = float(look.flash_pdf)  # the flash pass's near-specular cut: integrators and recording keys
+        self.max_depth = int(look.max_depth)  # likewise
+        self.caustics = bool(look.caustics)  # likewise
+        self.split = bool(look.split)  # likewise
         # both bands at once: the near-infrared lane of an RGBN variant, else the dual sensor; the sky in the
         # near-infrared at daylight's share either way
         fs = self.freeze_spp
@@ -934,8 +1294,7 @@ class Resident:
         spp, repeats = int(spp), 1
         if self.freeze_spp and spp > self.freeze_spp and spp % self.freeze_spp == 0:
             spp, repeats = self.freeze_spp, spp // self.freeze_spp
-        tail = ("dual", sky) if dual is not None else ("rgbn", sky) if self.rgbn else ()
-        key = (spp, int(width), int(height), pass_name) + tail
+        key = self._key(spp, width, height, pass_name, dual, sky)
         t2 = time.perf_counter()
         if key not in self.frozen:  # spp and film size are baked into each recording
             # A frozen render's inputs include every live sensor, shape and emitter (Dr.Jit's registry), not
@@ -952,7 +1311,7 @@ class Resident:
             for name in names:
                 self._prepare_inputs(dual if dual is not None else self.sensor, self.pass_integrators(name, sky)[0])
                 self._record(spp, int(width), int(height), name, dual, sky)
-            self._absorb([(spp, int(width), int(height), n) + tail for n in names])
+            self._absorb([self._key(spp, width, height, n, dual, sky) for n in names])
             t2 = time.perf_counter()
         # a replay whose inputs changed layout records again: report it like a recording (see progress.py)
         progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=1, remember=False,
@@ -1046,7 +1405,7 @@ class Resident:
         seeds); every input changes between frames, so all are recorded opaque rather than as literals."""
         import drjit as dr
 
-        key = (spp, width, height, pass_name) + (("dual", sky) if dual is not None else ("rgbn", sky) if self.rgbn else ())
+        key = self._key(spp, width, height, pass_name, dual, sky)
         if key in self.frozen:
             return
         mi, its = self.mi, self.pass_integrators(pass_name, sky)
@@ -1172,6 +1531,17 @@ class Resident:
         return [img[:, i * w:(i + 1) * w] for i in range(k)]
 
 
+def level_offset(c2w: np.ndarray, offset) -> np.ndarray:
+    """``offset`` (right, up, forward; metres) in world space, in the level frame of the view: the camera's right and
+    forward with the pitch taken out, and world up. A pitched camera moves the light as a level one would."""
+    right = np.array(c2w[:3, 0], dtype=np.float64)
+    right[1] = 0.0
+    right /= np.linalg.norm(right)
+    forward = np.cross((0.0, 1.0, 0.0), right)  # columns (right, up, -forward): up x right = forward
+    o = [float(v) for v in offset] + [0.0] * (3 - len(offset))
+    return right * o[0] + np.array((0.0, o[1], 0.0)) + forward * o[2]
+
+
 def flash_matrix(c2w: np.ndarray, size_world, distance_m: float, roll_deg: float = 0.0) -> np.ndarray:
     """Camera-aligned rectangle (port of multimodal._camera_aligned_rectangle_matrix)."""
     right = c2w[:3, 0] / np.linalg.norm(c2w[:3, 0])
@@ -1257,7 +1627,7 @@ class MainThreadExecutor:
 class Renderer:
     """Mitsuba work runs on the main thread (see MainThreadExecutor); one process serialises its renders."""
 
-    def __init__(self, pack: Path, variant: str | None, max_resident: int, freeze: str = "auto",
+    def __init__(self, pack, variant: str | None, max_resident: int, freeze: str = "auto",
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
                  envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16):
         import drjit as dr
@@ -1271,7 +1641,9 @@ class Renderer:
             if chosen not in available:
                 raise SystemExit(f"no Mitsuba variant for {mode} mode (available: {available})")
             self.variant_of[mode] = chosen
-        self.mi, self.dr, self.pack = mi, dr, pack
+        # one or more packs (--pack repeated): a scene comes from the first pack that has it
+        self.packs = [Path(p) for p in (pack if isinstance(pack, (list, tuple)) else [pack])]
+        self.mi, self.dr, self.pack = mi, dr, self.packs[0]
         self.variant = next(iter(self.variant_of.values()))
         mi.set_variant(self.variant)
         # Per-kernel codegen / compile / GPU times split a frame into tracing vs ray tracing, but reading the
@@ -1282,7 +1654,14 @@ class Renderer:
         # ponytail: one render loop per server process; run one server per GPU to scale out.
         self.executor = MainThreadExecutor()
         self.max_resident = max(1, max_resident)
-        self.meta = {p.parent.name: json.loads(p.read_text()) for p in sorted((pack / "scenes").glob("*/scene.json"))}
+        self.meta, self.pack_of = {}, {}  # scan -> scene.json, scan -> its pack
+        for p in self.packs:
+            for scene_json in sorted((p / "scenes").glob("*/scene.json")):
+                scan = scene_json.parent.name
+                if scan in self.pack_of:
+                    print(f"[pack] {scan} is in {self.pack_of[scan]} and {p}: serving the first", flush=True)
+                    continue
+                self.meta[scan], self.pack_of[scan] = json.loads(scene_json.read_text()), p
         # resident scenes by (scan, xml, flash_xml, mode); a variant renders on one of them (see plan)
         self.cache: OrderedDict[tuple, Resident] = OrderedDict()
         self.plans: dict[tuple[str, str, str], tuple] = {}
@@ -1293,18 +1672,35 @@ class Renderer:
         self.has_rgb2nir = self._has_plugin({"type": "rgb2nir", "nested": {"type": "rgb", "value": [0.5, 0.5, 0.5]}})
         self.has_nocaustics = self._has_plugin({"type": "path_nocaustics", "assist": ASSIST_PREFIX,
                                                 "assist_mode": "exclude"})
+        # path_nocaustics's "split" mode: an active frame on one path (an older plugin has none: two paths)
+        self.has_split = self.has_nocaustics and self._has_plugin({"type": "path_nocaustics", "assist": ASSIST_PREFIX,
+                                                                    "assist_mode": "split"})
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
+        self.preloading: list[list[str]] = []  # [scan, variant, mode] of --preload loads not done yet (main)
         # environment maps a view may ask for by name (file stem): <pack>/envmaps unless --envmaps says otherwise
-        folder = Path(envmap_dir) if envmap_dir else pack / "envmaps"
+        folder = Path(envmap_dir) if envmap_dir else next((p / "envmaps" for p in self.packs if (p / "envmaps").is_dir()),
+                                                          self.pack / "envmaps")
         self.envmaps = {f.stem: f for f in sorted(folder.glob("*")) if f.suffix.lower() in (".exr", ".hdr")} \
             if folder.is_dir() else {}
         self.env_cache: dict[str, np.ndarray] = {}
         self.sun_deg = float(sun_deg)
         self.freeze_spp = int(freeze_spp)
+        for scan in self.meta:
+            synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
+                                self.has_nocaustics)
 
+    def scene_dir(self, scan: str) -> Path:
+        return self.pack_of.get(scan, self.pack) / "scenes" / scan
+
+    def reload_meta(self, scan: str) -> None:
+        """Read a scene's scene.json again (after compact_on_start rewrote it); its plans go with the old one."""
+        self.meta[scan] = json.loads((self.scene_dir(scan) / "scene.json").read_text())
+        synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
+                            self.has_nocaustics)
+        self.plans = {k: v for k, v in self.plans.items() if k[0] != scan}
     def pool(self, scan: str) -> dict | None:
         """The scene's perturbation pool (scenes/<scan>/perturbation_pool.json), if built."""
-        path = self.pack / "scenes" / scan / "perturbation_pool.json"
+        path = self.scene_dir(scan) / "perturbation_pool.json"
         return json.loads(path.read_text()) if path.is_file() else None
 
     def env_image(self, name: str) -> np.ndarray:
@@ -1357,7 +1753,10 @@ class Renderer:
         if hidden is not None:
             host = variants[host_name]
             rkey = (scan, host["xml"], host.get("flash_xml"), mode)
-            two_pass = bool(host.get("flash_xml"))
+            # an old one-pass active scene is rendered as the current protocol too (upgrade_flash_text): two passes
+            two_pass = bool(host.get("flash_xml")) or (self.has_nocaustics and bool(host.get("flash")))
+            if two_pass:  # the passive pass leaves the camera-assist shapes out by itself; never hide them
+                hidden = tuple(s for s in hidden if not s.startswith(ASSIST_PREFIX))
             # Two-pass: "passive" ignores the flash (it sits at the camera when the light is on) and "flash"
             # adds it. One pass: the scene's own integrator for all variants, the flash and its polarizer
             # shrunk to nothing while the light is off, so on and off share one freeze recording.
@@ -1381,7 +1780,7 @@ class Renderer:
             return None
         if spec["xml"] == host["xml"]:  # two-pass: the active variant's passive scene file
             return ()
-        base = self.pack / "scenes" / scan
+        base = self.scene_dir(scan)
         return extra_shapes((base / host["xml"]).read_text(), (base / spec["xml"]).read_text())
 
     def served(self) -> list[tuple[tuple, Resident, tuple]]:
@@ -1408,7 +1807,7 @@ class Renderer:
             # loads, or the old scene's memory and the new one's add up (28 of 32.6 GB on Device 1 while a
             # variant switch loaded, with another process holding 8.8 GB) and freeze recordings fail
             self.dr.flush_malloc_cache()
-        base = self.pack / "scenes" / scan  # XML asset paths are relative to this directory
+        base = self.scene_dir(scan)  # XML asset paths are relative to this directory
         # the flash of the active variant this scene file carries (or, two-pass, takes from flash_xml)
         flash = next((v["flash"] for v in self.meta[scan]["variants"].values()
                       if v.get("flash") and v["xml"] == xml and v.get("flash_xml") == flash_xml), None)
@@ -1422,7 +1821,7 @@ class Renderer:
             loaded = Resident(self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
                               flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
                               envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
-                              pool=self.pool(scan))
+                              pool=self.pool(scan), upgrade_flash=self.has_nocaustics)
         self.cache[rkey] = loaded
         return loaded
 
@@ -1523,6 +1922,29 @@ class Renderer:
         lighting = str(view.get("lighting", "all"))
         if lighting not in LIGHTING:
             raise ValueError(f"lighting must be one of {sorted(LIGHTING)}")
+        lamps = bool(view.get("lamps", False))  # also light the lamps the scene left dark (lamp_lights_text)
+        flash_scale = float(view.get("flash_scale", 1.0))  # a larger flash at the same power (Look.flash_scale)
+        if not 0.25 <= flash_scale <= 8.0:
+            raise ValueError("flash_scale must be 0.25..8")
+        flash_offset = tuple(float(v) for v in (view.get("flash_offset") or (0.0, 0.0, 0.0)))  # right, up, forward (m)
+        if len(flash_offset) not in (2, 3) or not all(abs(v) <= 2.0 for v in flash_offset):
+            raise ValueError("flash_offset is [right, up, forward] in metres, each within 2")
+        flash_offset = (flash_offset + (0.0,))[:3]
+        max_depth = int(view.get("max_depth") or 0)  # every pass's path length cap; 0 or absent: the scene's own
+        caustics = bool(view.get("caustics", True))  # False: the lights' passes drop caustics as the flash pass does
+        # the active pass on one path (path_nocaustics "split") when the plugin can; "active_split": false, two paths.
+        # Checked against two paths at 1024 spp (20263004, sim vanilla_r2): means within 0.1% (RGB and NIR), the
+        # same outliers, GPU per 16 spp frame 143 -> 101 and 111 -> 77 ms
+        split = bool(view.get("active_split", True)) and bool(getattr(self, "has_split", False))
+        # pseudo near-infrared reflectance, 0.5..1 by robomituba's formula, mapped onto [low, high] (rgb2nir)
+        nir_range = tuple(float(v) for v in (view.get("nir_range") or (0.5, 1.0)))
+        if len(nir_range) != 2 or not 0.0 <= nir_range[0] <= nir_range[1] <= 1.0:
+            raise ValueError("nir_range is [low, high] with 0 <= low <= high <= 1")
+        if not 0 <= max_depth <= 64:
+            raise ValueError("max_depth must be 0 (the scene's own) .. 64")
+        flash_pdf = float(view.get("flash_caustic_pdf", FLASH_PDF))  # the flash pass's near-specular cut (FLASH_PDF)
+        if not 0.1 <= flash_pdf <= 1e4:
+            raise ValueError("flash_caustic_pdf must be 0.1..10000")
         mirrors = view.get("mirrors")  # None: the variant's own; else a share of the scene's perturbation pool
         if mirrors is not None:
             mirrors = (float(dict(mirrors).get("density", 1.0)), int(dict(mirrors).get("glass", 0)),
@@ -1530,34 +1952,45 @@ class Renderer:
             if not (0.0 <= mirrors[0] <= 100.0 and 0 <= mirrors[1] <= 64):
                 raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
-                mirrors)
+                mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float):
         """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined)."""
         started = time.perf_counter()
         scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot, bands,
-                                                                        flash_band, nir, lighting, mirrors) = key
+                                                                        flash_band, nir, lighting, mirrors, lamps,
+                                                                        flash_scale, flash_pdf, flash_offset, max_depth,
+                                                                        caustics, split, nir_range) = key
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
             rkey, passes, follow, hidden = self.plan(scan, variant, mode)
             resident = self._resident(rkey, variant)
-            # lighting mode: light groups it leaves out are removed from the scene (hidden), not just dimmed
-            hidden = frozenset(hidden) | {s for s, g in resident.groups.items() if g not in LIGHTING[lighting]
-                                          and (s in resident.blocks or s in resident.transforms)}
+            # lighting mode (and the lamps added to dark lamps, when asked for): the light groups it leaves out
+            # are removed from the scene (hidden), not just dimmed
+            groups = LIGHTING[lighting] + (("lamp",) if lamps else ())
+            # a lamp's own glowing part (lamp_lights_text) is the lamp: it goes dark (its group's uniforms), not away
+            parts = set(resident.lamp_lights)
+            hidden = frozenset(hidden) | {s for s, g in resident.groups.items() if g not in groups and g != "lamp"
+                                          and s not in parts and (s in resident.blocks or s in resident.transforms)}
+            if mirrors is None and self.meta[scan]["variants"][variant].get("pool_share"):
+                mirrors = tuple(self.meta[scan]["variants"][variant]["pool_share"])  # a synthetic variant's mirrors
             hidden = hidden | self._pool_hidden(resident, mirrors)
             # one look per band: visible (0) and pseudo near-infrared (1), the same recordings for both
             # the flash emits only for the active variant (elsewhere it is parked, dark)
             flash = {"flash_rgb": follow and flash_band in ("rgb", "both"),
                      "flash_nir": follow and flash_band in ("nir", "both")}
-            groups = LIGHTING[lighting]
             if resident.band_keys and (bands == "both" or resident.rgbn):
                 # one render, both bands: the RGBN variant's lanes (whichever bands are asked: the same render
                 # serves all three), else the dual sensor
-                looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups)}
+                looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups, flash_scale=flash_scale,
+                               flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
+                               split=split, nir_range=nir_range)}
             else:  # one band per render
-                looks = {b: Look(hidden, lights, env, env_scale, env_rot, band=b, nir=nir, **flash, groups=groups)
+                looks = {b: Look(hidden, lights, env, env_scale, env_rot, band=b, nir=nir, **flash, groups=groups, flash_scale=flash_scale,
+                               flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
+                               split=split, nir_range=nir_range)
                          for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
@@ -1584,23 +2017,35 @@ class Renderer:
                     breakdowns = [bd for d in done.values() for _, bd in d]
                 else:
                     per_band, breakdowns = batch, [getattr(resident, "breakdown", None) or {}]
-                if resident.rgbn:  # R, G, B and near-infrared lanes: the RGB layout, per band asked for
-                    rendered, per_band = per_band, {}
-                    for b, views in rendered.items():
-                        for want in ((0, 1) if b == 2 else (b,)):
-                            if want == 0 and bands == "nir" or want == 1 and bands == "rgb":
-                                continue
-                            per_band[want] = [[stokes.rgbn_band(v, want) for v in vs] for vs in views]
-                elif 2 in per_band:  # dual: visible slot left, near-infrared right, margins cropped
-                    wm, m = int(width) + 2 * DUAL_MARGIN, DUAL_MARGIN
-                    dual = per_band.pop(2)
-                    per_band[0] = [[v[:, m:m + int(width)] for v in views] for views in dual]
-                    per_band[1] = [[v[:, wm + m:wm + m + int(width)] for v in views] for views in dual]
                 for b in breakdowns:
                     for k, v in b.items():
                         parts[k] = parts.get(k, 0.0) + v
                 render_s = launch_s + time.perf_counter() - t1
-                return self._assemble(key, cams, per_band, parts, render_s)
+
+            def assemble():
+                bands_out = per_band
+                if resident.rgbn:  # R, G, B and near-infrared lanes: the RGB layout, per band asked for
+                    bands_out = {}
+                    for b, views in per_band.items():
+                        for want in ((0, 1) if b == 2 else (b,)):
+                            if want == 0 and bands == "nir" or want == 1 and bands == "rgb":
+                                continue
+                            bands_out[want] = [[stokes.rgbn_band(v, want) for v in vs] for vs in views]
+                elif 2 in per_band:  # dual: visible slot left, near-infrared right, margins cropped
+                    wm, m = int(width) + 2 * DUAL_MARGIN, DUAL_MARGIN
+                    bands_out = dict(per_band)
+                    dual = bands_out.pop(2)
+                    bands_out[0] = [[v[:, m:m + int(width)] for v in views] for views in dual]
+                    bands_out[1] = [[v[:, wm + m:wm + m + int(width)] for v in views] for views in dual]
+                return self._assemble(key, cams, bands_out, parts, render_s)
+
+            # The render thread only reads back (above). Splitting the film into bands and Stokes images, adding
+            # the passes up and converting them (5-6 ms a pass at 512x384) run on the request's thread
+            # (render_views), so the render thread starts the next pass meanwhile. The denoiser (OptiX) and the
+            # kernel history stay on the render thread.
+            if denoise or self.kernel_history:
+                return assemble()
+            return assemble
         return finish
 
     @staticmethod
@@ -1696,8 +2141,9 @@ class Renderer:
             j = i + 1
             while j < len(checked) and checked[j][0] == key:
                 j += 1
-            outs, kernels, render_s, denoise_s = self.executor.submit_pipelined(
-                self._start, key, [c for _, c in checked[i:j]], time.perf_counter()).result()
+            done = self.executor.submit_pipelined(self._start, key, [c for _, c in checked[i:j]],
+                                                  time.perf_counter()).result()
+            outs, kernels, render_s, denoise_s = done() if callable(done) else done  # (see _start: assemble)
             t0 = time.perf_counter()
             results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)),
                                         bool(views[i + n].get("s3", True)))
@@ -1720,7 +2166,6 @@ class Renderer:
 
 
 def make_handler(renderer: Renderer, token: str | None = None):
-    pack = renderer.pack
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1746,6 +2191,17 @@ def make_handler(renderer: Renderer, token: str | None = None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_parts(self, code: int, parts: list, ctype: str, headers: dict | None = None):
+            """A reply written piece by piece (each array's own buffer), never joined into one bytes object."""
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(sum(len(p) for p in parts)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            for part in parts:
+                self.wfile.write(part)
+
         def _json(self, code: int, payload) -> None:
             self._send(code, json.dumps(payload).encode())
 
@@ -1760,6 +2216,7 @@ def make_handler(renderer: Renderer, token: str | None = None):
                         "activity": ACTIVITY.snapshot(), "freeze": renderer.freeze, "freeze_spp": renderer.freeze_spp,
                         # every variant a resident scene renders (an active variant and its flash-off twin share one)
                         "resident": [list(k) for k, _, _ in served],
+                        "preloading": list(getattr(renderer, "preloading", [])),  # --preload scenes still loading
                         # freeze recordings per variant: [spp, width, height] recorded for all its passes
                         "recorded": {"|".join(k): renderer.recorded(r, passes) for k, r, passes in served},
                         # freeze recordings made so far by the resident scenes (one per new spp, size and pass);
@@ -1769,12 +2226,15 @@ def make_handler(renderer: Renderer, token: str | None = None):
                 if parts == ["v1", "info"]:
                     return self._json(200, {
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,
+                        "mitsuba_version": getattr(getattr(renderer, "mi", None), "__version__", None),
                         "modes": renderer.variant_of, "path_nocaustics": renderer.has_nocaustics,
                         "envmaps": sorted(renderer.envmaps), "nir": renderer.has_rgb2nir,
+                        "active_split": getattr(renderer, "has_split", False),
                         "nir_defaults": NIR_DEFAULTS,
                         "drjit_freeze": renderer.freeze, "spp_chunk": SPP_CHUNK,
                         "scans": {s: renderer.variants(s) for s in renderer.meta},
                         "resident": [list(k) + [round(r.load_s, 1)] for k, r, _ in renderer.served()],
+                        "preloading": list(getattr(renderer, "preloading", [])),
                     })
                 if parts == ["v1", "scans"]:
                     return self._json(200, sorted(renderer.meta))
@@ -1783,6 +2243,8 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     if parts[3] == "meta":
                         meta = dict(renderer.meta[scan])
                         meta["variants_available"] = renderer.variants(scan)
+                        if hasattr(renderer, "scene_dir"):  # where a viewer on this machine finds tone frames, room map
+                            meta["scene_dir"] = str(renderer.scene_dir(scan).resolve())
                         pool = renderer.pool(scan)
                         if pool:  # what a view's "mirrors" can show, and the R2R edges each glass wall blocks
                             meta["perturbation_pool"] = {
@@ -1791,7 +2253,25 @@ def make_handler(renderer: Renderer, token: str | None = None):
                                 "glass": [{k: g[k] for k in ("id", "rank", "splits_r2r", "blocked_edges")}
                                           for g in pool["glass"]]}
                         return self._json(200, meta)
+                    if parts[3] == "stats":  # the resident scene that renders this scan, if loaded
+                        served = [(k, r, passes) for k, r, passes in renderer.served() if k[0] == scan]
+                        if not served:
+                            return self._json(200, {"scan": scan, "resident": False, "gpu": gpu_memory()})
+                        r = served[0][1]
+                        groups: dict[str, int] = {}
+                        for g in r.groups.values():
+                            groups[g] = groups.get(g, 0) + 1
+                        weights = list(r.emitter_weights.values())
+                        return self._json(200, {
+                            "scan": scan, "resident": True, "name": r.name, "load_s": round(r.load_s, 1), **r.stats,
+                            "light_groups": groups, "lamps_lit_from_parts": len(r.lamp_lights),
+                            "emitter_weights": [round(min(weights), 3), round(max(weights), 3)] if weights else None,
+                            "pool": {"mirrors": len(r.pool["mirrors"]), "glass": len(r.pool["glass"])} if r.pool else None,
+                            "variants": sorted(k[1] for k, _, _ in served),
+                            "recordings": sum(getattr(f, "n_recordings", 0) for f in list(r.frozen.values())),
+                            "mitsuba_variant": renderer.variant, "gpu": gpu_memory()})
                     if parts[3] == "connectivity":
+                        pack = getattr(renderer, "pack_of", {}).get(scan, renderer.pack)
                         path = pack / "connectivity" / f"{scan}_connectivity.json"
                         if not path.is_file():  # packed without a navigation graph (scene.json "spawn")
                             return self._json(404, {"error": f"{scan} has no navigation graph"})
@@ -1842,6 +2322,20 @@ def make_handler(renderer: Renderer, token: str | None = None):
                 results, total = renderer.render_views(views, dtype)
                 arrays = {f"{k}_{i}": v for i, result in enumerate(results) for k, v in result.items()}
                 t_enc = time.perf_counter()
+                if req.get("format") == "raw":  # header + raw bytes: no zip to build here or to unpack there
+                    arrays = {k: np.ascontiguousarray(v) for k, v in arrays.items()}
+                    header, offset = [], 0
+                    for k, v in arrays.items():
+                        header.append([k, v.dtype.str, list(v.shape), offset, v.nbytes])
+                        offset += v.nbytes
+                    head = json.dumps(header).encode()
+                    total["encode_s"] = time.perf_counter() - t_enc
+                    self._send_parts(200, [len(head).to_bytes(8, "little"), head] + [memoryview(v).cast("B")
+                                                                                     for v in arrays.values()],
+                                     RAW_ARRAYS_TYPE,
+                                     {"X-Render-Seconds": f"{time.time() - started:.4f}",
+                                      "X-Render-Timing": json.dumps({k: round(v, 4) for k, v in total.items()})})
+                    return
                 buf = io.BytesIO()
                 np.savez(buf, **arrays)
                 total["encode_s"] = time.perf_counter() - t_enc
@@ -1850,15 +2344,53 @@ def make_handler(renderer: Renderer, token: str | None = None):
                             "X-Render-Timing": json.dumps({k: round(v, 4) for k, v in total.items()})})
             except (KeyError, ValueError, TypeError) as exc:
                 self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+            except (BrokenPipeError, ConnectionResetError):  # the client left mid-reply (a viewer restarted)
+                return
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
     return Handler
 
 
+def compact_on_start(renderer: Renderer, skip=()) -> None:
+    """Compact every served scene that still needs it (tools/compact_assets.py), one subprocess per scene: its
+    Mitsuba runs scalar_rgb, which must not switch this process's variant. Listed in /v1/status as the activity
+    ``compacting <scan>`` meanwhile; renders wait in the queue."""
+    import importlib.util
+    import subprocess
+    import sys
+
+    tool = Path(__file__).resolve().parents[1] / "tools" / "compact_assets.py"
+    if not tool.is_file():
+        print("[compact] tools/compact_assets.py not found: scenes are served as they are", flush=True)
+        return
+    spec = importlib.util.spec_from_file_location("compact_assets", tool)
+    compact = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compact)  # needs_compaction is a text scan; nothing of Mitsuba is imported
+    todo = [s for s in sorted(renderer.meta) if s not in skip and compact.needs_compaction(renderer.scene_dir(s))]
+    print(f"[compact] {len(todo)} of {len(renderer.meta)} scenes need compacting: {todo}", flush=True)
+    for scan in todo:
+        started = time.time()
+        with ACTIVITY.doing(f"compacting {scan}"):
+            done = subprocess.run([sys.executable, str(tool), "--pack", str(renderer.pack_of[scan]), "--scene", scan,
+                                   "--if-needed"], check=False)
+        if done.returncode == 0:
+            renderer.reload_meta(scan)
+            print(f"[compact] {scan} in {time.time() - started:.0f} s", flush=True)
+        else:
+            print(f"[compact] {scan} failed (exit {done.returncode}): served as it is", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pack", required=True, help="scene pack directory (tools/build_pack.py output)")
+    ap.add_argument("--pack", required=True, action="append",
+                    help="scene pack directory (tools/build_pack.py output); repeat to serve several (a scene name "
+                         "in two packs comes from the first)")
+    ap.add_argument("--no-compact", action="store_true",
+                    help="serve scenes as they are: by default a scene not yet compacted (tools/compact_assets.py: "
+                         "OBJ meshes, textures not named by content) is compacted once at start, before it loads")
+    ap.add_argument("--compact-skip", action="append", default=[], metavar="SCAN",
+                    help="leave this scene out of the start-up compaction (another process is writing it)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18770)
     ap.add_argument("--variant", default=None,
@@ -1890,7 +2422,7 @@ def main() -> int:
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
-    renderer = Renderer(Path(args.pack).resolve(), args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
+    renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg,
                         freeze_spp=args.freeze_spp)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
@@ -1899,10 +2431,15 @@ def main() -> int:
     print(f"[serve] http://{args.host}:{args.port}  modes={renderer.variant_of}  scans={len(renderer.meta)}  "
           f"path_nocaustics={renderer.has_nocaustics}  freeze={renderer.freeze}  "
           f"kernel_history={renderer.kernel_history}", flush=True)
+    if not args.no_compact:
+        compact_on_start(renderer, set(args.compact_skip))
     for item in args.preload:
         parts = item.split(":")
-        scan, variant, mode = parts[0], (parts[1:2] or ["base"])[0], (parts[2:3] or [modes[0]])[0]
+        renderer.preloading.append([parts[0], (parts[1:2] or ["base"])[0], (parts[2:3] or [modes[0]])[0]])
+    while renderer.preloading:
+        scan, variant, mode = renderer.preloading[0]
         print(f"[preload] {scan}:{variant}:{mode} in {renderer.preload(scan, variant, mode):.1f}s", flush=True)
+        renderer.preloading.pop(0)
     try:
         renderer.executor.run_forever()
     except KeyboardInterrupt:

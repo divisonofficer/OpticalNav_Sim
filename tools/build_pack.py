@@ -259,9 +259,147 @@ def build_scene(scene: str, project: Path, repo_root: Path, out: Path, mode: str
         "frames": "connectivity/state frame: (x, -y_dataset, height), z-up; heading = pi - dataset_yaw",
     }
     (dst / "scene.json").write_text(json.dumps(meta, indent=1))
+    # robomituba tools/infinigen/export_room_map.py: room polygons + door/open markers for the bird's-eye map, dataset (x, y) frame
+    if (scene_dir / "room_map.json").is_file():
+        shutil.copyfile(scene_dir / "room_map.json", dst / "room_map.json")
     print(f"[pack] {scene}: {len(rows)} nodes, {meta['graph']['edges']} edges, variants {sorted(variants)}, "
           f"assets {sum(n for _, n in written.values())} refs, episodes {meta['episodes']}"
           + (f", {len(problems)} episodes skipped" if problems else ""), flush=True)
+
+
+KEEP_OWN_BSDF = ("mirror_auto_", "glass_auto_", "pool_")  # the server hides these per shape
+
+
+def share_bsdfs(scene_dst: Path) -> dict:
+    """Make every variant XML of a pack scene share identical BSDFs (fewer material instances to trace).
+
+    (a) byte-identical asset files collapse to one name (the duplicates are unlinked from the pack);
+    (b) top-level <bsdf>/<texture> nobody references are dropped;
+    (c) each distinct inline shape BSDF (hashed on its canonical XML after (a), twosided wrapper included) is
+        hoisted to one top-level <bsdf id="sb_<hash>"> and the inline copies become <ref id>.
+    Shapes with an emitter and the hideable mirror/glass/pool shapes keep their own BSDF; shape ids and the
+    opticalnav-obj comments are kept. Files are rewritten through os.replace, so hard links into another
+    pack or the project are never modified."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+
+    xmls = sorted(p for p in scene_dst.glob("*.xml") if not p.name.startswith("_"))
+    assets = scene_dst / "assets"
+    digest = {p.name: hashlib.sha1(p.read_bytes()).hexdigest() for p in assets.iterdir() if p.is_file()}
+    keep_name: dict[str, str] = {}
+    for name in sorted(digest):
+        keep_name.setdefault(digest[name], name)
+    alias = {n: keep_name[h] for n, h in digest.items()}
+
+    def canon(el) -> str:
+        attrs = sorted((k, v) for k, v in el.attrib.items() if k != "id")
+        return f"<{el.tag}{attrs}>" + "".join(canon(c) for c in el if isinstance(c.tag, str)) + f"</{el.tag}>"
+
+    stats = {"files": len(xmls), "asset_files": len(digest), "asset_contents": len(keep_name)}
+    for path in xmls:
+        root = ET.parse(path, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))).getroot()
+        for el in root.iter():  # (a)
+            if el.tag == "string" and el.get("name") == "filename" and el.get("value", "").startswith("assets/"):
+                el.set("value", "assets/" + alias.get(el.get("value")[7:], el.get("value")[7:]))
+        refs = {r.get("id") for r in root.iter("ref")}
+        dropped = [c for c in list(root) if c.tag in ("bsdf", "texture") and c.get("id") not in refs]
+        for c in dropped:  # (b)
+            root.remove(c)
+        hoisted, shared_ids, inline_before = {}, set(), 0
+        for shape in root.findall("./shape"):  # (c)
+            inner = shape.findall("./bsdf")
+            inline_before += len(inner)
+            if not inner or shape.find("./emitter") is not None or str(shape.get("id", "")).startswith(KEEP_OWN_BSDF):
+                continue
+            for b in inner:
+                key = "sb_" + hashlib.sha1(canon(b).encode()).hexdigest()[:16]
+                if key not in hoisted:
+                    b.set("id", key)
+                    hoisted[key] = b
+                idx = list(shape).index(b)
+                shape.remove(b)
+                shape.insert(idx, ET.Element("ref", {"id": key}))
+                shared_ids.add(key)
+        first_shape = next((i for i, c in enumerate(root) if c.tag == "shape"), len(root))
+        for k, b in enumerate(hoisted.values()):
+            root.insert(first_shape + k, b)
+        ET.indent(root, space="  ")
+        tmp = path.with_name(f"_{path.name}.tmp")
+        tmp.write_text(ET.tostring(root, encoding="unicode"))
+        os.replace(tmp, path)
+        stats[path.name] = {"unreferenced_dropped": len(dropped), "inline_bsdfs_before": inline_before,
+                            "shared_bsdfs": len(hoisted)}
+    used = {m.group(1) for p in xmls for m in re.finditer(r'value="assets/([^"]+)"', p.read_text())}
+    removed = [n for n in digest if n not in used]
+    for n in removed:
+        (assets / n).unlink()
+    stats["asset_files_removed"] = len(removed)
+    return stats
+
+
+def spawn_points(scene_dir: Path, eye_height: float, count: int = 3, step: int = 7) -> list[dict]:
+    """Start poses for a graph-less scene: in each of the largest traversable regions, the grid point farthest
+    from every non-structure object's footprint, at camera height, in the connectivity frame (x, -y_dataset, z).
+    ponytail: rectangle footprints from the authoring map; a free-space grid would be exact."""
+    authoring = json.loads((scene_dir / "authoring_map.json").read_text())
+    rooms = sorted((r["geometry"]["bounds"] for r in authoring.get("regions") or []
+                    if r.get("type") == "traversable" and (r.get("geometry") or {}).get("bounds")),
+                   key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))
+    boxes = []
+    for o in authoring.get("objects") or []:
+        g, md = o.get("geometry") or {}, o.get("metadata") or {}
+        c, s = g.get("center"), g.get("size_m")
+        if md.get("kind") == "structure" or not (isinstance(c, list) and isinstance(s, list) and len(c) >= 2 and len(s) >= 3):
+            continue
+        boxes.append((c[0] - s[0] / 2, c[1] - s[2] / 2, c[0] + s[0] / 2, c[1] + s[2] / 2))
+
+    def clearance(x: float, y: float) -> float:
+        return min((math.hypot(max(b[0] - x, 0, x - b[2]), max(b[1] - y, 0, y - b[3])) for b in boxes), default=9.9)
+
+    out = []
+    for x0, y0, x1, y1 in rooms[:count]:
+        pts = [(x0 + (x1 - x0) * (i + 0.5) / step, y0 + (y1 - y0) * (j + 0.5) / step) for i in range(step) for j in range(step)]
+        x, y = max(pts, key=lambda p: clearance(*p))
+        out.append({"position": [round(x, 3), round(-y, 3), round(eye_height, 3)], "heading_deg": 0.0,
+                    "clearance_m": round(clearance(x, y), 2)})
+    return out
+
+
+def build_staged_scene(scene: str, project: Path, repo_root: Path, out: Path, mode: str) -> dict:
+    """A scene staged without rendering (robomituba apps/stage_sim_scene.py writes sim_stage.json): base
+    variant only, no graph, episodes or reference frames. Mirrors come from tools/build_perturbation_pool.py."""
+    scene_dir = project / "scenes" / scene
+    stage = json.loads((scene_dir / "sim_stage.json").read_text())
+    src = repo_root / stage["stokes_xml"]
+    dst = out / "scenes" / scene
+    dst.mkdir(parents=True, exist_ok=True)
+    refs = rewrite_xml(src, dst / "base.xml", repo_root, dst / "assets", mode)
+    if '<bsdf type="measured_polarized' in (dst / "base.xml").read_text():
+        raise ValueError(f"{scene}: measured_polarized BSDF in a staged simulator scene")
+    camera, mount = DEFAULT_CAMERA, DEFAULT_CAMERA["extras"]["robot_mount"]
+    meta = {
+        "scan": scene,
+        "camera": {"sensor_id": camera["camera_id"], "width": camera["resolution"][0],
+                   "height": camera["resolution"][1], "hfov_deg": camera["fov_deg"], "mount": mount,
+                   "nominal_pitch_rad": frames.nominal_pitch(mount), "dataset_spp": None},
+        "stokes": {"basis": "world_gravity_y_v1", "reference_axis": stage["stokes_reference_axis"],
+                   "components": ["s0", "s1", "s2", "s3"], "channels": "linear RGB per component"},
+        "variants": {"base": {"xml": "base.xml", "source_xml": str(src), "protocol": "staged_without_render_v1",
+                              "texture_max_resolution": stage.get("texture_max_resolution")}},
+        "variants_unavailable": {},
+        "reference_views": [],
+        "graph": None,
+        "episodes": {},
+        "episode_problems": [],
+        "spawn": spawn_points(scene_dir, float(mount["xyz_m"][1])),
+        "staged": stage,
+        "frames": "connectivity/state frame: (x, -y_dataset, height), z-up; heading = pi - dataset_yaw",
+    }
+    (dst / "scene.json").write_text(json.dumps(meta, indent=1))
+    # robomituba tools/infinigen/export_room_map.py: room polygons + door/open markers for the bird's-eye map, dataset (x, y) frame
+    if (scene_dir / "room_map.json").is_file():
+        shutil.copyfile(scene_dir / "room_map.json", dst / "room_map.json")
+    print(f"[pack] {scene}: staged base only, {refs} asset refs, no graph or episodes", flush=True)
+    return meta
 
 
 DEFAULT_CAMERA = {"camera_id": "polar_cam", "resolution": [512, 384], "fov_deg": 90.0,
@@ -335,6 +473,7 @@ def aggregate(out: Path, project: Path) -> dict[str, int]:
             row["path_id"] = path_id
             path_id += 1
         (data / f"R2R_{split}.json").write_text(json.dumps(tasks[split]))
+    (out / "connectivity").mkdir(parents=True, exist_ok=True)  # a pack of graph-less staged scenes has none yet
     (out / "connectivity" / "scans.txt").write_text("\n".join(scans) + "\n")
     counts = {s: len(r) for s, r in tasks.items()}
     (out / "pack.json").write_text(json.dumps({
@@ -353,20 +492,28 @@ def main() -> int:
     ap.add_argument("--link", choices=["hard", "copy"], default="hard")
     ap.add_argument("--tasks-only", action="store_true",
                     help="only rebuild R2R tasks for scenes already in the pack (no observation manifests needed)")
+    ap.add_argument("--share-bsdfs", action="store_true",
+                    help="after packing, make each scene's XMLs share identical BSDFs (see share_bsdfs)")
     args = ap.parse_args()
     project = args.project.resolve()
     repo_root = (args.repo_root or project.parents[2]).resolve()
     scenes = args.scene or (
         sorted(p.parent.name for p in (args.out.resolve() / "scenes").glob("*/scene.json")) if args.tasks_only
-        else [s["scene_id"] if isinstance(s, dict) else s for s in json.loads((project / "dataset.json").read_text())["scenes"]])
+        else [s["scene_id"] if isinstance(s, dict) else s for s in json.loads((project / "dataset.json").read_text())["scenes"]]
+        if (project / "dataset.json").is_file()
+        else sorted(p.parent.name for p in (project / "scenes").glob("*/sim_stage.json")))
     out = args.out.resolve()
     failed = []
     for scene in scenes:
         try:
-            if args.tasks_only:
+            if (project / "scenes" / scene / "sim_stage.json").is_file():  # staged without rendering
+                build_staged_scene(scene, project, repo_root, out, args.link)
+            elif args.tasks_only:
                 scene_tasks(scene, project, out, args.link)
             else:
                 build_scene(scene, project, repo_root, out, args.link)
+            if args.share_bsdfs and not args.tasks_only:
+                print(f"[share] {scene}: {json.dumps(share_bsdfs(out / 'scenes' / scene))}", flush=True)
         except Exception as exc:  # noqa: BLE001 - one broken scene must not sink the pack
             failed.append(scene)
             print(f"[skip] {scene}: {type(exc).__name__}: {exc}", flush=True)

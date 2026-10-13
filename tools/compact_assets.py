@@ -4,7 +4,9 @@
     source /home/jinnyeong/robomituba-build/mitsuba3/setpath.sh
     python3.10 tools/compact_assets.py --pack packs/opticalnav-v0.2 [--scene SCENE ...] [--jobs 6] [--keep-unused]
 
-Run it after tools/build_pack.py; a second run changes nothing.
+Run it after tools/build_pack.py; a second run changes nothing. ``--if-needed`` skips scenes already
+compacted, so it is safe to run on every start (a pack shared before compaction is converted once);
+needs_compaction / compact_pack do the same from Python.
 
 * Textures. build_pack names an asset by its source path, so one image under several paths
   becomes several files. Here each texture takes its content hash as name (``assets/tex_<sha1>.png``,
@@ -41,6 +43,7 @@ FILENAME_RE = re.compile(r'(<string name="filename" value=")(assets/[^"]+)(")')
 # build_pack writes a mesh's filename as the shape's first child
 OBJ_SHAPE_RE = re.compile(r'<shape type="obj"(\s[^>]*)?>(\s*<string name="filename" value=")(assets/[^"]+\.obj)(")')
 MESH_SUFFIXES = (".obj", ".ply", ".serialized")
+TEXTURE_NAME = re.compile(r"assets/tex_[0-9a-f]{20}\.[a-z0-9]+$")  # a texture already named by its content
 OBJ_ONLY = ("flip_tex_coords",)  # OBJ-plugin properties a converted shape must not carry
 NORMAL_TOLERANCE = 1e-6
 
@@ -138,6 +141,35 @@ def json_refs(scene_dir: Path) -> set[str]:
     return {r for f in scene_dir.rglob("*.json") for r in re.findall(r'assets/[^"\\\s]+', f.read_text())}
 
 
+def needs_compaction(scene_dir: Path) -> bool:
+    """Whether a scene's XMLs still name an OBJ mesh or a texture not yet named by its content. A text scan
+    (no Mitsuba, milliseconds): what a server or fetch_pack runs before deciding to compact."""
+    for f in scene_dir.glob("*.xml"):
+        text = f.read_text()
+        if OBJ_SHAPE_RE.search(text):
+            return True
+        if any(not ref.lower().endswith(MESH_SUFFIXES) and not TEXTURE_NAME.match(ref)
+               for ref in (m.group(2) for m in FILENAME_RE.finditer(text))):
+            return True
+    return False
+
+
+def compact_pack(pack: Path, scenes=(), jobs: int = 6, keep_unused: bool = False, if_needed: bool = True) -> dict:
+    """Compact the scenes of a pack (default: all), by default only those that need it. Scene id -> summary,
+    or None for a scene skipped as already compacted."""
+    pack = Path(pack)
+    scenes = list(scenes) or sorted(p.parent.name for p in (pack / "scenes").glob("*/scene.json"))
+    out = {}
+    for scene in scenes:
+        scene_dir = (pack / "scenes" / scene).resolve()
+        if if_needed and not needs_compaction(scene_dir):
+            out[scene] = None
+            continue
+        _mitsuba()
+        out[scene] = compact_scene(scene_dir, jobs, keep_unused)
+    return out
+
+
 def compact_scene(scene_dir: Path, jobs: int, keep_unused: bool) -> dict:
     started = time.time()
     xmls = sorted(scene_dir.glob("*.xml"))
@@ -216,11 +248,13 @@ def main() -> int:
     ap.add_argument("--scene", action="append", default=[], help="scene id (repeatable; default: every scene)")
     ap.add_argument("--jobs", type=int, default=6, help="meshes converted at once (each holds one mesh in memory)")
     ap.add_argument("--keep-unused", action="store_true", help="keep assets the rewritten scene no longer names")
+    ap.add_argument("--if-needed", action="store_true", help="skip scenes already compacted (a text scan)")
     args = ap.parse_args()
     _mitsuba()  # fail before touching anything when Mitsuba is not importable
-    scenes = args.scene or sorted(p.parent.name for p in (args.pack / "scenes").glob("*/scene.json"))
-    for scene in scenes:
-        compact_scene((args.pack / "scenes" / scene).resolve(), args.jobs, args.keep_unused)
+    done = compact_pack(args.pack, args.scene, args.jobs, args.keep_unused, args.if_needed)
+    skipped = [s for s, r in done.items() if r is None]
+    if skipped:
+        print(f"already compacted: {len(skipped)} scene(s)", flush=True)
     return 0
 
 

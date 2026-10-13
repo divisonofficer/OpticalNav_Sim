@@ -6,88 +6,170 @@
 <meta name="theme-color" content="#0e1316">
 <title>OpticalNav Sim Viewer</title>
 <style>
-/* Instrument layout. Desktop: two camera panes over a status strip, map and readouts on the right.
-   Phone: one pane with a channel switcher, a thumb pad under it, map and readouts below. */
+/* Instrument layout. Desktop: status chips, a row of control cards, two camera panes and a side column (map, info
+   tabs), a status bar; the page fits the window. Phone: settings fold away, one pane, a thumb pad, then the rest. */
 :root {
-  --bg: #0e1316; --panel: #151c20; --panel-2: #1b2429; --ink: #e2e9ec; --muted: #8b9ca4; --rule: #27333a;
-  --accent: #3fc9d4; --accent-2: #f08250; --warn: #e3a05a; --bad: #ef6b6b;
+  --bg: #0b1114; --panel: #121a1e; --panel-2: #182227; --panel-3: #1e2a30; --ink: #e2e9ec; --muted: #8b9ca4; --rule: #24323a;
+  --accent: #3fc9d4; --accent-2: #f08250; --warn: #e3a05a; --bad: #ef6b6b; --ok: #45c48a;
   --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
   --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --radius: 10px;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; min-height: 100%; }
-body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); display: flex; flex-direction: column;
-  padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+body { background: var(--bg); color: var(--ink); font: 13.5px/1.45 var(--sans); display: flex; flex-direction: column; gap: 10px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); }
 button, select, input, summary { touch-action: manipulation; }
-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; padding: 10px 16px; border-bottom: 1px solid var(--rule); background: var(--panel); }
-header h1 { font-size: 15px; margin: 0; font-weight: 700; }
+svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+/* top bar */
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 0 4px; }
+.top h1 { font-size: 17px; margin: 0; font-weight: 700; letter-spacing: .01em; }
+.icon-btn { display: inline-grid; place-items: center; min-width: 30px; height: 30px; padding: 0 8px; gap: 6px; grid-auto-flow: column;
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--rule); border-radius: 8px; font: inherit; font-size: 12.5px; cursor: pointer; }
+.icon-btn:hover { color: var(--ink); border-color: var(--muted); }
+.icon-btn[aria-pressed=true] { color: var(--accent); border-color: var(--accent); }
 .monitor { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
-.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 7px; border: 1px solid var(--rule); border-radius: 99px;
-  background: var(--panel-2); font: 12px var(--sans); color: var(--muted); white-space: nowrap; max-width: 100%; }
+.chip { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px 4px 9px; border: 1px solid var(--rule); border-radius: 99px;
+  background: var(--panel); font: 12px var(--sans); color: var(--muted); white-space: nowrap; max-width: 100%; }
 .chip b { color: var(--ink); font-weight: 600; }
-.chip .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
-.chip.ok .dot { background: #45c48a; }
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.chip.ok .dot { background: var(--ok); box-shadow: 0 0 6px rgba(69, 196, 138, .7); }
 .chip.warn .dot { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .chip.bad .dot { background: var(--bad); }
-.chip.ok { border-color: rgba(69, 196, 138, .35); }
 .chip.warn { border-color: rgba(227, 160, 90, .45); color: var(--ink); }
 .chip.bad { border-color: rgba(239, 107, 107, .55); color: var(--ink); }
 @keyframes pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .chip.warn .dot { animation: none; } }
+/* cards */
+.card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); min-width: 0; }
+.card > h2, .card-head h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 700; color: var(--ink); }
+.card > h2 svg.i, .card-head svg.i { color: var(--accent); width: 18px; height: 18px; }
 details.settings > summary { display: none; }
-.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
-.controls label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
-select { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 6px; font: inherit; max-width: 100%; }
-input[type=range], input[type=checkbox] { accent-color: var(--accent); }
-.flash { background: var(--panel-2); color: var(--muted); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
-.flash[aria-pressed=true] { background: var(--warn); border-color: var(--warn); color: #241505; }
+.cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+.cards .card { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.card-act { margin-left: auto; font-weight: 500; padding: 3px 10px; }
+.toggles { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+.fields.one { grid-template-columns: minmax(0, 1fr); }
+.f { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; min-width: 0; }
+.f > span:first-child { flex: none; white-space: nowrap; }
+.f select { flex: 1; min-width: 0; }
+.f input[type=range] { flex: 1; min-width: 50px; }
+.f .v { font: 12px var(--mono); color: var(--ink); min-width: 3.4em; text-align: right; white-space: nowrap; }
+select { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 7px; padding: 5px 8px; font: inherit; font-size: 12.5px; max-width: 100%; }
+input[type=range] { accent-color: var(--accent); }
+/* switches: checkboxes and the variant toggles (mirrors, camera light) look alike */
+.tg { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: 13px; cursor: pointer; white-space: nowrap; }
+input[type=checkbox].sw { appearance: none; -webkit-appearance: none; margin: 0; position: relative; width: 34px; height: 19px; border-radius: 10px;
+  background: var(--panel-3); border: 1px solid var(--rule); cursor: pointer; flex: none; transition: background .15s; }
+input[type=checkbox].sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
+input[type=checkbox].sw:checked { background: var(--accent); border-color: var(--accent); }
+input[type=checkbox].sw:checked::after { transform: translateX(15px); background: #062126; }
+.toggle { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; color: var(--ink); font: inherit; font-size: 13px; cursor: pointer; }
+.toggle .sw { position: relative; width: 34px; height: 19px; border-radius: 10px; background: var(--panel-3); border: 1px solid var(--rule); flex: none; transition: background .15s; }
+.toggle .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
+.toggle .ts { display: none; }
+.toggle kbd { font-size: 10px; }
+.toggle[aria-pressed=true] .sw { background: var(--accent); border-color: var(--accent); }
+.toggle[aria-pressed=true] .sw::after { transform: translateX(15px); background: #062126; }
+#flash.toggle[aria-pressed=true] .sw { background: var(--warn); border-color: var(--warn); }
+#flash.toggle[aria-pressed=true] .sw::after { background: #241505; }
+@media (prefers-reduced-motion: reduce) { .toggle .sw, .toggle .sw::after, input.sw, input.sw::after { transition: none; } }
+.flash { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 7px; padding: 5px 12px; font: inherit; font-size: 12.5px; cursor: pointer; }
+.flash:hover { border-color: var(--muted); }
+.flash.primary { border-color: var(--accent); color: var(--accent); }
+.flash[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: #062126; }
 select:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
-.views { min-width: 0; display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
-.panes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.pane { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.pane-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; min-height: 28px; }
-.tabs { display: flex; gap: 2px; background: var(--panel-2); border-radius: 5px; padding: 2px; flex-wrap: wrap; }
-.tabs button { font: 12px var(--mono); color: var(--muted); background: none; border: 0; border-radius: 3px; padding: 4px 9px; cursor: pointer; }
-.tabs button[aria-pressed=true] { background: var(--rule); color: var(--ink); }
-.scale { display: flex; align-items: center; gap: 6px; color: var(--muted); font: 12px var(--mono); }
-.scale input { width: 110px; }
-.pane-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
-.scale .ev-v { min-width: 4.5em; }
-.frame { position: relative; background: #000; border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; aspect-ratio: 4 / 3; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
+/* panes and side column */
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 340px; gap: 10px; min-height: 0; }
+.pane { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; min-height: 0; }
+.pane-head { display: flex; align-items: center; gap: 8px; min-height: 30px; }
+.pane-head h2 { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pdot { width: 12px; height: 12px; border-radius: 50%; flex: none; background: conic-gradient(#ef5350, #fdd835, #66bb6a, #29b6f6, #ab47bc, #ef5350); }
+.pdot[data-band=r] { background: #ef5350; } .pdot[data-band=g] { background: #66bb6a; } .pdot[data-band=b] { background: #42a5f5; }
+.pdot[data-band=nir] { background: radial-gradient(circle, #ff6ad5, #8a2be2); }
+.tabsets { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs { display: flex; gap: 2px; background: var(--panel-2); border-radius: 7px; padding: 2px; flex-wrap: wrap; }
+.tabs button { font: 12px var(--mono); color: var(--muted); background: none; border: 0; border-radius: 5px; padding: 4px 10px; cursor: pointer; }
+.tabs button:hover { color: var(--ink); }
+.tabs button[aria-pressed=true] { background: var(--accent); color: #062126; font-weight: 600; }
+/* step sliders: a numeric menu shown as a slider over its options (the select stays, hidden, and keeps the logic) */
+select.as-slider { display: none; }
+.frame-wrap { flex: 1; min-height: 0; container-type: size; display: grid; place-items: center; }
+.frame { position: relative; width: min(100cqw, calc(100cqh * 4 / 3)); aspect-ratio: 4 / 3; background: #000; border: 1px solid var(--rule); border-radius: 8px;
+  overflow: hidden; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
+.frame.grid::after { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)),
+              linear-gradient(0deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)); }
+.frame:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; border: 0; border-radius: 0; }
 .cands { position: absolute; inset: 0; pointer-events: none; }
 .cand { position: absolute; transform: translate(-50%, -50%); pointer-events: auto; cursor: pointer;
   min-width: 30px; height: 30px; border-radius: 15px; border: 2px solid var(--accent); background: rgba(14, 19, 22, .72);
   color: var(--ink); font: 700 13px var(--mono); display: grid; place-items: center; padding: 0 6px; }
 .cand:hover, .cand:focus-visible { background: var(--accent); color: #062126; outline: none; }
 .cand.first { border-color: var(--accent-2); }
-.badge { position: absolute; left: 8px; top: 8px; font: 12px var(--mono); background: rgba(14, 19, 22, .75); padding: 2px 7px; border-radius: 3px; pointer-events: none; }
-.note { top: auto; bottom: 10px; right: 8px; left: 8px; text-align: center; white-space: normal; }
+.badge { position: absolute; left: 8px; top: 8px; font: 12px var(--mono); background: rgba(10, 14, 16, .78); padding: 3px 8px; border-radius: 5px; pointer-events: none; }
+.note { top: auto; bottom: 10px; right: 10px; left: 10px; text-align: center; white-space: normal; }
 .progress { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); width: 0; transition: width .12s linear; }
 .legend { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font: 11.5px var(--mono); color: var(--muted); min-height: 16px; }
-.legend-bar { height: 8px; border-radius: 2px; }
+.legend-bar { height: 8px; border-radius: 3px; }
 .pad { display: none; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.pad button { min-height: 52px; font: 600 14px var(--sans); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-radius: 8px; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; line-height: 1.2; }
+.pad button { min-height: 52px; font: 600 14px var(--sans); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-radius: 10px; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; line-height: 1.2; }
 .pad button span { font: 11px var(--sans); color: var(--muted); }
 .pad button:active { background: var(--rule); }
 .pad .go { border-color: var(--accent); }
-.status { display: flex; flex-wrap: wrap; gap: 4px 16px; font: 12.5px var(--mono); color: var(--muted); padding: 8px 10px; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; }
-.status b { color: var(--ink); font-weight: 500; }
-.status .jitlog { flex-basis: 100%; margin: 4px 0 0; max-height: 9.5em; overflow: auto; white-space: pre; font: 11.5px var(--mono); color: var(--muted); }
-.busy { color: var(--warn); }
-.err { color: var(--bad); white-space: pre-wrap; font: 12.5px var(--mono); background: var(--panel); border: 1px solid var(--bad); border-radius: 4px; padding: 8px 10px; }
-aside { border-left: 1px solid var(--rule); background: var(--panel); display: flex; flex-direction: column; gap: 14px; padding: 14px; min-width: 0; }
-aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 6px; font-weight: 700; }
-#map { width: 100%; aspect-ratio: 1; background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; cursor: pointer; display: block; touch-action: manipulation; }
+aside { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
+aside > .card { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+aside > .card.info { flex: 1; overflow-y: auto; }
+#map { width: 100%; height: clamp(150px, 24vh, 300px); background: var(--bg); border: 1px solid var(--rule); border-radius: 8px; cursor: pointer; display: block; touch-action: manipulation; }
 dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; margin: 0; font: 12.5px var(--mono); }
 dt { color: var(--muted); }
 dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+aside dl > div { display: contents; }
 .keys { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; font-size: 12.5px; color: var(--muted); }
 kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: 3px; padding: 0 5px; }
-.hint { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+.hint { font-size: 12px; color: var(--muted); margin: 0; }
+.hint:empty { display: none; }
+.ptabs { display: flex; gap: 2px; background: var(--panel-2); border-radius: 8px; padding: 3px; }
+.ptabs button { flex: 1; font: 12.5px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 6px; padding: 6px 4px; cursor: pointer; white-space: nowrap; }
+.ptabs button[aria-selected=true] { background: var(--panel-3); color: var(--ink); font-weight: 600; }
+/* status bar */
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; padding: 8px 14px; }
+.status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px; font: 12.5px var(--mono); color: var(--muted); flex: 1; min-width: 0; }
+.status b { color: var(--ink); font-weight: 600; }
+.status .logline { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60ch; }
+.sysinfo { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px var(--mono); color: var(--muted); margin-left: auto; }
+.sysinfo span + span::before { content: "|"; margin-right: 14px; color: var(--rule); }
+.busy { color: var(--warn); }
+.err { position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: min(900px, calc(100vw - 32px)); z-index: 5;
+  color: var(--bad); white-space: pre-wrap; font: 12.5px var(--mono); background: var(--panel); border: 1px solid var(--bad); border-radius: 8px; padding: 8px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+/* desktop: the page fits the window */
+@media (min-width: 1001px) {
+  html, body { height: 100%; }
+  body { height: 100vh; overflow: hidden; }
+}
+dialog#help { max-width: min(780px, calc(100vw - 32px)); max-height: calc(100vh - 48px); width: 100%; padding: 0; overflow: hidden;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--rule); border-radius: 12px; }
+dialog#help[open] { display: flex; flex-direction: column; }
+dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
+.help-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--rule); }
+.help-head h2 { margin: 0; font-size: 15px; }
+.help-body { overflow-y: auto; padding: 4px 16px 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 0 24px; }
+.help-body h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 14px 0 6px; }
+#rig-readout dd { white-space: nowrap; font-size: 11.5px; }
+#rig-readout dt { font-size: 11.5px; }
+.rig-view { position: relative; }
+#rig3d { width: 100%; height: clamp(150px, 24vh, 240px); display: block; background: var(--bg); border: 1px solid var(--rule); border-radius: 8px; outline: none; touch-action: none; }
+#rig3d:focus-visible { border-color: var(--accent); }
+.rig-view.big #rig3d { height: clamp(240px, 52vh, 460px); }
+.rig-mode { position: absolute; left: 8px; top: 8px; font: 11.5px var(--mono); color: var(--ink); background: rgba(14, 19, 22, .78); padding: 2px 7px; border-radius: 4px; pointer-events: none; white-space: pre; }
+.rig-mode:empty { display: none; }
+.rig-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+#rig-readout { margin-top: 8px; }
 .touch-only { display: none; }
+@media (max-width: 1500px) { .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (hover: none), (max-width: 760px) {
   .pad { display: grid; }
   .touch-only { display: block; }
@@ -95,115 +177,192 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
 }
 @media (max-width: 1000px) {
   main { grid-template-columns: minmax(0, 1fr); }
-  aside { border-left: 0; border-top: 1px solid var(--rule); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .frame-wrap { container-type: normal; display: block; }
+  .frame { width: 100%; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
-  header { padding: 8px 12px; gap: 6px 12px; }
+  body { padding: 8px; }
   .monitor { margin-left: 0; width: 100%; }
-  details.settings { width: 100%; }
   details.settings > summary { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--muted); font-size: 13px; list-style: none; padding: 4px 0; }
   details.settings > summary::-webkit-details-marker { display: none; }
   details.settings > summary::before { content: "▸"; }
   details.settings[open] > summary::before { content: "▾"; }
-  .controls { flex-direction: column; align-items: stretch; gap: 8px; padding-top: 6px; }
-  .controls label { justify-content: space-between; }
-  .controls select { flex: 1; min-width: 0; }
-  .views { padding: 10px 12px; }
-  .panes { grid-template-columns: minmax(0, 1fr); }
+  .cards { grid-template-columns: minmax(0, 1fr); }
   #pane-b { display: none; }
-  aside { grid-template-columns: minmax(0, 1fr); padding: 12px; }
-  .scale input { width: 90px; }
 }
 </style>
 </head>
 <body>
-<header>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3 2 8l10 5 10-5-10-5Z"/><path d="m2 16 10 5 10-5"/><path d="m2 12 10 5 10-5"/></symbol>
+  <symbol id="i-render" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+  <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V18h6v-1.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2Z"/></symbol>
+  <symbol id="i-cube" viewBox="0 0 24 24"><path d="M21 16V8l-9-5-9 5v8l9 5 9-5Z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><path d="M1 6v16l7-4 8 4 7-4V2l-7 4-8-4-7 4Z"/><path d="M8 2v16M16 6v16"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+  <symbol id="i-shot" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2Z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><path d="M3 3h18v18H3zM9 3v18M15 3v18M3 9h18M3 15h18"/></symbol>
+  <symbol id="i-full" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></symbol>
+</svg>
+<header class="top">
   <h1>OpticalNav Sim Viewer</h1>
+  <button type="button" class="icon-btn" id="help-btn" aria-haspopup="dialog" title="조작법과 3D 리그 편집 키 (?)">도움말 ?</button>
   <div class="monitor" id="monitor" role="status" aria-live="polite"></div>
-  <details class="settings" id="settings">
-    <summary>설정</summary>
-    <div class="controls">
-      <label for="scene">씬 <select id="scene"></select></label>
-      <button type="button" id="mirrors" class="flash" hidden aria-pressed="false"
-        title="거울과 유리(M): perturbed와 base 전환. 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다.">거울 없음</button>
-      <button type="button" id="flash" class="flash" hidden aria-pressed="false"
-        title="카메라 앞 액티브 편광 조명(L). 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다.">조명 꺼짐</button>
-      <label for="mirrorsrc" title="거울·유리벽: 변형(perturbed)의 데이터셋 배치, 또는 robomituba 배치 로직으로 미리 만든 후보 풀에서 밀도만큼(로드·freeze 재기록 없음)">거울 배치 <select id="mirrorsrc"><option value="dataset">데이터셋</option><option value="pool">랜덤 풀</option></select></label>
-      <label for="mdensity" title="robomituba 단위 밀도(1 = 기본)">밀도 <input type="range" id="mdensity" min="0" max="4" step="0.25" value="1"> <span id="mdensity-v">1</span></label>
-      <label for="mglass" title="유리벽 수(우회로가 남는 것만)">유리벽 <select id="mglass"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></label>
-      <label for="lighting" title="조명(I로 순환). 실내 조명은 Infinigen 원래 램프·천장등, 전역 조명은 로드 때 방마다 더한 소프트박스. 빠지는 조명은 끄는 대신 씬에서 지웁니다(freeze 재기록 없음).">조명 <select id="lighting"><option value="none">없음</option><option value="fixtures">실내 조명</option><option value="all">실내+전역 조명</option></select></label>
-      <label for="env" title="창밖 하늘(환경맵). 픽셀만 바꿔 넣으므로 freeze를 다시 기록하지 않습니다.">하늘 <select id="env"></select></label>
-      <label for="bands" title="근적외선은 같은 씬을 의사 NIR 재질(RGB 기본색에서 계산)로 한 번 더 렌더합니다. freeze 기록은 같이 씁니다.">대역 <select id="bands"><option value="rgb">RGB</option><option value="both">RGB+NIR</option><option value="nir">NIR</option></select></label>
-      <label for="flashband" title="액티브 조명이 내는 대역">조명 대역 <select id="flashband"><option value="rgb">RGB</option><option value="nir">NIR</option><option value="both">둘 다</option></select></label>
-      <label for="envrot" title="하늘을 수직축으로 돌립니다">회전 <input type="range" id="envrot" min="0" max="345" step="15" value="0"> <span id="envrot-v">0°</span></label>
-      <label for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다.">패스 spp <select id="pass"></select></label>
-      <label for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다.">목표 spp <select id="target"></select></label>
-      <label for="denoise" title="패스마다 적용합니다"><input type="checkbox" id="denoise"> 디노이저</label>
-      <label for="speed" title="W/A/S/D를 누르고 있을 때 움직이는 속도">이동 속도 <select id="speed"><option value="0.5">0.5 m/s</option><option value="1" selected>1 m/s</option><option value="2">2 m/s</option><option value="4">4 m/s</option></select></label>
-      <label for="step" title="터치 패드 버튼 한 번에 움직이는 거리">패드 보폭 <select id="step"><option value="0.1">0.1 m</option><option value="0.25" selected>0.25 m</option><option value="0.5">0.5 m</option></select></label>
-      <label for="auto"><input type="checkbox" id="auto" checked> 멈추면 누적</label>
-    </div>
-  </details>
 </header>
+<details class="settings" id="settings">
+  <summary>설정</summary>
+  <div class="cards">
+    <section class="card">
+      <h2><svg class="i"><use href="#i-layers"/></svg>Scene</h2>
+      <div class="fields one">
+        <label class="f" for="scene"><span>씬</span><select id="scene"></select></label>
+        <label class="f" for="env" title="창밖 하늘(환경맵). 픽셀만 바꿔 넣으므로 freeze를 다시 기록하지 않습니다."><span>하늘</span><select id="env"></select></label>
+        <label class="f" for="envrot" title="하늘(환경맵)을 수직축으로 돌립니다. 광원 편광과는 무관합니다. 원래 하늘이 균일한 씬(대부분의 Infinigen 씬)에서는 바뀌는 것이 없고, sunny_day·blue_hour 같은 맵에서 해와 밝은 쪽의 방향이 바뀝니다"><span>하늘 회전</span><input type="range" id="envrot" min="0" max="345" step="15" value="0"><span class="v" id="envrot-v">0°</span></label>
+      </div>
+    </section>
+    <section class="card">
+      <h2><svg class="i"><use href="#i-render"/></svg>Render</h2>
+      <div class="toggles">
+        <label class="tg" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
+        <label class="tg" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
+        <label class="tg" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
+        <label class="tg" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
+      </div>
+      <div class="fields">
+        <label class="f" for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다."><span>패스 spp</span><select id="pass" class="as-slider"></select></label>
+        <label class="f" for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다."><span>목표 spp</span><select id="target" class="as-slider"></select></label>
+        <label class="f" for="maxdepth" title="빛 경로 길이 상한(Mitsuba max_depth). 1: 직접 보이는 광원만, 2: 직접광, 3: 간접광 한 번 더, …. 노이즈와 흰 점(firefly)이 몇 번째 반사에서 오는지 가르는 진단용입니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>경로 깊이</span><select id="maxdepth" class="as-slider"><option value="0">씬 기본</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option><option>12</option></select></label>
+      </div>
+    </section>
+    <section class="card">
+      <h2><svg class="i"><use href="#i-bulb"/></svg>Lighting</h2>
+      <div class="toggles">
+        <button type="button" id="flash" class="toggle" hidden aria-pressed="false"
+          title="카메라 액티브 편광 조명(플래시) 켜기/끄기 (L). 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다."><span class="sw" aria-hidden="true"></span><span class="tl">플래시</span><span class="ts">꺼짐</span><kbd>L</kbd></button>
+        <label class="tg" for="lamps" title="Infinigen이 빛을 넣지 않은 램프(책상·스탠드 램프)의 갓도 빛나게 합니다. 세기는 이 씬의 다른 램프와 같고, 대역별 세기는 백열등을 따릅니다. 데이터셋은 이 램프들을 꺼진 채로 렌더했습니다."><input type="checkbox" class="sw" id="lamps"> 꺼진 램프</label>
+      </div>
+      <div class="fields">
+        <label class="f" for="lighting" title="조명(I로 순환). 실내 조명은 Infinigen 원래 램프·천장등, 전역 조명은 로드 때 방마다 더한 소프트박스. 빠지는 조명은 어두워지거나(램프) 씬에서 빠집니다(freeze 재기록 없음)."><span>조명 방식</span><select id="lighting"><option value="none">없음</option><option value="fixtures">실내 조명</option><option value="all">실내+전역</option></select></label>
+        <label class="f" for="flashscale" title="카메라 조명(플래시)의 크기. 전체 세기(파워)는 그대로 두고 면적만 키웁니다(방사휘도 ÷ 배율²). 작은 조명은 거울·광택면을 거친 빛이 드물게 매우 밝게 잡혀 흰 점(firefly)이 생기는데, 큰 조명은 이를 크게 줄입니다. 1×가 데이터셋의 플래시(0.12×0.08 m)입니다."><span>플래시 크기</span><select id="flashscale" class="as-slider"><option value="1">1× 기본</option><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option></select></label>
+        <label class="f" for="flashband" title="액티브 조명이 내는 대역"><span>플래시 대역</span><select id="flashband"><option value="rgb">RGB</option><option value="nir">NIR</option><option value="both">둘 다</option></select></label>
+      </div>
+    </section>
+    <section class="card">
+      <h2><svg class="i"><use href="#i-cube"/></svg>Mirrors · Motion</h2>
+      <div class="toggles">
+        <button type="button" id="mirrors" class="toggle" hidden aria-pressed="false"
+          title="거울과 유리 켜기/끄기 (M): perturbed와 base 전환. 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다."><span class="sw" aria-hidden="true"></span><span class="tl">거울</span><span class="ts">꺼짐</span><kbd>M</kbd></button>
+      </div>
+      <div class="fields">
+        <label class="f" for="mirrorsrc" title="거울·유리벽: 변형(perturbed)의 데이터셋 배치, 또는 robomituba 배치 로직으로 미리 만든 후보 풀에서 밀도만큼(로드·freeze 재기록 없음)"><span>거울 배치</span><select id="mirrorsrc"><option value="dataset">데이터셋</option><option value="pool">랜덤 풀</option></select></label>
+        <label class="f" for="mdensity" title="robomituba 단위 밀도(1 = 기본)"><span>밀도</span><input type="range" id="mdensity" min="0" max="4" step="0.25" value="1"><span class="v" id="mdensity-v">1</span></label>
+        <label class="f" for="mglass" title="유리벽 수(우회로가 남는 것만)"><span>유리벽</span><select id="mglass" class="as-slider"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></label>
+        <label class="f" for="speed" title="W/A/S/D를 누르고 있을 때 움직이는 속도"><span>이동 속도</span><select id="speed" class="as-slider"><option value="0.5">0.5 m/s</option><option value="1" selected>1 m/s</option><option value="2">2 m/s</option><option value="4">4 m/s</option></select></label>
+        <label class="f" for="step" title="터치 패드 버튼 한 번에 움직이는 거리"><span>패드 보폭</span><select id="step" class="as-slider"><option value="0.1">0.1 m</option><option value="0.25" selected>0.25 m</option><option value="0.5">0.5 m</option></select></label>
+      </div>
+    </section>
+    <section class="card">
+      <h2><svg class="i"><use href="#i-eye"/></svg>View · Exposure<button type="button" id="refit" class="flash primary card-act" title="지금 화면의 밝은 부분에 맞춰 RGB와 NIR의 노출 기준점을 다시 잡고, 노출 조절을 0으로 돌립니다">자동 노출</button></h2>
+      <div class="fields">
+        <label class="f" for="bands" title="근적외선 대역을 같이 렌더합니다(같은 경로에서 의사 NIR 재질로). freeze 기록은 같이 씁니다."><span>대역</span><select id="bands"><option value="rgb">RGB</option><option value="both">RGB+NIR</option><option value="nir">NIR</option></select></label>
+        <label class="f" for="scale" title="DoLP·S1·S2 색 범위"><span>범위</span><input type="range" id="scale" min="0.05" max="1" step="0.05" value="0.2"><span class="v" id="scale-v">0.20</span></label>
+        <label class="f" for="ev-rgb" title="RGB 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다"><span>RGB 노출</span><input type="range" id="ev-rgb" min="-4" max="4" step="0.25" value="0"><span class="v" id="ev-rgb-v">0 EV</span></label>
+        <label class="f" for="ev-nir" title="NIR 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다"><span>NIR 노출</span><input type="range" id="ev-nir" min="-4" max="4" step="0.25" value="0"><span class="v" id="ev-nir-v">0 EV</span></label>
+      </div>
+      <div class="fields one">
+        <label class="f" for="nirlow" title="의사 NIR 반사율의 범위. robomituba 식(기본색 c의 dot(max(c, 1−c), 휘도 가중치))은 0.5(중간 회색)~1(검정·흰색)이라 모든 표면이 근적외선을 절반 이상 반사합니다. 그 범위를 [아래, 위]로 옮깁니다. 0.50–1.00이 데이터셋 그대로입니다. 렌더를 다시 기록하지 않습니다."><span>NIR 반사율</span><input type="range" id="nirlow" min="0" max="1" step="0.05" value="0.5" aria-label="NIR 반사율 아래"><input type="range" id="nirhigh" min="0" max="1" step="0.05" value="1" aria-label="NIR 반사율 위"><span class="v" id="nirrange-v">0.50–1.00</span></label>
+      </div>
+    </section>
+  </div>
+</details>
 <main>
-  <section class="views">
-    <div class="panes">
-      <div class="pane" id="pane-a">
-        <div class="pane-head">
-          <div class="tabs" role="group" aria-label="왼쪽 화면 채널" data-pane="a"></div>
-          <div class="pane-tools">
-            <label class="scale" for="scale">범위 <input type="range" id="scale" min="0.05" max="1" step="0.05" value="0.2"> <span id="scale-v">0.20</span></label>
-            <label class="scale" for="ev-rgb" title="RGB 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다">RGB 노출 <input type="range" id="ev-rgb" min="-4" max="4" step="0.25" value="0"> <span class="ev-v" id="ev-rgb-v">0 EV</span></label>
-          </div>
-        </div>
-        <div class="frame" id="frame-a">
-          <img id="img-a" alt="현재 시점">
-          <div class="cands" id="cands"></div>
-          <span class="badge" id="badge"></span>
-          <div class="progress" id="progress"></div>
-        </div>
-        <div class="legend" id="legend-a"></div>
-      </div>
-      <div class="pane" id="pane-b">
-        <div class="pane-head">
-          <div class="tabs" role="group" aria-label="오른쪽 화면 채널" data-pane="b"></div>
-          <div class="pane-tools">
-            <label class="scale" for="ev-nir" title="NIR 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다">NIR 노출 <input type="range" id="ev-nir" min="-4" max="4" step="0.25" value="0"> <span class="ev-v" id="ev-nir-v">0 EV</span></label>
-            <button type="button" id="refit" class="flash" title="지금 화면의 밝은 부분에 맞춰 RGB와 NIR의 노출 기준점을 다시 잡고, 노출 조절을 0으로 돌립니다">자동 노출</button>
-          </div>
-        </div>
-        <div class="frame" id="frame-b"><img id="img-b" alt="현재 시점의 두 번째 채널"></div>
-        <div class="legend" id="legend-b"></div>
-      </div>
+  <section class="card pane" id="pane-a">
+    <div class="pane-head card-head">
+      <span class="pdot" id="dot-a"></span><h2 id="title-a">RGB 영상</h2>
+      <button type="button" class="icon-btn" data-act="shot" data-pane="a" title="이 화면 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
+      <button type="button" class="icon-btn" data-act="grid" data-pane="a" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
+      <button type="button" class="icon-btn" data-act="full" data-pane="a" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
     </div>
-    <div class="pad" role="group" aria-label="조작">
-      <button type="button" data-op="turn" data-v="-1">↶ 회전<span id="pad-turn-l"></span></button>
-      <button type="button" class="go" data-fly="forward" data-v="1">W 앞으로<span class="pad-step"></span></button>
-      <button type="button" data-op="turn" data-v="1">↷ 회전<span id="pad-turn-r"></span></button>
-      <button type="button" data-fly="right" data-v="-1">A 왼쪽<span class="pad-step"></span></button>
-      <button type="button" data-fly="forward" data-v="-1">S 뒤로<span class="pad-step"></span></button>
-      <button type="button" data-fly="right" data-v="1">D 오른쪽<span class="pad-step"></span></button>
-      <button type="button" data-fly="up" data-v="-1">Q 아래로<span>0.1 m</span></button>
-      <button type="button" data-op="forward">↑ 정면 후보<span>그래프 이동</span></button>
-      <button type="button" data-fly="up" data-v="1">E 위로<span>0.1 m</span></button>
+    <div class="tabsets"><div class="tabs" role="group" aria-label="왼쪽 화면 대역" data-pane="a" data-kind="band"></div><div class="tabs" role="group" aria-label="왼쪽 화면 보기" data-pane="a" data-kind="view"></div></div>
+    <div class="frame-wrap"><div class="frame" id="frame-a">
+      <img id="img-a" alt="현재 시점">
+      <div class="cands" id="cands"></div>
+      <span class="badge" id="badge"></span>
+      <div class="progress" id="progress"></div>
+    </div></div>
+    <div class="legend" id="legend-a"></div>
+  </section>
+  <section class="card pane" id="pane-b">
+    <div class="pane-head card-head">
+      <span class="pdot" id="dot-b"></span><h2 id="title-b">RGB DoLP</h2>
+      <button type="button" class="icon-btn" data-act="shot" data-pane="b" title="이 화면 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
+      <button type="button" class="icon-btn" data-act="grid" data-pane="b" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
+      <button type="button" class="icon-btn" data-act="full" data-pane="b" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
     </div>
-    <div class="status" id="status"><span>서버에 연결하는 중…</span></div>
-    <div class="err" id="error" hidden></div>
+    <div class="tabsets"><div class="tabs" role="group" aria-label="오른쪽 화면 대역" data-pane="b" data-kind="band"></div><div class="tabs" role="group" aria-label="오른쪽 화면 보기" data-pane="b" data-kind="view"></div></div>
+    <div class="frame-wrap"><div class="frame" id="frame-b"><img id="img-b" alt="현재 시점의 두 번째 채널"></div></div>
+    <div class="legend" id="legend-b"></div>
   </section>
   <aside>
-    <div>
-      <h2>지도</h2>
+    <section class="card">
+      <h2><svg class="i"><use href="#i-map"/></svg>지도</h2>
       <canvas id="map" width="600" height="600" aria-label="연결 그래프 지도. 누르면 가장 가까운 지점으로 이동"></canvas>
-      <p class="hint">지도를 누르면 가장 가까운 그래프 지점으로 이동합니다(에피소드 단계가 0으로 돌아갑니다).</p>
-    </div>
-    <div>
-      <h2>현재 상태</h2>
-      <dl id="readout"></dl>
-      <h2 style="margin-top: 14px">픽셀 값</h2>
-      <dl id="probe"><dt>위치</dt><dd class="desk-only">이미지 위에 마우스를 올리세요</dd><dd class="touch-only">이미지를 탭하세요</dd></dl>
-    </div>
-    <div class="desk-only">
-      <h2>조작</h2>
+      <p class="hint" id="map-src"></p>
+    </section>
+    <section class="card info">
+      <div class="ptabs" role="tablist" aria-label="정보 패널">
+        <button type="button" role="tab" id="t-rig" aria-controls="p-rig" data-tab="rig">카메라 리그</button>
+        <button type="button" role="tab" id="t-state" aria-controls="p-state" data-tab="state">현재 상태</button>
+        <button type="button" role="tab" id="t-probe" aria-controls="p-probe" data-tab="probe">픽셀 값</button>
+        <button type="button" role="tab" id="t-scene" aria-controls="p-scene" data-tab="scene">씬 정보</button>
+      </div>
+      <section class="ppanel" role="tabpanel" id="p-rig" aria-labelledby="t-rig" hidden>
+        <div class="rig-view" id="rig-view">
+          <canvas id="rig3d" tabindex="0" aria-label="카메라와 플래시 위치를 관측자 기준으로 편집하는 3D 보기"></canvas>
+          <div class="rig-mode" id="rig-mode"></div>
+        </div>
+        <div class="rig-tools">
+          <button type="button" class="flash" id="rig-sel-camera" aria-pressed="false">카메라 선택</button>
+          <button type="button" class="flash" id="rig-sel-flash" aria-pressed="false">플래시 선택</button>
+          <button type="button" class="flash" id="rig-reset" title="선택한 것을 데이터셋 위치로 (Alt+G)">원위치</button>
+          <button type="button" class="flash" id="rig-big" aria-pressed="false">크게</button>
+        </div>
+        <dl id="rig-readout"></dl>
+      </section>
+      <section class="ppanel" role="tabpanel" id="p-state" aria-labelledby="t-state" hidden><dl id="readout"></dl></section>
+      <section class="ppanel" role="tabpanel" id="p-probe" aria-labelledby="t-probe" hidden>
+        <dl id="probe"><div><dt>위치</dt><dd class="desk-only">이미지 위에 마우스를 올리세요</dd><dd class="touch-only">이미지를 탭하세요</dd></div></dl>
+      </section>
+      <section class="ppanel" role="tabpanel" id="p-scene" aria-labelledby="t-scene" hidden>
+        <dl id="scene-stats"><div><dt>씬</dt><dd>불러오는 중…</dd></div></dl>
+        <p class="hint">렌더 서버에 올라간 씬 기준, 5초마다 갱신. GPU는 장치 전체 사용량(다른 프로세스 포함).</p>
+      </section>
+    </section>
+  </aside>
+</main>
+<div class="pad" role="group" aria-label="조작">
+  <button type="button" data-op="turn" data-v="-1">↶ 회전<span id="pad-turn-l"></span></button>
+  <button type="button" class="go" data-fly="forward" data-v="1">W 앞으로<span class="pad-step"></span></button>
+  <button type="button" data-op="turn" data-v="1">↷ 회전<span id="pad-turn-r"></span></button>
+  <button type="button" data-fly="right" data-v="-1">A 왼쪽<span class="pad-step"></span></button>
+  <button type="button" data-fly="forward" data-v="-1">S 뒤로<span class="pad-step"></span></button>
+  <button type="button" data-fly="right" data-v="1">D 오른쪽<span class="pad-step"></span></button>
+  <button type="button" data-fly="up" data-v="-1">Q 아래로<span>0.1 m</span></button>
+  <button type="button" data-op="forward">↑ 정면 후보<span>그래프 이동</span></button>
+  <button type="button" data-fly="up" data-v="1">E 위로<span>0.1 m</span></button>
+</div>
+<footer class="card bar">
+  <div class="status" id="status"><span>서버에 연결하는 중…</span></div>
+  <div class="sysinfo" id="sysinfo"></div>
+</footer>
+<div class="err" id="error" hidden></div>
+<dialog id="help" aria-labelledby="help-title">
+  <div class="help-head"><h2 id="help-title">조작법</h2><button type="button" class="flash" id="help-close" aria-label="닫기">닫기 (Esc)</button></div>
+  <div class="help-body">
+    <section class="desk-only">
+      <h3>이동과 보기</h3>
       <div class="keys">
         <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>누르고 있는 동안 자유 이동 (앞·왼쪽·뒤·오른쪽, 이동 속도로)</span>
         <span><kbd>Q</kbd> <kbd>E</kbd></span><span>높이 내리기 / 올리기 (0.5 m/s)</span>
@@ -213,23 +372,42 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
         <span><kbd>↑</kbd> · <kbd>1</kbd>–<kbd>9</kbd></span><span>그래프 후보로 이동 (정면 후보 · 번호)</span>
         <span><kbd>↓</kbd></span><span>뒤로 돌기 (180°)</span>
         <span><kbd>G</kbd></span><span>가장 가까운 그래프 지점으로 붙기</span>
+        <span><kbd>M</kbd> <kbd>L</kbd> <kbd>I</kbd></span><span>거울 · 조명(플래시) 켜고 끄기 · 실내 조명 단계 순환</span>
         <span><kbd>Space</kbd></span><span>누적 일시정지 / 재개</span>
+        <span><kbd>?</kbd></span><span>이 도움말</span>
       </div>
-    </div>
-    <div class="touch-only">
-      <h2>터치 조작</h2>
+      <h3>지도</h3>
+      <p class="hint">누르면 가장 가까운 그래프 지점으로 이동합니다(에피소드 단계가 0으로 돌아갑니다). 방 평면도가 있는 씬은 방 종류별 색과 이름, 문(■)과 트인 통로(○)가 함께 그려집니다.</p>
+    </section>
+    <section class="touch-only">
+      <h3>터치 조작</h3>
       <p class="hint">버튼으로 움직이고, 화면을 좌우로 밀면 회전합니다. 화면을 두 번 탭하면 그곳으로 고개를 돌리고, 한 번 탭하면 그 픽셀의 편광 값이 나옵니다. 번호 원을 누르면 그래프 지점으로 갑니다.</p>
-    </div>
-  </aside>
-</main>
+    </section>
+    <section>
+      <h3>카메라 리그 (3D 편집)</h3>
+      <p class="hint">관측자(바닥의 원과 화살표) 기준으로 카메라 마운트와 플래시를 옮깁니다. 플래시는 카메라를 따라 움직이고 계속 카메라 시야 방향을 봅니다. 카메라를 올리면 데이터셋 리그처럼 시선이 조금 더 아래로 향합니다. 옮기는 동안 렌더가 따라오며, freeze를 다시 기록하지 않습니다. 키는 3D 보기를 누른 뒤에 듣습니다.</p>
+      <div class="keys desk-only">
+        <span>클릭</span><span>카메라·플래시 선택, 화살표를 끌어 축 방향으로 이동</span>
+        <span><kbd>G</kbd></span><span>잡기: 마우스를 따라 이동, 클릭·<kbd>Enter</kbd> 확정, 우클릭·<kbd>Esc</kbd> 취소</span>
+        <span><kbd>X</kbd> <kbd>Y</kbd> <kbd>Z</kbd></span><span>잡는 중 축 고정 (X 오른쪽, Y 앞, Z 위). 숫자를 치면 그 거리(m)만큼</span>
+        <span><kbd>Alt</kbd>+<kbd>G</kbd></span><span>선택한 것을 데이터셋 위치로</span>
+        <span>드래그 / 휠</span><span>빈 곳을 끌면 회전, <kbd>Shift</kbd>·우클릭 드래그는 이동, 휠은 확대</span>
+        <span><kbd>1</kbd> <kbd>3</kbd> <kbd>7</kbd></span><span>앞 · 오른쪽 · 위에서 보기 (잡는 중이 아닐 때)</span>
+      </div>
+    </section>
+  </div>
+</dialog>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const PASS = [1, 2, 4, 8, 16, 32, 64];
 const TARGET = [64, 128, 256, 512, 1024, 2048, 4096];
-const CHANNELS = [["rgb", "RGB"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"],
-  ["nir", "NIR"], ["nir_dolp", "NIR DoLP"], ["nir_aolp", "NIR AoLP"]];
-const view = { a: "rgb", b: "dolp" };
+// a pane shows one band (RGB: the colour image and the dataset's luminance polarization; R, G, B, NIR: that
+// band's own Stokes vector) in one view; the server takes "<band>.<view>"
+const BANDS = [["rgb", "RGB"], ["r", "R"], ["g", "G"], ["b", "B"], ["nir", "NIR"]];
+const VIEWS = [["img", "영상"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"]];
+const pick = { a: { band: "rgb", view: "img" }, b: { band: "rgb", view: "dolp" } };
+const view = { get a() { return `${pick.a.band}.${pick.a.view}`; }, get b() { return `${pick.b.band}.${pick.b.view}`; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let S = null, graph = null, poseKey = "";
 // The server renders on its own (newest camera, accumulating while it stays put). One WebSocket carries
@@ -255,25 +433,55 @@ function fillSelect(sel, values, current) {
   }
 }
 
+// each pane: a band select and a view select in its header, remembered in this browser
+function paneTitle(pane) {
+  const band = BANDS.find(([v]) => v === pick[pane].band)[1], v = VIEWS.find(([x]) => x === pick[pane].view)[1];
+  $(`title-${pane}`).textContent = `${band} ${v}`;
+  $(`dot-${pane}`).dataset.band = pick[pane].band;
+}
 function buildTabs() {
+  try {  // each pane's band and view, remembered in this browser
+    const saved = JSON.parse(localStorage.getItem("opticalnav-panes") || "null");
+    for (const pane of ["a", "b"]) {
+      const s = saved && saved[pane];
+      if (s && BANDS.some(([v]) => v === s.band) && VIEWS.some(([v]) => v === s.view)) pick[pane] = { band: s.band, view: s.view };
+    }
+  } catch (e) { /* storage blocked or unreadable: the defaults */ }
   document.querySelectorAll(".tabs").forEach((box) => {
-    const pane = box.dataset.pane;
+    const pane = box.dataset.pane, kind = box.dataset.kind;
     box.innerHTML = "";
-    for (const [ch, label] of CHANNELS) {
+    for (const [value, label] of kind === "band" ? BANDS : VIEWS) {
       const b = document.createElement("button");
-      b.type = "button"; b.textContent = label; b.dataset.ch = ch;
-      b.setAttribute("aria-pressed", String(view[pane] === ch));
+      b.type = "button"; b.textContent = label;
+      b.setAttribute("aria-pressed", String(pick[pane][kind] === value));
       b.addEventListener("click", () => {
-        view[pane] = ch;
+        pick[pane][kind] = value;
+        try { localStorage.setItem("opticalnav-panes", JSON.stringify(pick)); } catch (e) { /* not remembered */ }
         // a near-infrared pane needs the near-infrared band: turn it on alongside the visible one
-        if (ch.startsWith("nir") && S && S.nir_available && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
+        if (pick[pane].band === "nir" && S && S.nir_available && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
         box.querySelectorAll("button").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
-        showImages(); renderLegends();
+        paneTitle(pane); showImages(); renderLegends();
       });
       box.appendChild(b);
     }
   });
+  paneTitle("a"); paneTitle("b");
 }
+// pane header buttons: save the shown JPEG, a rule-of-thirds grid, full screen
+document.querySelectorAll(".pane-head .icon-btn").forEach((b) => b.addEventListener("click", () => {
+  const pane = b.dataset.pane, frame = $(`frame-${pane}`);
+  if (b.dataset.act === "shot") {
+    if (!paneUrl[pane]) return;
+    const a = document.createElement("a");
+    a.href = paneUrl[pane];
+    a.download = `opticalnav_${S ? S.scene : "view"}_${view[pane].replace(".", "_")}_${S ? S.frame_spp : 0}spp.jpg`;
+    a.click();
+  } else if (b.dataset.act === "grid") {
+    b.setAttribute("aria-pressed", String(frame.classList.toggle("grid")));
+  } else if (b.dataset.act === "full") {
+    if (document.fullscreenElement) document.exitFullscreen(); else frame.requestFullscreen().catch(() => {});
+  }
+}));
 
 async function boot() {
   const wide = window.matchMedia("(min-width: 761px)");
@@ -286,6 +494,7 @@ async function boot() {
   fillSelect($("scene"), scenes, first);
   fillSelect($("pass"), PASS, S.pass_spp);
   fillSelect($("target"), TARGET, S.target_spp);
+  makeSliders();
   $("denoise").checked = S.denoise;
   $("auto").checked = S.auto;
   $("pad-turn-l").textContent = $("pad-turn-r").textContent = `${S.turn_deg}°`;
@@ -481,6 +690,35 @@ function rendererText(r) {
   return "";
 }
 
+// a select with class "as-slider" gets a range input over its options and a value label; the slider writes the select
+// (and fires its change), and syncSliders follows the select when the page sets it from the server's state
+function makeSliders() {
+  document.querySelectorAll("select.as-slider").forEach((sel) => {
+    if (sel._slider) return;
+    const range = document.createElement("input"), label = document.createElement("span");
+    range.type = "range"; range.min = "0"; range.step = "1"; range.className = "step-range";
+    range.setAttribute("aria-label", sel.closest("label")?.querySelector("span")?.textContent || sel.id);
+    label.className = "v";
+    sel.after(range, label);
+    sel._slider = { range, label };
+    range.addEventListener("input", () => { label.textContent = sel.options[Number(range.value)]?.text || ""; });
+    range.addEventListener("change", () => {
+      sel.selectedIndex = Number(range.value);
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  });
+  syncSliders();
+}
+function syncSliders() {
+  document.querySelectorAll("select.as-slider").forEach((sel) => {
+    const sl = sel._slider;
+    if (!sl || document.activeElement === sl.range) return;
+    sl.range.max = String(Math.max(0, sel.options.length - 1));
+    sl.range.value = String(Math.max(0, sel.selectedIndex));
+    sl.label.textContent = sel.options[sel.selectedIndex]?.text || "";
+  });
+}
+
 function showError(text) { $("error").hidden = !text; $("error").textContent = text || ""; }
 
 function apply(st) {
@@ -499,7 +737,9 @@ function apply(st) {
     $("badge").textContent = `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
     $("progress").style.width = `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
-  renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors();
+  renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
+  syncSliders();
+  rigSync();
   if ($("auto").checked !== S.auto) $("auto").checked = S.auto;
 }
 
@@ -512,18 +752,27 @@ function variantsHere() { return (S && S.scans[S.scene]) || []; }
 function renderFlash() {
   const vs = variantsHere(), mirrorsOn = S.variant === "perturbed" || S.variant === "active_polar";
   const toggles = [
-    ["mirrors", vs.includes("base") && vs.includes("perturbed"), mirrorsOn, "거울 있음", "거울 없음"],
-    ["flash", vs.includes("active_polar") && vs.includes("perturbed"), S.variant === "active_polar", "조명 켜짐", "조명 꺼짐"],
+    ["mirrors", vs.includes("base") && vs.includes("perturbed"), mirrorsOn],
+    ["flash", vs.includes("active_polar"), S.variant === "active_polar"],
   ];
-  for (const [id, shown, on, onText, offText] of toggles) {
+  for (const [id, shown, on] of toggles) {
     const b = $(id);
     b.hidden = !shown;
-    b.textContent = on ? onText : offText;
+    b.querySelector(".ts").textContent = on ? "켜짐" : "꺼짐";
     b.setAttribute("aria-pressed", String(on));
   }
 }
 function renderSky() {
   if (document.activeElement !== $("lighting") && $("lighting").value !== (S.lighting || "all")) $("lighting").value = S.lighting || "all";
+  if (document.activeElement !== $("lamps")) $("lamps").checked = !!S.lamps;
+  if (document.activeElement !== $("flashscale")) $("flashscale").value = String(S.flash_scale || 1);
+  if (document.activeElement !== $("maxdepth")) $("maxdepth").value = String(S.max_depth || 0);
+  if (document.activeElement !== $("caustics")) $("caustics").checked = S.caustics !== false;
+  if (document.activeElement !== $("split")) $("split").checked = S.active_split !== false;
+  const nr = S.nir_range || [0.5, 1];
+  if (document.activeElement !== $("nirlow") && document.activeElement !== $("nirhigh")) {
+    $("nirlow").value = String(nr[0]); $("nirhigh").value = String(nr[1]); showNirRange();
+  }
   const env = S.env || { map: "original", scale: 1, rotate_deg: 0 };
   const names = ["original", ...(S.envmaps || []), "__off__"];
   const sel = $("env"), want = env.scale > 0 ? env.map : "__off__";
@@ -560,7 +809,7 @@ function toggleLights() {  // I: none -> fixtures -> all -> none
 function toggleFlash() {
   if (!variantsHere().includes("active_polar")) return;
   const on = S.variant === "active_polar";
-  configure({ variant: on ? "perturbed" : "active_polar" }, on ? "조명 끄기" : "조명 켜기");
+  configure({ variant: on ? (variantsHere().includes("perturbed") ? "perturbed" : "base") : "active_polar" }, on ? "조명 끄기" : "조명 켜기");
 }
 function toggleMirrors() {
   if (!variantsHere().includes("base") || !variantsHere().includes("perturbed")) return;
@@ -597,10 +846,12 @@ function drawCandidates() {
 function mapTransform(canvas) {
   const pad = 24, w = canvas.width, h = canvas.height;
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-  for (let i = 0; i < graph.x.length; i++) { x0 = Math.min(x0, graph.x[i]); x1 = Math.max(x1, graph.x[i]); y0 = Math.min(y0, graph.y[i]); y1 = Math.max(y1, graph.y[i]); }
+  const grow = (x, y) => { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); };
+  for (let i = 0; i < graph.x.length; i++) grow(graph.x[i], graph.y[i]);
+  for (const room of (graph.rooms || {}).rooms || []) for (const poly of room.polygons) for (const [x, y] of poly) grow(x, y);
   const s = Math.min((w - 2 * pad) / Math.max(x1 - x0, 1e-3), (h - 2 * pad) / Math.max(y1 - y0, 1e-3));
   const ox = (w - s * (x1 - x0)) / 2 - s * x0, oy = (h + s * (y1 - y0)) / 2 + s * y0;
-  return { to: (x, y) => [ox + s * x, oy - s * y], from: (px, py) => [(px - ox) / s, (oy - py) / s] };
+  return { to: (x, y) => [ox + s * x, oy - s * y], from: (px, py) => [(px - ox) / s, (oy - py) / s], scale: s };
 }
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
@@ -612,6 +863,7 @@ function drawMap() {
   g.clearRect(0, 0, c.width, c.height);
   if (!graph || !S) return;
   const T = mapTransform(c);
+  drawRooms(g, T, dpr);
   g.fillStyle = css("--muted"); g.globalAlpha = 0.55;
   const dot = Math.max(1.5, 1.8 * dpr);
   for (let i = 0; i < graph.x.length; i++) { const [px, py] = T.to(graph.x[i], graph.y[i]); g.fillRect(px - dot / 2, py - dot / 2, dot, dot); }
@@ -631,14 +883,55 @@ function drawMap() {
   g.beginPath(); g.arc(cx, cy, 5 * dpr, 0, 7); g.fill();
 }
 
+// floor plan under the graph (robomituba room_map): one hue per room type, its name at the centroid, a
+// square on a door and a ring on an open passage between two rooms
+const ROOM_TYPES = {
+  "living-room": ["거실", "#5b8def"], "dining-room": ["식당", "#8f6be8"], "kitchen": ["주방", "#d9a441"],
+  "bedroom": ["침실", "#4fb87a"], "bathroom": ["욕실", "#4aa7c9"], "closet": ["수납", "#9aa35a"],
+  "hallway": ["복도", "#7f8c93"], "balcony": ["발코니", "#c46fa8"], "utility": ["다용도", "#b07a50"],
+  "office": ["서재", "#d1665a"], "entrance": ["현관", "#a08bd1"], "garage": ["차고", "#6f7f8c"],
+};
+function drawRooms(g, T, dpr) {
+  const plan = graph && graph.rooms;
+  $("map-src").textContent = plan ? "바탕은 방 평면도(robomituba room_map). 지도를 누르면 가장 가까운 지점으로 갑니다." : "";
+  if (!plan) return;
+  for (const room of plan.rooms) {
+    const [, hue] = ROOM_TYPES[room.type] || ["", "#7f8c93"];
+    g.beginPath();
+    for (const poly of room.polygons) poly.forEach(([x, y], i) => { const [px, py] = T.to(x, y); i ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.closePath();
+    g.globalAlpha = 0.16; g.fillStyle = hue; g.fill("evenodd");
+    g.globalAlpha = 0.55; g.strokeStyle = hue; g.lineWidth = 1 * dpr; g.stroke();
+  }
+  g.globalAlpha = 1;
+  g.fillStyle = css("--muted"); g.font = `${11 * dpr}px ${css("--sans")}`; g.textAlign = "center"; g.textBaseline = "middle";
+  for (const room of plan.rooms) {
+    if (!room.centroid) continue;
+    const [px, py] = T.to(room.centroid[0], room.centroid[1]);
+    const [name] = ROOM_TYPES[room.type] || [room.type];
+    if (Math.sqrt(room.area_m2 || 0) * T.scale > 34 * dpr) g.fillText(name, px, py);  // only where it fits
+  }
+  g.strokeStyle = css("--ink"); g.fillStyle = css("--ink"); g.lineWidth = 1.2 * dpr;
+  for (const link of plan.connections) {
+    const [px, py] = T.to(link.midpoint[0], link.midpoint[1]), r = 3 * dpr;
+    if (link.kind === "Door") g.fillRect(px - r, py - r, 2 * r, 2 * r);
+    else { g.beginPath(); g.arc(px, py, r, 0, 7); g.stroke(); }
+  }
+}
+
 function renderReadout() {
   const rows = [["씬", S.scene], ["변형", S.frame_variant || S.variant], ["지점", S.viewpoint], ["단계", S.step],
     ["위치 (m)", `${S.position[0].toFixed(2)}, ${S.position[1].toFixed(2)}`],
     ["헤딩", `${S.heading_deg.toFixed(1)}°`], ["고도각", `${S.elevation_deg.toFixed(1)}°`],
     ["카메라 높이", `${S.height_m.toFixed(2)} m`], ["이동 방식", S.free ? "자유 (그래프 밖)" : "그래프"], ["보이는 후보", S.candidates.length]];
-  $("readout").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  $("readout").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
 }
 
+function renderSysinfo() {
+  const si = S.server_info || {};
+  const parts = [si.mitsuba_version ? `Mitsuba ${si.mitsuba_version}` : "", si.mitsuba_variant || "", S.variant ? `변형 ${S.variant}` : "", S.pack || ""];
+  $("sysinfo").innerHTML = parts.filter(Boolean).map((p) => `<span>${p}</span>`).join("");
+}
 function renderStatus() {
   if (!S) return;
   const sv = S.server || {};
@@ -648,14 +941,16 @@ function renderStatus() {
     $("status").innerHTML = `<span class="busy">새 화면을 기다리는 중 ${sv.elapsed_s.toFixed(1)} s</span>` +
       (sv.renderer ? `<span class="busy">${rendererText(sv.renderer)}</span>` : "") +
       (basis ? `<span>예상 근거: ${basis}</span>` : "") +
-      (tail.length ? `<pre class="jitlog">${tail.map((l) => l.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])).join("\n")}</pre>` : "");
+      (tail.length ? `<span class="logline" title="${tail.join("\n").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])}">${tail[tail.length - 1].replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])}</span>` : "");
     return;
   }
   if (!S.has_frame) { $("status").innerHTML = "<span>첫 프레임을 렌더하는 중…</span>"; return; }
+  const ms = (v) => (v || 0).toFixed(0);
   const t = S.timing || {};
   $("status").innerHTML = `<span><b>${S.frame_spp}</b>/${S.target_spp} spp</span><span>패스 <b>${S.passes}</b> × ${S.pass_spp}</span>` +
-    `<span>표시 <b>${(S.fps || 0).toFixed(1)}</b> fps</span><span>패스 왕복 <b>${(t.wall_ms || 0).toFixed(0)}</b> ms</span>` +
-    `<span>서버 <b>${(t.server_ms || 0).toFixed(0)}</b> ms</span>` + (t.gpu_ms ? `<span>GPU <b>${t.gpu_ms.toFixed(0)}</b> ms</span>` : "") +
+    `<span>표시 <b>${(S.fps || 0).toFixed(1)}</b> fps</span><span title="렌더 요청을 보내고 화면에 올리기까지 (최근 5초 중앙값)">패스 <b>${ms(t.wall_ms)}</b> ms</span>` +
+    `<span class="split" title="패스 시간 내역 (최근 5초 중앙값). GPU: 서버가 커널을 넣은 뒤 GPU를 기다린 시간(CPU 작업에 가려지지 않은 GPU 시간). 서버 CPU: 렌더 호출의 나머지와 분리·인코딩. 대기열: 서버의 렌더 스레드에서 다른 패스 뒤에 기다린 시간. 전송: 왕복에서 서버 시간을 뺀 나머지. 뷰어: 누적·디노이즈·편광 계산">` +
+    `GPU <b>${ms(t.gpu_ms)}</b> · 서버 CPU <b>${ms(t.server_cpu_ms)}</b> · 대기열 <b>${ms(t.queue_ms)}</b> · 전송 <b>${ms(t.transfer_ms)}</b> · 뷰어 <b>${ms(t.viewer_ms)}</b> ms</span>` +
     `<span>동시 요청 <b>${S.in_flight}</b></span>` + (S.auto ? "" : `<span class="busy">누적 멈춤 (Space)</span>`);
 }
 
@@ -664,10 +959,9 @@ const GRAD = {
   aolp: "linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)",
   s: "linear-gradient(90deg,#2166ac,#f7f7f7,#b2182b)",
 };
-function legendHtml(ch, sc) {
-  if (ch === "rgb" || ch === "nir") return "";
-  if (ch === "nir_dolp") ch = "dolp";
-  if (ch === "nir_aolp") ch = "aolp";
+function legendHtml(pane, sc) {
+  const ch = pane.split(".")[1];
+  if (ch === "img") return "";
   if (ch === "dolp") return `<span>0</span><div class="legend-bar" style="background:${GRAD.dolp}"></div><span>DoLP ${sc}</span>`;
   if (ch === "aolp") return `<span>0°</span><div class="legend-bar" style="background:${GRAD.aolp}"></div><span>180° · 밝기 = DoLP/${sc}</span>`;
   return `<span>−${sc}</span><div class="legend-bar" style="background:${GRAD.s}"></div><span>+${sc}</span>`;
@@ -688,12 +982,15 @@ function probeAt(img, clientX, clientY) {
   const x = Math.floor((clientX - r.left - (r.width - k * S.width) / 2) / k), y = Math.floor((clientY - r.top - (r.height - k * S.height) / 2) / k);
   if (x < 0 || y < 0 || x >= S.width || y >= S.height) return;
   clearTimeout(probeTimer);
-  probeTimer = setTimeout(() => wsSend({ type: "probe", frame: S.frame_id, x, y }), 40);
+  // the probe reads the left pane's band (RGB: luminance Stokes)
+  const pol = pick.a.band === "rgb" ? "luma" : pick.a.band;
+  probeTimer = setTimeout(() => wsSend({ type: "probe", frame: S.frame_id, x, y, pol }), 40);
 }
 function showProbe(p) {
-  $("probe").innerHTML = [["위치", `${p.x}, ${p.y}`], ["S0 (휘도)", p.s0.toFixed(4)], ["DoLP", p.dolp.toFixed(4)],
+  const band = { luma: "휘도", r: "R", g: "G", b: "B", nir: "NIR" }[p.channel || "luma"];
+  $("probe").innerHTML = [["위치", `${p.x}, ${p.y}`], ["채널 (왼쪽 화면)", band], ["S0", p.s0.toFixed(4)], ["DoLP", p.dolp.toFixed(4)],
     ["AoLP", `${p.aolp_deg.toFixed(1)}°`], ["S1/S0", p.s1_over_s0.toFixed(4)], ["S2/S0", p.s2_over_s0.toFixed(4)]]
-    .map(([k2, v]) => `<dt>${k2}</dt><dd>${v}</dd>`).join("");
+    .map(([k2, v]) => `<div><dt>${k2}</dt><dd>${v}</dd></div>`).join("");
 }
 for (const id of ["frame-a", "frame-b"]) {
   const frame = $(id), img = frame.querySelector("img");
@@ -765,6 +1062,19 @@ $("scene").addEventListener("change", () => { const sc = $("scene").value; graph
 $("flash").addEventListener("click", toggleFlash);
 $("mirrors").addEventListener("click", toggleMirrors);
 $("lighting").addEventListener("change", () => configure({ lighting: $("lighting").value }, "조명 변경"));
+$("lamps").addEventListener("change", () => configure({ lamps: $("lamps").checked }, "램프 전환"));
+$("flashscale").addEventListener("change", () => configure({ flash_scale: Number($("flashscale").value) }, "플래시 크기"));
+function showNirRange() { $("nirrange-v").textContent = `${Number($("nirlow").value).toFixed(2)}–${Number($("nirhigh").value).toFixed(2)}`; }
+for (const id of ["nirlow", "nirhigh"]) {
+  $(id).addEventListener("input", () => {  // the two ends never cross
+    if (Number($("nirlow").value) > Number($("nirhigh").value)) $(id === "nirlow" ? "nirhigh" : "nirlow").value = $(id).value;
+    showNirRange();
+  });
+  $(id).addEventListener("change", () => configure({ nir_range: [Number($("nirlow").value), Number($("nirhigh").value)] }, "NIR 반사율 범위"));
+}
+$("split").addEventListener("change", () => configure({ active_split: $("split").checked }, "split 전환"));
+$("caustics").addEventListener("change", () => configure({ caustics: $("caustics").checked }, "caustic 전환"));
+$("maxdepth").addEventListener("change", () => configure({ max_depth: Number($("maxdepth").value) }, "경로 깊이"));
 $("bands").addEventListener("change", () => configure({ bands: $("bands").value }, "대역 변경"));
 $("mirrorsrc").addEventListener("change", sendMirrors);
 $("mdensity").addEventListener("input", () => { $("mdensity-v").textContent = $("mdensity").value; });
@@ -796,7 +1106,7 @@ function keyOf(ev) {
   return ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
 }
 document.addEventListener("keydown", (ev) => {
-  if (ev.target.closest("select, input") || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
+  if (ev.target.closest("select, input, #rig3d, dialog") || $("help").open || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
   const key = keyOf(ev), k = key;
   let handled = true;
   if (key in MOVE_KEYS) held.add(key);  // continuous while held; key repeats change nothing
@@ -820,6 +1130,370 @@ document.addEventListener("change", (ev) => {
 });
 window.addEventListener("blur", () => held.clear());  // a key released in another window must not stick
 
+// --- camera rig editor: three.js, loaded when the panel first opens ---
+// Blender's frame: X right, Y forward, Z up (metres), the observer on the floor at the origin facing +Y. The
+// camera sits at the scene's mount plus camera_offset; the flash at the dataset's place (distance_m behind the
+// camera along its view) plus flash_offset; both offsets are [right, up, forward] on the server.
+const RIG = { ready: false, loading: null, sel: null, dragging: false, grab: null, lastSend: 0, ndc: [0, 0], st: null };
+function loadScript(src) {
+  return new Promise((ok, fail) => {
+    const e = document.createElement("script");
+    e.src = src; e.onload = ok; e.onerror = () => fail(new Error(src));
+    document.head.appendChild(e);
+  });
+}
+function rigLoad() {
+  if (!RIG.loading) {
+    RIG.loading = (async () => {
+      await loadScript("https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js");
+      await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js");
+      await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js");
+      rigBuild();
+    })();
+  }
+  return RIG.loading;
+}
+const clamp2 = (v) => Math.max(-2, Math.min(2, v));
+const fmt = (v) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}`;
+
+function rigBuild() {
+  const T3 = THREE;
+  T3.Object3D.DefaultUp.set(0, 0, 1);
+  const canvas = $("rig3d");
+  const renderer = new T3.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  const scene = new T3.Scene();
+  scene.background = new T3.Color(css("--bg"));
+  const cam = new T3.PerspectiveCamera(40, 1, 0.01, 50);
+  cam.up.set(0, 0, 1);
+  cam.position.set(2.0, -2.2, 2.1);
+  const orbit = new T3.OrbitControls(cam, canvas);
+  orbit.mouseButtons = { LEFT: T3.MOUSE.ROTATE, MIDDLE: T3.MOUSE.ROTATE, RIGHT: T3.MOUSE.PAN };
+  orbit.target.set(0, 0, 1.1);
+  orbit.update();
+  scene.add(new T3.HemisphereLight(0xffffff, 0x334455, 1.1));
+  const grid = new T3.GridHelper(4, 40, 0x3a4a52, 0x222d33);
+  grid.rotation.x = Math.PI / 2;
+  scene.add(grid);
+  const line = (pts, color, dashed) => {
+    const geo = new T3.BufferGeometry().setFromPoints(pts.map((p) => new T3.Vector3(...p)));
+    const l = new T3.Line(geo, dashed ? new T3.LineDashedMaterial({ color, dashSize: 0.04, gapSize: 0.03 }) : new T3.LineBasicMaterial({ color }));
+    if (dashed) l.computeLineDistances();
+    return l;
+  };
+  scene.add(line([[0, 0, 0.001], [0.6, 0, 0.001]], 0xe0505a), line([[0, 0, 0.001], [0, 0.6, 0.001]], 0x6cc04a), line([[0, 0, 0], [0, 0, 0.6]], 0x4a7fe0));
+  // the observer: a disc on the floor and its heading
+  const disc = new T3.Mesh(new T3.CircleGeometry(0.25, 48), new T3.MeshBasicMaterial({ color: 0x8b9ca4, transparent: true, opacity: 0.22, side: T3.DoubleSide }));
+  scene.add(disc, new T3.ArrowHelper(new T3.Vector3(0, 1, 0), new T3.Vector3(0, 0, 0.003), 0.55, 0x8b9ca4, 0.12, 0.08));
+  let pole = line([[0, 0, 0], [0, 0, 1]], 0x8b9ca4, true);
+  scene.add(pole);
+  // the camera: body and view frustum, pitched about its right axis (X)
+  const camGroup = new T3.Group(), camPitch = new T3.Group();
+  camGroup.add(camPitch); scene.add(camGroup);
+  const camMat = new T3.MeshStandardMaterial({ color: 0x9fb3bb, emissive: 0x000000 });
+  const body = new T3.Mesh(new T3.BoxGeometry(0.09, 0.06, 0.06), camMat);
+  const lens = new T3.Mesh(new T3.CylinderGeometry(0.02, 0.02, 0.03, 20), camMat);
+  lens.position.set(0, 0.045, 0);
+  camPitch.add(body, lens);
+  let frustum = null;
+  const pickCam = new T3.Mesh(new T3.SphereGeometry(0.09, 12, 8), new T3.MeshBasicMaterial({ visible: false }));
+  pickCam.userData.pick = "camera"; camGroup.add(pickCam);
+  // the flash: a rectangle facing the camera's view
+  const flashGroup = new T3.Group(), flashPitch = new T3.Group();
+  flashGroup.add(flashPitch); scene.add(flashGroup);
+  const flashMat = new T3.MeshBasicMaterial({ color: 0xffd27a, side: T3.DoubleSide });
+  const flashRect = new T3.Mesh(new T3.PlaneGeometry(1, 1), flashMat);
+  flashRect.rotation.x = -Math.PI / 2;  // normal +Z -> +Y (forward)
+  flashPitch.add(flashRect);
+  const pickFlash = new T3.Mesh(new T3.SphereGeometry(0.07, 12, 8), new T3.MeshBasicMaterial({ visible: false }));
+  pickFlash.userData.pick = "flash"; flashGroup.add(pickFlash);
+  // where the dataset puts them
+  const ghostMat = new T3.LineBasicMaterial({ color: 0x5d6d75 });
+  const ghostCam = new T3.Group(), ghostCamPitch = new T3.Group();
+  ghostCam.add(ghostCamPitch); scene.add(ghostCam);
+  ghostCamPitch.add(new T3.LineSegments(new T3.EdgesGeometry(new T3.BoxGeometry(0.09, 0.06, 0.06)), ghostMat));
+  const ghostFlash = new T3.Group(), ghostFlashPitch = new T3.Group();
+  ghostFlash.add(ghostFlashPitch); scene.add(ghostFlash);
+  const ghostRect = new T3.LineSegments(new T3.EdgesGeometry(new T3.PlaneGeometry(1, 1)), ghostMat);
+  ghostRect.rotation.x = -Math.PI / 2; ghostFlashPitch.add(ghostRect);
+
+  const gizmo = new T3.TransformControls(cam, canvas);
+  gizmo.setSpace("world"); gizmo.setSize(0.75);
+  scene.add(gizmo);
+  const draw = () => renderer.render(scene, cam);
+  orbit.addEventListener("change", draw);
+  gizmo.addEventListener("change", draw);
+  gizmo.addEventListener("dragging-changed", (e) => {
+    orbit.enabled = !e.value && !RIG.grab;
+    RIG.dragging = e.value;
+    if (!e.value) rigSend(RIG.sel, true);
+  });
+  gizmo.addEventListener("objectChange", () => { rigFromObjects(RIG.sel); rigSend(RIG.sel, false); });
+  new ResizeObserver(() => {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); draw();
+  }).observe(canvas);
+
+  Object.assign(RIG, { T3, canvas, scene, cam, orbit, gizmo, draw, camGroup, camPitch, flashGroup, flashPitch, flashRect,
+    camMat, flashMat, ghostCam, ghostCamPitch, ghostFlash, ghostFlashPitch, ghostRect, picks: [pickCam, pickFlash], ready: true,
+    setPole(a, b) { scene.remove(pole); pole = line([a, b], 0x8b9ca4, true); scene.add(pole); },
+    setFrustum(hfov, vfov) {
+      if (frustum) camPitch.remove(frustum);
+      const L = 0.35, x = L * Math.tan(hfov * Math.PI / 360), z = L * Math.tan(vfov * Math.PI / 360);
+      const c = [[-x, L, -z], [x, L, -z], [x, L, z], [-x, L, z]], o = [0, 0.03, 0], pts = [];
+      for (let i = 0; i < 4; i++) pts.push(o, c[i], c[i], c[(i + 1) % 4]);
+      pts.push([-x * 0.4, L, z * 1.15], [0, L, z * 1.5], [0, L, z * 1.5], [x * 0.4, L, z * 1.15]);  // the up marker
+      frustum = new T3.LineSegments(new T3.BufferGeometry().setFromPoints(pts.map((p) => new T3.Vector3(...p))),
+        new T3.LineBasicMaterial({ color: 0x3fc9d4 }));
+      camPitch.add(frustum);
+    } });
+  rigEvents();
+}
+
+// geometry of a rig state, in the editor's frame
+function rigGeom(st, camOff = st.cam, flashOff = st.flash) {
+  const eye = st.mount[1] + camOff[1];
+  const pitch = Math.atan2(-0.1 * eye, 1) + st.elev * Math.PI / 180;  // the rig looks at 0.9 x eye height, 1 m ahead
+  const camPos = [st.mount[0] + camOff[0], st.mount[2] + camOff[2], eye];
+  const fwd = [0, Math.cos(pitch), Math.sin(pitch)];
+  const base = camPos.map((v, i) => v - fwd[i] * st.dist);
+  return { pitch, camPos, base, flashPos: [base[0] + flashOff[0], base[1] + flashOff[2], base[2] + flashOff[1]] };
+}
+function rigPlace() {
+  const st = RIG.st;
+  if (!RIG.ready || !st) return;
+  const g = rigGeom(st), g0 = rigGeom(st, [0, 0, 0], [0, 0, 0]);
+  RIG.camGroup.position.set(...g.camPos); RIG.camPitch.rotation.x = g.pitch;
+  RIG.flashGroup.visible = st.hasFlash;
+  RIG.flashGroup.position.set(...g.flashPos); RIG.flashPitch.rotation.x = g.pitch;
+  RIG.flashRect.scale.set(st.size[0] * st.scale, st.size[1] * st.scale, 1);
+  RIG.ghostCam.visible = st.cam.some((v) => Math.abs(v) > 1e-4);
+  RIG.ghostCam.position.set(...g0.camPos); RIG.ghostCamPitch.rotation.x = g0.pitch;
+  RIG.ghostFlash.visible = st.hasFlash && (RIG.ghostCam.visible || st.flash.some((v) => Math.abs(v) > 1e-4));
+  RIG.ghostFlash.position.set(...g0.flashPos); RIG.ghostFlashPitch.rotation.x = g0.pitch;
+  RIG.ghostRect.scale.set(st.size[0], st.size[1], 1);
+  RIG.setPole([g.camPos[0], g.camPos[1], 0], g.camPos);
+  RIG.setFrustum(st.hfov, st.vfov);
+  RIG.camMat.emissive.setHex(RIG.sel === "camera" ? 0x1f6f76 : 0x000000);
+  RIG.flashMat.color.setHex(RIG.sel === "flash" ? 0xfff1c4 : 0xffd27a);
+  const rel = [g.flashPos[0] - g.camPos[0], g.flashPos[1] - g.camPos[1], g.flashPos[2] - g.camPos[2]];
+  $("rig-readout").innerHTML = [
+    ["카메라", `X ${fmt(g.camPos[0])} · Y ${fmt(g.camPos[1])} · Z ${g.camPos[2].toFixed(2)} m`],
+    ["카메라 이동", `X ${fmt(st.cam[0])} · Y ${fmt(st.cam[2])} · Z ${fmt(st.cam[1])} m`],
+    ["시선 기울기", `${(g.pitch * 180 / Math.PI).toFixed(1)}°`],
+    ...(st.hasFlash ? [["플래시−카메라", `X ${fmt(rel[0])} · Y ${fmt(rel[1])} · Z ${fmt(rel[2])} m`],
+      ["플래시 이동", `X ${fmt(st.flash[0])} · Y ${fmt(st.flash[2])} · Z ${fmt(st.flash[1])} m`]] : [["플래시", "이 씬에는 없음"]]),
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  RIG.draw();
+}
+// the server's state, unless the editor is moving something
+function rigSync() {
+  if (!RIG.ready || !S || !S.rig || RIG.dragging || RIG.grab) return;
+  const r = S.rig;
+  RIG.st = { mount: r.mount_xyz_m, cam: r.camera_offset.slice(), flash: (r.flash_offset.concat([0, 0, 0])).slice(0, 3),
+    dist: r.flash ? r.flash.distance_m : 0.2, size: r.flash ? r.flash.size_m : [0.12, 0.08], hasFlash: !!r.flash,
+    scale: r.flash_scale || 1, elev: S.elevation_deg || 0, hfov: S.hfov_deg, vfov: S.vfov_deg };
+  if (RIG.sel === "flash" && !RIG.st.hasFlash) rigSelect(null);
+  rigPlace();
+}
+// offsets from where the dragged object now is
+function rigFromObjects(kind) {
+  const st = RIG.st;
+  if (kind === "camera") {
+    const p = RIG.camGroup.position;
+    st.cam = [clamp2(p.x - st.mount[0]), clamp2(p.z - st.mount[1]), clamp2(p.y - st.mount[2])];
+  } else if (kind === "flash") {
+    const p = RIG.flashGroup.position, b = rigGeom(st).base;
+    st.flash = [clamp2(p.x - b[0]), clamp2(p.z - b[2]), clamp2(p.y - b[1])];
+  }
+  rigPlace();
+}
+// live while moving (when the last change has been taken), and once more when it ends
+function rigSend(kind, final) {
+  if (!kind || !RIG.st) return;
+  if (!final && (pending || performance.now() - RIG.lastSend < 120)) return;
+  RIG.lastSend = performance.now();
+  const v = (kind === "camera" ? RIG.st.cam : RIG.st.flash).map((x) => Math.round(x * 1000) / 1000);
+  configure(kind === "camera" ? { camera_offset: v } : { flash_offset: v }, kind === "camera" ? "카메라 위치" : "플래시 위치");
+}
+function rigSelect(kind) {
+  RIG.sel = kind;
+  if (kind === "camera") RIG.gizmo.attach(RIG.camGroup);
+  else if (kind === "flash") RIG.gizmo.attach(RIG.flashGroup);
+  else RIG.gizmo.detach();
+  $("rig-sel-camera").setAttribute("aria-pressed", String(kind === "camera"));
+  $("rig-sel-flash").setAttribute("aria-pressed", String(kind === "flash"));
+  rigPlace();
+}
+function rigReset() {
+  if (!RIG.sel || !RIG.st) return;
+  if (RIG.sel === "camera") RIG.st.cam = [0, 0, 0]; else RIG.st.flash = [0, 0, 0];
+  rigPlace(); rigSend(RIG.sel, true);
+}
+
+// G: grab. The selection follows the mouse in the view plane (X, Y, Z: along that axis only; digits: exactly
+// that far), a click or Enter keeps it, a right click or Esc puts it back.
+const AXES = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
+function rigRay(ndc) {
+  const rc = new RIG.T3.Raycaster();
+  rc.setFromCamera(new RIG.T3.Vector2(ndc[0], ndc[1]), RIG.cam);
+  return rc.ray;
+}
+function grabPlaneHit(ndc, origin, axis) {
+  const T3 = RIG.T3, view = new T3.Vector3();
+  RIG.cam.getWorldDirection(view);
+  let n = view.clone();
+  if (axis) {  // the plane holding the axis that faces the viewer most
+    const a = new T3.Vector3(...axis);
+    n = a.clone().cross(view.clone().cross(a));
+    if (n.lengthSq() < 1e-8) n = view.clone();
+  }
+  const plane = new T3.Plane().setFromNormalAndCoplanarPoint(n.normalize(), origin);
+  return rigRay(ndc).intersectPlane(plane, new T3.Vector3());
+}
+function grabStart() {
+  if (!RIG.st) return;
+  if (!RIG.sel) rigSelect(RIG.st.hasFlash ? "flash" : "camera");
+  const obj = RIG.sel === "camera" ? RIG.camGroup : RIG.flashGroup;
+  RIG.grab = { kind: RIG.sel, cam: RIG.st.cam.slice(), flash: RIG.st.flash.slice(), origin: obj.position.clone(),
+    ndc: RIG.ndc.slice(), axis: null, num: "" };
+  RIG.orbit.enabled = false;
+  grabUpdate();
+}
+function grabUpdate() {
+  const g = RIG.grab;
+  if (!g) return;
+  const T3 = RIG.T3, axis = g.axis && AXES[g.axis];
+  let delta;
+  if (g.num && g.num !== "-" && Number.isFinite(Number(g.num))) {
+    delta = new T3.Vector3(...(axis || AXES.x)).multiplyScalar(Number(g.num));
+  } else {
+    const a = grabPlaneHit(g.ndc, g.origin, axis), b = grabPlaneHit(RIG.ndc, g.origin, axis);
+    delta = a && b ? b.sub(a) : new T3.Vector3();
+    if (axis) delta = new T3.Vector3(...axis).multiplyScalar(delta.dot(new T3.Vector3(...axis)));
+  }
+  const obj = g.kind === "camera" ? RIG.camGroup : RIG.flashGroup;
+  if (g.kind === "flash") {  // the flash's base moves with nothing here, but keep the camera where it started
+    RIG.st.cam = g.cam.slice();
+  }
+  obj.position.copy(g.origin).add(delta);
+  rigFromObjects(g.kind);
+  const name = { x: "X축 (오른쪽)", y: "Y축 (앞)", z: "Z축 (위)" }[g.axis] || "자유 (화면 평면)";
+  $("rig-mode").textContent = `잡기 · ${g.kind === "camera" ? "카메라" : "플래시"} · ${name}` +
+    `\nΔ X ${fmt(delta.x)}  Y ${fmt(delta.y)}  Z ${fmt(delta.z)} m${g.num ? `  [${g.num}]` : ""}`;
+  rigSend(g.kind, false);
+}
+function grabEnd(keep) {
+  const g = RIG.grab;
+  if (!g) return;
+  RIG.grab = null;
+  if (!keep) { RIG.st.cam = g.cam; RIG.st.flash = g.flash; rigPlace(); }
+  RIG.orbit.enabled = true;
+  $("rig-mode").textContent = "";
+  rigSend(g.kind, true);
+}
+function rigView(which) {
+  const t = RIG.orbit.target, d = RIG.cam.position.distanceTo(t);
+  const dir = { front: [0, -1, 0.0001], right: [1, 0, 0.0001], top: [0, -0.0001, 1] }[which];
+  RIG.cam.position.set(t.x + dir[0] * d, t.y + dir[1] * d, t.z + dir[2] * d);
+  RIG.orbit.update(); RIG.draw();
+}
+
+function rigEvents() {
+  const c = RIG.canvas;
+  let down = null;
+  c.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  c.addEventListener("pointermove", (ev) => {
+    const r = c.getBoundingClientRect();
+    RIG.ndc = [((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1];
+    if (RIG.grab) grabUpdate();
+  });
+  c.addEventListener("pointerdown", (ev) => {
+    c.focus({ preventScroll: true });
+    if (RIG.grab) { grabEnd(ev.button === 0); ev.preventDefault(); ev.stopImmediatePropagation(); return; }
+    down = { x: ev.clientX, y: ev.clientY, b: ev.button };
+  }, true);
+  c.addEventListener("pointerup", (ev) => {
+    if (!down || RIG.dragging) { down = null; return; }
+    const click = down.b === 0 && Math.abs(ev.clientX - down.x) + Math.abs(ev.clientY - down.y) < 4;
+    down = null;
+    if (!click) return;
+    const hits = new RIG.T3.Raycaster();
+    hits.setFromCamera(new RIG.T3.Vector2(...RIG.ndc), RIG.cam);
+    const hit = hits.intersectObjects(RIG.picks.filter((p) => p.parent.visible), false)[0];
+    if (hit) rigSelect(hit.object.userData.pick);
+    else if (!RIG.gizmo.axis) rigSelect(null);
+  });
+  c.addEventListener("keydown", (ev) => {
+    const k = keyOf(ev), g = RIG.grab;
+    let handled = true;
+    if (k === "g" && ev.altKey) rigReset();
+    else if (k === "g" && !g) grabStart();
+    else if (g && (k === "x" || k === "y" || k === "z")) { g.axis = g.axis === k ? null : k; grabUpdate(); }
+    else if (g && (/^[0-9]$/.test(k) || k === "." || k === "-" || k === "Backspace")) {
+      g.num = k === "Backspace" ? g.num.slice(0, -1) : k === "-" ? (g.num.startsWith("-") ? g.num.slice(1) : `-${g.num}`) : g.num + k;
+      grabUpdate();
+    } else if (g && (k === "Enter" || k === " ")) grabEnd(true);
+    else if (k === "Escape") { if (g) grabEnd(false); else rigSelect(null); }
+    else if (k === "Tab") rigSelect(RIG.sel === "camera" && RIG.st && RIG.st.hasFlash ? "flash" : "camera");
+    else if (!g && (k === "1" || ev.code === "Numpad1")) rigView("front");
+    else if (!g && (k === "3" || ev.code === "Numpad3")) rigView("right");
+    else if (!g && (k === "7" || ev.code === "Numpad7")) rigView("top");
+    else handled = false;
+    if (handled) { ev.preventDefault(); ev.stopPropagation(); }
+  });
+  c.addEventListener("blur", () => grabEnd(false));
+}
+
+$("rig-sel-camera").addEventListener("click", () => { if (RIG.ready) rigSelect(RIG.sel === "camera" ? null : "camera"); });
+$("rig-sel-flash").addEventListener("click", () => { if (RIG.ready && RIG.st && RIG.st.hasFlash) rigSelect(RIG.sel === "flash" ? null : "flash"); });
+$("rig-reset").addEventListener("click", () => { if (RIG.ready) rigReset(); });
+$("rig-big").addEventListener("click", () => {
+  const big = $("rig-view").classList.toggle("big");
+  $("rig-big").setAttribute("aria-pressed", String(big));
+});
+// --- side panel tabs: camera rig, state, pixel values, scene ---
+let panelTab = "state", statsTimer = null;
+function showTab(name) {
+  panelTab = name;
+  document.querySelectorAll(".ptabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
+  for (const t of ["rig", "state", "probe", "scene"]) $(`p-${t}`).hidden = t !== name;
+  try { localStorage.setItem("opticalnav-panel-tab", name); } catch (e) { /* not remembered */ }
+  if (name === "rig") rigLoad().then(rigSync).catch((e) => { $("rig-mode").textContent = `three.js를 불러오지 못했습니다 (${e.message})`; });
+  clearInterval(statsTimer);
+  if (name === "scene") { loadSceneStats(); statsTimer = setInterval(loadSceneStats, 5000); }
+}
+document.querySelectorAll(".ptabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
+const GROUP_NAMES = { fixture: "실내 조명", fill: "전역(소프트박스)", lamp: "꺼진 램프" };
+async function loadSceneStats() {
+  if (!S || !S.scene || panelTab !== "scene") return;
+  let st;
+  try { st = await api(`/api/scene_stats?scene=${encodeURIComponent(S.scene)}`); } catch (e) { $("scene-stats").innerHTML = `<div><dt>오류</dt><dd>${e.message}</dd></div>`; return; }
+  const n = (v) => v == null ? "—" : Number(v).toLocaleString("ko-KR");
+  const gpu = (st.gpu || []).map((g) => [`GPU ${g.index}`, `${(g.used_mb / 1024).toFixed(1)} / ${(g.total_mb / 1024).toFixed(1)} GB`]);
+  const groups = Object.entries(st.light_groups || {}).map(([g, c]) => `${GROUP_NAMES[g] || g} ${c}`).join(" · ");
+  const rows = !st.resident ? [["씬", `${st.scan}`], ["상태", "렌더 서버에 아직 안 올라감"], ...gpu] : [
+    ["씬 파일", st.name], ["로드 · freeze", `${st.load_s} s · 기록 ${n(st.recordings)}개`],
+    ["오브젝트", `${n(st.shapes)} (메시 ${n(st.meshes)})`],
+    ["삼각형 · 정점", `${(st.triangles / 1e6).toFixed(2)} M · ${(st.vertices / 1e6).toFixed(2)} M`],
+    ["BSDF · 텍스처", `${n(st.bsdfs)} · ${n(st.textures)}`],
+    ["광원", `${n(st.emitters)} (하늘 포함)`], ["광원 그룹", groups],
+    ["램프 발광 부품", `${n(st.lamps_lit_from_parts)}`],
+    ["광원 선택", st.emitter_weights ? `파워 비례 ${st.emitter_weights[0]}–${st.emitter_weights[1]}` : "균일"],
+    ["거울 풀", st.pool ? `거울 ${st.pool.mirrors} · 유리 ${st.pool.glass}` : "없음"],
+    ["변형", (st.variants || []).join(", ")], ["씬 텍스트 · Mitsuba", `${st.text_mb} MB · ${st.mitsuba_variant}`], ...gpu];
+  $("scene-stats").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
+}
+try { showTab(localStorage.getItem("opticalnav-panel-tab") || "state"); } catch (e) { showTab("state"); }
+
+function openHelp() { if (!$("help").open) $("help").showModal(); }
+$("help-btn").addEventListener("click", openHelp);
+$("help-close").addEventListener("click", () => $("help").close());
+$("help").addEventListener("click", (ev) => { if (ev.target === $("help")) $("help").close(); });  // the backdrop
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "?" && !ev.target.closest("select, input, #rig3d")) { ev.preventDefault(); openHelp(); }
+});
 boot().catch((e) => showError(`시작 실패: ${e.message}`));
 </script>
 </body>

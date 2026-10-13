@@ -42,7 +42,17 @@ class RenderClient:
             try:
                 conn.request(method, self._prefix + path, body=body, headers=headers)
                 resp = conn.getresponse()
-                data = resp.read()
+                length = resp.getheader("Content-Length")
+                if length is not None:  # read into a buffer of our own: arrays viewing it stay writable
+                    data = bytearray(int(length))
+                    view, got = memoryview(data), 0
+                    while got < len(data):
+                        n = resp.readinto(view[got:])
+                        if not n:
+                            raise ConnectionError("render server closed the connection mid-reply")
+                        got += n
+                else:
+                    data = resp.read()
                 break
             except (http.client.HTTPException, ConnectionError, OSError):
                 conn.close()
@@ -73,6 +83,10 @@ class RenderClient:
     def meta(self, scan: str) -> dict:
         return self._json(f"/v1/scans/{scan}/meta")
 
+    def stats(self, scan: str) -> dict:
+        """What the render server's resident scene for ``scan`` holds (shapes, BSDFs, lights, GPU memory)."""
+        return self._json(f"/v1/scans/{scan}/stats")
+
     def connectivity(self, scan: str) -> list[dict]:
         return self._json(f"/v1/scans/{scan}/connectivity")
 
@@ -81,15 +95,22 @@ class RenderClient:
         width, height, hfov_deg, spp, seed, mode ("polar" | "rgb"), denoise. Returns per view
         {rgb, s0, s1, s2, s3} in polar mode or {rgb, radiance} in rgb mode."""
         payload = {"views": [dict(v, camera_to_world=np.asarray(v["camera_to_world"]).tolist()) for v in views],
-                   "stokes_dtype": stokes_dtype}
+                   "stokes_dtype": stokes_dtype, "format": "raw"}
         data, headers = self._request("POST", "/v1/render", json.dumps(payload).encode())
         self.last_render_seconds = float(headers.get("X-Render-Seconds", 0.0))
         self.last_timing = json.loads(headers.get("X-Render-Timing", "{}"))
-        npz = np.load(io.BytesIO(data))
+        if headers.get("Content-Type") == "application/x-opticalnav-arrays":  # header + raw bytes: views, no copy
+            size = int.from_bytes(data[:8], "little")
+            arrays = {name: np.frombuffer(data, dtype=np.dtype(dt), count=int(np.prod(shape)) if shape else 1,
+                                          offset=8 + size + off).reshape(shape)
+                      for name, dt, shape, off, _ in json.loads(data[8:8 + size])}
+        else:  # an older server: npz
+            npz = np.load(io.BytesIO(data))
+            arrays = {key: npz[key] for key in npz.files}
         out = [{} for _ in views]
-        for key in npz.files:
+        for key, value in arrays.items():
             name, _, index = key.rpartition("_")
-            out[int(index)][name] = npz[key]
+            out[int(index)][name] = value
         return out
 
     def denoise(self, images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

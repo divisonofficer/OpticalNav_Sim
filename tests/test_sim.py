@@ -302,6 +302,15 @@ def test_gui_session_and_routes():
     frame = dict(session._frame(st["frame_id"]))
     dark, plain = session._tonemapped(frame, "rgb", -2.0), session._tonemapped(frame, "rgb", 0.0)
     assert dark.mean() <= plain.mean() and session.image(st["frame_id"], "rgb", 0.2, {"rgb": -2.0})[:2] == b"\xff\xd8"
+    for pol in ("r", "g", "b"):  # one channel's own Stokes vector: the same as a mono derivation of it
+        k = "rgb".index(pol)
+        want = gui.stokes.derived_mono(frame["s0"][..., k], frame["s1"][..., k], frame["s2"][..., k])
+        assert np.array_equal(session._polarization(frame, pol)["dolp"], want["dolp"])
+        for view in gui.PANE_VIEWS:  # every band x view pane
+            assert session.image(st["frame_id"], f"{pol}.{view}", 0.2)[:2] == b"\xff\xd8"
+    probe = session.probe(st["frame_id"], 3, 3, "g")
+    assert probe["dolp"] == float(session._polarization(frame, "g")["dolp"][3, 3]) and probe["s0"] == float(frame["s0"][3, 3, 1])
+    assert gui.pane_channel("nir_aolp") == ("nir", "aolp") and gui.pane_channel("rgb.img") == ("rgb", "img")
     session.configure({"refit_tone": True})
     assert session.tones[(frame["scan"], frame["variant"])] == gui.tonemap.global_params([frame["s0"]])
 
@@ -516,6 +525,19 @@ def test_compact_assets_rewrites_textures_and_obj_shapes():
     assert '<shape type="obj" id="kept">\n    <string name="filename" value="assets/b_bad.obj" />' in out  # failed: stays OBJ
     assert 'value="/tmp/rect.ply"' in out  # files outside assets/ are not the pack's
     assert rewrite(out, {"assets/tex_1.png": "assets/tex_1.png"}, {}) == out  # a second run changes nothing
+    from compact_assets import needs_compaction
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:  # a scene shared before compaction is found, a compacted one is not
+        scene = Path(tmp)
+        (scene / "base.xml").write_text(text)
+        assert needs_compaction(scene)
+        done = rewrite(text, {"assets/x_base_color.png": "assets/tex_0123456789abcdef0123.png"},
+                       {"assets/a_cup.obj": "assets/mesh_2.ply", "assets/b_bad.obj": "assets/mesh_3.ply"})
+        (scene / "base.xml").write_text(done)
+        assert not needs_compaction(scene)
+        (scene / "base.xml").write_text(done.replace("tex_0123456789abcdef0123", "x_base_color"))
+        assert needs_compaction(scene)  # a texture not yet named by its content
 
 
 def test_decimation_policy_and_crease_normals():
@@ -551,6 +573,48 @@ def test_decimation_policy_and_crease_normals():
     assert "normalmap" in kept and 'value="assets/c.png"' in kept
 
 
+def test_atlas_materials_folds_and_maps_uvs():
+    import xml.etree.ElementTree as ET
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import atlas_materials as am
+
+    def shape(sid, bsdf, kind="ply"):
+        return ET.fromstring(f'<shape type="{kind}" id="{sid}"><string name="filename" value="assets/m.ply" />{bsdf}</shape>')
+
+    def bmp(name, f, raw):
+        return (f'<texture name="{name}" type="bitmap"><string name="filename" value="{f}" />'
+                + ('<boolean name="raw" value="true" />' if raw else "") + "</texture>")
+
+    textured = ('<bsdf type="twosided"><bsdf type="normalmap">' + bmp("normalmap", "assets/n.png", True)
+                + '<bsdf type="pplastic">' + bmp("diffuse_reflectance", "assets/c.png", False)
+                + bmp("alpha", "assets/r.png", True) + "</bsdf></bsdf></bsdf>")
+    mat = am.material(shape("cup", textured), {})
+    assert mat == ("pplastic", (), (("file", "assets/c.png"), ("file", "assets/r.png"), ("file", "assets/n.png")))
+    plain = '<bsdf type="twosided"><bsdf type="pplastic"><rgb name="diffuse_reflectance" value="0.2 0.3 0.4" /></bsdf></bsdf>'
+    assert am.material(shape("box", plain), {}) == ("pplastic", (), (("const", (0.2, 0.3, 0.4)), ("const", 0.1), am.FLAT))
+    metal = '<bsdf type="twosided"><bsdf type="roughconductor"><string name="material" value="Al" /><float name="alpha" value="0.6" /></bsdf></bsdf>'
+    assert am.material(shape("pot", metal), {}) == ("conductor", "Al", ("const", 0.6))
+    # what stays as it is: a texture in the other colour space, the server's hideables, built-in shapes, shared atlases
+    assert am.material(shape("cup", textured.replace(bmp("alpha", "assets/r.png", True), bmp("alpha", "assets/r.png", False))), {}) is None
+    assert am.material(shape("mirror_auto_001", plain), {}) is None and am.material(shape("box", plain, "cube"), {}) is None
+    assert am.material(ET.fromstring('<shape type="ply" id="x"><string name="filename" value="assets/m.ply" />'
+                                     '<ref id="atlas_pplastic_p0" /></shape>'), {}) is None
+    # a 512 region and an 8x8 constant: UV corners land on the region's texels, constants on the cell centre
+    atlas = am.Atlas(2048)
+    atlas.layout({"t": (512, 512), "c": (am.SMALL, am.SMALL)})
+    (_, x0, y0, w, h, pad), W = atlas.placed["t"], atlas.pages[0][0]
+    assert pad == am.PAD and (w, h) == (512, 512) and len(atlas.pages) == 1
+    uv = atlas.uv("t", np.array([[0.0, 0.0], [1.0, 1.0]]), 2)
+    assert np.allclose(uv[0] * atlas.pages[0], [x0, y0]) and np.allclose(uv[1] * atlas.pages[0], [x0 + 512, y0 + 512])
+    c = atlas.uv("c", None, 3)
+    _, cx, cy, cw, ch, _ = atlas.placed["c"]
+    assert np.allclose(c * atlas.pages[0], [cx + cw / 2, cy + ch / 2]) and x0 + 512 + am.PAD <= W
+    small = am.Atlas(600)  # a second region that does not fit starts a second page
+    small.layout({"a": (512, 512), "b": (512, 512)})
+    assert len(small.pages) == 2 and small.placed["b"][0] == 1
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
@@ -582,3 +646,60 @@ def test_spawn_points_stand_in_for_a_missing_graph():
     assert (st.location.x, st.location.y) == (3.0, 0.0) and [c.viewpointId for c in st.navigableLocations] == ["spawn_1"]
     sim.teleport(["scene"], [[1.2, -2.1, 1.4]], [0.0], [0.0])  # free movement snaps to the nearest spawn id
     assert sim.getState()[0].location.viewpointId == "spawn_0"
+
+
+def test_base_only_scene_gets_synthetic_variants():
+    """A scene packed with base alone gets perturbed (its pool's share) and active_polar (the dataset's flash) on
+    the same scene file; one with dataset mirrors but no flash gets the flash on the perturbed file."""
+    meta = {"variants": {"base": {"xml": "base.xml"}}}
+    assert server.synthesize_variants(meta, has_pool=True, has_nocaustics=True) == ["perturbed", "active_polar"]
+    v = meta["variants"]
+    assert v["perturbed"]["xml"] == v["active_polar"]["xml"] == "base.xml"
+    assert v["perturbed"]["pool_share"] == v["active_polar"]["pool_share"] == list(server.SYNTHETIC_POOL_SHARE)
+    assert v["active_polar"]["flash"]["synthetic"] and "flash_xml" not in v["active_polar"]
+    meta = {"variants": {"base": {"xml": "base.xml"}, "perturbed": {"xml": "perturbed.xml"}}}
+    assert server.synthesize_variants(meta, has_pool=True, has_nocaustics=True) == ["active_polar"]
+    assert meta["variants"]["active_polar"]["xml"] == "perturbed.xml" and meta["variants"]["active_polar"]["pool_share"] is None
+    lit = {"variants": {"base": {"xml": "base.xml"}, "active_polar": {"xml": "a.xml", "flash": {"distance_m": 0.2}}}}
+    assert server.synthesize_variants(lit, True, True) == ["perturbed"]  # a dataset flash is kept as it is
+    assert server.synthesize_variants({"variants": {"base": {"xml": "b.xml"}}}, False, False) == []
+    text = server.flash_scene_text("<scene>\n</scene>", server.SYNTHETIC_FLASH)
+    shape = server.ASSIST_SHAPE.search(text)
+    assert shape and 'id="camera_assist_light"' in shape.group(0) and 'type="polarized_area"' in text
+    assert "0.06 0 0 0 0 0.04 0 0 0 0 -1 0.2" in text and text.rstrip().endswith("</scene>")
+
+
+def test_rig_offsets_move_along_the_level_view():
+    """Flash and camera offsets are [right, up, forward] of the observer's level view, whatever the pitch."""
+    c2w = frames.camera_at_position((1.0, 2.0, 1.5), math.radians(30.0), math.radians(-25.0), MOUNT)
+    right, level_fwd = c2w[:3, 0], np.array([math.sin(frames.yaw_from_heading(math.radians(30.0))), 0.0,
+                                             math.cos(frames.yaw_from_heading(math.radians(30.0)))])
+    assert np.allclose(server.level_offset(c2w, (0.0, 0.0, 1.0)), level_fwd)
+    assert np.allclose(server.level_offset(c2w, (1.0, 0.0, 0.0)), right / np.linalg.norm(right))
+    assert np.allclose(server.level_offset(c2w, (0.0, 0.3)), [0.0, 0.3, 0.0])  # two values: no forward
+    sim = MatterSim.Simulator()
+    sim.setCameraResolution(64, 48)
+    sim.initialize()
+    sim._client = SpawnClient([])
+    sim.newEpisode(["scene"], ["spawn_1"], [0.5], [0.0])
+    st = sim.getState()[0]
+    before = sim._camera(st)
+    sim.setCameraOffset(0.1, 0.2, 0.3)
+    after = sim._camera(st)
+    shift = after[:3, 3] - before[:3, 3]
+    assert np.allclose(shift, server.level_offset(before, (0.1, 0.2, 0.3)), atol=1e-9)
+    assert after[1, 2] > before[1, 2]  # raised: the rig looks further down (camera back axis tilts up)
+    rig = sim.rig("scene")
+    assert rig["camera_offset"] == [0.1, 0.2, 0.3] and rig["mount_xyz_m"] == MOUNT["xyz_m"] and rig["flash"] is None
+
+
+def test_room_map_drawn_in_the_r2r_frame():
+    from opticalnav_sim.gui import room_map_r2r
+    data = {"rooms": [{"id": "bedroom_0/0", "type": "bedroom", "area_m2": 4.0, "centroid": [1.0, 2.0],
+                       "polygons": [[[0, 1], [2, 1], [2, 3], [0, 3]]]}],
+            "connections": [{"rooms": ["bedroom_0/0", "hallway_0/0"], "kind": "Door", "midpoint": [2.0, 2.0],
+                             "passage_width_m": 0.9}, {"rooms": ["a", "b"], "kind": "Open"}]}
+    out = room_map_r2r(data)
+    assert out["rooms"][0]["centroid"] == [1.0, -2.0] and out["rooms"][0]["polygons"][0][2] == [2.0, -3.0]
+    assert out["connections"] == [{"rooms": ["bedroom_0/0", "hallway_0/0"], "kind": "Door", "midpoint": [2.0, -2.0],
+                                   "width_m": 0.9}]  # a passage without a midpoint has nowhere to be drawn

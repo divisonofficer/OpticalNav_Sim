@@ -52,6 +52,11 @@ so both MIS strategies drop the same set of paths.
      the environment) are ignored, and it is sampled directly, as if it were
      the scene's single emitter. ``all`` (the default) changes nothing. This
      lets one resident scene render a passive pass and a flash-only pass.
+     ``split`` renders both on one path: the other emitters as ``exclude``
+     (with ``caustics`` as given), plus the assist emitter as ``only`` (its own
+     emitter sample each bounce, and never caustics). Its expected value is the
+     sum of an ``exclude`` and an ``only`` render, at the cost of one path and
+     an extra shadow ray per bounce instead of two paths.
  * - sky_nir
    - |float|
    - Factor on light from the environment emitter in the near-infrared: its lane in RGBN variants,
@@ -66,7 +71,7 @@ public:
     MI_IMPORT_BASE(MonteCarloIntegrator, m_max_depth, m_rr_depth, m_hide_emitters)
     MI_IMPORT_TYPES(Scene, Sampler, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr, Shape, ShapePtr)
 
-    enum class AssistMode { All, Only, Exclude };
+    enum class AssistMode { All, Only, Exclude, Split };
 
     PathNoCausticsIntegrator(const Properties &props) : Base(props) {
         m_specular_pdf_threshold = props.get<ScalarFloat>("specular_pdf_threshold", 20.f);
@@ -80,8 +85,10 @@ public:
             m_assist_mode = AssistMode::Only;
         else if (mode == "exclude")
             m_assist_mode = AssistMode::Exclude;
+        else if (mode == "split")
+            m_assist_mode = AssistMode::Split;
         else
-            Throw("path_nocaustics: 'assist_mode' must be all, only or exclude (got \"%s\")", mode);
+            Throw("path_nocaustics: 'assist_mode' must be all, only, exclude or split (got \"%s\")", mode);
         if (m_assist_mode != AssistMode::All && m_assist.empty())
             Throw("path_nocaustics: 'assist_mode' %s needs an 'assist' shape id prefix", mode);
     }
@@ -117,7 +124,7 @@ public:
                 if (shape->emitter())
                     assist_emitter = shape->emitter();
             }
-            if (m_assist_mode == AssistMode::Only && !assist_emitter)
+            if ((m_assist_mode == AssistMode::Only || m_assist_mode == AssistMode::Split) && !assist_emitter)
                 Throw("path_nocaustics: no emitter on a shape whose id starts with \"%s\"", m_assist);
         }
 
@@ -136,6 +143,33 @@ public:
                 if (dr::none_or<false>(hit))
                     break;
                 SurfaceInteraction3f si = pi.compute_surface_interaction(ray, +RayFlags::Minimal, hit);
+                Ray3f next = si.spawn_ray(ray.d);
+                PreliminaryIntersection3f pi_next =
+                    scene->ray_intersect_preliminary(next, false, false, 0, 0, hit);
+                dr::masked(ray, hit) = next;
+                dr::masked(pi, hit) = pi_next;
+            }
+        };
+
+        /* 'split': light from the assist emitter reached by a ray (a BSDF sample, or a camera-side specular chain:
+           the flash seen in a mirror), as 'only' counts it (its own pdf for MIS; dropped through a near-specular
+           bounce after a rough one, whatever 'caustics' says), then the ray goes on through the shape as
+           'exclude' has it. Called right after each intersection, before the loop state moves on. */
+        auto assist_hits = [&](Ray3f &ray, PreliminaryIntersection3f &pi, Spectrum &result, const Spectrum &throughput,
+                               const Interaction3f &prev_si, Float prev_bsdf_pdf, Bool prev_bsdf_delta,
+                               Bool prev_caustic, Mask active) {
+            for (size_t i = 0; i < assist_shapes.size(); ++i) {
+                Mask hit = active && pi.is_valid() && is_assist(pi.shape);
+                if (dr::none_or<false>(hit))
+                    break;
+                SurfaceInteraction3f si = pi.compute_surface_interaction(ray, +RayFlags::All, hit);
+                DirectionSample3f ds(scene, si, prev_si);
+                Float em_pdf = dr::select(prev_bsdf_delta, 0.f,
+                                          assist_emitter->pdf_direction(prev_si, ds, hit && !prev_bsdf_delta));
+                Mask counted = hit && (si.emitter(scene) == EmitterPtr(assist_emitter)) &&
+                               (prev_bsdf_pdf > 0.f) && !prev_caustic;
+                Spectrum light = assist_emitter->eval(si, counted) * mis_weight(prev_bsdf_pdf, em_pdf);
+                dr::masked(result, counted) = spec_fma(throughput, light, result);
                 Ray3f next = si.spawn_ray(ray.d);
                 PreliminaryIntersection3f pi_next =
                     scene->ray_intersect_preliminary(next, false, false, 0, 0, hit);
@@ -206,6 +240,9 @@ public:
                                                  ls.active);
         if (m_assist_mode == AssistMode::Exclude)
             skip_assist(ls.ray, ls.pi, ls.active);
+        else if (m_assist_mode == AssistMode::Split)
+            assist_hits(ls.ray, ls.pi, ls.result, ls.throughput, ls.prev_si, ls.prev_bsdf_pdf, ls.prev_bsdf_delta,
+                        ls.prev_caustic, ls.active);
 
         // ---------------------- Hide area emitters ----------------------
 
@@ -233,7 +270,7 @@ public:
 
         dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
             [](const LoopState& ls) { return ls.active; },
-            [this, scene, bsdf_ctx, &skip_assist, assist_emitter](LoopState& ls) {
+            [this, scene, bsdf_ctx, &skip_assist, &assist_hits, assist_emitter](LoopState& ls) {
 
             /* dr::while_loop implicitly masks all code in the loop using the
                'active' flag, so there is no need to pass it to every function */
@@ -312,7 +349,7 @@ public:
                 } else {
                     std::tie(ds, em_weight) = scene->sample_emitter_direction(
                         si, ls.sampler->next_2d(), true, active_em);
-                    if (m_assist_mode == AssistMode::Exclude)
+                    if (m_assist_mode == AssistMode::Exclude || m_assist_mode == AssistMode::Split)
                         active_em &= ds.emitter != EmitterPtr(assist_emitter);
                     if (m_sky_nir != 1.f && scene->environment() != nullptr)
                         em_weight = sky_nir(em_weight, ds.emitter == EmitterPtr(scene->environment()), si.time);
@@ -354,6 +391,26 @@ public:
                 // Accumulate, being careful with polarization (see spec_fma)
                 ls.result[active_em] = spec_fma(
                     ls.throughput, bsdf_val * em_weight * mis_em, ls.result);
+            }
+
+            // ------------- 'split': the assist emitter's own sample -------------
+
+            if (m_assist_mode == AssistMode::Split) {
+                // as 'only' samples it: the assist emitter alone, its own pdf, its shadow ray, and the flash rule
+                // (no light through a near-specular lobe after a rough bounce, whatever 'caustics' says)
+                Mask active_f = active_next && has_flag(bsdf->flags(), BSDFFlags::Smooth);
+                auto [ds_f, em_f] = assist_emitter->sample_direction(si, ls.sampler->next_2d(), active_f);
+                active_f &= (ds_f.pdf != 0.f);
+                if (dr::any_or<true>(active_f)) {
+                    Mask occluded = scene->ray_test(si.spawn_ray_to(ds_f.p), active_f);
+                    active_f &= !occluded;
+                    Vector3f wo_f = si.to_local(ds_f.d);
+                    auto [val_f, pdf_f] = bsdf->eval_pdf(bsdf_ctx, si, wo_f, active_f);
+                    active_f &= !(ls.rough_seen && (pdf_f > m_specular_pdf_threshold));
+                    val_f = si.to_world_mueller(val_f, -wo_f, si.wi);
+                    Float mis_f = dr::select(ds_f.delta, 1.f, mis_weight(ds_f.pdf, pdf_f));
+                    ls.result[active_f] = spec_fma(ls.throughput, val_f * em_f * mis_f, ls.result);
+                }
             }
 
             // ---------------------- BSDF sampling ----------------------
@@ -422,6 +479,9 @@ public:
                                                      ls.active);
             if (m_assist_mode == AssistMode::Exclude)
                 skip_assist(ls.ray, ls.pi, ls.active);
+            else if (m_assist_mode == AssistMode::Split)
+                assist_hits(ls.ray, ls.pi, ls.result, ls.throughput, ls.prev_si, ls.prev_bsdf_pdf, ls.prev_bsdf_delta,
+                            ls.prev_caustic, ls.active);
         });
 
         return {
@@ -442,7 +502,8 @@ public:
             "  assist = \"%s\" (%s)\n"
             "]", m_max_depth, m_rr_depth, m_specular_pdf_threshold, m_caustics,
             m_assist, m_assist_mode == AssistMode::Only ? "only"
-                      : m_assist_mode == AssistMode::Exclude ? "exclude" : "all");
+                      : m_assist_mode == AssistMode::Exclude ? "exclude"
+                      : m_assist_mode == AssistMode::Split ? "split" : "all");
     }
 
     /**

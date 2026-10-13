@@ -92,6 +92,14 @@ class Simulator:
         self.env = {"map": "original", "scale": 1.0, "rotate_deg": 0.0}  # sky (setEnvironment)
         self.bands = "rgb"  # setBands
         self.lighting = "all"  # setLighting
+        self.lamps = False  # setLamps
+        self.flash_scale = 1.0  # setFlashScale
+        self.flash_offset = (0.0, 0.0, 0.0)  # setFlashOffset
+        self.camera_offset = (0.0, 0.0, 0.0)  # setCameraOffset
+        self.max_depth = 0  # setMaxDepth: 0 is the scene's own
+        self.caustics = True  # setCaustics
+        self.nir_range = (0.5, 1.0)  # setNirRange
+        self.active_split = True  # setActiveSplit
         self.mirrors = None  # setMirrors: None (the variant's own) or {"density", "glass", "glass_blocking"}
         self.flash_band = "rgb"  # setFlashBand
         self.nir = {}  # setNirScales (server defaults otherwise)
@@ -224,6 +232,83 @@ class Simulator:
         if mode not in ("none", "fixtures", "all"):
             raise ValueError("lighting must be 'none', 'fixtures' or 'all'")
         self.lighting = mode
+
+    def setFlashScale(self, scale: float) -> None:
+        """The camera flash's side times ``scale`` at the same power (radiance / scale^2): a larger light leaves far
+        fewer bright outliers (fireflies) through glossy and mirror bounces. 1 is the dataset's flash. From the
+        next render, without recording."""
+        if not 0.25 <= float(scale) <= 8.0:
+            raise ValueError("flash scale must be 0.25..8")
+        self.flash_scale = float(scale)
+
+    def setFlashOffset(self, right_m: float, up_m: float, forward_m: float = 0.0) -> None:
+        """Move the camera flash from where the dataset put it (0.2 m behind the camera, on its axis) by ``right_m``,
+        ``up_m`` and ``forward_m``: the observer's right, world up and the observer's level forward. It rides with
+        the camera and keeps facing its view. Off the axis, a glossy surface facing the camera no longer sends the
+        flash straight back into it: at 0.2 m up, a view with the light on had as few bright outliers as with it
+        off (46 vs 152), at the same brightness. From the next render, without recording."""
+        offset = (float(right_m), float(up_m), float(forward_m))
+        if not all(abs(v) <= 2.0 for v in offset):
+            raise ValueError("flash offset must be within 2 m")
+        self.flash_offset = offset
+
+    def setMaxDepth(self, depth: int) -> None:
+        """Cap every light path at ``depth`` vertices (Mitsuba's max_depth: 1 shows emitters seen directly, 2 adds
+        direct light, 3 and up one more indirect bounce each); 0 renders with the scene's own. A diagnostic: it
+        splits where noise and fireflies come from by path length. Each new depth records its freeze once."""
+        if not 0 <= int(depth) <= 64:
+            raise ValueError("max_depth must be 0..64")
+        self.max_depth = int(depth)
+
+    def setCaustics(self, on: bool) -> None:
+        """Off: the lights' passes drop caustics as the flash pass always does (path_nocaustics: light reaching an
+        emitter past a near-specular bounce that follows a rough one), which removes the bright outliers of
+        mirror, glass and glossy paths but also the light such paths carry (a room lit through window glass
+        darkens). On (default) is the dataset's rendering. Each setting records its freeze once."""
+        self.caustics = bool(on)
+
+    def setActiveSplit(self, on: bool) -> None:
+        """With the camera light on, render the lights and the flash on one path (path_nocaustics "split": the
+        same image as two paths, about a third less GPU time) instead of two. On by default; the render server
+        falls back to two paths when its plugin has no split mode. Each setting records its freeze once."""
+        self.active_split = bool(on)
+
+    def setNirRange(self, low: float, high: float) -> None:
+        """Map the pseudo near-infrared reflectance onto [``low``, ``high``]. robomituba's formula
+        (``dot(max(c, 1 - c), luma)`` of the base colour) spans 0.5 (mid grey) to 1 (black or white): every surface
+        reflects at least half the near-infrared, which keeps paths alive through many bounces (grain and
+        fireflies). (0.5, 1) is the formula as the dataset used it. From the next render, without recording."""
+        if not 0.0 <= float(low) <= float(high) <= 1.0:
+            raise ValueError("nir range must satisfy 0 <= low <= high <= 1")
+        self.nir_range = (float(low), float(high))
+
+    def setCameraOffset(self, right_m: float, up_m: float, forward_m: float = 0.0) -> None:
+        """Move the camera on its rig by ``right_m``, ``up_m`` and ``forward_m`` (the observer's right, world up and
+        level forward) from the scene's mount. Raising it tilts the view down as the dataset rig does (it looks at
+        0.9 x eye height, 1 m ahead); (0, 0, 0) is the dataset camera. The flash follows. From the next render."""
+        offset = (float(right_m), float(up_m), float(forward_m))
+        if not all(abs(v) <= 2.0 for v in offset):
+            raise ValueError("camera offset must be within 2 m")
+        self.camera_offset = offset
+
+    def rig(self, scene: str) -> dict:
+        """The camera rig of ``scene`` for an editor: the mount (lateral, height, forward; m), the flash (distance
+        behind the camera, size), and the offsets set on top."""
+        meta = self._scene_meta(scene)
+        mount = (meta.get("camera") or {}).get("mount") or {}
+        flash = next((v["flash"] for v in (meta.get("variants") or {}).values() if v.get("flash")), None)
+        return {"mount_xyz_m": [float(v) for v in (mount.get("xyz_m") or [0.0, 1.0, 0.0])],
+                "nominal_pitch_deg": math.degrees(frames.nominal_pitch(self._mount(scene))),
+                "flash": {"distance_m": float(flash["distance_m"]), "size_m": [float(v) for v in flash["size_world"]]}
+                if flash else None,
+                "camera_offset": list(self.camera_offset), "flash_offset": list(self.flash_offset),
+                "flash_scale": self.flash_scale}
+
+    def setLamps(self, on: bool) -> None:
+        """Also light the lamps the scene left dark (Infinigen spawns a light with only some of its lamps; the
+        server adds one inside every other lamp's shade, at the power of the scene's own lamp lights). On top
+        of the lighting mode; off by default, as the dataset rendered. From the next render, without recording."""
+        self.lamps = bool(on)
 
     def setIndoorLights(self, level: float) -> None:
         """Scale every indoor light (the scene's area emitters; not the camera flash or the sky): 1 as built,
@@ -404,6 +489,33 @@ class Simulator:
         return self._client.render([self._view(scene, variant, c2w, w, h, hfov)], self.stokesDtype)[0]
 
     # --- internals ---
+    def _mount(self, scene: str) -> dict:
+        """The scene's camera mount, raised by the camera offset (setCameraOffset)."""
+        mount = dict(self._scene_meta(scene)["camera"]["mount"] or {})
+        if self.camera_offset[1]:
+            xyz = list(mount.get("xyz_m") or [0.0, 1.0, 0.0])
+            xyz[1] = float(xyz[1]) + self.camera_offset[1]
+            mount["xyz_m"] = xyz
+        return mount
+
+    def _camera(self, state) -> np.ndarray:
+        """Camera to world of ``state``: the dataset rig (frames.camera_at_viewpoint / camera_at_position) with the
+        camera offset on top, its height through the mount (the rig's pitch follows it), the rest along the level
+        view."""
+        scene = self._split(state.scanId)[0]
+        mount = self._mount(scene)
+        if state._free_position is None:
+            c2w = frames.camera_at_viewpoint(state.location.x, state.location.y, state.heading, state.elevation, mount)
+        else:
+            x, y, z = state._free_position
+            c2w = frames.camera_at_position((x, y, z + self.camera_offset[1]), state.heading, state.elevation, mount)
+        right_m, _, forward_m = self.camera_offset
+        if right_m or forward_m:
+            right = c2w[:3, 0] / np.linalg.norm(c2w[:3, 0])  # level already: the rig pitches about it
+            c2w = c2w.copy()
+            c2w[:3, 3] += right * right_m + np.cross((0.0, 1.0, 0.0), right) * forward_m
+        return c2w
+
     def _hfov_deg(self, width: int, height: int) -> float:
         return math.degrees(2.0 * math.atan(math.tan(self.vfov / 2.0) * width / height))
 
@@ -411,7 +523,9 @@ class Simulator:
         return {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": width, "height": height,
                 "hfov_deg": hfov_deg, "spp": self.spp, "seed": self.seed, "mode": self.renderMode,
                 "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env),
-                "bands": self.bands, "flash_band": self.flash_band, "nir": dict(self.nir), "lighting": self.lighting,
+                "bands": self.bands, "flash_band": self.flash_band, "nir": dict(self.nir), "lighting": self.lighting, "lamps": self.lamps,
+                "flash_scale": self.flash_scale, "flash_offset": list(self.flash_offset), "max_depth": self.max_depth,
+                "caustics": self.caustics, "nir_range": list(self.nir_range), "active_split": self.active_split,
                 "mirrors": dict(self.mirrors) if self.mirrors is not None else None}
 
     def _set_heading_elevation(self, heading, elevation) -> None:
@@ -462,12 +576,7 @@ class Simulator:
         hfov = self._hfov_deg(self.width, self.height)
         for state in self.states:
             scene, variant = self._split(state.scanId)
-            mount = self._scene_meta(scene)["camera"]["mount"]
-            if state._free_position is None:
-                c2w = frames.camera_at_viewpoint(state.location.x, state.location.y, state.heading,
-                                                 state.elevation, mount)
-            else:
-                c2w = frames.camera_at_position(state._free_position, state.heading, state.elevation, mount)
+            c2w = self._camera(state)
             state.camera_to_world = c2w
             state.variant = variant  # setVariant / setActiveLight apply from the next render
             views.append(self._view(scene, variant, c2w, self.width, self.height, hfov))

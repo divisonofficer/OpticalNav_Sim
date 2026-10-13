@@ -18,6 +18,7 @@ the GPU. The page long-polls /api/state for new frames. Needs numpy and Pillow.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hmac
 import io
 import json
@@ -40,7 +41,22 @@ from .client import RenderClient
 
 PAGE = Path(__file__).with_name("gui.html")
 ACCUMULATED = ("s0", "s1", "s2", "nir_s0", "nir_s1", "nir_s2")  # summed over passes, shown as their mean
-CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")
+CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  # the older pane names
+PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
+PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2")
+_OLD_PANES = {"rgb": ("rgb", "img"), "dolp": ("rgb", "dolp"), "aolp": ("rgb", "aolp"), "s1": ("rgb", "s1"),
+              "s2": ("rgb", "s2"), "nir": ("nir", "img"), "nir_dolp": ("nir", "dolp"), "nir_aolp": ("nir", "aolp")}
+
+
+def pane_channel(name: str) -> tuple[str, str]:
+    """A pane's (band, view): ``"<band>.<view>"`` (PANE_BANDS x PANE_VIEWS, e.g. ``"g.aolp"``) or an older
+    name (CHANNELS). KeyError for anything else."""
+    if name in _OLD_PANES:
+        return _OLD_PANES[name]
+    band, _, view = str(name).partition(".")
+    if band not in PANE_BANDS or view not in PANE_VIEWS:
+        raise KeyError(name)
+    return band, view
 
 
 def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
@@ -63,6 +79,20 @@ def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
     if channel in ("s1", "s2"):
         return stokes.signed_rgb(d[f"{channel}_over_s0"] / scale)
     raise KeyError(channel)
+
+
+def room_map_r2r(data: dict) -> dict:
+    """A robomituba room_map.v1 (dataset x, y) in the R2R frame the map draws: (x, -y)."""
+    def pt(p):
+        return [round(float(p[0]), 3), round(-float(p[1]), 3)]
+
+    rooms = [{"id": r.get("id"), "type": r.get("type") or "room", "area_m2": r.get("area_m2"),
+              "centroid": pt(r["centroid"]) if r.get("centroid") else None,
+              "polygons": [[pt(p) for p in poly] for poly in r.get("polygons") or ([r["polygon"]] if r.get("polygon") else [])]}
+             for r in data.get("rooms", [])]
+    links = [{"rooms": c.get("rooms"), "kind": c.get("kind"), "midpoint": pt(c["midpoint"]),
+              "width_m": c.get("passage_width_m")} for c in data.get("connections", []) if c.get("midpoint")]
+    return {"rooms": rooms, "connections": links}
 
 
 def jpeg(img: np.ndarray, quality: int = 90) -> bytes:
@@ -94,6 +124,8 @@ class Session:
         sim.setPreviewEnabled(False)  # the page tonemaps the running mean itself
         self.tones: dict[tuple[str, str], dict] = {}  # fixed display exposure per (scene, variant)
         self.envmaps: list[str] = []  # environment maps the render server offers (main sets them)
+        self.room_maps: dict[str, dict | None] = {}  # scene -> floor plan for the map (room_map)
+        self.server_info: dict = {}  # the render server's Mitsuba version and variant (main sets them)
         self.nir_available = False  # the render server has the rgb2nir plugin (main sets it)
         self.lock = threading.Lock()
         self.cv = threading.Condition()
@@ -112,6 +144,7 @@ class Session:
         self.frame_id = 0
         self.frames: dict[int, dict] = {}  # the last four, so image requests that lag a frame or two still work
         self.arrivals: deque = deque(maxlen=64)
+        self.timings: deque = deque(maxlen=64)  # (arrival, the pass's time split) of the frames shown
         self.trail: list[tuple[float, float]] = []
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(self.depth, thread_name_prefix="pass")
@@ -218,6 +251,30 @@ class Session:
         if "lighting" in settings:
             self.sim.setLighting(str(settings["lighting"]))
             restart = True
+        if "lamps" in settings:
+            self.sim.setLamps(bool(settings["lamps"]))
+            restart = True
+        if "flash_scale" in settings:
+            self.sim.setFlashScale(float(settings["flash_scale"]))
+            restart = True
+        if "flash_offset" in settings:  # [right, up(, forward)] m from the dataset's flash (MatterSim.setFlashOffset)
+            self.sim.setFlashOffset(*(float(v) for v in settings["flash_offset"]))
+            restart = True
+        if "max_depth" in settings:  # 0: the scene's own (MatterSim.setMaxDepth)
+            self.sim.setMaxDepth(int(settings["max_depth"]))
+            restart = True
+        if "nir_range" in settings:  # [low, high] (MatterSim.setNirRange)
+            self.sim.setNirRange(*(float(v) for v in settings["nir_range"]))
+            restart = True
+        if "active_split" in settings:  # MatterSim.setActiveSplit
+            self.sim.setActiveSplit(bool(settings["active_split"]))
+            restart = True
+        if "caustics" in settings:  # MatterSim.setCaustics
+            self.sim.setCaustics(bool(settings["caustics"]))
+            restart = True
+        if "camera_offset" in settings:  # [right, up(, forward)] m from the scene's mount (MatterSim.setCameraOffset)
+            self.sim.setCameraOffset(*(float(v) for v in settings["camera_offset"]))
+            restart = True
         if "bands" in settings:
             self.sim.setBands(str(settings["bands"]))
             restart = True
@@ -256,10 +313,7 @@ class Session:
     # --- the render loop ---
     def _camera(self, st) -> np.ndarray:
         """The camera MatterSim would render for this state (MatterSim._render)."""
-        mount = self.sim._scene_meta(self.sim._split(st.scanId)[0])["camera"]["mount"]
-        if st._free_position is None:
-            return frames.camera_at_viewpoint(st.location.x, st.location.y, st.heading, st.elevation, mount)
-        return frames.camera_at_position(st._free_position, st.heading, st.elevation, mount)
+        return self.sim._camera(st)
 
     def _moved(self) -> None:
         """The state changed: describe it, and point the render loop at the new camera."""
@@ -271,12 +325,14 @@ class Session:
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
                 "denoise": False, "preview": False, "s3": False, "lights": sim.lights, "env": dict(sim.env),
-                "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting,
+                "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting, "lamps": sim.lamps,
+                "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth,
+                "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
                 "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
         pos = st._free_position or (st.location.x, st.location.y)
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
             self.trail.append((pos[0], pos[1]))
-        height = st._free_position[2] if st._free_position is not None else float(c2w[1, 3])
+        height = float(c2w[1, 3])
         pose = {
             "scene": st.scanId, "viewpoint": st.location.viewpointId, "step": st.step,
             "heading_deg": round(math.degrees(st.heading), 2), "elevation_deg": round(math.degrees(st.elevation), 2),
@@ -288,6 +344,8 @@ class Session:
                             "distance_m": round(c.rel_distance, 3)}
                            for i, c in enumerate(st.navigableLocations) if i > 0],
             "trail": [[round(x, 3), round(y, 3)] for x, y in self.trail[-400:]],
+            "rig": sim.rig(scene),  # the rig editor's camera mount, flash and offsets
+            "pack": self.scene_dir(scene).parent.parent.name,  # the scene's pack (several may be served)
         }
         with self.cv:
             self.gen += 1
@@ -329,8 +387,11 @@ class Session:
         started = time.perf_counter()
         try:
             client = self._client()
-            out = client.render([dict(view, seed=int(seed))], "float16")[0]  # half the bytes; summed in float32
+            # float32: numpy's float32 -> float16 conversion on the server took 20-29 ms a pass (on the HTTP thread,
+            # holding the GIL against the render thread); the bytes it saved cost ~3 ms to send on one machine
+            out = client.render([dict(view, seed=int(seed))], "float32")[0]
             timing = dict(getattr(client, "last_timing", {}) or {})
+            server_s = float(getattr(client, "last_render_seconds", 0.0) or 0.0)  # the request, on the server
         except Exception as exc:  # noqa: BLE001 - shown on the page; the next input retries
             with self.cv:
                 self.inflight -= 1
@@ -339,7 +400,7 @@ class Session:
                     self.version += 1
                 self.cv.notify_all()
             return
-        wall = time.perf_counter() - started
+        wall = time.perf_counter() - started  # the render request's round trip
         with self.cv:
             self.inflight -= 1
             self.cv.notify_all()
@@ -381,10 +442,19 @@ class Session:
             extra = {"nir_grey": nir[0], "nir_derived": stokes.derived_mono(nir[0], nir[1], nir[2])}
         # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
         frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
-                 "derived": stokes.derived(s0, s1, s2), "spp": passes * view["spp"], "passes": passes,
-                 "variant": view["variant"], "wall_ms": 1000.0 * wall,
-                 "server_ms": 1000.0 * float(timing.get("render_s", 0.0)),
-                 "gpu_ms": 1000.0 * float(timing.get("gpu_s", 0.0))}
+                 "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": passes * view["spp"], "passes": passes,
+                 "variant": view["variant"]}
+        # Where a pass's time went (ms). gpu: the server waiting for the GPU after queuing the pass's kernels, the
+        # GPU time no CPU work hid (exact kernel times would need a sync per kernel); server_cpu: the rest of its
+        # render call plus splitting and encoding; queue: waiting behind other passes on the server's one render
+        # thread; transfer: the round trip minus the server's time (network, decoding); viewer: accumulating,
+        # denoising, deriving here.
+        g = lambda k: 1000.0 * float(timing.get(k, 0.0))
+        frame["timing"] = {
+            "wall_ms": 1000.0 * (time.perf_counter() - started), "round_trip_ms": 1000.0 * wall,
+            "queue_ms": g("queue_s"), "gpu_ms": g("wait_s"),
+            "server_cpu_ms": g("render_s") - g("wait_s") + g("split_s") + g("post_s") + g("encode_s"),
+            "transfer_ms": max(0.0, 1000.0 * (wall - server_s)), "viewer_ms": 1000.0 * (time.perf_counter() - started - wall)}
         with self.cv:
             if gen == self.gen:
                 if passes <= self.published:  # a later pass of this camera got here first
@@ -397,9 +467,9 @@ class Session:
             for old in [k for k in self.frames if k < self.frame_id - 3]:
                 del self.frames[old]
             self.arrivals.append(time.time())
+            self.timings.append((time.time(), frame["timing"]))
             self.frame_meta = {"frame_id": self.frame_id, "frame_gen": gen, "frame_spp": frame["spp"],
-                               "frame_variant": frame["variant"], "passes": passes,
-                               "timing": {k: round(frame[k], 1) for k in ("wall_ms", "server_ms", "gpu_ms")}}
+                               "frame_variant": frame["variant"], "passes": passes}
             self.version += 1
             self.cv.notify_all()
 
@@ -412,7 +482,7 @@ class Session:
             self.tones[key] = tonemap.global_params([radiance])
         if key not in self.tones:
             try:
-                self.tones[key] = tonemap.scene_params(Path(self.sim.navGraphPath).parent / "scenes" / scene, variant)
+                self.tones[key] = tonemap.scene_params(self.scene_dir(scene), variant)
             except (OSError, ValueError, KeyError):
                 self.tones[key] = tonemap.global_params([radiance])
         return self.tones[key]
@@ -427,28 +497,35 @@ class Session:
         sim = self.sim
         with self.cv:
             now = time.time()
-            recent = [t for t in self.arrivals if now - t <= 2.0]
+            # frames shown in the last 5 s (2 s jumped with every slow pass); the time split as medians over them
+            recent = [t for t in self.arrivals if now - t <= 5.0]
             fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 2 and recent[-1] > recent[0] else 0.0
+            split = [s for t, s in self.timings if now - t <= 5.0] or [s for _, s in list(self.timings)[-1:]]
+            timing = {k: round(float(np.median([s[k] for s in split])), 1) for k in (split[0] if split else {})}
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             out = {"scans": self.scans, "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
-                   "lighting": sim.lighting, "mirrors": sim.mirrors,
+                   "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
+                   "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth,
+                   "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
+                   "active_split": sim.active_split,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
                    "hfov_deg": sim._hfov_deg(sim.width, sim.height), "vfov_deg": math.degrees(sim.vfov),
                    "width": sim.width, "height": sim.height, **self.pose, **self.frame_meta,
                    "done": spp_now >= self.target_spp or (not self.auto and spp_now > 0),
-                   "stale": waiting, "fps": round(fps, 1), "in_flight": self.inflight}
+                   "stale": waiting, "fps": round(fps, 1), "in_flight": self.inflight, "timing": timing}
             waited = now - self.gen_started if waiting else 0.0
             info = self.renderer or {}
             out["renderer"] = {"reachable": info.get("reachable"), "activity": self._renderer_status(),
                                "resident": info.get("resident", []), "freeze_available": info.get("freeze"),
                                "ready": self.readiness()}
-            resident = info.get("resident") or []
+            # the scene the render server holds, or is still preloading (a page opened during --preload waits for it)
+            resident = info.get("resident") or info.get("preloading") or []
             out["default_scene"] = resident[0][0] if resident else None
         server = {"busy": waiting, "what": "render", "waiting": 0, "elapsed_s": round(waited, 1)}
         if waiting and waited > 1.0:
@@ -527,14 +604,37 @@ class Session:
                 raise TimeoutError("not idle")
             self.wait(st["version"], end - time.time())
 
+    POL_CHANNELS = ("luma", "r", "g", "b", "nir")  # probe channels (luma: the dataset's luminance Stokes)
+
+    def _polarization(self, frame: dict, pol: str) -> dict | None:
+        """DoLP, AoLP, S1/S0, S2/S0 of one channel: "luma" (the dataset's definition, from luminance Stokes),
+        "r", "g", "b" (that channel's own Stokes vector) or "nir". None when the frame has no such band."""
+        if pol in ("luma", None, ""):
+            return frame["derived"]
+        if pol == "nir":
+            return frame.get("nir_derived")
+        k = "rgb".index(pol)
+        return stokes.derived_mono(frame["s0"][..., k], frame["s1"][..., k], frame["s2"][..., k])
+
     def image(self, frame_id: int, channel: str, scale: float, ev: dict | None = None) -> bytes:
-        """A pane's JPEG. ``ev``: the page's exposure offset per band ({"rgb": stops, "nir": stops}), on top of
-        the scene's tone fit, so a page brightens or darkens what it shows without rendering again."""
+        """A pane's JPEG. ``channel``: a band and a view (pane_channel), e.g. ``"g.aolp"``: the image (the colour
+        image for ``rgb``, the band's own S0 in grey for ``r``, ``g``, ``b``, the near-infrared image) or that
+        band's DoLP, AoLP, S1/S0, S2/S0 (``rgb``: from luminance Stokes, as the dataset defines them). ``ev``:
+        the page's exposure offset per band ({"rgb": stops, "nir": stops}) on top of the scene's tone fit.
+        Nothing renders again."""
+        band, view = pane_channel(channel)
         frame = self._frame(frame_id)
-        if channel in ("rgb", "nir") and (channel == "rgb" or "nir_grey" in frame):
-            frame = dict(frame)
-            frame[channel] = self._tonemapped(frame, channel, float((ev or {}).get(channel, 0.0)))
-        return jpeg(channel_image(frame, channel, scale))
+        ev = ev or {}
+        if band == "nir" and "nir_grey" not in frame:  # the near-infrared band is not being rendered
+            return jpeg(np.full(frame["s0_luma"].shape + (3,), 24, np.uint8))
+        if view == "img":
+            if band in ("rgb", "nir"):
+                return jpeg(self._tonemapped(frame, band, float(ev.get(band, 0.0))))
+            grey = np.repeat(frame["s0"][..., "rgb".index(band), None], 3, axis=2)
+            tone = self._tone(frame["scan"], frame["variant"], frame["s0"])
+            return jpeg(tonemap.reinhard(grey, tone["exposure"] * 2.0 ** float(ev.get("rgb", 0.0)), tone["white"]))
+        derived = self._polarization(frame, "luma" if band == "rgb" else band)
+        return jpeg(channel_image(dict(frame, derived=derived), view, scale))
 
     def _tonemapped(self, frame: dict, band: str, ev: float) -> np.ndarray:
         """Extended Reinhard at the band's tone fit (see _tone), its exposure shifted by ``ev`` stops."""
@@ -559,12 +659,15 @@ class Session:
             self.version += 1
             self.cv.notify_all()
 
-    def probe(self, frame_id: int, x: int, y: int) -> dict:
+    def probe(self, frame_id: int, x: int, y: int, pol: str = "luma") -> dict:
         f = self._frame(frame_id)
         h, w = f["s0_luma"].shape
         x, y = min(max(int(x), 0), w - 1), min(max(int(y), 0), h - 1)
-        d = f["derived"]
-        return {"x": x, "y": y, "s0": float(f["s0_luma"][y, x]), "dolp": float(d["dolp"][y, x]),
+        d = self._polarization(f, pol) if pol in self.POL_CHANNELS else None
+        if d is None:  # an unknown channel, or the near-infrared band not rendered: luminance
+            pol, d = "luma", f["derived"]
+        s0 = (f["s0_luma"] if pol == "luma" else f["nir_grey"] if pol == "nir" else f["s0"][..., "rgb".index(pol)])[y, x]
+        return {"x": x, "y": y, "channel": pol, "s0": float(s0), "dolp": float(d["dolp"][y, x]),
                 "aolp_deg": float(d["aolp_deg"][y, x]), "s1_over_s0": float(d["s1_over_s0"][y, x]),
                 "s2_over_s0": float(d["s2_over_s0"][y, x])}
 
@@ -574,7 +677,34 @@ class Session:
         with self.lock:
             g = self.sim._graph(scene)
         keep = [i for i, ok in enumerate(g.included) if ok]
-        return {"scene": scene, "x": [round(g.pos[i][0], 3) for i in keep], "y": [round(g.pos[i][1], 3) for i in keep]}
+        return {"scene": scene, "x": [round(g.pos[i][0], 3) for i in keep], "y": [round(g.pos[i][1], 3) for i in keep],
+                "rooms": self.room_map(scene)}
+
+    def scene_dir(self, scene: str) -> Path:
+        """The scene's pack directory on this machine: as the render server reports it (it may serve several
+        packs), else under the first --pack."""
+        with contextlib.suppress(Exception):
+            reported = Path(self.sim._scene_meta(scene)["scene_dir"])
+            if reported.is_dir():
+                return reported
+        return Path(self.sim.navGraphPath).parent / "scenes" / scene
+
+    def room_map(self, scene: str) -> dict | None:
+        """The scene's floor plan for the map (robomituba tools/infinigen/export_room_map.py, schema
+        robomituba.room_map.v1), in the R2R frame the map draws: rooms with type, polygons and centroid, and the
+        passages between them. Read from the pack, else from the project the pack was built from; None when
+        neither has one."""
+        if scene not in self.room_maps:
+            scene_dir = self.scene_dir(scene)
+            pack = scene_dir.parent.parent
+            places = [scene_dir / "room_map.json"]
+            try:
+                places.append(Path(json.loads((pack / "pack.json").read_text())["project"]) / "scenes" / scene / "room_map.json")
+            except (OSError, KeyError, ValueError):
+                pass
+            path = next((p for p in places if p.is_file()), None)
+            self.room_maps[scene] = room_map_r2r(json.loads(path.read_text())) if path else None
+        return self.room_maps[scene]
 
 
 COOKIE = "opticalnav_gui"
@@ -687,14 +817,15 @@ def make_handler(session: Session, token: str | None = None):
                     if "after" in q:
                         session.wait(int(q["after"]), float(q.get("wait", 2.0)))
                     return self._json(200, session.status())
+                if parts == ["api", "scene_stats"]:  # the scene tab: asks the render server each time
+                    return self._json(200, session.sim._client.stats(q["scene"]))
                 if parts == ["api", "graph"]:
                     return self._json(200, session.graph(q["scene"]))
                 if parts == ["api", "probe"]:
-                    return self._json(200, session.probe(int(q["frame"]), int(q["x"]), int(q["y"])))
+                    return self._json(200, session.probe(int(q["frame"]), int(q["x"]), int(q["y"]), q.get("pol", "luma")))
                 if len(parts) == 4 and parts[:2] == ["api", "frame"] and parts[3].endswith(".jpg"):
                     channel = parts[3][:-4]
-                    if channel not in CHANNELS:
-                        raise KeyError(channel)
+                    pane_channel(channel)  # KeyError (404) for an unknown pane
                     body = session.image(int(parts[2]), channel, float(q.get("scale", 0.2)),
                                          {"rgb": float(q.get("ev_rgb", 0.0)), "nir": float(q.get("ev_nir", 0.0))})
                     return self._send(200, body, "image/jpeg")
@@ -744,7 +875,7 @@ def make_handler(session: Session, token: str | None = None):
             self.end_headers()
             self.close_connection = True
             ws = WebSocket(self.rfile, self.wfile)
-            sub = {"panes": {"a": "rgb", "b": "dolp"}, "scale": 0.2, "ev": {}, "dirty": True}
+            sub = {"panes": {"a": "rgb.img", "b": "rgb.dolp"}, "scale": 0.2, "ev": {}, "dirty": True}
             alive = threading.Event()
             alive.set()
 
@@ -763,7 +894,11 @@ def make_handler(session: Session, token: str | None = None):
                             sent_frame = frame_id
                             for i, pane in enumerate(("a", "b")):
                                 ch = sub["panes"].get(pane)
-                                if ch in CHANNELS:
+                                try:
+                                    pane_channel(ch)
+                                except KeyError:  # no pane (a phone shows one), or an unknown name
+                                    ch = None
+                                if ch is not None:
                                     try:
                                         img = session.image(frame_id, ch, float(sub["scale"]), sub["ev"])
                                     except KeyError:  # already replaced by a newer frame
@@ -802,7 +937,8 @@ def make_handler(session: Session, token: str | None = None):
                             session.cv.notify_all()
                     elif kind == "probe":
                         try:
-                            ws.send_json({"type": "probe", **session.probe(int(msg["frame"]), int(msg["x"]), int(msg["y"]))})
+                            ws.send_json({"type": "probe", **session.probe(int(msg["frame"]), int(msg["x"]), int(msg["y"]),
+                                                                           str(msg.get("pol", "luma")))})
                         except KeyError:
                             pass
             except (ConnectionError, OSError, ValueError):
@@ -817,7 +953,9 @@ def make_handler(session: Session, token: str | None = None):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pack", required=True, type=Path)
+    ap.add_argument("--pack", required=True, type=Path, action="append",
+                    help="scene pack (repeatable, as the render server's): graphs are read from the first one's "
+                         "connectivity/, the other packs' from the render server")
     ap.add_argument("--server", default=None, help="render server URL (default $OPTICALNAV_SIM_URL)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18780)
@@ -835,7 +973,7 @@ def main() -> int:
     sim = MatterSim.Simulator()
     if args.server:
         sim.setDatasetPath(args.server)
-    sim.setNavGraphPath(str(args.pack / "connectivity"))
+    sim.setNavGraphPath(str(args.pack[0] / "connectivity"))
     sim.initialize()
     waited = 0
     while True:  # the render server may still be loading its --preload scene (it listens only after that)
@@ -847,10 +985,12 @@ def main() -> int:
                 print(f"[gui] waiting for the render server at {sim._client.url} ({type(exc).__name__})", flush=True)
             time.sleep(2)
             waited += 2
-    if info.get("resident"):  # start on what the render server has loaded (pages start its first scene)
-        sim.setVariant(info["resident"][0][1])
+    # start on what the render server has loaded, or is preloading (pages start its first scene)
+    if info.get("resident") or info.get("preloading"):
+        sim.setVariant((info.get("resident") or info["preloading"])[0][1])
     session = Session(sim, info["scans"], args.pass_spp, args.target_spp, args.turn_deg, args.pitch_deg, args.depth)
     session.envmaps = list(info.get("envmaps", []))
+    session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant")}
     session.nir_available = bool(info.get("nir"))
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token))
     resident = [r[0] for r in info.get("resident", [])]

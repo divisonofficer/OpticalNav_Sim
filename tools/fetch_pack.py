@@ -11,6 +11,9 @@
 Only the scenes asked for are downloaded (default: all of them). Each archive's sha256 is checked against
 manifest.json before it is unpacked, and pack.json, connectivity/scans.txt and the R2R task files are
 rewritten for the scenes present in --out, so a partial pack works with the simulator and the evaluator.
+Scenes archived before tools/compact_assets.py existed are then compacted in place (binary PLY meshes,
+one file per distinct texture; it needs Mitsuba in this Python, else it says so and the render server
+does it on its next start). --no-compact leaves them as they came.
 Needs tar and zstd (Ubuntu: apt install zstd).
 """
 from __future__ import annotations
@@ -93,6 +96,7 @@ def main() -> int:
     ap.add_argument("--scene", action="append", default=[], help="scene id (repeatable; default: every scene)")
     ap.add_argument("--list", action="store_true", help="print the scenes on offer and exit")
     ap.add_argument("--keep-archives", action="store_true")
+    ap.add_argument("--no-compact", action="store_true", help="leave scenes archived before compaction as they are")
     args = ap.parse_args()
     for tool in ("tar", "zstd"):
         if not shutil.which(tool):
@@ -133,8 +137,26 @@ def main() -> int:
             archive.unlink()
         print(f"[ok] {name}", flush=True)
     counts = finish(out, manifest)
+    if not args.no_compact:
+        compact(out, wanted)
     print(f"[done] {out}: scenes {len(json.loads((out / 'pack.json').read_text())['scans'])}, R2R splits {counts}")
     return 0
+
+
+def compact(out: Path, scenes: list[str]) -> None:
+    """Compact the scenes that still need it (tools/compact_assets.py --if-needed), in a child process: it
+    needs Mitsuba, which this script does not."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from compact_assets import needs_compaction  # noqa: PLC0415
+
+    todo = [s for s in scenes if (out / "scenes" / s).is_dir() and needs_compaction(out / "scenes" / s)]
+    if not todo:
+        return
+    print(f"[compact] {len(todo)} scene(s) archived before compaction", flush=True)
+    cmd = [sys.executable, str(Path(__file__).resolve().parent / "compact_assets.py"), "--pack", str(out), "--if-needed"]
+    if subprocess.run(cmd + [a for s in todo for a in ("--scene", s)]).returncode != 0:
+        print("[compact] skipped: run tools/compact_assets.py --pack <pack> --if-needed with the Python that has "
+              "Mitsuba (the render server also does it when it starts)", flush=True)
 
 
 if __name__ == "__main__":
