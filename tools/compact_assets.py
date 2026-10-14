@@ -28,6 +28,8 @@ which also makes tools/export_pack.py pack the scene again.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -154,9 +156,37 @@ def needs_compaction(scene_dir: Path) -> bool:
     return False
 
 
+LOCK_NAME = ".compact.lock"
+
+
+class SceneBusy(RuntimeError):
+    """Another process holds the scene's lock (see scene_lock)."""
+
+
+@contextlib.contextmanager
+def scene_lock(scene_dir: Path):
+    """Exclusive lock (flock on <scene>/.compact.lock) for a tool rewriting a scene: compact_assets,
+    decimate_meshes, and the render server's compaction on start. A second writer gets
+    SceneBusy at once instead of racing the first one over the same XMLs and assets."""
+    handle = os.open(scene_dir / LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SceneBusy(f"{scene_dir.name}: another process is rewriting this scene") from None
+        os.ftruncate(handle, 0)
+        os.write(handle, f"{os.getpid()}\n".encode())
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        os.close(handle)
+
+
 def compact_pack(pack: Path, scenes=(), jobs: int = 6, keep_unused: bool = False, if_needed: bool = True) -> dict:
     """Compact the scenes of a pack (default: all), by default only those that need it. Scene id -> summary,
-    or None for a scene skipped as already compacted."""
+    None for a scene skipped as already compacted, or "busy" for one another process is rewriting."""
     pack = Path(pack)
     scenes = list(scenes) or sorted(p.parent.name for p in (pack / "scenes").glob("*/scene.json"))
     out = {}
@@ -166,11 +196,20 @@ def compact_pack(pack: Path, scenes=(), jobs: int = 6, keep_unused: bool = False
             out[scene] = None
             continue
         _mitsuba()
-        out[scene] = compact_scene(scene_dir, jobs, keep_unused)
+        try:
+            out[scene] = compact_scene(scene_dir, jobs, keep_unused)
+        except SceneBusy as exc:
+            print(f"skipped: {exc}", flush=True)
+            out[scene] = "busy"
     return out
 
 
 def compact_scene(scene_dir: Path, jobs: int, keep_unused: bool) -> dict:
+    with scene_lock(scene_dir):
+        return _compact_scene(scene_dir, jobs, keep_unused)
+
+
+def _compact_scene(scene_dir: Path, jobs: int, keep_unused: bool) -> dict:
     started = time.time()
     xmls = sorted(scene_dir.glob("*.xml"))
     texts = {f: f.read_text() for f in xmls}

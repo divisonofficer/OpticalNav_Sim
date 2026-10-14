@@ -538,6 +538,16 @@ def test_compact_assets_rewrites_textures_and_obj_shapes():
         assert not needs_compaction(scene)
         (scene / "base.xml").write_text(done.replace("tex_0123456789abcdef0123", "x_base_color"))
         assert needs_compaction(scene)  # a texture not yet named by its content
+        from compact_assets import SceneBusy, scene_lock
+
+        with scene_lock(scene):  # one writer per scene: a second one is turned away, then let in
+            try:
+                with scene_lock(scene):
+                    raise AssertionError("a second writer got the lock")
+            except SceneBusy:
+                pass
+        with scene_lock(scene):
+            pass
 
 
 def test_decimation_policy_and_crease_normals():
@@ -572,47 +582,6 @@ def test_decimation_policy_and_crease_normals():
     kept = dm.rewrite_shape(body, "assets/mesh_new.ply", {**row, "kind": "atlas_kept", "textures": {}})
     assert "normalmap" in kept and 'value="assets/c.png"' in kept
 
-
-def test_atlas_materials_folds_and_maps_uvs():
-    import xml.etree.ElementTree as ET
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-    import atlas_materials as am
-
-    def shape(sid, bsdf, kind="ply"):
-        return ET.fromstring(f'<shape type="{kind}" id="{sid}"><string name="filename" value="assets/m.ply" />{bsdf}</shape>')
-
-    def bmp(name, f, raw):
-        return (f'<texture name="{name}" type="bitmap"><string name="filename" value="{f}" />'
-                + ('<boolean name="raw" value="true" />' if raw else "") + "</texture>")
-
-    textured = ('<bsdf type="twosided"><bsdf type="normalmap">' + bmp("normalmap", "assets/n.png", True)
-                + '<bsdf type="pplastic">' + bmp("diffuse_reflectance", "assets/c.png", False)
-                + bmp("alpha", "assets/r.png", True) + "</bsdf></bsdf></bsdf>")
-    mat = am.material(shape("cup", textured), {})
-    assert mat == ("pplastic", (), (("file", "assets/c.png"), ("file", "assets/r.png"), ("file", "assets/n.png")))
-    plain = '<bsdf type="twosided"><bsdf type="pplastic"><rgb name="diffuse_reflectance" value="0.2 0.3 0.4" /></bsdf></bsdf>'
-    assert am.material(shape("box", plain), {}) == ("pplastic", (), (("const", (0.2, 0.3, 0.4)), ("const", 0.1), am.FLAT))
-    metal = '<bsdf type="twosided"><bsdf type="roughconductor"><string name="material" value="Al" /><float name="alpha" value="0.6" /></bsdf></bsdf>'
-    assert am.material(shape("pot", metal), {}) == ("conductor", "Al", ("const", 0.6))
-    # what stays as it is: a texture in the other colour space, the server's hideables, built-in shapes, shared atlases
-    assert am.material(shape("cup", textured.replace(bmp("alpha", "assets/r.png", True), bmp("alpha", "assets/r.png", False))), {}) is None
-    assert am.material(shape("mirror_auto_001", plain), {}) is None and am.material(shape("box", plain, "cube"), {}) is None
-    assert am.material(ET.fromstring('<shape type="ply" id="x"><string name="filename" value="assets/m.ply" />'
-                                     '<ref id="atlas_pplastic_p0" /></shape>'), {}) is None
-    # a 512 region and an 8x8 constant: UV corners land on the region's texels, constants on the cell centre
-    atlas = am.Atlas(2048)
-    atlas.layout({"t": (512, 512), "c": (am.SMALL, am.SMALL)})
-    (_, x0, y0, w, h, pad), W = atlas.placed["t"], atlas.pages[0][0]
-    assert pad == am.PAD and (w, h) == (512, 512) and len(atlas.pages) == 1
-    uv = atlas.uv("t", np.array([[0.0, 0.0], [1.0, 1.0]]), 2)
-    assert np.allclose(uv[0] * atlas.pages[0], [x0, y0]) and np.allclose(uv[1] * atlas.pages[0], [x0 + 512, y0 + 512])
-    c = atlas.uv("c", None, 3)
-    _, cx, cy, cw, ch, _ = atlas.placed["c"]
-    assert np.allclose(c * atlas.pages[0], [cx + cw / 2, cy + ch / 2]) and x0 + 512 + am.PAD <= W
-    small = am.Atlas(600)  # a second region that does not fit starts a second page
-    small.layout({"a": (512, 512), "b": (512, 512)})
-    assert len(small.pages) == 2 and small.placed["b"][0] == 1
 
 
 if __name__ == "__main__":

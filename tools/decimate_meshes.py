@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from compact_assets import FILENAME_RE, json_refs, sha1, xml_refs  # noqa: E402
+from compact_assets import FILENAME_RE, json_refs, scene_lock, sha1, xml_refs  # noqa: E402
 
 PLY_SHAPE_RE = re.compile(r'(\n  <shape type="ply" id="([^"]+)">)(.*?)(\n  </shape>)', re.S)
 BITMAP_RE = re.compile(r'<texture name="([a-z_]+)" type="bitmap">\s*<string name="filename" value="([^"]+)"')
@@ -439,6 +439,11 @@ def rewrite_shape(body: str, mesh: str, row: dict) -> str:
 
 
 def decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bool, keep_unused: bool) -> dict:
+    with scene_lock(scene_dir):  # one writer per scene (compact_assets.scene_lock)
+        return _decimate_scene(scene_dir, jobs, fixed, dry_run, keep_unused)
+
+
+def _decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bool, keep_unused: bool) -> dict:
     started = time.time()
     _mitsuba()
     todo = plan(scene_dir, fixed)

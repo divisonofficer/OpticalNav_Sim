@@ -615,6 +615,8 @@ On `infinigen_apartment_natural_v1_20268504`:
 
 The geometry no longer matches the dataset's reference frames exactly.
 
+The scene tools (compact_assets, decimate_meshes, and the server's compaction on start) take an exclusive lock on `<scene>/.compact.lock`. A second writer skips the scene instead of racing the first one.
+
 ### Sharing packs
 
 A pack is too large for git (71 GB, 60,740 files, mostly text OBJ meshes), so the code travels through GitHub and the scenes through a shared folder, one compressed archive per scene.
