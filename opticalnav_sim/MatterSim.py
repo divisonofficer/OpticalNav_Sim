@@ -97,6 +97,7 @@ class Simulator:
         self.flash_offset = (0.0, 0.0, 0.0)  # setFlashOffset
         self.camera_offset = (0.0, 0.0, 0.0)  # setCameraOffset
         self.max_depth = 0  # setMaxDepth: 0 is the scene's own
+        self.rr_depth = 0  # setRussianRouletteDepth: 0 is Mitsuba's 5
         self.caustics = True  # setCaustics
         self.nir_range = (0.5, 1.0)  # setNirRange
         self.active_split = True  # setActiveSplit
@@ -259,6 +260,14 @@ class Simulator:
         if not 0 <= int(depth) <= 64:
             raise ValueError("max_depth must be 0..64")
         self.max_depth = int(depth)
+
+    def setRussianRouletteDepth(self, depth: int) -> None:
+        """Start Russian roulette at ``depth`` (Mitsuba's rr_depth): from there a path continues with its
+        throughput's probability (at most 0.95) and is reweighted, so means stay and dim paths end early. Lower
+        is faster and noisier; 0 renders with Mitsuba's 5. Each new depth records its freeze once."""
+        if not 0 <= int(depth) <= 64:
+            raise ValueError("rr_depth must be 0..64")
+        self.rr_depth = int(depth)
 
     def setCaustics(self, on: bool) -> None:
         """Off: the lights' passes drop caustics as the flash pass always does (path_nocaustics: light reaching an
@@ -524,7 +533,7 @@ class Simulator:
                 "hfov_deg": hfov_deg, "spp": self.spp, "seed": self.seed, "mode": self.renderMode,
                 "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env),
                 "bands": self.bands, "flash_band": self.flash_band, "nir": dict(self.nir), "lighting": self.lighting, "lamps": self.lamps,
-                "flash_scale": self.flash_scale, "flash_offset": list(self.flash_offset), "max_depth": self.max_depth,
+                "flash_scale": self.flash_scale, "flash_offset": list(self.flash_offset), "max_depth": self.max_depth, "rr_depth": self.rr_depth,
                 "caustics": self.caustics, "nir_range": list(self.nir_range), "active_split": self.active_split,
                 "mirrors": dict(self.mirrors) if self.mirrors is not None else None}
 

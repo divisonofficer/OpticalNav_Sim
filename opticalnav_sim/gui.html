@@ -100,6 +100,7 @@ select.as-slider { display: none; }
 .frame { position: relative; width: min(100cqw, calc(100cqh * 4 / 3)); aspect-ratio: 4 / 3; background: #000; border: 1px solid var(--rule); border-radius: 8px;
   overflow: hidden; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
+.frame canvas.warp { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
 .frame.grid::after { content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(90deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)),
               linear-gradient(0deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)); }
@@ -229,11 +230,14 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <label class="tg" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
         <label class="tg" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
         <label class="tg" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
+        <label class="tg" for="warp" title="움직이는 동안 다음 프레임이 끝나기 전까지 마지막 프레임을 새 카메라 쪽으로 옮겨 보여 줍니다. 렌더 서버가 같이 보내는 깊이로 프레임을 입체 격자로 만들어 새 시점에서 그립니다(WebGL): 회전과 이동 모두 맞고, 가려져 있던 곳은 늘이지 않고 다음 프레임까지 검게 비워 둡니다. 프레임을 섞지 않아 흐려지지 않고, 멈추면 렌더한 그대로입니다."><input type="checkbox" class="sw" id="warp" checked> 이동 보간</label>
       </div>
       <div class="fields">
         <label class="f" for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다."><span>패스 spp</span><select id="pass" class="as-slider"></select></label>
         <label class="f" for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다."><span>목표 spp</span><select id="target" class="as-slider"></select></label>
         <label class="f" for="maxdepth" title="빛 경로 길이 상한(Mitsuba max_depth). 1: 직접 보이는 광원만, 2: 직접광, 3: 간접광 한 번 더, …. 노이즈와 흰 점(firefly)이 몇 번째 반사에서 오는지 가르는 진단용입니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>경로 깊이</span><select id="maxdepth" class="as-slider"><option value="0">씬 기본</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option><option>12</option></select></label>
+        <label class="f" for="rrdepth" title="이 깊이부터 Russian roulette로 경로를 확률적으로 끊습니다(Mitsuba rr_depth). 어두운 경로가 일찍 끝나 빨라지고, 살아남은 경로에 가중치를 줘서 평균은 그대로지만 노이즈는 조금 늘어납니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>RR 시작 깊이</span><select id="rrdepth" class="as-slider"><option value="0">Mitsuba 기본 (5)</option><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+        <label class="f" for="res" title="렌더 해상도(4:3, 세로 화각은 그대로). 픽셀 수에 비례해 GPU 시간이 줄고, 화면에는 늘려서 보여 줍니다. 해상도마다 처음 한 번 freeze를 기록합니다."><span>해상도</span><select id="res" class="as-slider"><option value="256x192">256×192</option><option value="320x240">320×240</option><option value="384x288">384×288</option><option value="448x336">448×336</option><option value="512x384">512×384</option><option value="640x480">640×480</option></select></label>
       </div>
     </section>
     <section class="card">
@@ -285,7 +289,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <button type="button" class="icon-btn" data-act="grid" data-pane="a" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
       <button type="button" class="icon-btn" data-act="full" data-pane="a" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
     </div>
-    <div class="tabsets"><div class="tabs" role="group" aria-label="왼쪽 화면 대역" data-pane="a" data-kind="band"></div><div class="tabs" role="group" aria-label="왼쪽 화면 보기" data-pane="a" data-kind="view"></div></div>
+    <div class="tabsets"><div class="tabs" role="group" aria-label="왼쪽 화면 대역" data-pane="a" data-kind="band"></div><div class="tabs" role="group" aria-label="왼쪽 화면 보기" data-pane="a" data-kind="view"></div><div class="tabs" role="group" aria-label="왼쪽 화면 채널 무관 (AOV)" data-pane="a" data-kind="aov"></div></div>
     <div class="frame-wrap"><div class="frame" id="frame-a">
       <img id="img-a" alt="현재 시점">
       <div class="cands" id="cands"></div>
@@ -301,7 +305,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <button type="button" class="icon-btn" data-act="grid" data-pane="b" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
       <button type="button" class="icon-btn" data-act="full" data-pane="b" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
     </div>
-    <div class="tabsets"><div class="tabs" role="group" aria-label="오른쪽 화면 대역" data-pane="b" data-kind="band"></div><div class="tabs" role="group" aria-label="오른쪽 화면 보기" data-pane="b" data-kind="view"></div></div>
+    <div class="tabsets"><div class="tabs" role="group" aria-label="오른쪽 화면 대역" data-pane="b" data-kind="band"></div><div class="tabs" role="group" aria-label="오른쪽 화면 보기" data-pane="b" data-kind="view"></div><div class="tabs" role="group" aria-label="오른쪽 화면 채널 무관 (AOV)" data-pane="b" data-kind="aov"></div></div>
     <div class="frame-wrap"><div class="frame" id="frame-b"><img id="img-b" alt="현재 시점의 두 번째 채널"></div></div>
     <div class="legend" id="legend-b"></div>
   </section>
@@ -406,8 +410,11 @@ const TARGET = [64, 128, 256, 512, 1024, 2048, 4096];
 // band's own Stokes vector) in one view; the server takes "<band>.<view>"
 const BANDS = [["rgb", "RGB"], ["r", "R"], ["g", "G"], ["b", "B"], ["nir", "NIR"]];
 const VIEWS = [["img", "영상"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"]];
-const pick = { a: { band: "rgb", view: "img" }, b: { band: "rgb", view: "dolp" } };
-const view = { get a() { return `${pick.a.band}.${pick.a.view}`; }, get b() { return `${pick.b.band}.${pick.b.view}`; } };
+// what is the same in every band (the render server's AOVs), in a group of its own; picked, it replaces band and view
+const AOVS = [["depth", "깊이"]];
+const pick = { a: { band: "rgb", view: "img", aov: null }, b: { band: "rgb", view: "dolp", aov: null } };
+const paneView = (p) => pick[p].aov ? `rgb.${pick[p].aov}` : `${pick[p].band}.${pick[p].view}`;
+const view = { get a() { return paneView("a"); }, get b() { return paneView("b"); } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let S = null, graph = null, poseKey = "";
 // The server renders on its own (newest camera, accumulating while it stays put). One WebSocket carries
@@ -436,36 +443,45 @@ function fillSelect(sel, values, current) {
 // each pane: a band select and a view select in its header, remembered in this browser
 function paneTitle(pane) {
   const band = BANDS.find(([v]) => v === pick[pane].band)[1], v = VIEWS.find(([x]) => x === pick[pane].view)[1];
-  $(`title-${pane}`).textContent = `${band} ${v}`;
-  $(`dot-${pane}`).dataset.band = pick[pane].band;
+  const aov = pick[pane].aov && AOVS.find(([x]) => x === pick[pane].aov)[1];
+  $(`title-${pane}`).textContent = aov || `${band} ${v}`;
+  $(`dot-${pane}`).dataset.band = pick[pane].aov || pick[pane].band;
+}
+// pressed buttons: an AOV, or the band and the view
+function syncTabs(pane) {
+  document.querySelectorAll(`.tabs[data-pane="${pane}"]`).forEach((box) => {
+    const kind = box.dataset.kind;
+    box.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed",
+      String(kind === "aov" ? pick[pane].aov === b.dataset.value : !pick[pane].aov && pick[pane][kind] === b.dataset.value)));
+  });
 }
 function buildTabs() {
   try {  // each pane's band and view, remembered in this browser
     const saved = JSON.parse(localStorage.getItem("opticalnav-panes") || "null");
     for (const pane of ["a", "b"]) {
       const s = saved && saved[pane];
-      if (s && BANDS.some(([v]) => v === s.band) && VIEWS.some(([v]) => v === s.view)) pick[pane] = { band: s.band, view: s.view };
+      if (s && BANDS.some(([v]) => v === s.band) && VIEWS.some(([v]) => v === s.view))
+        pick[pane] = { band: s.band, view: s.view, aov: AOVS.some(([v]) => v === s.aov) ? s.aov : null };
     }
   } catch (e) { /* storage blocked or unreadable: the defaults */ }
   document.querySelectorAll(".tabs").forEach((box) => {
     const pane = box.dataset.pane, kind = box.dataset.kind;
     box.innerHTML = "";
-    for (const [value, label] of kind === "band" ? BANDS : VIEWS) {
+    for (const [value, label] of { band: BANDS, view: VIEWS, aov: AOVS }[kind]) {
       const b = document.createElement("button");
-      b.type = "button"; b.textContent = label;
-      b.setAttribute("aria-pressed", String(pick[pane][kind] === value));
+      b.type = "button"; b.textContent = label; b.dataset.value = value;
       b.addEventListener("click", () => {
-        pick[pane][kind] = value;
+        if (kind === "aov") pick[pane].aov = value;
+        else { pick[pane][kind] = value; pick[pane].aov = null; }
         try { localStorage.setItem("opticalnav-panes", JSON.stringify(pick)); } catch (e) { /* not remembered */ }
         // a near-infrared pane needs the near-infrared band: turn it on alongside the visible one
         if (pick[pane].band === "nir" && S && S.nir_available && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
-        box.querySelectorAll("button").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
-        paneTitle(pane); showImages(); renderLegends();
+        syncTabs(pane); paneTitle(pane); showImages(); renderLegends();
       });
       box.appendChild(b);
     }
   });
-  paneTitle("a"); paneTitle("b");
+  for (const pane of ["a", "b"]) { syncTabs(pane); paneTitle(pane); }
 }
 // pane header buttons: save the shown JPEG, a rule-of-thirds grid, full screen
 document.querySelectorAll(".pane-head .icon-btn").forEach((b) => b.addEventListener("click", () => {
@@ -593,13 +609,184 @@ function send(path, body, what) {
 // pane images: 4-byte frame id, 1-byte pane (0 = a, 1 = b), then the JPEG
 const paneUrl = { a: null, b: null };
 function showPane(buf) {
-  const pane = new DataView(buf).getUint8(4) === 0 ? "a" : "b";
+  const dv = new DataView(buf), id = dv.getUint32(0), kind = dv.getUint8(4);
+  if (kind === 2) return keepDepthGrid(id, dv);
+  const pane = kind === 0 ? "a" : "b";
   const url = URL.createObjectURL(new Blob([buf.slice(5)], { type: "image/jpeg" }));
   const img = $(`img-${pane}`), old = paneUrl[pane];
   paneUrl[pane] = url;
+  img.onload = () => { paneFrame[pane] = id; if (warpGL[pane]) warpGL[pane].texDirty = true; warpPanes(); };
   img.src = url;
   if (old) setTimeout(() => URL.revokeObjectURL(old), 1000);
 }
+// --- motion warp ---
+// While the camera moves, each pane shows its last finished frame reprojected to the newest camera. With the
+// frame's depth grid (the render server's depth, DEPTH_GRID cells across, sent after the panes) the frame is a
+// mesh at that depth, drawn from the new camera in WebGL: turns and moves both line up, near things shift more
+// than far ones. Triangles across a depth edge are left out (meshCells), so what the frame never saw stays
+// black until the next frame instead of stretching. Without depth (or WebGL), a homography through a plane
+// WARP_DEPTH m ahead (exact for turns only). Frames are never blended, so nothing blurs; a frame
+// of the current camera shows as rendered.
+const WARP_DEPTH = 2.5, WARP_FAR = 60;  // no hit (a window's sky): this far
+const frameC2w = new Map(), depthGrids = new Map(), paneFrame = { a: null, b: null };
+function keepDepthGrid(id, dv) {
+  const gw = dv.getUint16(5), gh = dv.getUint16(7), z = new Float32Array((gw + 1) * (gh + 1));
+  for (let k = 0; k < z.length; k++) { const mm = dv.getUint16(9 + 2 * k); z[k] = mm ? mm / 1000 : WARP_FAR; }
+  depthGrids.set(id, { gw, gh, z });
+  for (const k of depthGrids.keys()) if (k < id - 16) depthGrids.delete(k);
+  warpPanes();
+}
+const m3 = (a, b) => [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => a[3 * r] * b[c] + a[3 * r + 1] * b[3 + c] + a[3 * r + 2] * b[6 + c]));
+function m3inv(m) {
+  const [a, b, c, d, e, f, g, h, i] = m, A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + c * C;
+  return [A, c * h - b * i, b * f - c * e, B, a * i - c * g, c * d - a * f, C, b * g - a * h, a * e - b * d].map((v) => v / det);
+}
+const focalPx = () => S.height / 2 / Math.tan(S.vfov_deg * Math.PI / 360);
+// source frame pixels -> pixels of the camera dst (row-major 4x4 camera to world: columns right, up, back)
+function warpHomography(src, dst) {
+  const W = S.width, H = S.height, f = focalPx();
+  const K = [f, 0, -W / 2, 0, -f, -H / 2, 0, 0, -1];  // camera point (looking down -z) -> homogeneous pixel, y down
+  const R = (m) => [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]];
+  const Rd = R(dst), RdT = [Rd[0], Rd[3], Rd[6], Rd[1], Rd[4], Rd[7], Rd[2], Rd[5], Rd[8]];
+  const M = m3(RdT, R(src));
+  const d = [src[3] - dst[3], src[7] - dst[7], src[11] - dst[11]];
+  const t = [0, 1, 2].map((r) => RdT[3 * r] * d[0] + RdT[3 * r + 1] * d[1] + RdT[3 * r + 2] * d[2]);
+  for (let r = 0; r < 3; r++) M[3 * r + 2] -= t[r] / WARP_DEPTH;  // the plane z = -WARP_DEPTH: X' = (R - t n^T / -z) X
+  return m3(m3(K, M), m3inv(K));
+}
+// row-major 4x4 -> column-major for GLSL; a rigid camera-to-world inverted
+const colMajor = (m) => [0, 1, 2, 3].flatMap((c) => [0, 1, 2, 3].map((r) => m[4 * r + c]));
+function rigidInverse(m) {
+  const out = new Array(16).fill(0);
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) out[4 * r + c] = m[4 * c + r];
+    out[4 * r + 3] = -(m[r] * m[3] + m[4 + r] * m[7] + m[8 + r] * m[11]);
+  }
+  out[15] = 1;
+  return out;
+}
+const WARP_VS = `
+attribute vec2 aUV; attribute float aZ;
+uniform mat4 uSrc, uDst; uniform vec2 uSize; uniform float uF;
+varying vec2 vUV;
+void main() {
+  vUV = aUV;
+  vec2 px = aUV * uSize;
+  vec4 pw = uSrc * vec4((px.x - 0.5 * uSize.x) / uF * aZ, -(px.y - 0.5 * uSize.y) / uF * aZ, -aZ, 1.0);
+  vec4 pd = uDst * pw;
+  float w = -pd.z;
+  if (w < 0.02) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }  // behind the new camera: clipped
+  vec2 ndc = vec2(2.0 * uF * pd.x / (w * uSize.x), 2.0 * uF * pd.y / (w * uSize.y));
+  gl_Position = vec4(ndc * w, (clamp(w / 100.0, 0.0, 1.0) * 2.0 - 1.0) * w, w);
+}`;
+const WARP_FS = `precision mediump float; uniform sampler2D uTex; varying vec2 vUV;
+void main() { gl_FragColor = texture2D(uTex, vUV); }`;
+const warpGL = { a: null, b: null };
+function warpContext(pane) {
+  if (warpGL[pane] !== null) return warpGL[pane];
+  const img = $(`img-${pane}`), cv = document.createElement("canvas");
+  cv.className = "warp";
+  img.after(cv);
+  const gl = cv.getContext("webgl", { antialias: false, alpha: false });
+  if (!gl) return (warpGL[pane] = false);
+  const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, WARP_VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, WARP_FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return (warpGL[pane] = false);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                        [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  const u = (n) => gl.getUniformLocation(prog, n);
+  return (warpGL[pane] = { cv, gl, prog, tex, uv: gl.createBuffer(), z: gl.createBuffer(), idx: gl.createBuffer(),
+    uSrc: u("uSrc"), uDst: u("uDst"), uSize: u("uSize"), uF: u("uF"), aUV: gl.getAttribLocation(prog, "aUV"),
+    aZ: gl.getAttribLocation(prog, "aZ"), grid: null, gridOf: null, count: 0, texDirty: true });
+}
+// The triangles of a depth grid that lie on surfaces: on a plane 1/depth is affine in the image, so its second
+// difference across a corner is 0. A corner where it is not (EDGE_CURVE of its 1/depth, along either axis) sits
+// on a depth edge, and a triangle there spanning more than EDGE_GAP in depth would stretch from the near side to
+// the far one over what the frame never saw: left out. Grazing floors are planes, and stay.
+const EDGE_CURVE = 0.08, EDGE_GAP = 1.1;
+function meshCells(grid) {
+  const { gw, gh, z } = grid, n = gw + 1, inv = z.map((v) => 1 / v), edge = new Uint8Array(z.length);
+  for (let j = 0; j <= gh; j++) for (let i = 0; i <= gw; i++) {
+    const k = j * n + i, tol = EDGE_CURVE * inv[k];
+    if ((i > 0 && i < gw && Math.abs(inv[k - 1] - 2 * inv[k] + inv[k + 1]) > tol) ||
+        (j > 0 && j < gh && Math.abs(inv[k - n] - 2 * inv[k] + inv[k + n]) > tol)) edge[k] = 1;
+  }
+  const out = new Uint16Array(6 * gw * gh);
+  let m = 0;
+  const tri = (a, b, c) => {
+    if (edge[a] || edge[b] || edge[c]) {
+      const lo = Math.min(z[a], z[b], z[c]), hi = Math.max(z[a], z[b], z[c]);
+      if (hi > EDGE_GAP * lo) return;
+    }
+    out[m++] = a; out[m++] = b; out[m++] = c;
+  };
+  for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+    const a = j * n + i, b = a + 1, c = a + n, d = c + 1;
+    tri(a, c, b); tri(b, c, d);
+  }
+  return out.subarray(0, m);
+}
+// draw a pane's frame as its depth mesh seen from dst; false if it cannot (no WebGL)
+function warpDraw(pane, img, grid, src, dst) {
+  const w = warpContext(pane);
+  if (!w) return false;
+  const { gl, cv } = w, dpr = window.devicePixelRatio || 1;
+  const cw = Math.round(img.clientWidth * dpr), ch = Math.round(img.clientHeight * dpr);
+  if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
+  gl.useProgram(w.prog);
+  if (w.grid !== `${grid.gw}x${grid.gh}`) {  // the grid's corners, once per grid size
+    const { gw, gh } = grid, uv = new Float32Array(2 * (gw + 1) * (gh + 1));
+    for (let j = 0, k = 0; j <= gh; j++) for (let i = 0; i <= gw; i++, k++) { uv[2 * k] = i / gw; uv[2 * k + 1] = j / gh; }
+    gl.bindBuffer(gl.ARRAY_BUFFER, w.uv); gl.bufferData(gl.ARRAY_BUFFER, uv, gl.STATIC_DRAW);
+    w.grid = `${gw}x${gh}`;
+  }
+  if (w.gridOf !== grid) {  // a new frame's depth: its corners' depth and the triangles kept (meshCells)
+    const idx = meshCells(grid);
+    gl.bindBuffer(gl.ARRAY_BUFFER, w.z); gl.bufferData(gl.ARRAY_BUFFER, grid.z, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, w.idx); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.DYNAMIC_DRAW);
+    w.gridOf = grid; w.count = idx.length;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, w.tex);
+  if (w.texDirty) { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img); w.texDirty = false; }
+  const k = Math.min(cw / S.width, ch / S.height);
+  gl.viewport(0, 0, cw, ch); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.viewport(Math.round((cw - k * S.width) / 2), Math.round((ch - k * S.height) / 2), Math.round(k * S.width), Math.round(k * S.height));
+  gl.enable(gl.DEPTH_TEST);
+  gl.bindBuffer(gl.ARRAY_BUFFER, w.uv); gl.enableVertexAttribArray(w.aUV); gl.vertexAttribPointer(w.aUV, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, w.z); gl.enableVertexAttribArray(w.aZ); gl.vertexAttribPointer(w.aZ, 1, gl.FLOAT, false, 0, 0);
+  gl.uniformMatrix4fv(w.uSrc, false, colMajor(src)); gl.uniformMatrix4fv(w.uDst, false, colMajor(rigidInverse(dst)));
+  gl.uniform2f(w.uSize, S.width, S.height); gl.uniform1f(w.uF, focalPx());
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, w.idx);
+  gl.drawElements(gl.TRIANGLES, w.count, gl.UNSIGNED_SHORT, 0);
+  cv.style.display = "block";
+  return true;
+}
+function warpPanes() {
+  const dst = S && S.camera_to_world, on = $("warp").checked;
+  for (const pane of ["a", "b"]) {
+    const img = $(`img-${pane}`), src = frameC2w.get(paneFrame[pane]), grid = depthGrids.get(paneFrame[pane]);
+    let tf = "", drawn = false;
+    if (on && dst && src && img.naturalWidth && src.some((v, k) => Math.abs(v - dst[k]) > 1e-4) &&
+        Math.hypot(src[3] - dst[3], src[7] - dst[7], src[11] - dst[11]) < 2) {
+      drawn = !!grid && warpDraw(pane, img, grid, src, dst);
+      if (!drawn) {
+        const cw = img.clientWidth, ch = img.clientHeight, k = Math.min(cw / S.width, ch / S.height);
+        const ox = (cw - k * S.width) / 2, oy = (ch - k * S.height) / 2;  // object-fit: contain
+        const A = [k, 0, ox, 0, k, oy, 0, 0, 1], h = m3(m3(A, warpHomography(src, dst)), m3inv(A));
+        tf = `matrix3d(${[h[0], h[3], 0, h[6], h[1], h[4], 0, h[7], 0, 0, 1, 0, h[2], h[5], 0, h[8]].join(",")})`;
+      }
+    }
+    if (!drawn && warpGL[pane]) warpGL[pane].cv.style.display = "none";
+    img.style.transformOrigin = "0 0";
+    img.style.transform = tf;
+  }
+}
+addEventListener("resize", () => S && warpPanes());
+
 function subscribe() {
   const showB = getComputedStyle($("pane-b")).display !== "none";
   wsSend({ type: "subscribe", panes: { a: view.a, b: showB ? view.b : null }, scale: Number($("scale").value),
@@ -621,6 +808,7 @@ function pumpLook() { pumpMotion(); }
 // second, whatever the key repeat rate, so the camera moves at the set speed; the server keeps rendering
 // the newest camera and the page draws every frame that finishes
 const held = new Set();
+let MOTION_MS = 16;  // the most often a move is sent (ms); each move is a new camera, and so at most one frame
 const motion = { forward: 0, right: 0, up: 0, yaw_deg: 0, pitch_deg: 0 };
 let lastTick = performance.now(), lastSent = 0;
 const MOVE_KEYS = { w: ["forward", 1], s: ["forward", -1], a: ["right", -1], d: ["right", 1], q: ["up", -1], e: ["up", 1],
@@ -646,7 +834,7 @@ function pumpMotion() {
   const big = Math.abs(motion.forward) + Math.abs(motion.right) + Math.abs(motion.up) > 1e-3 ||
     Math.abs(motion.yaw_deg) + Math.abs(motion.pitch_deg) > 0.05;
   // about 25 updates a second; the server renders the newest camera and shows each finished frame
-  if (!big || pending || !S || performance.now() - lastSent < 40) return;
+  if (!big || pending || !S || performance.now() - lastSent < MOTION_MS) return;
   const o = { ...motion };
   for (const k of Object.keys(motion)) motion[k] = 0;
   lastSent = performance.now();
@@ -655,7 +843,7 @@ function pumpMotion() {
 requestAnimationFrame(motionTick);
 // turn so the clicked pixel comes to the image centre (pinhole camera with the viewer's field of view)
 function lookAt(img, clientX, clientY) {
-  const r = img.getBoundingClientRect();
+  const r = img.parentElement.getBoundingClientRect();
   const k = Math.min(r.width / S.width, r.height / S.height);
   const px = (clientX - r.left - (r.width - k * S.width) / 2) / k, py = (clientY - r.top - (r.height - k * S.height) / 2) / k;
   if (px < 0 || py < 0 || px > S.width || py > S.height) return;
@@ -724,6 +912,11 @@ function showError(text) { $("error").hidden = !text; $("error").textContent = t
 function apply(st) {
   if (!st || (S && st.version < S.version && st.started === S.started)) return;  // an older answer than we have
   S = st;
+  if (S.has_frame && S.frame_c2w) {
+    frameC2w.set(S.frame_id, S.frame_c2w);
+    for (const k of frameC2w.keys()) if (k < S.frame_id - 16) frameC2w.delete(k);
+  }
+  warpPanes();
   if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: startScene() }, "첫 프레임"); return; }  // GUI server restarted
   showError(S.error ? `렌더 실패: ${S.error}` + (/frozen|not permitted|record/.test(S.error)
     ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "") : "");
@@ -767,6 +960,8 @@ function renderSky() {
   if (document.activeElement !== $("lamps")) $("lamps").checked = !!S.lamps;
   if (document.activeElement !== $("flashscale")) $("flashscale").value = String(S.flash_scale || 1);
   if (document.activeElement !== $("maxdepth")) $("maxdepth").value = String(S.max_depth || 0);
+  if (document.activeElement !== $("rrdepth")) $("rrdepth").value = String(S.rr_depth || 0);
+  if (document.activeElement !== $("res")) $("res").value = `${S.width}x${S.height}`;
   if (document.activeElement !== $("caustics")) $("caustics").checked = S.caustics !== false;
   if (document.activeElement !== $("split")) $("split").checked = S.active_split !== false;
   const nr = S.nir_range || [0.5, 1];
@@ -949,8 +1144,8 @@ function renderStatus() {
   const t = S.timing || {};
   $("status").innerHTML = `<span><b>${S.frame_spp}</b>/${S.target_spp} spp</span><span>패스 <b>${S.passes}</b> × ${S.pass_spp}</span>` +
     `<span>표시 <b>${(S.fps || 0).toFixed(1)}</b> fps</span><span title="렌더 요청을 보내고 화면에 올리기까지 (최근 5초 중앙값)">패스 <b>${ms(t.wall_ms)}</b> ms</span>` +
-    `<span class="split" title="패스 시간 내역 (최근 5초 중앙값). GPU: 서버가 커널을 넣은 뒤 GPU를 기다린 시간(CPU 작업에 가려지지 않은 GPU 시간). 서버 CPU: 렌더 호출의 나머지와 분리·인코딩. 대기열: 서버의 렌더 스레드에서 다른 패스 뒤에 기다린 시간. 전송: 왕복에서 서버 시간을 뺀 나머지. 뷰어: 누적·디노이즈·편광 계산">` +
-    `GPU <b>${ms(t.gpu_ms)}</b> · 서버 CPU <b>${ms(t.server_cpu_ms)}</b> · 대기열 <b>${ms(t.queue_ms)}</b> · 전송 <b>${ms(t.transfer_ms)}</b> · 뷰어 <b>${ms(t.viewer_ms)}</b> ms</span>` +
+    `<span class="split" title="패스 시간 내역 (최근 5초 중앙값). GPU: 서버가 커널을 넣은 뒤 GPU를 기다린 시간(CPU 작업에 가려지지 않은 GPU 시간). 서버 CPU: 렌더 호출의 나머지와 분리·인코딩. 대기열: 서버의 렌더 스레드에서 다른 패스 뒤에 기다린 시간. 전송: 왕복에서 서버 시간을 뺀 나머지. 뷰어: 누적·디노이즈·편광 계산. JPEG: 패스를 받은 스레드에서 열린 페이지들의 화면 JPEG(편광 색·톤매핑)과 깊이 격자를 미리 만드는 시간(렌더와 겹쳐 돎). 화면: 페이지로 보내는 시간(미리 만든 것이 없으면 만드는 시간 포함)">` +
+    `GPU <b>${ms(t.gpu_ms)}</b> · 서버 CPU <b>${ms(t.server_cpu_ms)}</b> · 대기열 <b>${ms(t.queue_ms)}</b> · 전송 <b>${ms(t.transfer_ms)}</b> · 뷰어 <b>${ms(t.viewer_ms)}</b> · JPEG <b>${ms(t.jpeg_ms)}</b> · 화면 <b>${ms(t.screen_ms)}</b> ms</span>` +
     `<span>동시 요청 <b>${S.in_flight}</b></span>` + (S.auto ? "" : `<span class="busy">누적 멈춤 (Space)</span>`);
 }
 
@@ -958,10 +1153,12 @@ const GRAD = {
   dolp: "linear-gradient(90deg,#000,#f00)",
   aolp: "linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)",
   s: "linear-gradient(90deg,#2166ac,#f7f7f7,#b2182b)",
+  depth: "linear-gradient(90deg,#7a0403,#e4460a,#fbb938,#a4fc3c,#1ae4b6,#4686fb,#30123b)",  // turbo, near to far (gui.depth_rgb)
 };
 function legendHtml(pane, sc) {
   const ch = pane.split(".")[1];
   if (ch === "img") return "";
+  if (ch === "depth") return `<span>0.3 m</span><div class="legend-bar" style="background:${GRAD.depth}"></div><span>12 m (로그) · 검정 = 안 맞음</span>`;
   if (ch === "dolp") return `<span>0</span><div class="legend-bar" style="background:${GRAD.dolp}"></div><span>DoLP ${sc}</span>`;
   if (ch === "aolp") return `<span>0°</span><div class="legend-bar" style="background:${GRAD.aolp}"></div><span>180° · 밝기 = DoLP/${sc}</span>`;
   return `<span>−${sc}</span><div class="legend-bar" style="background:${GRAD.s}"></div><span>+${sc}</span>`;
@@ -977,7 +1174,7 @@ function renderLegends() {
 let probeTimer = null;
 function probeAt(img, clientX, clientY) {
   if (!S || !S.has_frame) return;
-  const r = img.getBoundingClientRect();
+  const r = img.parentElement.getBoundingClientRect();
   const k = Math.min(r.width / S.width, r.height / S.height);
   const x = Math.floor((clientX - r.left - (r.width - k * S.width) / 2) / k), y = Math.floor((clientY - r.top - (r.height - k * S.height) / 2) / k);
   if (x < 0 || y < 0 || x >= S.width || y >= S.height) return;
@@ -989,7 +1186,8 @@ function probeAt(img, clientX, clientY) {
 function showProbe(p) {
   const band = { luma: "휘도", r: "R", g: "G", b: "B", nir: "NIR" }[p.channel || "luma"];
   $("probe").innerHTML = [["위치", `${p.x}, ${p.y}`], ["채널 (왼쪽 화면)", band], ["S0", p.s0.toFixed(4)], ["DoLP", p.dolp.toFixed(4)],
-    ["AoLP", `${p.aolp_deg.toFixed(1)}°`], ["S1/S0", p.s1_over_s0.toFixed(4)], ["S2/S0", p.s2_over_s0.toFixed(4)]]
+    ["AoLP", `${p.aolp_deg.toFixed(1)}°`], ["S1/S0", p.s1_over_s0.toFixed(4)], ["S2/S0", p.s2_over_s0.toFixed(4)],
+    ["깊이", p.depth_m == null ? "—" : `${p.depth_m.toFixed(3)} m`]]
     .map(([k2, v]) => `<div><dt>${k2}</dt><dd>${v}</dd></div>`).join("");
 }
 for (const id of ["frame-a", "frame-b"]) {
@@ -1010,7 +1208,7 @@ for (const id of ["frame-a", "frame-b"]) {
     if (!mouselook) return;
     const dx = ev.clientX - mouselook.x, dy = ev.clientY - mouselook.y;
     mouselook.x = ev.clientX; mouselook.y = ev.clientY; mouselook.moved += Math.abs(dx) + Math.abs(dy);
-    const r = img.getBoundingClientRect();
+    const r = img.parentElement.getBoundingClientRect();
     const degPerPx = S.hfov_deg / Math.min(r.width, r.height * S.width / S.height);  // drawn image width
     lookAcc.yaw += dx * degPerPx; lookAcc.pitch -= dy * degPerPx;
     pumpLook();
@@ -1026,7 +1224,7 @@ for (const id of ["frame-a", "frame-b"]) {
     const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
     start = null;
     if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) {
-      fly({ yaw_deg: -dx * S.hfov_deg / img.getBoundingClientRect().width });
+      fly({ yaw_deg: -dx * S.hfov_deg / img.parentElement.getBoundingClientRect().width });
     } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) probeAt(img, ev.clientX, ev.clientY);
   });
   frame.addEventListener("pointercancel", () => { start = null; });
@@ -1075,6 +1273,9 @@ for (const id of ["nirlow", "nirhigh"]) {
 $("split").addEventListener("change", () => configure({ active_split: $("split").checked }, "split 전환"));
 $("caustics").addEventListener("change", () => configure({ caustics: $("caustics").checked }, "caustic 전환"));
 $("maxdepth").addEventListener("change", () => configure({ max_depth: Number($("maxdepth").value) }, "경로 깊이"));
+$("warp").addEventListener("change", warpPanes);
+$("rrdepth").addEventListener("change", () => configure({ rr_depth: Number($("rrdepth").value) }, "RR 시작 깊이"));
+$("res").addEventListener("change", () => configure({ resolution: $("res").value.split("x").map(Number) }, "해상도"));
 $("bands").addEventListener("change", () => configure({ bands: $("bands").value }, "대역 변경"));
 $("mirrorsrc").addEventListener("change", sendMirrors);
 $("mdensity").addEventListener("input", () => { $("mdensity-v").textContent = $("mdensity").value; });

@@ -43,7 +43,7 @@ PAGE = Path(__file__).with_name("gui.html")
 ACCUMULATED = ("s0", "s1", "s2", "nir_s0", "nir_s1", "nir_s2")  # summed over passes, shown as their mean
 CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  # the older pane names
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
-PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2")
+PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
 _OLD_PANES = {"rgb": ("rgb", "img"), "dolp": ("rgb", "dolp"), "aolp": ("rgb", "aolp"), "s1": ("rgb", "s1"),
               "s2": ("rgb", "s2"), "nir": ("nir", "img"), "nir_dolp": ("nir", "dolp"), "nir_aolp": ("nir", "aolp")}
 
@@ -57,6 +57,33 @@ def pane_channel(name: str) -> tuple[str, str]:
     if band not in PANE_BANDS or view not in PANE_VIEWS:
         raise KeyError(name)
     return band, view
+
+
+DEPTH_RANGE = (0.3, 12.0)  # metres shown from red (near) to blue (far), on a log scale
+DEPTH_GRID = 64  # cells across the depth grid the page warps frames with (and as many down as the aspect gives)
+
+
+def depth_rgb(z: np.ndarray) -> np.ndarray:
+    """uint8 RGB of a depth map (m): turbo (Google's polynomial fit) from red at DEPTH_RANGE[0] to blue at
+    DEPTH_RANGE[1], log scale; black where nothing was hit."""
+    near, far = DEPTH_RANGE
+    t = 1.0 - np.log(np.clip(z, near, far) / near) / math.log(far / near)
+    r = 0.13572138 + t * (4.61539260 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943))))
+    g = 0.09140261 + t * (2.19418839 + t * (4.84296658 + t * (-14.18503333 + t * (4.27729857 + t * 2.82956604))))
+    b = 0.10667330 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973))))
+    rgb = np.clip(np.stack([r, g, b], axis=-1), 0.0, 1.0) * (z > 0)[..., None]
+    return (255.0 * rgb + 0.5).astype(np.uint8)
+
+
+def depth_grid(z: np.ndarray, cells: int = DEPTH_GRID) -> bytes:
+    """The depth at the corners of a ``cells`` x (by aspect) grid over the image, for the page's warp: uint16
+    columns and rows, then the corners row by row as uint16 millimetres (0: nothing hit), big-endian."""
+    h, w = z.shape
+    gw, gh = cells, max(1, round(cells * h / w))
+    ys = np.clip(np.round(np.linspace(0, h - 1, gh + 1)).astype(int), 0, h - 1)
+    xs = np.clip(np.round(np.linspace(0, w - 1, gw + 1)).astype(int), 0, w - 1)
+    mm = np.clip(np.round(z[np.ix_(ys, xs)] * 1000.0), 0, 65535).astype(">u2")
+    return np.array([gw, gh], dtype=">u2").tobytes() + mm.tobytes()
 
 
 def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
@@ -145,6 +172,8 @@ class Session:
         self.frames: dict[int, dict] = {}  # the last four, so image requests that lag a frame or two still work
         self.arrivals: deque = deque(maxlen=64)
         self.timings: deque = deque(maxlen=64)  # (arrival, the pass's time split) of the frames shown
+        self.screens: deque = deque(maxlen=64)  # (sent, ms) a page's panes and depth grid took to make and send
+        self.subs: dict[int, dict] = {}  # each page's panes, scale and exposure: the JPEGs a frame makes ahead
         self.trail: list[tuple[float, float]] = []
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(self.depth, thread_name_prefix="pass")
@@ -263,6 +292,15 @@ class Session:
         if "max_depth" in settings:  # 0: the scene's own (MatterSim.setMaxDepth)
             self.sim.setMaxDepth(int(settings["max_depth"]))
             restart = True
+        if "rr_depth" in settings:  # 0: Mitsuba's 5 (MatterSim.setRussianRouletteDepth)
+            self.sim.setRussianRouletteDepth(int(settings["rr_depth"]))
+            restart = True
+        if "resolution" in settings:  # [width, height]; the vertical field of view stays
+            w, h = (int(v) for v in settings["resolution"])
+            if not (64 <= w <= 2048 and 48 <= h <= 2048):
+                raise ValueError(f"resolution {w}x{h} out of range")
+            self.sim.setCameraResolution(w, h)
+            restart = True
         if "nir_range" in settings:  # [low, high] (MatterSim.setNirRange)
             self.sim.setNirRange(*(float(v) for v in settings["nir_range"]))
             restart = True
@@ -324,9 +362,9 @@ class Session:
         scene, variant = sim._split(st.scanId)
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
-                "denoise": False, "preview": False, "s3": False, "lights": sim.lights, "env": dict(sim.env),
+                "denoise": False, "preview": False, "s3": False, "depth": True, "lights": sim.lights, "env": dict(sim.env),
                 "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting, "lamps": sim.lamps,
-                "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth,
+                "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                 "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
                 "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
         pos = st._free_position or (st.location.x, st.location.y)
@@ -338,6 +376,7 @@ class Session:
             "heading_deg": round(math.degrees(st.heading), 2), "elevation_deg": round(math.degrees(st.elevation), 2),
             "position": [round(pos[0], 3), round(pos[1], 3)], "free": st._free_position is not None,
             "height_m": round(float(height), 3),
+            "camera_to_world": [round(float(v), 5) for v in np.asarray(c2w).ravel()],  # row-major 4x4
             "candidates": [{"index": i, "viewpoint": c.viewpointId, "x": round(c.x, 3), "y": round(c.y, 3),
                             "rel_heading_deg": round(math.degrees(c.rel_heading), 2),
                             "rel_elevation_deg": round(math.degrees(c.rel_elevation), 2),
@@ -443,7 +482,8 @@ class Session:
         # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
         frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
                  "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": passes * view["spp"], "passes": passes,
-                 "variant": view["variant"]}
+                 "variant": view["variant"], "depth": out.get("depth"),
+                 "c2w": [round(float(v), 5) for v in np.asarray(view["camera_to_world"]).ravel()]}
         # Where a pass's time went (ms). gpu: the server waiting for the GPU after queuing the pass's kernels, the
         # GPU time no CPU work hid (exact kernel times would need a sync per kernel); server_cpu: the rest of its
         # render call plus splitting and encoding; queue: waiting behind other passes on the server's one render
@@ -455,6 +495,9 @@ class Session:
             "queue_ms": g("queue_s"), "gpu_ms": g("wait_s"),
             "server_cpu_ms": g("render_s") - g("wait_s") + g("split_s") + g("post_s") + g("encode_s"),
             "transfer_ms": max(0.0, 1000.0 * (wall - server_s)), "viewer_ms": 1000.0 * (time.perf_counter() - started - wall)}
+        made = time.perf_counter()
+        self._prepare(frame)
+        frame["timing"]["jpeg_ms"] = 1000.0 * (time.perf_counter() - made)
         with self.cv:
             if gen == self.gen:
                 if passes <= self.published:  # a later pass of this camera got here first
@@ -469,7 +512,8 @@ class Session:
             self.arrivals.append(time.time())
             self.timings.append((time.time(), frame["timing"]))
             self.frame_meta = {"frame_id": self.frame_id, "frame_gen": gen, "frame_spp": frame["spp"],
-                               "frame_variant": frame["variant"], "passes": passes}
+                               "frame_variant": frame["variant"], "passes": passes,
+                               "frame_c2w": frame["c2w"]}  # the page warps it toward camera_to_world while moving
             self.version += 1
             self.cv.notify_all()
 
@@ -502,6 +546,9 @@ class Session:
             fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 2 and recent[-1] > recent[0] else 0.0
             split = [s for t, s in self.timings if now - t <= 5.0] or [s for _, s in list(self.timings)[-1:]]
             timing = {k: round(float(np.median([s[k] for s in split])), 1) for k in (split[0] if split else {})}
+            screens = [ms for t, ms in self.screens if now - t <= 5.0]
+            if screens:  # per page: JPEGs (polarization, tone), the depth grid, the socket writes
+                timing["screen_ms"] = round(float(np.median(screens)), 1)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             out = {"scans": self.scans, "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
@@ -509,7 +556,7 @@ class Session:
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
                    "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
-                   "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth,
+                   "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                    "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
                    "active_split": sim.active_split,
                    "has_frame": bool(self.frame_meta),
@@ -616,15 +663,44 @@ class Session:
         k = "rgb".index(pol)
         return stokes.derived_mono(frame["s0"][..., k], frame["s1"][..., k], frame["s2"][..., k])
 
+    @staticmethod
+    def _image_key(channel: str, scale: float, ev: dict | None) -> tuple:
+        return str(channel), round(float(scale), 4), tuple(sorted((ev or {}).items()))
+
+    def _prepare(self, frame: dict) -> None:
+        """Make a new frame's pane JPEGs (every page's subscribed channels) and depth grid on the pass thread that
+        rendered it, before it is published: three pass threads make them side by side with the renders, and a
+        page's sender only writes them out (Session.image falls back to making one, for a page that changed)."""
+        with self.cv:
+            wanted = {self._image_key(ch, sub["scale"], sub["ev"]) for sub in self.subs.values()
+                      for ch in sub["panes"].values() if ch}
+        frame["jpegs"] = {}
+        for key in wanted:
+            with contextlib.suppress(KeyError, ValueError):
+                frame["jpegs"][key] = self._image_of(frame, key[0], key[1], dict(key[2]))
+        frame["grid"] = None if frame.get("depth") is None else depth_grid(frame["depth"])
+
     def image(self, frame_id: int, channel: str, scale: float, ev: dict | None = None) -> bytes:
         """A pane's JPEG. ``channel``: a band and a view (pane_channel), e.g. ``"g.aolp"``: the image (the colour
         image for ``rgb``, the band's own S0 in grey for ``r``, ``g``, ``b``, the near-infrared image) or that
         band's DoLP, AoLP, S1/S0, S2/S0 (``rgb``: from luminance Stokes, as the dataset defines them). ``ev``:
         the page's exposure offset per band ({"rgb": stops, "nir": stops}) on top of the scene's tone fit.
         Nothing renders again."""
-        band, view = pane_channel(channel)
         frame = self._frame(frame_id)
+        key = self._image_key(channel, scale, ev)
+        cached = frame.get("jpegs", {}).get(key)
+        if cached is None:
+            cached = frame.setdefault("jpegs", {})[key] = self._image_of(frame, channel, scale, ev)
+        return cached
+
+    def _image_of(self, frame: dict, channel: str, scale: float, ev: dict | None = None) -> bytes:
+        """A pane's JPEG of ``frame`` (see image)."""
+        band, view = pane_channel(channel)
         ev = ev or {}
+        if view == "depth":  # the render server's depth through each pixel, every band alike
+            if frame.get("depth") is None:
+                return jpeg(np.full(frame["s0_luma"].shape + (3,), 24, np.uint8))
+            return jpeg(depth_rgb(frame["depth"]))
         if band == "nir" and "nir_grey" not in frame:  # the near-infrared band is not being rendered
             return jpeg(np.full(frame["s0_luma"].shape + (3,), 24, np.uint8))
         if view == "img":
@@ -659,6 +735,16 @@ class Session:
             self.version += 1
             self.cv.notify_all()
 
+    def depth_grid(self, frame_id: int) -> bytes | None:
+        """The frame's depth grid for the page's warp (module depth_grid), None without depth."""
+        try:
+            frame = self._frame(frame_id)
+        except KeyError:
+            return None
+        if "grid" not in frame:
+            frame["grid"] = None if frame.get("depth") is None else depth_grid(frame["depth"])
+        return frame["grid"]
+
     def probe(self, frame_id: int, x: int, y: int, pol: str = "luma") -> dict:
         f = self._frame(frame_id)
         h, w = f["s0_luma"].shape
@@ -667,7 +753,9 @@ class Session:
         if d is None:  # an unknown channel, or the near-infrared band not rendered: luminance
             pol, d = "luma", f["derived"]
         s0 = (f["s0_luma"] if pol == "luma" else f["nir_grey"] if pol == "nir" else f["s0"][..., "rgb".index(pol)])[y, x]
+        depth = f.get("depth")
         return {"x": x, "y": y, "channel": pol, "s0": float(s0), "dolp": float(d["dolp"][y, x]),
+                "depth_m": None if depth is None or depth[y, x] <= 0 else round(float(depth[y, x]), 3),
                 "aolp_deg": float(d["aolp_deg"][y, x]), "s1_over_s0": float(d["s1_over_s0"][y, x]),
                 "s2_over_s0": float(d["s2_over_s0"][y, x])}
 
@@ -876,6 +964,8 @@ def make_handler(session: Session, token: str | None = None):
             self.close_connection = True
             ws = WebSocket(self.rfile, self.wfile)
             sub = {"panes": {"a": "rgb.img", "b": "rgb.dolp"}, "scale": 0.2, "ev": {}, "dirty": True}
+            with session.cv:
+                session.subs[id(sub)] = sub
             alive = threading.Event()
             alive.set()
 
@@ -892,6 +982,7 @@ def make_handler(session: Session, token: str | None = None):
                         if frame_id is not None and (frame_id != sent_frame or sub["dirty"]):
                             sub["dirty"] = False
                             sent_frame = frame_id
+                            shown = time.perf_counter()
                             for i, pane in enumerate(("a", "b")):
                                 ch = sub["panes"].get(pane)
                                 try:
@@ -904,6 +995,11 @@ def make_handler(session: Session, token: str | None = None):
                                     except KeyError:  # already replaced by a newer frame
                                         break
                                     ws.send(frame_id.to_bytes(4, "big") + bytes([i]) + img, opcode=0x2)
+                            grid = session.depth_grid(frame_id)
+                            if grid is not None:  # the page's motion warp (pane byte 2)
+                                ws.send(frame_id.to_bytes(4, "big") + bytes([2]) + grid, opcode=0x2)
+                            with session.cv:
+                                session.screens.append((time.time(), 1000.0 * (time.perf_counter() - shown)))
                 except (ConnectionError, OSError, ValueError):
                     alive.clear()
 
@@ -928,11 +1024,11 @@ def make_handler(session: Session, token: str | None = None):
                         except Exception as exc:  # noqa: BLE001 - shown on the page
                             ws.send_json({"type": "ack", "id": msg.get("id"), "error": f"{type(exc).__name__}: {exc}"})
                     elif kind == "subscribe":
-                        sub["panes"] = dict(msg.get("panes") or sub["panes"])
-                        sub["scale"] = float(msg.get("scale", sub["scale"]))
-                        sub["ev"] = {k: float(v) for k, v in dict(msg.get("ev") or {}).items() if k in ("rgb", "nir")}
-                        sub["dirty"] = True
                         with session.cv:  # wake the sender to resend this frame's panes
+                            sub["panes"] = {k: v for k, v in dict(msg.get("panes") or sub["panes"]).items()}
+                            sub["scale"] = float(msg.get("scale", sub["scale"]))
+                            sub["ev"] = {k: float(v) for k, v in dict(msg.get("ev") or {}).items() if k in ("rgb", "nir")}
+                            sub["dirty"] = True
                             session.version += 1
                             session.cv.notify_all()
                     elif kind == "probe":
@@ -946,6 +1042,7 @@ def make_handler(session: Session, token: str | None = None):
             finally:
                 alive.clear()
                 with session.cv:
+                    session.subs.pop(id(sub), None)
                     session.cv.notify_all()
 
     return Handler
@@ -961,6 +1058,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18780)
     ap.add_argument("--pass-spp", type=int, default=16, help="samples per render pass (moves show one pass)")
     ap.add_argument("--target-spp", type=int, default=1024, help="stop accumulating at this many samples")
+    ap.add_argument("--resolution", default="512x384", help="render size WIDTHxHEIGHT (the viewer can change it)")
+    ap.add_argument("--rr-depth", type=int, default=2,
+                    help="Russian roulette from this path depth (0: Mitsuba's 5). 2 measured on vanilla_r2, 512x384, "
+                         "16 spp: GPU 95 -> 68 ms, means unchanged, noise +3%% RGB / +9%% NIR")
     ap.add_argument("--turn-deg", type=float, default=15.0)
     ap.add_argument("--pitch-deg", type=float, default=10.0)
     ap.add_argument("--depth", type=int, default=2, help="passes in flight on the render server (2 overlaps CPU and GPU)")
@@ -974,6 +1075,8 @@ def main() -> int:
     if args.server:
         sim.setDatasetPath(args.server)
     sim.setNavGraphPath(str(args.pack[0] / "connectivity"))
+    sim.setCameraResolution(*(int(v) for v in args.resolution.lower().split("x")))
+    sim.setRussianRouletteDepth(args.rr_depth)
     sim.initialize()
     waited = 0
     while True:  # the render server may still be loading its --preload scene (it listens only after that)

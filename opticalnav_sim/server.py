@@ -628,6 +628,7 @@ class Look:
     flash_scale: float = 1.0         # the flash's side x this, its radiance / this^2: the same power (fewer fireflies)
     flash_pdf: float = 20.0          # the flash pass's near-specular cut (path_nocaustics specular_pdf_threshold)
     max_depth: int = 0               # path length cap of every pass (Mitsuba's max_depth); 0: the scene's own
+    rr_depth: int = 0                # the depth Russian roulette starts at (Mitsuba's rr_depth); 0: Mitsuba's 5
     caustics: bool = True            # the lights' passes keep caustics (light reaching an emitter past a near-specular bounce)
     split: bool = False              # the active pass as one path_nocaustics "split" path, not a passive and a flash path
     nir_range: tuple = (0.5, 1.0)    # pseudo near-infrared reflectance mapped onto this (rgb2nir low, high): 0.5..1 as is
@@ -968,6 +969,7 @@ class Resident:
         self.sky_nir = NIR_DEFAULTS["daylight"]
         self.flash_pdf = FLASH_PDF  # the flash pass's near-specular cut, set per launch from the view's Look
         self.max_depth = 0  # path length cap of every pass, set per launch (Look.max_depth); 0: the scene's own
+        self.rr_depth = 0  # Russian roulette's first depth, set per launch (Look.rr_depth); 0: Mitsuba's 5
         self.caustics = True  # the passive and own passes keep caustics, set per launch (Look.caustics)
         self.split = False  # the active pass on one path (Look.split), set per launch
 
@@ -975,12 +977,12 @@ class Resident:
         """path_nocaustics in an assist mode (or, for "own", as plain path: caustics kept, every emitter),
         with ``sky`` (default: daylight's near-infrared share) on the sky seen by a dual render's
         near-infrared slot. Without bandscale lights, "own" is the scene's own integrator (None)."""
-        if name == "own" and not self.band_keys and not self.max_depth and self.caustics:
+        if name == "own" and not self.band_keys and not self.max_depth and not self.rr_depth and self.caustics:
             return None
         sky = self.sky_nir if sky is None else float(sky)
         # the flash's near-specular cut (Look.flash_pdf); split cuts the flash's paths with it too
         pdf = float(self.flash_pdf) if name in ("flash", "split") else None
-        key = (name, sky, pdf, self.max_depth, self.caustics)
+        key = (name, sky, pdf, self.max_depth, self.rr_depth, self.caustics)
         if key not in self.integrators:
             spec = dict(self.depth["passive" if name == "split" else name])
             if name == "split":  # one path long enough for both passes
@@ -997,6 +999,8 @@ class Resident:
                          "assist_mode": "exclude" if name == "passive" else "only",
                          "caustics": name == "passive" and self.caustics}
             inner["sky_nir"] = sky
+            if self.rr_depth:
+                inner["rr_depth"] = int(self.rr_depth)
             if pdf is not None:
                 inner["specular_pdf_threshold"] = pdf
             if self.mode != "rgb":
@@ -1013,6 +1017,8 @@ class Resident:
             tail += ("flash_pdf", float(self.flash_pdf))
         if self.max_depth:
             tail += ("max_depth", int(self.max_depth))
+        if self.rr_depth:
+            tail += ("rr_depth", int(self.rr_depth))
         if not self.caustics and pass_name != "flash":
             tail += ("no_caustics",)
         if pass_name == "active" and self.split:
@@ -1147,6 +1153,34 @@ class Resident:
         self.fov, self.size, self.pose = float(hfov_deg), (int(width), int(height)), pose
         return {"traverse_s": t1 - t0, "update_s": t2 - t1, "scene_update_s": time.perf_counter() - t2}
 
+    def depth_image(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float):
+        """Queue the depth (m along the view axis; 0 where a ray leaves the scene) through each pixel's centre of
+        the camera ``c2w``, against the scene as the last launch left it (hidden shapes, mirrors). One ray a pixel,
+        no antialiasing. The pixel directions are cached per size; the camera goes in as opaque values, so every
+        frame replays the same kernel. Returns a Dr.Jit array scheduled on the GPU (read it with np.array)."""
+        import drjit as dr
+        mi = self.mi
+        key = (int(width), int(height), round(float(hfov_deg), 6))
+        if getattr(self, "_depth_key", None) != key:
+            t = math.tan(math.radians(float(hfov_deg)) / 2.0)
+            u = (2.0 * (np.arange(width) + 0.5) / width - 1.0) * t
+            v = (1.0 - 2.0 * (np.arange(height) + 0.5) / height) * t * height / width
+            uu, vv = np.meshgrid(u, v)
+            inv = 1.0 / np.sqrt(uu * uu + vv * vv + 1.0)  # a unit ray's distance per metre of depth
+            self._depth_dirs = [mi.Float(np.ascontiguousarray(a.ravel(), dtype=np.float32))
+                                for a in (uu * inv, vv * inv, -inv)]
+            self._depth_inv = mi.Float(np.ascontiguousarray(inv.ravel(), dtype=np.float32))
+            self._depth_key = key
+        m = np.asarray(c2w, dtype=np.float64)
+        r = [[dr.opaque(mi.Float, float(m[i, j])) for j in range(3)] for i in range(3)]
+        cx, cy, cz = self._depth_dirs
+        d = mi.Vector3f(*(r[i][0] * cx + r[i][1] * cy + r[i][2] * cz for i in range(3)))
+        o = mi.Point3f(*(dr.opaque(mi.Float, float(m[i, 3])) for i in range(3)))
+        pi = self.scene.ray_intersect_preliminary(mi.Ray3f(o, d), coherent=True)
+        z = dr.select(pi.is_valid(), pi.t * self._depth_inv, 0.0)
+        dr.schedule(z)
+        return z
+
     def _write_assist(self, p, writes: dict) -> None:
         """Write the assist shapes' transforms: into ``p`` (the whole scene's parameters, updated by the
         caller), or, without it, through each shape's own parameters and then the scene, whose update
@@ -1269,6 +1303,7 @@ class Resident:
         breakdown = self._set_camera(c2w, width, height, hfov_deg, follow, look)
         self.flash_pdf = float(look.flash_pdf)  # the flash pass's near-specular cut: integrators and recording keys
         self.max_depth = int(look.max_depth)  # likewise
+        self.rr_depth = int(look.rr_depth)  # likewise
         self.caustics = bool(look.caustics)  # likewise
         self.split = bool(look.split)  # likewise
         # both bands at once: the near-infrared lane of an RGBN variant, else the dual sensor; the sky in the
@@ -1439,6 +1474,9 @@ class Resident:
         import drjit as dr
 
         t0 = time.perf_counter()
+        if hasattr(img, "result"):  # a copy queued behind this view's kernels (readback.AsyncReadback)
+            out = img.result()  # waits for this view alone, not for views queued after it
+            return out, {**breakdown, "wait_s": time.perf_counter() - t0, "readback_s": 0.0}
         dr.sync_thread()  # wait for this view's kernels (and any queued before them)
         t1 = time.perf_counter()
         out = np.array(img)
@@ -1644,6 +1682,13 @@ class Renderer:
         # one or more packs (--pack repeated): a scene comes from the first pack that has it
         self.packs = [Path(p) for p in (pack if isinstance(pack, (list, tuple)) else [pack])]
         self.mi, self.dr, self.pack = mi, dr, self.packs[0]
+        # frames read back behind their own kernels, so the next frame's CPU half overlaps this one's GPU
+        # (readback.py); OPTICALNAV_ASYNC_READBACK=0 reads back as before (a whole-stream sync)
+        self.readback = None
+        if os.environ.get("OPTICALNAV_ASYNC_READBACK", "1") != "0":
+            from . import readback
+            self.readback = readback.AsyncReadback.create()
+        print(f"[serve] async readback: {'on' if self.readback is not None else 'off'}", flush=True)
         self.variant = next(iter(self.variant_of.values()))
         mi.set_variant(self.variant)
         # Per-kernel codegen / compile / GPU times split a frame into tracing vs ray tracing, but reading the
@@ -1931,6 +1976,9 @@ class Renderer:
             raise ValueError("flash_offset is [right, up, forward] in metres, each within 2")
         flash_offset = (flash_offset + (0.0,))[:3]
         max_depth = int(view.get("max_depth") or 0)  # every pass's path length cap; 0 or absent: the scene's own
+        rr_depth = int(view.get("rr_depth") or 0)  # Russian roulette from this depth; 0 or absent: Mitsuba's 5
+        if not 0 <= rr_depth <= 64:
+            raise ValueError("rr_depth must be 0 (Mitsuba's 5) .. 64")
         caustics = bool(view.get("caustics", True))  # False: the lights' passes drop caustics as the flash pass does
         # the active pass on one path (path_nocaustics "split") when the plugin can; "active_split": false, two paths.
         # Checked against two paths at 1024 spp (20263004, sim vanilla_r2): means within 0.1% (RGB and NIR), the
@@ -1952,16 +2000,16 @@ class Renderer:
             if not (0.0 <= mirrors[0] <= 100.0 and 0 <= mirrors[1] <= 64):
                 raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
-                mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range)
+                mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
-    def _start(self, key: tuple, cams: list, submitted: float):
+    def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False):
         """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined)."""
         started = time.perf_counter()
         scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot, bands,
                                                                         flash_band, nir, lighting, mirrors, lamps,
                                                                         flash_scale, flash_pdf, flash_offset, max_depth,
-                                                                        caustics, split, nir_range) = key
+                                                                        caustics, split, nir_range, rr_depth) = key
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
@@ -1986,11 +2034,11 @@ class Renderer:
                 # serves all three), else the dual sensor
                 looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups, flash_scale=flash_scale,
                                flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
-                               split=split, nir_range=nir_range)}
+                               split=split, nir_range=nir_range, rr_depth=rr_depth)}
             else:  # one band per render
                 looks = {b: Look(hidden, lights, env, env_scale, env_rot, band=b, nir=nir, **flash, groups=groups, flash_scale=flash_scale,
                                flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
-                               split=split, nir_range=nir_range)
+                               split=split, nir_range=nir_range, rr_depth=rr_depth)
                          for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
@@ -2002,9 +2050,18 @@ class Renderer:
                                for p in run] for b, look in looks.items()}
                 if len(run) > 1:  # added on the GPU, read back once
                     handles = {b: [self._sum_handles(hs)] for b, hs in handles.items()}
+                if self.readback is not None:  # each image copied out behind its own kernels (readback.py)
+                    handles = {b: [(img if isinstance(img, np.ndarray) else self.readback.start(img), bd)
+                                   for img, bd in hs] for b, hs in handles.items()}
             else:  # batch sensor: completes here
                 batch = {b: [resident.render_many(cams, width, height, hfov, spp, seed, p, follow, look)
                              for p in passes] for b, look in looks.items()}
+            # each view's depth (Resident.depth_image), queued behind its passes: the scene as they rendered it
+            depths = [resident.depth_image(c, width, height, hfov) for c in cams] if depth else None
+            if depths is not None:
+                self.dr.eval(*depths)
+                if self.readback is not None and len(cams) == 1:
+                    depths = [self.readback.start(z, (int(height), int(width))) for z in depths]
             launch_s = time.perf_counter() - t0
 
         def finish():
@@ -2020,6 +2077,9 @@ class Renderer:
                 for b in breakdowns:
                     for k, v in b.items():
                         parts[k] = parts.get(k, 0.0) + v
+                depth_maps = None if depths is None else [
+                    z.result() if hasattr(z, "result") else np.array(z, dtype=np.float32).reshape(int(height), int(width))
+                    for z in depths]
                 render_s = launch_s + time.perf_counter() - t1
 
             def assemble():
@@ -2037,7 +2097,10 @@ class Renderer:
                     dual = bands_out.pop(2)
                     bands_out[0] = [[v[:, m:m + int(width)] for v in views] for views in dual]
                     bands_out[1] = [[v[:, wm + m:wm + m + int(width)] for v in views] for views in dual]
-                return self._assemble(key, cams, bands_out, parts, render_s)
+                outs, *rest = self._assemble(key, cams, bands_out, parts, render_s)
+                for out, z in zip(outs, depth_maps or []):
+                    out["depth"] = z
+                return (outs, *rest)
 
             # The render thread only reads back (above). Splitting the film into bands and Stokes images, adding
             # the passes up and converting them (5-6 ms a pass at 512x384) run on the request's thread
@@ -2116,6 +2179,8 @@ class Renderer:
         stokes_keys = ("s0", "s1", "s2", "s3") if s3 else ("s0", "s1", "s2")
         result = {k: v.astype(dtype) for k, v in out.items()
                   if k == "nir" or (k.startswith("nir_s") and (s3 or k != "nir_s3"))}
+        if "depth" in out:  # metres, float32 whatever the Stokes dtype (float16 steps 8 mm at 10 m)
+            result["depth"] = out["depth"]
         if mode == "rgb":
             if "radiance" in out:
                 rad = out["radiance"]
@@ -2142,7 +2207,8 @@ class Renderer:
             while j < len(checked) and checked[j][0] == key:
                 j += 1
             done = self.executor.submit_pipelined(self._start, key, [c for _, c in checked[i:j]],
-                                                  time.perf_counter()).result()
+                                                  time.perf_counter(),
+                                                  any(bool(v.get("depth")) for v in views[i:j])).result()
             outs, kernels, render_s, denoise_s = done() if callable(done) else done  # (see _start: assemble)
             t0 = time.perf_counter()
             results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)),
