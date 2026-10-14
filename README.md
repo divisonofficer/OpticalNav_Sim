@@ -121,20 +121,21 @@ python -m opticalnav_sim.gui --pack packs/opticalnav-v0.2 --server http://127.0.
 
 The page fits the window.
 
-* **Control cards** (Scene, Render, Lighting, Mirrors · Motion, View · Exposure). Switches toggle settings, and step sliders set the numeric ones (pass and target spp, path depth, flash size, glass walls, speed).
-* **Two camera panes.** Each has band tabs (RGB, R, G, B, NIR) and view tabs (영상, DoLP, AoLP, S1/S0, S2/S0), plus buttons to save the JPEG, overlay a thirds grid or go full screen. A phone shows one pane.
+* **Control cards** (Scene, Render, Lighting, Mirrors · Motion, View · Exposure). Switches toggle settings, and step sliders set the numeric ones (pass and target spp, path depth, RR start depth, render size, flash size, glass walls, speed).
+* **Two camera panes.** Each has band tabs (RGB, R, G, B, NIR), view tabs (영상, DoLP, AoLP, S1/S0, S2/S0) and a 깊이 (depth) button that is the same in every band, plus buttons to save the JPEG, overlay a thirds grid or go full screen. A phone shows one pane.
 * **Map.** The graph, drawn over the scene's room plan when the pack has one.
 * **Info tabs.** Camera rig, current state, pixel Stokes values, and scene info.
-* **Status bar.** Pass timing split into GPU, server CPU, queue, transfer and viewer, plus the Mitsuba version, the variant and the scene's pack.
+* **Status bar.** Pass timing split into GPU, server CPU, queue, transfer, viewer, JPEG and screen, plus the Mitsuba version, the variant and the scene's pack.
 * **Help.** `?` (or 도움말) opens all keys in a modal.
 * **Exposure.** Each band has an exposure slider (RGB 노출, NIR 노출, ±4 EV). 자동 노출 fits both bands' tone to the frame on screen; the near-infrared band has no dataset frames, so otherwise its tone comes from its first frame. Exposure is applied when a pane is sent, so it renders nothing.
 
 * **Moving.** W/A/S/D move freely (forward, left, back, right by the step size), Q/E lower and raise the camera, and dragging with the right mouse button turns the head (a plain right-click turns to the clicked point). ←/→ turn 15°, R/F look up and down, ↑ or 1–9 move to a graph candidate, ↓ turns around, and G snaps back to the nearest graph viewpoint. Space pauses accumulation. M (or the 거울 switch) puts the mirrors and glass in or takes them out (`perturbed` or `base`). L (or the 플래시 switch) switches the camera's active polarized light on or off (`active_polar` or `perturbed`). Both switches stay on the loaded scene. On touch screens a 3×3 button pad replaces the keys, a horizontal swipe turns, and a double tap turns to that point. Clicking the map jumps to the nearest viewpoint. Free movement has no collision check.
 * **Rendering** runs on its own, like a game loop. Inputs only change the simulator state and are acknowledged at once. A background loop keeps `--depth` (default 2) passes of the newest camera in flight on the render server. Each pass is `--pass-spp` samples with its own seed; while the camera stays put, passes add up to a running mean until `--target-spp`, and the next input starts over. The seed is an input of the server's freeze recording, so one pass spp costs one recording however many passes run. The first frame for a pass spp records once per pass, about 90–100 s each on Device 1 (see `Resident._prepare_inputs`).
-* **One WebSocket** (`/ws`) carries everything: the server pushes the state on every change and the panes' JPEGs for every new frame, and the page sends inputs and probes. The HTTP routes (`/api/state`, `/api/action`, …) remain for scripts.
-* **Speed** on an RTX 5090 with a 16 spp pass: the page showed about 11.5 frames per second while accumulating, up from 6.3 when the page requested one pass at a time. The render server's main thread spends about 40–55 ms per view (camera update 15–30 ms, freeze replay ~23 ms) next to ~40 ms of GPU work, so views overlap only partly (88 → 72 ms per view with 1 → 3 requests in flight). S0 error against the dataset frame fell from 16.2% (1 pass) to 6.2% (8 passes) and 2.9% (64 passes), the same as one render of the same spp.
+* **One WebSocket** (`/ws`) carries everything: the server pushes the state on every change and the panes' JPEGs for every new frame, and the page sends inputs and probes. The pass threads make each new frame's JPEGs (every open page's channels) and depth grid as it arrives, so the socket only writes them out. Moves are sent at most every 16 ms; each is a new camera and so at most one frame (at 40 ms they capped 256x192 at 25 fps). The HTTP routes (`/api/state`, `/api/action`, …) remain for scripts.
+* **Motion warp** (이동 보간 switch, on by default). Until the next frame of a moving camera arrives, each pane shows the last frame drawn from the newest camera: a WebGL mesh at the frame's depth grid (64 cells across, sent with the panes). Turns and moves line up, and near things shift more than far ones. Triangles across a depth edge are left out, so what the frame never saw stays black for that moment instead of stretching. Frames are never blended, so nothing blurs, and a still camera shows the frame as rendered. Against the frame later rendered at the new camera, a 6° turn went from 9.9 to 3.1 mean grey levels apart and a 0.3 m step forward from 11.4 to 3.3.
+* **Speed** on an RTX 5090, 16 spp passes, turning, `active_polar` with the flash at the scene's path depth: 27.9 fps at 256x192, 18.5 at 384x288, 12.1 at 512x384. At 512x384 the GPU is the limit (60–68 ms a frame with the flash); below that, the CPU half of a frame. S0 error against the dataset frame fell from 16.2% (1 pass) to 6.2% (8 passes) and 2.9% (64 passes), the same as one render of the same spp.
 
-Render server options that matter here: `GET /v1/status` answers at once with what the server is doing (loading a scene, recording a freeze, rendering), the loaded scenes and their recorded settings. Views are pipelined: the server queues the next view's kernels before reading back the last one. `--kernel-history` adds per-kernel GPU times to `X-Render-Timing`, but reading them synchronises the GPU every view, so leave it off except for measurements (`tools/benchmark_modes.py`, `tools/frame_overhead.py`). `OPTICALNAV_SIM_FREEZE_INPUT=sensor` passes only the camera to the frozen render instead of the whole scene; it measured no faster.
+Render server options that matter here: `GET /v1/status` answers at once with what the server is doing (loading a scene, recording a freeze, rendering), the loaded scenes and their recorded settings. Views are pipelined: the server queues the next view's kernels before reading back the last one, and reads each back without waiting for the ones queued after it (`readback.py`, see *Where a frame's time goes*). `--kernel-history` adds per-kernel GPU times to `X-Render-Timing`, but reading them synchronises the GPU every view, so leave it off except for measurements (`tools/benchmark_modes.py`, `tools/frame_overhead.py`). `OPTICALNAV_SIM_FREEZE_INPUT=sensor` passes only the camera to the frozen render instead of the whole scene; it measured no faster.
 
 **6. Replay exported OpticalNav episodes.** `tools/replay_episode.py` re-renders the episodes of an export (or a robomituba project, or this pack) step by step and writes them in the export bundle's layout.
 
@@ -202,6 +203,21 @@ The lit parts stay in the scene's lights (group `fixture`, same light class), so
 
 **Split active pass** (split switch, `setActiveSplit`, view `active_split`; *records once*). With the camera light on, the passive and flash passes render on one path. This is `path_nocaustics` `assist_mode=split`: the scene's lights as the passive pass sees them, plus the flash's own emitter sample at each bounce (never caustics). The image is the same as two paths: at 1024 spp the means agreed within 0.1% in RGB and NIR on `20263004` and `sim_apt_22572521_vanilla_r2`. GPU time per 16 spp frame fell from 143 to 101 ms and from 127 to 84 ms. It is on by default.
 
+**Render size** (해상도, `setCameraResolution`, viewer `--resolution`, default 512x384; *records once*). 4:3 from 256x192 to 640x480, keeping the vertical field of view; the page scales the image up. GPU time follows the pixel count (16 spp, flash and split: 96 ms at 512x384, 55 at 384x288, 39 at 320x240, 26 at 256x192), but the CPU half of a frame does not (see below).
+
+**Russian roulette start depth** (RR 시작 깊이, `setRussianRouletteDepth`, view `rr_depth`; *records once*). From this path depth on, a path continues with its throughput's probability (at most 0.95) and is reweighted, so means stay and dim paths end early. Mitsuba starts at 5; the viewer starts at 2 (`--rr-depth`, 0 for Mitsuba's). On `sim_apt_22572521_vanilla_r2`, 512x384, 16 spp:
+
+| setting | GPU per frame | noise RGB / NIR | mean RGB / NIR |
+|---|---|---|---|
+| depth 6, RR 5 | 94.7 ms | 1.00 / 1.00 | 1.000 / 1.000 |
+| depth 6, RR 3 | 76.3 ms | 1.01 / 1.04 | 1.000 / 1.000 |
+| depth 6, RR 2 | 68.4 ms | 1.03 / 1.09 | 1.000 / 1.000 |
+| depth 4, RR 5 | 82.2 ms | 0.82 / 0.65 | 0.967 / 0.908 |
+
+Capping the depth at 4 looks less noisy because it drops light (NIR 9% darker); RR 2 keeps the light.
+
+**Depth** (깊이 button, view `"depth": true`). The render server also returns each pixel's distance along the view axis (m, 0 where nothing is hit): one ray through the pixel centre against the scene as the frame rendered it, about 1 ms of GPU at 512x384. The pane shows it in turbo (red 0.3 m to blue 12 m, log scale), the pixel tab reads it, and the motion warp uses it.
+
 **Diagnostics** (*records once*).
 
 * **경로 깊이** (`setMaxDepth`) caps every path. 1 shows emitters only, 2 adds direct light, and each step above adds one indirect bounce. Use it to find the bounce where noise or outliers start: mirrors need 3 or more.
@@ -217,11 +233,16 @@ The lit parts stay in the scene's lights (group `fixture`, same light class), so
 |---|---|---|---|---|---|
 | dataset scene | 12.17 M | 215 | 97 ms | 7.4 GB | — |
 | heavy meshes decimated (`tools/decimate_meshes.py`, 71 units ≥ 50k triangles to 10%) | 3.48 M | 215 | 88–90 ms | 3.9 GB | mean +0.08%, sofa folds smoother |
-| materials folded into atlases (`tools/atlas_materials.py`) | 12.17 M | 47 | 100 ms | 11.9–13.3 GB | mean within 0.02% |
+| materials folded into atlases (`tools/atlas_materials.py`, not in the repo) | 12.17 M | 47 | 100 ms | 11.9–13.3 GB | mean within 0.02% |
 
 * **Triangles.** OptiX ray traversal grows roughly with the logarithm of the triangle count, so cutting triangles by 72% saved 9% of the frame. It still halves the GPU memory.
-* **Materials.** Folding them saved per-render tracing and code generation (Mitsuba 3.7), which dr.freeze replay no longer pays. It cost 4–5 GB for the float atlas pages and doubled the load time.
+* **Materials.** Folding them saved per-render tracing and code generation (Mitsuba 3.7), which dr.freeze replay no longer pays. It cost 4–5 GB for the float atlas pages and doubled the load time. It does cut the CPU half of a frame, though (see below): the frozen replay fell from 7.8 to 1.9 ms.
 * **Textures.** Mitsuba keeps bitmaps as float32 RGB on the GPU, so a 4096² map costs about 200 MB. On `sim_apt_22572521_vanilla_r2` (41 structure maps, 623 others) GPU memory while rendering was 14.2 GB with 4096 structure maps and 128 px for the rest. With 2048 and 512 it was 9.3 GB, with no change in frame time (78–79 ms).
+
+**Where a frame's time goes.** A frame is GPU work plus a CPU half on the server's render thread (camera write, the frozen replay, readback), about 10–17 ms whatever the size.
+
+* **Readback overlap.** The server queues frame N+1 before reading N back, but Dr.Jit's readbacks (`dr.sync_thread`, `np.array`) wait for the whole CUDA stream, so reading N also waited for N+1. The next frame's CPU half then ran with the GPU idle: GPU busy 81% at 512x384 and 58% at 256x192. `opticalnav_sim/readback.py` puts each image's and depth's copy to page-locked host memory on the stream right behind its own kernels, with a CUDA event, and waits for that event alone. It calls Dr.Jit core's exported `jit_cuda_stream`, `jit_var_data` and `jit_memcpy_async` and the CUDA driver through ctypes. `OPTICALNAV_ASYNC_READBACK=0`, or a build without them, reads back as before. The server alone, 3 views in flight, base, 16 spp: 512x384 went from 19.1 to 22.9 fps (GPU busy 96%), 256x192 from 52.3 to 73.2 (84%). Alternating two opposite cameras 120 times, every result was its own camera's (depth exactly equal).
+* **The frozen replay is the scene walk.** About 8–10 ms a frame, and a frozen no-op over the same inputs (scene, sensor) costs the same: Dr.Jit walks every input variable each call. The walk follows the registry, which holds every live BSDF and texture, nested ones included (two-sided wrappers, `rgb2nir` and its colour). On `sim_apt_22572521_vanilla_r2` that is 304 shapes, 690 BSDFs and 1170 textures for the 286 BSDFs and 517 textures the scene lists. On `20268504` the material atlas took it from 225 / 525 / 901 to 61 / 77 / 136 and the replay from 7.8 to 1.9 ms.
 
 ## Environment setup
 
