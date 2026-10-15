@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import json
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -204,15 +205,23 @@ _KEEP: list = []  # the ctypes callback must outlive the hook
 
 
 def install() -> bool:
-    """Hook Dr.Jit's log (Info level) into FREEZE. False when libdrjit-core cannot be found; recordings
-    then report elapsed time only."""
+    """Hook Dr.Jit's log (Info level) into FREEZE, its warnings and errors still printed. False when
+    libdrjit-core cannot be found; recordings then report elapsed time only."""
     try:
         core = ctypes.CDLL("libdrjit-core.so")
         hook = core._Z26jit_set_log_level_callback8LogLevelPFvS_PKcE  # jit_set_log_level_callback(LogLevel, cb)
     except (OSError, AttributeError):
         return False
-    callback = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)(
-        lambda level, msg: FREEZE.on_log(msg.decode(errors="replace")) if msg else None)
+    def on_log(level, msg):
+        if not msg:
+            return
+        text = msg.decode(errors="replace")
+        if level <= 2:  # Error, Warn: the callback takes Dr.Jit's log over, so these are printed here (a failure's
+            sys.stderr.write(f"[drjit] {text}\n")  # reason comes before its abort, else it is lost)
+            sys.stderr.flush()
+        FREEZE.on_log(text)
+
+    callback = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)(on_log)
     hook(3, callback)  # LogLevel::Info
     _KEEP.append(callback)
     FREEZE.hooked = True

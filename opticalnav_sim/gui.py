@@ -295,6 +295,12 @@ class Session:
         if "rr_depth" in settings:  # 0: Mitsuba's 5 (MatterSim.setRussianRouletteDepth)
             self.sim.setRussianRouletteDepth(int(settings["rr_depth"]))
             restart = True
+        if "renderer" in settings:  # "path" or "raster" (MatterSim.setRenderer)
+            self.sim.setRenderer(str(settings["renderer"]))
+            restart = True
+        if "raster_aa" in settings:  # MatterSim.setRasterAntialiasing
+            self.sim.setRasterAntialiasing(str(settings["raster_aa"]))
+            restart = True
         if "resolution" in settings:  # [width, height]; the vertical field of view stays
             w, h = (int(v) for v in settings["resolution"])
             if not (64 <= w <= 2048 and 48 <= h <= 2048):
@@ -365,7 +371,7 @@ class Session:
                 "denoise": False, "preview": False, "s3": False, "depth": True, "lights": sim.lights, "env": dict(sim.env),
                 "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting, "lamps": sim.lamps,
                 "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
-                "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
+                "renderer": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
                 "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
         pos = st._free_position or (st.location.x, st.location.y)
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
@@ -402,6 +408,8 @@ class Session:
             return False
         if self.issued == 0:
             return True
+        if self.view.get("renderer") == "raster":  # noiseless: one image is the frame
+            return False
         return self.auto and self.issued * self.pass_spp < self.target_spp
 
     def _loop(self) -> None:
@@ -557,14 +565,15 @@ class Session:
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
                    "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
-                   "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
+                   "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
                    "active_split": sim.active_split,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
                    "hfov_deg": sim._hfov_deg(sim.width, sim.height), "vfov_deg": math.degrees(sim.vfov),
                    "width": sim.width, "height": sim.height, **self.pose, **self.frame_meta,
-                   "done": spp_now >= self.target_spp or (not self.auto and spp_now > 0),
+                   "done": spp_now >= self.target_spp or (not self.auto and spp_now > 0)
+                           or (sim.renderer == "raster" and spp_now > 0),
                    "stale": waiting, "fps": round(fps, 1), "in_flight": self.inflight, "timing": timing}
             waited = now - self.gen_started if waiting else 0.0
             info = self.renderer or {}

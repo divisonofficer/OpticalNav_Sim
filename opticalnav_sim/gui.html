@@ -49,6 +49,8 @@ details.settings > summary { display: none; }
 .cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
 .cards .card { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 .card-act { margin-left: auto; font-weight: 500; padding: 3px 10px; }
+.seg.card-act { padding: 2px; flex-wrap: nowrap; }
+body.raster .mitsuba-only, body:not(.raster) .raster-only { display: none; }
 .toggles { display: flex; flex-wrap: wrap; gap: 8px 16px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(185px, 1fr)); gap: 8px 12px; }
 .fields.one { grid-template-columns: minmax(0, 1fr); }
@@ -224,19 +226,20 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
     </section>
     <section class="card">
-      <h2><svg class="i"><use href="#i-render"/></svg>Render</h2>
+      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button></span></h2>
       <div class="toggles">
-        <label class="tg" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
-        <label class="tg" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
-        <label class="tg" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
-        <label class="tg" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
+        <label class="tg mitsuba-only" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
+        <label class="tg mitsuba-only" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
+        <label class="tg mitsuba-only" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
+        <label class="tg mitsuba-only" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
         <label class="tg" for="warp" title="움직이는 동안 다음 프레임이 끝나기 전까지 마지막 프레임을 새 카메라 쪽으로 옮겨 보여 줍니다. 렌더 서버가 같이 보내는 깊이로 프레임을 입체 격자로 만들어 새 시점에서 그립니다(WebGL): 회전과 이동 모두 맞고, 가려져 있던 곳은 늘이지 않고 다음 프레임까지 검게 비워 둡니다. 프레임을 섞지 않아 흐려지지 않고, 멈추면 렌더한 그대로입니다."><input type="checkbox" class="sw" id="warp" checked> 이동 보간</label>
       </div>
       <div class="fields">
-        <label class="f" for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다."><span>패스 spp</span><select id="pass" class="as-slider"></select></label>
-        <label class="f" for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다."><span>목표 spp</span><select id="target" class="as-slider"></select></label>
-        <label class="f" for="maxdepth" title="빛 경로 길이 상한(Mitsuba max_depth). 1: 직접 보이는 광원만, 2: 직접광, 3: 간접광 한 번 더, …. 노이즈와 흰 점(firefly)이 몇 번째 반사에서 오는지 가르는 진단용입니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>경로 깊이</span><select id="maxdepth" class="as-slider"><option value="0">씬 기본</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option><option>12</option></select></label>
-        <label class="f" for="rrdepth" title="이 깊이부터 Russian roulette로 경로를 확률적으로 끊습니다(Mitsuba rr_depth). 어두운 경로가 일찍 끝나 빨라지고, 살아남은 경로에 가중치를 줘서 평균은 그대로지만 노이즈는 조금 늘어납니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>RR 시작 깊이</span><select id="rrdepth" class="as-slider"><option value="0">Mitsuba 기본 (5)</option><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+        <label class="f mitsuba-only" for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다."><span>패스 spp</span><select id="pass" class="as-slider"></select></label>
+        <label class="f mitsuba-only" for="target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다."><span>목표 spp</span><select id="target" class="as-slider"></select></label>
+        <label class="f mitsuba-only" for="maxdepth" title="빛 경로 길이 상한(Mitsuba max_depth). 1: 직접 보이는 광원만, 2: 직접광, 3: 간접광 한 번 더, …. 노이즈와 흰 점(firefly)이 몇 번째 반사에서 오는지 가르는 진단용입니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>경로 깊이</span><select id="maxdepth" class="as-slider"><option value="0">씬 기본</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option><option>12</option></select></label>
+        <label class="f mitsuba-only" for="rrdepth" title="이 깊이부터 Russian roulette로 경로를 확률적으로 끊습니다(Mitsuba rr_depth). 어두운 경로가 일찍 끝나 빨라지고, 살아남은 경로에 가중치를 줘서 평균은 그대로지만 노이즈는 조금 늘어납니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>RR 시작 깊이</span><select id="rrdepth" class="as-slider"><option value="0">Mitsuba 기본 (5)</option><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+        <label class="f raster-only" for="rasteraa" title="래스터 미리보기의 안티에일리어싱. 끔: 픽셀당 한 샘플. 가장자리: 물체 윤곽선을 덮은 비율만큼 섞습니다(nvdiffrast antialias, 거의 공짜). 2×2: 픽셀당 네 샘플을 평균합니다(텍스처 반짝임, 하이라이트, 그림자 경계까지 부드러워지지만 셰이딩이 4배)."><span>안티에일리어싱</span><select id="rasteraa" class="as-slider"><option value="off">끔</option><option value="edge">가장자리</option><option value="ssaa2">2×2</option></select></label>
         <label class="f" for="res" title="렌더 해상도(4:3, 세로 화각은 그대로). 픽셀 수에 비례해 GPU 시간이 줄고, 화면에는 늘려서 보여 줍니다. 해상도마다 처음 한 번 freeze를 기록합니다."><span>해상도</span><select id="res" class="as-slider"><option value="256x192">256×192</option><option value="320x240">320×240</option><option value="384x288">384×288</option><option value="448x336">448×336</option><option value="512x384">512×384</option><option value="640x480">640×480</option></select></label>
       </div>
     </section>
@@ -464,7 +467,7 @@ function buildTabs() {
         pick[pane] = { band: s.band, view: s.view, aov: AOVS.some(([v]) => v === s.aov) ? s.aov : null };
     }
   } catch (e) { /* storage blocked or unreadable: the defaults */ }
-  document.querySelectorAll(".tabs").forEach((box) => {
+  document.querySelectorAll(".tabs[data-pane]").forEach((box) => {  // the panes' tabs (not the renderer switch)
     const pane = box.dataset.pane, kind = box.dataset.kind;
     box.innerHTML = "";
     for (const [value, label] of { band: BANDS, view: VIEWS, aov: AOVS }[kind]) {
@@ -552,7 +555,7 @@ function renderMonitor() {
     : r.freeze_available === false ? ["", "꺼짐", "freeze 없이 매번 트레이싱합니다 (느림)"] : ["", "—"];
   const sv = S.server || {};
   const render = S.error ? ["bad", "실패", S.error] : sv.busy && sv.elapsed_s > 0.6 ? ["warn", `새 프레임 대기 ${sv.elapsed_s.toFixed(0)} s`]
-    : S.has_frame ? ["ok", `${(S.fps || 0).toFixed(1)} fps`, `${S.frame_spp}/${S.target_spp} spp`] : ["warn", "첫 프레임 대기"];
+    : S.has_frame ? ["ok", `${(S.fps || 0).toFixed(1)} fps`, S.render_mode === "raster" ? "래스터" : `${S.frame_spp}/${S.target_spp} spp`] : ["warn", "첫 프레임 대기"];
   $("monitor").innerHTML = chip(link[0], "뷰어", link[1]) + chip(server[0], "렌더 서버", server[1]) +
     chip(scene[0], "씬", scene[1], scene[2]) + chip(freeze[0], "freeze", freeze[1], freeze[2]) + chip(render[0], "렌더", render[1], render[2]);
 }
@@ -927,8 +930,8 @@ function apply(st) {
     loadGraph(S.scene).then(drawMap).catch(() => {});
   }
   if (S.has_frame) {
-    $("badge").textContent = `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
-    $("progress").style.width = `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
+    $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
+    $("progress").style.width = S.render_mode === "raster" ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
   syncSliders();
@@ -961,6 +964,10 @@ function renderSky() {
   if (document.activeElement !== $("flashscale")) $("flashscale").value = String(S.flash_scale || 1);
   if (document.activeElement !== $("maxdepth")) $("maxdepth").value = String(S.max_depth || 0);
   if (document.activeElement !== $("rrdepth")) $("rrdepth").value = String(S.rr_depth || 0);
+  const raster = S.render_mode === "raster";  // (S.renderer: the render server's state)
+  if (document.activeElement !== $("rasteraa")) $("rasteraa").value = S.raster_aa || "off";
+  document.body.classList.toggle("raster", raster);
+  for (const b of $("engine").querySelectorAll("button")) b.setAttribute("aria-pressed", String((b.dataset.engine === "raster") === raster));
   if (document.activeElement !== $("res")) $("res").value = `${S.width}x${S.height}`;
   if (document.activeElement !== $("caustics")) $("caustics").checked = S.caustics !== false;
   if (document.activeElement !== $("split")) $("split").checked = S.active_split !== false;
@@ -1142,7 +1149,8 @@ function renderStatus() {
   if (!S.has_frame) { $("status").innerHTML = "<span>첫 프레임을 렌더하는 중…</span>"; return; }
   const ms = (v) => (v || 0).toFixed(0);
   const t = S.timing || {};
-  $("status").innerHTML = `<span><b>${S.frame_spp}</b>/${S.target_spp} spp</span><span>패스 <b>${S.passes}</b> × ${S.pass_spp}</span>` +
+  $("status").innerHTML = (S.render_mode === "raster" ? `<span><b>래스터</b></span>`
+    : `<span><b>${S.frame_spp}</b>/${S.target_spp} spp</span><span>패스 <b>${S.passes}</b> × ${S.pass_spp}</span>`) +
     `<span>표시 <b>${(S.fps || 0).toFixed(1)}</b> fps</span><span title="렌더 요청을 보내고 화면에 올리기까지 (최근 5초 중앙값)">패스 <b>${ms(t.wall_ms)}</b> ms</span>` +
     `<span class="split" title="패스 시간 내역 (최근 5초 중앙값). GPU: 서버가 커널을 넣은 뒤 GPU를 기다린 시간(CPU 작업에 가려지지 않은 GPU 시간). 서버 CPU: 렌더 호출의 나머지와 분리·인코딩. 대기열: 서버의 렌더 스레드에서 다른 패스 뒤에 기다린 시간. 전송: 왕복에서 서버 시간을 뺀 나머지. 뷰어: 누적·디노이즈·편광 계산. JPEG: 패스를 받은 스레드에서 열린 페이지들의 화면 JPEG(편광 색·톤매핑)과 깊이 격자를 미리 만드는 시간(렌더와 겹쳐 돎). 화면: 페이지로 보내는 시간(미리 만든 것이 없으면 만드는 시간 포함)">` +
     `GPU <b>${ms(t.gpu_ms)}</b> · 서버 CPU <b>${ms(t.server_cpu_ms)}</b> · 대기열 <b>${ms(t.queue_ms)}</b> · 전송 <b>${ms(t.transfer_ms)}</b> · 뷰어 <b>${ms(t.viewer_ms)}</b> · JPEG <b>${ms(t.jpeg_ms)}</b> · 화면 <b>${ms(t.screen_ms)}</b> ms</span>` +
@@ -1275,6 +1283,10 @@ $("caustics").addEventListener("change", () => configure({ caustics: $("caustics
 $("maxdepth").addEventListener("change", () => configure({ max_depth: Number($("maxdepth").value) }, "경로 깊이"));
 $("warp").addEventListener("change", warpPanes);
 $("rrdepth").addEventListener("change", () => configure({ rr_depth: Number($("rrdepth").value) }, "RR 시작 깊이"));
+$("rasteraa").addEventListener("change", () => configure({ raster_aa: $("rasteraa").value }, "안티에일리어싱"));
+for (const b of $("engine").querySelectorAll("button")) {
+  b.addEventListener("click", () => configure({ renderer: b.dataset.engine }, b.dataset.engine === "raster" ? "래스터 미리보기" : "Mitsuba 경로 추적"));
+}
 $("res").addEventListener("change", () => configure({ resolution: $("res").value.split("x").map(Number) }, "해상도"));
 $("bands").addEventListener("change", () => configure({ bands: $("bands").value }, "대역 변경"));
 $("mirrorsrc").addEventListener("change", sendMirrors);

@@ -98,6 +98,8 @@ class Simulator:
         self.camera_offset = (0.0, 0.0, 0.0)  # setCameraOffset
         self.max_depth = 0  # setMaxDepth: 0 is the scene's own
         self.rr_depth = 0  # setRussianRouletteDepth: 0 is Mitsuba's 5
+        self.renderer = "path"  # setRenderer: "path" (Mitsuba) or "raster" (the rasterized preview)
+        self.raster_aa = "edge"  # setRasterAntialiasing: the preview's antialiasing
         self.caustics = True  # setCaustics
         self.nir_range = (0.5, 1.0)  # setNirRange
         self.active_split = True  # setActiveSplit
@@ -268,6 +270,22 @@ class Simulator:
         if not 0 <= int(depth) <= 64:
             raise ValueError("rr_depth must be 0..64")
         self.rr_depth = int(depth)
+
+    def setRenderer(self, name: str) -> None:
+        """"path": Mitsuba's path tracer (the default). "raster": the render server's rasterized preview (direct light
+        from point lights with shadow maps, an ambient term for the rest, no polarization yet): one noiseless image
+        a frame for moving about; spp and the path settings do not apply."""
+        if name not in ("path", "raster"):
+            raise ValueError("renderer must be 'path' or 'raster'")
+        self.renderer = str(name)
+
+    def setRasterAntialiasing(self, mode: str) -> None:
+        """The raster preview's antialiasing: "off" (one sample a pixel), "edge" (silhouettes blended by coverage,
+        nvdiffrast's antialias; the default) or "ssaa2" (2 x 2 samples a pixel: also textures and highlights, four
+        times the shading)."""
+        if mode not in ("off", "edge", "ssaa2"):
+            raise ValueError("raster antialiasing must be 'off', 'edge' or 'ssaa2'")
+        self.raster_aa = str(mode)
 
     def setCaustics(self, on: bool) -> None:
         """Off: the lights' passes drop caustics as the flash pass always does (path_nocaustics: light reaching an
@@ -534,7 +552,7 @@ class Simulator:
                 "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env),
                 "bands": self.bands, "flash_band": self.flash_band, "nir": dict(self.nir), "lighting": self.lighting, "lamps": self.lamps,
                 "flash_scale": self.flash_scale, "flash_offset": list(self.flash_offset), "max_depth": self.max_depth, "rr_depth": self.rr_depth,
-                "caustics": self.caustics, "nir_range": list(self.nir_range), "active_split": self.active_split,
+                "renderer": self.renderer, "raster_aa": self.raster_aa, "caustics": self.caustics, "nir_range": list(self.nir_range), "active_split": self.active_split,
                 "mirrors": dict(self.mirrors) if self.mirrors is not None else None}
 
     def _set_heading_elevation(self, heading, elevation) -> None:

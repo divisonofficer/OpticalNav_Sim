@@ -774,6 +774,23 @@ def locate_blocks(meshes: dict, blocks: dict) -> dict:
     return out
 
 
+_RASTER_MTIME: list[float] = []
+
+
+def _raster_module():
+    """raster.py, imported when first asked for (torch, nvdiffrast); with OPTICALNAV_RASTER_RELOAD=1 reloaded
+    whenever it or raster_gi.py changed, and each resident then builds its preview again (for working on it live)."""
+    from . import raster, raster_gi
+    if os.environ.get("OPTICALNAV_RASTER_RELOAD"):
+        import importlib
+        mtime = max(Path(m.__file__).stat().st_mtime for m in (raster, raster_gi))
+        if _RASTER_MTIME and _RASTER_MTIME[0] != mtime:
+            importlib.reload(raster_gi)
+            raster = importlib.reload(raster)
+        _RASTER_MTIME[:] = [mtime]
+    return raster
+
+
 def integrator_spec(xml: Path) -> dict:
     """max_depth and Stokes reference axis of a scene file's integrator."""
     text = xml.read_text()
@@ -1180,6 +1197,35 @@ class Resident:
         z = dr.select(pi.is_valid(), pi.t * self._depth_inv, 0.0)
         dr.schedule(z)
         return z
+
+    def raster_views(self, cams: list, width: int, height: int, hfov_deg: float, follow: bool, look: Look,
+                     aa: str = "off") -> tuple:
+        """The rasterized preview (raster.py) of each camera, with the scene as ``look`` has it (written into the
+        scene as a launch would, so the path tracer and the preview always show the same state). Returns
+        (each view's Stokes images [S0..S3] in R, G, B and near-infrared lanes, depths, timing parts)."""
+        raster = _raster_module()
+        follow = bool(follow and self.k_flash is not None)
+        parts = {"scene_update_s": 0.0, "raster_build_s": 0.0, "raster_s": 0.0}
+        views, depths = [], []
+        for c2w in cams:
+            t0 = time.perf_counter()
+            # the flash stays parked: the preview lights it itself, and moving its rectangle every frame rebuilt its
+            # acceleration structure (a path frame puts it back at the camera when it writes its own pose)
+            self._set_camera(c2w, width, height, hfov_deg, False, look)
+            t1 = time.perf_counter()
+            if getattr(self, "_raster", None) is None or type(self._raster) is not raster.RasterScene:
+                self._raster = None
+                self._raster = raster.RasterScene(self)
+                parts["raster_build_s"] += self._raster.build_s
+            self._raster.sync(look.hidden)
+            t2 = time.perf_counter()
+            lanes, z = self._raster.render(c2w, width, height, hfov_deg, look, follow, aa)
+            parts["scene_update_s"] += t1 - t0
+            parts["raster_s"] += time.perf_counter() - t2
+            views.append(lanes)
+            depths.append(z)
+        parts["wait_s"] = parts["raster_s"]
+        return views, depths, parts
 
     def _write_assist(self, p, writes: dict) -> None:
         """Write the assist shapes' transforms: into ``p`` (the whole scene's parameters, updated by the
@@ -1999,8 +2045,15 @@ class Renderer:
                        bool(dict(mirrors).get("glass_blocking", False)))
             if not (0.0 <= mirrors[0] <= 100.0 and 0 <= mirrors[1] <= 64):
                 raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
+        renderer = str(view.get("renderer", "path"))  # "raster": the rasterized preview (raster.py)
+        if renderer not in ("path", "raster"):
+            raise ValueError("renderer must be 'path' or 'raster'")
+        raster_aa = str(view.get("raster_aa", "off"))  # the preview's antialiasing (raster.AA_MODES)
+        if raster_aa not in ("off", "edge", "ssaa2"):
+            raise ValueError("raster_aa must be 'off', 'edge' or 'ssaa2'")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
-                mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth)
+                mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth,
+                renderer, raster_aa)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False):
@@ -2009,7 +2062,8 @@ class Renderer:
         scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot, bands,
                                                                         flash_band, nir, lighting, mirrors, lamps,
                                                                         flash_scale, flash_pdf, flash_offset, max_depth,
-                                                                        caustics, split, nir_range, rr_depth) = key
+                                                                        caustics, split, nir_range, rr_depth,
+                                                                        renderer, raster_aa) = key
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
@@ -2040,6 +2094,9 @@ class Renderer:
                                flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
                                split=split, nir_range=nir_range, rr_depth=rr_depth)
                          for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
+            if renderer == "raster":  # the rasterized preview (raster.py): drawn here, one image a view
+                return self._raster_start(key, resident, cams, next(iter(looks.values())), follow, started - submitted,
+                                          bands, depth, raster_aa)
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
             t0 = time.perf_counter()
@@ -2108,6 +2165,40 @@ class Renderer:
             # kernel history stay on the render thread.
             if denoise or self.kernel_history:
                 return assemble()
+            return assemble
+        return finish
+
+    def _raster_start(self, key: tuple, resident, cams: list, look, follow: bool, queue_s: float, bands: str,
+                      depth: bool, aa: str = "off"):
+        """_start for the rasterized preview: the views drawn and read back here, handed on in the path tracer's
+        bands (RGB Stokes images, near-infrared ones) without its film split."""
+        if not resident.rgbn:
+            raise ValueError("the raster preview needs the RGBN polar variant (cuda_rgbn_polarized)")
+        t0 = time.perf_counter()
+        width, height, hfov = key[3], key[4], key[5]
+        with ACTIVITY.doing("rasterizing"):
+            views, depths, parts = resident.raster_views(cams, width, height, hfov, follow, look, aa)
+        render_s = time.perf_counter() - t0
+        parts.update(queue_s=queue_s, launch_s=0.0)
+
+        def finish():
+            def assemble():
+                t1 = time.perf_counter()
+                outs = []
+                for lanes, z in zip(views, depths):
+                    zero = np.zeros_like(lanes[0])
+                    stokes_ = [zero if v is None else v for v in lanes]  # S0..S3: R, G, B, near-infrared
+                    out = {}
+                    if bands != "nir":
+                        out.update({"rgb_src": stokes_[0][..., :3], **{f"s{k}": v[..., :3] for k, v in enumerate(stokes_)}})
+                    if bands != "rgb":
+                        out.update({f"nir_s{k}": v[..., 3] for k, v in enumerate(stokes_)})
+                    if depth:
+                        out["depth"] = z
+                    outs.append(out)
+                kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0, **parts,
+                           "split_s": time.perf_counter() - t1}
+                return outs, kernels, render_s, 0.0
             return assemble
         return finish
 
