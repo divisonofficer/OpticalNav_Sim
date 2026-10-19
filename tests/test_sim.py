@@ -584,6 +584,62 @@ def test_decimation_policy_and_crease_normals():
 
 
 
+def test_hand_built_lamps_pair_with_their_lights_by_position():
+    def note(obj):
+        return f"\n  <!--opticalnav-obj:{json.dumps(obj)}-->"
+
+    def shape(sid, body):
+        return f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="assets/{sid}.ply" />{body}\n  </shape>'
+
+    lamp = "DomePendantFactory_3_.spawn_asset_3"
+    plastic, metal = '<bsdf type="pplastic"/>', '<bsdf type="roughconductor"/>'
+    box = '<emitter type="area"><rgb name="radiance" value="10 10 10" /></emitter>'
+    text = ("<scene>"
+            + note({"id": lamp, "label": "DomePendantFactory(3).spawn_asset(3)",
+                    "geometry": {"center": [4.0, 1.0], "size_m": [0.4, 1.0, 0.4]}})
+            + shape(lamp, metal) + shape(lamp + "__part_000_cord", plastic) + shape(lamp + "__part_002_bulb", plastic)
+            + note({"id": "light_1_PointLampFactory_pendant_.spawn_asset_3", "is_emitter": True,
+                    "emitter_radiance": [10, 10, 10], "geometry": {"center": [4.0, 1.0], "size_m": [0.6, 0.08, 0.6]}})
+            + shape("light_1_PointLampFactory_pendant_.spawn_asset_3", box)
+            + note({"id": "light_2_PointLampFactory_added_.spawn_asset_0", "is_emitter": True,  # 2 m away: a ceiling light
+                    "emitter_radiance": [10, 10, 10], "geometry": {"center": [6.0, 1.0], "size_m": [0.6, 0.08, 0.6]}})
+            + shape("light_2_PointLampFactory_added_.spawn_asset_0", box) + "\n</scene>")
+    lowest = {"cord": 0.25, "bulb": 0.0}  # the cord hangs above the dome, the bulb inside it
+    info = lambda kind, f: (0.02, lowest[f.split("_")[-1][:-4]])  # noqa: E731
+    out, added = server.lamp_lights_text(text, mesh_info=info)  # no bounds: the bulb, not the cord or the dome
+    assert added == [lamp + "__part_002_bulb"]
+    assert 'id="light_1_PointLampFactory_pendant_.spawn_asset_3"' not in out  # its box is gone
+    assert 'id="light_2_PointLampFactory_added_.spawn_asset_0"' in out  # a light by no lamp stays
+    # with the dome's world box: a disk across its opening glows, facing down, with the box's power
+    dome = ([3.8, 1.8, 0.8], [4.2, 2.0, 1.2])
+    out, added = server.lamp_lights_text(text, mesh_info=info, mesh_bounds=lambda kind, body: dome)
+    assert added == [lamp + "__glow"] and 'id="light_1_PointLampFactory_pendant_.spawn_asset_3"' not in out
+    disk = out.split(f'<shape type="ply" id="{lamp}__glow">')[1].split("</shape>")[0]
+    assert '<rotate x="1" angle="90" />' in disk and 'y="1.800000"' in disk and 'x="4.000000"' in disk
+    r = 0.47 * 0.4
+    rad = float(disk.split('name="radiance" value="')[1].split()[0])
+    assert math.isclose(rad * math.pi * r * r, 10 * 0.912, rel_tol=1e-3)  # the box cube's power (0.912 m2), from the disk
+    assert "<emitter" not in out.split(f'id="{lamp}__part_002_bulb">')[1].split("</shape>")[0]
+
+
+def test_viewer_mean_holds_back_fireflies():
+    from opticalnav_sim import gui
+
+    B = gui.FIREFLY_BUCKETS
+    s0 = np.full((B, 2, 2, 3), 0.5, np.float32)
+    s1 = 0.2 * s0  # 20% linearly polarized everywhere
+    s0[3, 0, 0] = s1[3, 0, 0] = 400.0  # one bucket's firefly at one pixel
+    acc = {"s0": s0, "s1": s1, "s2": np.zeros_like(s0), "nir_s0": np.full((B, 2, 2), 0.3, np.float32)}
+    mean = gui.robust_mean(acc, [1] * B)
+    assert np.allclose(mean["s0"][1, 1], 0.5) and np.allclose(mean["nir_s0"], 0.3)  # light that is there keeps
+    cap = gui.FIREFLY_K * 0.5 + gui.FIREFLY_FLOOR
+    assert np.allclose(mean["s0"][0, 0], (7 * 0.5 + cap) / 8, rtol=1e-4)  # the firefly bucket down to the cap
+    assert mean["s0"][0, 0, 0] < 0.05 * acc["s0"][:, 0, 0, 0].mean()  # vs ~50 as a plain mean
+    assert np.allclose(mean["s1"][1, 1] / mean["s0"][1, 1], 0.2)  # polarization kept where nothing was cut
+    two = gui.robust_mean({k: v[:2] for k, v in acc.items()}, [1, 1])  # too few buckets: the plain mean
+    assert np.allclose(two["s0"], acc["s0"][:2].mean(axis=0))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

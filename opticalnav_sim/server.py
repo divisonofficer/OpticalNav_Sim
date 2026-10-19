@@ -293,6 +293,7 @@ def band_lights_text(text: str, classes: dict[str, str], groups: dict[str, str])
 
 
 _UNIT_RECT: list[Path] = []
+_UNIT_DISK: list[Path] = []
 
 
 _TAG = re.compile(r'<!--.*?-->|<(/?)([A-Za-z_][\w.:-]*)((?:[^>"]|"[^"]*")*?)(/?)>', re.S)
@@ -357,6 +358,24 @@ def unit_rectangle_ply() -> Path:
     return _UNIT_RECT[0]
 
 
+def unit_disk_ply(segments: int = 32) -> Path:
+    """A unit disk in z = 0 facing +z, as a PLY fan (a pendant's glowing opening; moved by its vertices like
+    the rectangle lights, so lighting modes never re-record)."""
+    if not _UNIT_DISK:
+        import tempfile
+
+        path = Path(tempfile.gettempdir()) / f"opticalnav_unit_disk_{segments}.ply"
+        rim = [(math.cos(2 * math.pi * i / segments), math.sin(2 * math.pi * i / segments)) for i in range(segments)]
+        verts = ["0 0 0 0.5 0.5"] + [f"{x:.6f} {y:.6f} 0 {0.5 + 0.5 * x:.6f} {0.5 + 0.5 * y:.6f}" for x, y in rim]
+        faces = [f"3 0 {i + 1} {(i + 1) % segments + 1}" for i in range(segments)]  # counter-clockwise from +z
+        path.write_text("ply\nformat ascii 1.0\n" f"element vertex {len(verts)}\n"
+                        "property float x\nproperty float y\nproperty float z\nproperty float u\nproperty float v\n"
+                        f"element face {segments}\nproperty list uchar int vertex_indices\nend_header\n"
+                        + "\n".join(verts + faces) + "\n")
+        _UNIT_DISK.append(path)
+    return _UNIT_DISK[0]
+
+
 def lights_as_meshes(text: str, ids) -> str:
     """Rectangle lights as PLY meshes. A lighting mode lifts a removed light out of the room; for a
     rectangle that is a write of its to_world, and the first such write after a recording changed the
@@ -369,11 +388,11 @@ def lights_as_meshes(text: str, ids) -> str:
     return text
 
 
-_LAMP = re.compile(r"^(\w*(?:Lamp|CeilingLight|Sconce|Chandelier)\w*)Factory")
+_LAMP = re.compile(r"^(\w*(?:Lamp|CeilingLight|Sconce|Chandelier|Pendant)\w*)Factory")
 _SPAWN = re.compile(r"_(\d+)_\.spawn_asset_(\d+)$")
 
 
-def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, list[str]]:
+def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None) -> tuple[str, list[str]]:
     """Lamps glow from their own parts instead of from boxes. Infinigen spawns a light (``PointLampFactory``) with
     only some of its lamps; robomituba's importer turns those into a flat emitter cube (0.6 x 0.6 x 0.08 m) at a
     desk or floor lamp's top and a 0.6 m square under a ceiling light, and the other lamps stay dark. A lamp is
@@ -393,7 +412,17 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, 
     A glowing part is sampled directly from everywhere. ``mesh_info(shape_type, filename)`` gives a part's
     (surface area, lowest y in its own frame): both sides of a shell emit. Without it, only a dark lamp with one
     non-metal part is lit (a cylinder from the lamp's recorded size standing in for its area) and lit lamps keep
-    their boxes. Returns (text, the ids of the parts that now emit)."""
+    their boxes. Returns (text, the ids of the parts that now emit).
+
+    Hand-built scenes (the cafe kits) name their lights by role, not by a lamp's seed and spawn id
+    (``PointLampFactory_pendant_.spawn_asset_3`` above ``DomePendantFactory_3_.spawn_asset_3``): a lamp without
+    a light of its own ids takes the nearest such light within 0.75 of its width.
+
+    A pendant with a metal dome glows from a disk across the dome's opening, facing down, given
+    ``mesh_bounds(shape_type, shape_body)`` (a part's world bounding box). Its bulb, the first try, held the
+    light box's power in ~0.02 m2: a source that bright and small left fireflies on every glossy surface of
+    the room. The disk spreads it over ~6x the area and is sampled directly from below. Without a dome
+    (or the callback) the pendant glows from its lowest non-metal part, the bulb (its highest is the cord)."""
     raw: dict[str, str] = {}  # note id -> the note as written, to drop a replaced box's note
     notes = []
     for note in re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", text):
@@ -409,6 +438,20 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, 
               if o.get("is_emitter") and o.get("id") and _SPAWN.search(o["id"])}
     lamps = [o for o in notes if not o.get("is_emitter") and _LAMP.match(str(o.get("label", "")))
              and o.get("id") and _SPAWN.search(o["id"])]
+    loose = [o for o in notes if o.get("is_emitter") and "PointLampFactory" in str(o.get("id", ""))
+             and not _SPAWN.search(o["id"]) and (o.get("geometry") or {}).get("center")]
+    paired = {}  # lamp id -> its light: same seed and spawn id, else the nearest loose light inside its footprint
+    for o in lamps:
+        light = lights.get(_SPAWN.search(o["id"]).groups())
+        g = o.get("geometry") or {}
+        if light is None and loose and g.get("center"):
+            near = min(loose, key=lambda L: math.dist(L["geometry"]["center"], g["center"]))
+            reach = 0.75 * max(float(v) for v in (g.get("size_m") or [0.0, 0.0, 0.0])[::2])
+            if math.dist(near["geometry"]["center"], g["center"]) <= reach:
+                light = near
+                loose.remove(near)
+        if light is not None:
+            paired[o["id"]] = light
 
     def light_power(light: dict) -> float | None:
         """Emitted power / pi of an importer's light box: radiance x its emitting area."""
@@ -421,7 +464,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, 
 
     power: dict[str, list[float]] = {}
     for o in lamps:  # the scene's own lamp lights, per kind
-        light = lights.get(_SPAWN.search(o["id"]).groups())
+        light = paired.get(o["id"])
         if light is not None and light_power(light) is not None:
             power.setdefault(_LAMP.match(o["label"]).group(1), []).append(light_power(light))
     every = [p for ps in power.values() for p in ps]
@@ -429,7 +472,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, 
     edits, added, xml, gone = [], [], [], []
     for o in lamps:
         kind = _LAMP.match(o["label"]).group(1)
-        light = lights.get(_SPAWN.search(o["id"]).groups())
+        light = paired.get(o["id"])
         if light is not None and not (lit and mesh_info is not None and light["id"] in shapes):
             continue
         ceiling = "Ceiling" in kind or "Chandelier" in kind
@@ -444,6 +487,38 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True) -> tuple[str, 
         height = float(((o.get("geometry") or {}).get("size_m") or [0, 0.5, 0])[1])
         if light is not None and ceiling:  # a ceiling light's fixture glows whole
             shades = [m for m in shades if m.group(2) in info]
+        elif "Pendant" in kind:  # the dome's opening glows (see above), else the bulb
+            dome = None
+            for m in parts:
+                if "conductor" in m.group(3) and mesh_bounds is not None:
+                    with contextlib.suppress(Exception):
+                        lo, hi = (np.asarray(v, float) for v in mesh_bounds(m.group(1), m.group(3)))
+                        dome = (lo, hi) if dome is None else (np.minimum(dome[0], lo), np.maximum(dome[1], hi))
+            if dome is not None:
+                lo, hi = dome
+                r = 0.47 * float(min(hi[0] - lo[0], hi[2] - lo[2]))
+                own = light_power(light) if light is not None else None
+                rad = (own if own is not None else float(np.mean(power.get(kind) or [default]))) / (math.pi * r * r)
+                sid = f"{o['id']}__glow"
+                xml.append(f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="{unit_disk_ply()}" />'
+                           f'\n    <transform name="to_world">\n      <scale value="{r:.6f}" />'
+                           f'\n      <rotate x="1" angle="90" />'  # +z (the disk's front) to -y: facing the floor
+                           f'\n      <translate x="{(lo[0] + hi[0]) / 2:.6f}" y="{lo[1]:.6f}" z="{(lo[2] + hi[2]) / 2:.6f}" />'
+                           f'\n    </transform>\n    <bsdf type="diffuse" />'
+                           f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
+                           f'\n    </emitter>\n  </shape>')
+                note = {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+                        "emitter_intensity": 1.0, "emitter_shape": "lamp_opening",
+                        "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
+                        "metadata": {"lamp": o["id"], "glowing_area_m2": round(math.pi * r * r, 4),
+                                     "replaces": (light or {}).get("id"), "added_by": "opticalnav_sim lamp_lights_text"},
+                        "geometry": o.get("geometry")}
+                xml.append(f'\n  <!--opticalnav-obj:{json.dumps(note)}-->')
+                added.append(sid)
+                if light is not None:
+                    gone.append(light["id"])
+                continue
+            shades = sorted((m for m in shades if m.group(2) in info), key=lambda m: info[m.group(2)][1])[:1]
         elif len(shades) > 1 or light is not None:  # the shade: the highest bottom, a quarter of the lamp up at least
             shades = sorted((m for m in shades if m.group(2) in info and info[m.group(2)][1] > 0.25 * height),
                             key=lambda m: info[m.group(2)][1])[-1:]
@@ -841,9 +916,17 @@ class Resident:
             mesh = mi.load_dict({"type": kind, "filename": str(base_dir / filename)})
             return float(dr.ravel(mesh.surface_area())[0]), float(mesh.bbox().min.y)
 
+        def mesh_bounds(kind: str, body: str):
+            """A part's world bounding box: the shape loaded alone with its transform (as shape_vertices does)."""
+            body = re.sub(r'<ref\b[^>]*/>|<bsdf\b.*?</bsdf>|<bsdf\b[^>]*/>|<emitter\b.*?</emitter>', "", body, flags=re.S)
+            body = re.sub(r'(<string name="filename" value=")(?!/)', rf'\g<1>{base_dir}/', body)
+            box = mi.load_string(f'<shape version="3.0.0" type="{kind}">{body}<bsdf type="diffuse"/></shape>').bbox()
+            return [float(v) for v in dr.ravel(box.min)], [float(v) for v in dr.ravel(box.max)]
+
         import drjit as dr
         # OPTICALNAV_BOX_LIGHTS=1: lit lamps keep the importer's boxes (the earlier look, for comparisons)
-        text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"))
+        text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"),
+                                                  mesh_bounds=mesh_bounds)
         radiance = emitter_radiance(text)  # before the band transforms wrap them
         self.classes = light_classes(text)  # shape id -> 'led' | 'incandescent'
         self.groups = light_groups(text)  # shape id -> 'fixture' | 'fill' | 'lamp' (lighting modes remove whole groups)

@@ -41,6 +41,38 @@ from .client import RenderClient
 
 PAGE = Path(__file__).with_name("gui.html")
 ACCUMULATED = ("s0", "s1", "s2", "nir_s0", "nir_s1", "nir_s2")  # summed over passes, shown as their mean
+FIREFLY_BUCKETS = 8   # passes are dealt into this many sums; their per-pixel median tells a firefly from light
+FIREFLY_K = 4.0       # a bucket brighter than this many times the median bucket is scaled down to it
+FIREFLY_FLOOR = 1e-3  # radiance a dark pixel's buckets may reach before they count as one
+
+
+def robust_mean(acc: dict[str, np.ndarray], counts) -> dict[str, np.ndarray]:
+    """The mean of the accumulated passes, fireflies held back. ``acc[k]`` holds FIREFLY_BUCKETS sums of
+    passes (dealt round-robin) and ``counts`` how many passes each holds. Per pixel and band, a bucket whose
+    S0 (RGB luma, or the near-infrared S0) is above FIREFLY_K times the buckets' median (plus FIREFLY_FLOOR)
+    is scaled down to that limit, all its Stokes components alike, so DoLP and AoLP keep. A firefly is one
+    sample thousands of times the pixel's light: it lands in one bucket and lifts it far above the others,
+    which light that is really there does not. The cost is a little of the light of rare, bright paths
+    (caustics); the mean equals the plain one wherever no bucket stands out. Under three filled buckets
+    there is no median to trust, and the plain mean is returned."""
+    n = np.asarray(counts, dtype=np.float32)
+    used = n > 0
+    w = n[used] / n[used].sum()
+    means = {k: v[used] / n[used].reshape((-1,) + (1,) * (v.ndim - 1)) for k, v in acc.items()}
+    out = {}
+    for band, keys in (("s0", [k for k in means if not k.startswith("nir_")]),
+                       ("nir_s0", [k for k in means if k.startswith("nir_")])):
+        if not keys:
+            continue
+        scale = None
+        if band in means and int(used.sum()) >= 3:
+            lum = means[band] @ stokes.LUMA if means[band].ndim == 4 else means[band]
+            cap = FIREFLY_K * np.median(lum, axis=0) + FIREFLY_FLOOR
+            scale = np.minimum(1.0, cap / np.maximum(lum, 1e-12))
+        for k in keys:
+            v = means[k] if scale is None else means[k] * (scale[..., None] if means[k].ndim == scale.ndim + 1 else scale)
+            out[k] = np.tensordot(w, v, axes=1).astype(np.float32)
+    return out
 CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  # the older pane names
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
 PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
@@ -142,7 +174,8 @@ class Session:
     FLY_KEYS = ("forward", "right", "up", "yaw_deg", "pitch_deg")
 
     def __init__(self, sim: MatterSim.Simulator, scans: dict[str, list[str]], pass_spp: int = 16,
-                 target_spp: int = 1024, turn_deg: float = 15.0, pitch_deg: float = 10.0, depth: int = 2):
+                 target_spp: int = 1024, turn_deg: float = 15.0, pitch_deg: float = 10.0, depth: int = 2,
+                 robust: bool = True):
         self.sim, self.scans = sim, scans
         self.pass_spp, self.target_spp = int(pass_spp), int(target_spp)
         self.turn, self.pitch = math.radians(turn_deg), math.radians(pitch_deg)
@@ -162,7 +195,9 @@ class Session:
         self.gen_started = 0.0
         self.issued = self.inflight = self.passes = 0
         self.published = 0                # passes in the newest published frame of this gen
-        self.acc: dict[str, np.ndarray] = {}
+        self.acc: dict[str, np.ndarray] = {}  # per key, FIREFLY_BUCKETS sums of passes (see robust_mean)
+        self.acc_n = [0] * FIREFLY_BUCKETS     # passes in each of them
+        self.robust = bool(robust)             # fireflies held back (robust_mean), else the plain mean
         self.auto = True                  # accumulate while the camera stays put
         self.error = ""
         self.started = False
@@ -396,7 +431,7 @@ class Session:
             self.gen += 1
             self.view, self.gen_started = view, time.time()
             self.issued = self.passes = self.published = 0
-            self.acc = {}
+            self.acc, self.acc_n = {}, [0] * FIREFLY_BUCKETS
             self.error = ""
             self.started = True
             self.pose = pose
@@ -459,13 +494,20 @@ class Session:
                 passes = 1
                 mean = {k: np.asarray(out[k], dtype=np.float32) for k in ACCUMULATED if k in out}
             else:
+                b = self.passes % FIREFLY_BUCKETS
                 for k in ACCUMULATED:
                     if k in out:
                         a = np.asarray(out[k], dtype=np.float32)
-                        self.acc[k] = a.copy() if k not in self.acc else self.acc[k] + a
+                        if k not in self.acc:
+                            self.acc[k] = np.zeros((FIREFLY_BUCKETS,) + a.shape, np.float32)
+                        self.acc[k][b] += a
+                self.acc_n[b] += 1
                 self.passes += 1
                 passes = self.passes
-                mean = {k: self.acc[k] / passes for k in ACCUMULATED if k in self.acc}
+                if self.robust:
+                    mean = robust_mean(self.acc, self.acc_n)
+                else:
+                    mean = {k: self.acc[k].sum(axis=0) / passes for k in ACCUMULATED if k in self.acc}
         nir = [mean.get(f"nir_s{k}") for k in range(3)]
         if self.sim.denoise:
             # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
@@ -1073,6 +1115,8 @@ def main() -> int:
                          "16 spp: GPU 95 -> 68 ms, means unchanged, noise +3%% RGB / +9%% NIR")
     ap.add_argument("--turn-deg", type=float, default=15.0)
     ap.add_argument("--pitch-deg", type=float, default=10.0)
+    ap.add_argument("--plain-mean", action="store_true",
+                    help="accumulate passes as a plain mean (default: fireflies held back, see robust_mean)")
     ap.add_argument("--depth", type=int, default=2, help="passes in flight on the render server (2 overlaps CPU and GPU)")
     ap.add_argument("--token", default=os.environ.get("OPTICALNAV_GUI_TOKEN"),
                     help="required to listen beyond localhost (default $OPTICALNAV_GUI_TOKEN); open /?token=<token>")
@@ -1100,7 +1144,8 @@ def main() -> int:
     # start on what the render server has loaded, or is preloading (pages start its first scene)
     if info.get("resident") or info.get("preloading"):
         sim.setVariant((info.get("resident") or info["preloading"])[0][1])
-    session = Session(sim, info["scans"], args.pass_spp, args.target_spp, args.turn_deg, args.pitch_deg, args.depth)
+    session = Session(sim, info["scans"], args.pass_spp, args.target_spp, args.turn_deg, args.pitch_deg, args.depth,
+                      robust=not args.plain_mean)
     session.envmaps = list(info.get("envmaps", []))
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant")}
     session.nir_available = bool(info.get("nir"))
