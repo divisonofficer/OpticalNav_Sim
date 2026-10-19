@@ -117,6 +117,10 @@ def rgb_scene_text(text: str) -> str:
 
 
 ASSIST_PREFIX = "camera_assist"  # the flash rectangle (and the old protocol's polarizer) in front of the camera
+# The room softboxes robomituba's importer adds for even fill (light_groups: "fill"): path_nocaustics's ``hidden``
+# lets camera rays through them, so they light the room without white squares under every ceiling (Blender's
+# camera visibility off, as the dataset meant them).
+FILL_PREFIX = "light_softbox_"
 ASSIST_SHAPE = re.compile(r'\s*<shape type="rectangle" id="camera_assist_[a-z]+">.*?</shape>', re.S)
 SENSOR_BLOCK = re.compile(r"\s*<sensor\b.*?</sensor>", re.S)
 COMMENT = re.compile(r"\s*<!--.*?-->", re.S)
@@ -389,7 +393,99 @@ def lights_as_meshes(text: str, ids) -> str:
 
 
 _LAMP = re.compile(r"^(\w*(?:Lamp|CeilingLight|Sconce|Chandelier|Pendant)\w*)Factory")
+PLACEHOLDER = "PointLampFactory"  # in the id of every light box robomituba's importer makes
 _SPAWN = re.compile(r"_(\d+)_\.spawn_asset_(\d+)$")
+FIXTURE = "fixture"  # the kind of a lamp found by position alone (pair_lamp_lights), whatever its name
+# a part named as the one that glows (a kit's "..._ir_led_panel_2"): of a ceiling fixture, only it glows
+_GLOWING_PART = re.compile(r"led|panel|diffuser|bulb|glow|emissi|lens", re.I)
+ORPHAN_DOWNLIGHT_R = 0.1  # m: the round downlight a light by no fixture becomes (instead of a 0.6 m square)
+
+
+def notes_from_shapes(shapes: dict) -> list[dict]:
+    """For a scene file written without opticalnav-obj notes (the oldest packs): what pair_lamp_lights needs, from
+    the shapes themselves. A lamp by its id (``DeskLampFactory_<seed>_.spawn_asset_<n>``), a light box by its id,
+    radiance and to_world scale (a rectangle's and a cube's half sides). Pairs by seed and spawn id only."""
+    out = []
+    for sid, m in shapes.items():
+        if "__part_" in sid:
+            continue
+        if PLACEHOLDER in sid and "<emitter" in m.group(3):
+            rgb = re.search(r'name="radiance" value="([^"]+)"', m.group(3))
+            scale = {a: float(v) for a, v in re.findall(r'<scale\b[^>]*?\b([xyz])="([-\d.e]+)"', m.group(3))}
+            sx, sy = 2 * scale.get("x", 1.0), 2 * scale.get("y", 1.0)
+            size = [sx, 0.0, sy] if m.group(1) == "rectangle" else [sx, sy, 2 * scale.get("z", 1.0)]
+            out.append({"id": sid, "is_emitter": True, "label": f"light:{sid}",
+                        "emitter_radiance": [float(v) for v in rgb.group(1).replace(",", " ").split()] if rgb else None,
+                        "geometry": {"size_m": size}})
+        elif _LAMP.match(sid) and _SPAWN.search(sid):
+            out.append({"id": sid, "label": sid})
+    return out
+
+
+def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[dict]]:
+    """The importer's light boxes (``PointLampFactory`` ids, a 0.6 m square or flat cube each) and the lamps that
+    glow with them: (lamps, lamp id -> kind, lamp id -> its light, the lights left with no fixture).
+
+    1. By name: a lamp whose label names a lamp (_LAMP) takes the light of its factory seed and spawn id, else the
+       nearest light with no seed of its own within 0.75 of its width (hand-built kits name lights by role:
+       ``PointLampFactory_pendant_.spawn_asset_3``). A named lamp with no light stays a lamp (a dark one).
+    2. By position, whatever the names: a light still alone takes the nearest asset (an id, a ``...Factory``
+       label) whose footprint holds it (10 cm to spare) and whose height is within 0.6 m of it: a track spot, a
+       ceiling fixture of a kit, any fixture a new kit brings. Kind FIXTURE: what glows follows from its parts.
+    3. Whatever is still alone (a light the importer placed by no mesh) is an orphan."""
+    lights = [o for o in notes if o.get("is_emitter") and PLACEHOLDER in str(o.get("id", ""))]
+    keyed = {_SPAWN.search(o["id"]).groups(): o for o in lights if _SPAWN.search(o["id"])}
+    loose = [o for o in lights if not _SPAWN.search(o["id"]) and (o.get("geometry") or {}).get("center")]
+    lamps = [o for o in notes if not o.get("is_emitter") and o.get("id") and _LAMP.match(str(o.get("label", "")))]
+    kinds = {o["id"]: _LAMP.match(o["label"]).group(1) for o in lamps}
+    paired: dict[str, dict] = {}
+    for o in lamps:
+        spawn = _SPAWN.search(o["id"])
+        light = keyed.get(spawn.groups()) if spawn else None
+        g = o.get("geometry") or {}
+        if light is None and loose and g.get("center"):
+            near = min(loose, key=lambda L: math.dist(L["geometry"]["center"], g["center"]))
+            reach = 0.75 * max(float(v) for v in (g.get("size_m") or [0.0, 0.0, 0.0])[::2])
+            if math.dist(near["geometry"]["center"], g["center"]) <= reach:
+                light = near
+                loose.remove(near)
+        if light is not None:
+            paired[o["id"]] = light
+    taken = {L["id"] for L in paired.values()}
+    named = {o["id"] for o in lamps}
+    assets = [o for o in notes if not o.get("is_emitter") and o.get("id") and o["id"] not in named
+              and "Factory" in str(o.get("label", "")) and (o.get("geometry") or {}).get("center")]
+
+    def height(o: dict) -> tuple[float, float]:  # (base, top) as the note has them
+        g = o.get("geometry") or {}
+        base = float(g.get("base_height_m") or 0.0)
+        return base, base + float((g.get("size_m") or [0.0, 0.0, 0.0])[1])
+
+    orphans = []
+    for light in lights:
+        if light["id"] in taken:
+            continue
+        g = light.get("geometry") or {}
+        if not g.get("center"):
+            orphans.append(light)
+            continue
+        (x, z), (lo, hi) = g["center"], height(light)
+        y = (lo + hi) / 2
+        fits = []
+        for o in assets:
+            c, s = o["geometry"]["center"], [float(v) for v in o["geometry"].get("size_m") or [0.0, 0.0, 0.0]]
+            b, t = height(o)
+            if abs(x - c[0]) <= s[0] / 2 + 0.1 and abs(z - c[1]) <= s[2] / 2 + 0.1 and b - 0.6 <= y <= t + 0.6:
+                fits.append((math.dist((x, z), c), o))
+        if not fits:
+            orphans.append(light)
+            continue
+        o = min(fits, key=lambda f: f[0])[1]
+        assets.remove(o)
+        lamps.append(o)
+        kinds[o["id"]] = FIXTURE
+        paired[o["id"]] = light
+    return lamps, kinds, paired, orphans
 
 
 def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None) -> tuple[str, list[str]]:
@@ -414,9 +510,13 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     non-metal part is lit (a cylinder from the lamp's recorded size standing in for its area) and lit lamps keep
     their boxes. Returns (text, the ids of the parts that now emit).
 
-    Hand-built scenes (the cafe kits) name their lights by role, not by a lamp's seed and spawn id
-    (``PointLampFactory_pendant_.spawn_asset_3`` above ``DomePendantFactory_3_.spawn_asset_3``): a lamp without
-    a light of its own ids takes the nearest such light within 0.75 of its width.
+    Which lamp a light belongs to: pair_lamp_lights, by name and then by position. A fixture found by position
+    alone (a kit's track spot or ceiling fixture, whatever it is called) glows as its parts say: all metal, from
+    a disk across its opening (as a pendant's dome); flat (half as tall as wide), from its named diffuser (``led``,
+    ``panel``, ...) or else every part that is not metal (as a ceiling light); else from its shade, or whole if
+    it is one part. A light by no fixture at all
+    becomes a round downlight (ORPHAN_DOWNLIGHT_R) where its square hung, at the square's power: no light of
+    the scene stays a square (tools/light_audit.py lists what a scene's lights pair with).
 
     A pendant with a metal dome glows from a disk across the dome's opening, facing down, given
     ``mesh_bounds(shape_type, shape_body)`` (a part's world bounding box). Its bulb, the first try, held the
@@ -434,24 +534,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         if obj.get("id"):
             raw[obj["id"]] = note
     shapes = {m.group(2): m for m in re.finditer(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>', text, re.S)}
-    lights = {_SPAWN.search(o["id"]).groups(): o for o in notes
-              if o.get("is_emitter") and o.get("id") and _SPAWN.search(o["id"])}
-    lamps = [o for o in notes if not o.get("is_emitter") and _LAMP.match(str(o.get("label", "")))
-             and o.get("id") and _SPAWN.search(o["id"])]
-    loose = [o for o in notes if o.get("is_emitter") and "PointLampFactory" in str(o.get("id", ""))
-             and not _SPAWN.search(o["id"]) and (o.get("geometry") or {}).get("center")]
-    paired = {}  # lamp id -> its light: same seed and spawn id, else the nearest loose light inside its footprint
-    for o in lamps:
-        light = lights.get(_SPAWN.search(o["id"]).groups())
-        g = o.get("geometry") or {}
-        if light is None and loose and g.get("center"):
-            near = min(loose, key=lambda L: math.dist(L["geometry"]["center"], g["center"]))
-            reach = 0.75 * max(float(v) for v in (g.get("size_m") or [0.0, 0.0, 0.0])[::2])
-            if math.dist(near["geometry"]["center"], g["center"]) <= reach:
-                light = near
-                loose.remove(near)
-        if light is not None:
-            paired[o["id"]] = light
+    lamps, kinds, paired, orphans = pair_lamp_lights(notes or notes_from_shapes(shapes))
 
     def light_power(light: dict) -> float | None:
         """Emitted power / pi of an importer's light box: radiance x its emitting area."""
@@ -462,31 +545,48 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         kind = shapes[light["id"]].group(1) if light["id"] in shapes else "cube"
         return rad * (sx * sz if kind in ("rectangle", "disk") else 2 * (sx * sz + sx * sy + sy * sz))
 
+    def disk(sid: str, r: float, center, rad: float, note: dict) -> None:
+        """A disk of radius r facing the floor, centred at ``center`` (x, y, z), glowing at ``rad``."""
+        xml.append(f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="{unit_disk_ply()}" />'
+                   f'\n    <transform name="to_world">\n      <scale value="{r:.6f}" />'
+                   f'\n      <rotate x="1" angle="90" />'  # +z (the disk's front) to -y: facing the floor
+                   f'\n      <translate x="{center[0]:.6f}" y="{center[1]:.6f}" z="{center[2]:.6f}" />'
+                   f'\n    </transform>\n    <bsdf type="diffuse" />'
+                   f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
+                   f'\n    </emitter>\n  </shape>')
+        xml.append(f'\n  <!--opticalnav-obj:{json.dumps(note)}-->')
+        added.append(sid)
+
     power: dict[str, list[float]] = {}
     for o in lamps:  # the scene's own lamp lights, per kind
         light = paired.get(o["id"])
         if light is not None and light_power(light) is not None:
-            power.setdefault(_LAMP.match(o["label"]).group(1), []).append(light_power(light))
+            power.setdefault(kinds[o["id"]], []).append(light_power(light))
     every = [p for ps in power.values() for p in ps]
     default = float(np.mean(every)) if every else 2.0 * 0.912
     edits, added, xml, gone = [], [], [], []
     for o in lamps:
-        kind = _LAMP.match(o["label"]).group(1)
+        kind = kinds[o["id"]]
         light = paired.get(o["id"])
         if light is not None and not (lit and mesh_info is not None and light["id"] in shapes):
             continue
-        ceiling = "Ceiling" in kind or "Chandelier" in kind
         parts = [m for sid, m in shapes.items() if sid == o["id"] or sid.startswith(o["id"] + "__part_")]
         shades = [m for m in parts if "conductor" not in m.group(3) and "<emitter" not in m.group(3)]
+        g = o.get("geometry") or {}
+        sx, sy, sz = (float(v) for v in g.get("size_m") or [0.2, 0.5, 0.2])
+        if kind == FIXTURE:  # found by position: what glows follows from its parts and its shape
+            kind = "Pendant" if not shades else "Ceiling" if sy < 0.5 * max(sx, sz) else FIXTURE
+        ceiling = "Ceiling" in kind or "Chandelier" in kind
         info = {}
         for m in shades:
             found = re.search(r'<string name="filename" value="([^"]+)"', m.group(3))
             if mesh_info is not None and found:
                 with contextlib.suppress(Exception):
                     info[m.group(2)] = tuple(float(v) for v in mesh_info(m.group(1), found.group(1)))
-        height = float(((o.get("geometry") or {}).get("size_m") or [0, 0.5, 0])[1])
-        if light is not None and ceiling:  # a ceiling light's fixture glows whole
+        height = sy
+        if light is not None and ceiling:  # a ceiling light's fixture glows whole, or its named diffuser
             shades = [m for m in shades if m.group(2) in info]
+            shades = [m for m in shades if _GLOWING_PART.search(m.group(2)[len(o["id"]):])] or shades
         elif "Pendant" in kind:  # the dome's opening glows (see above), else the bulb
             dome = None
             for m in parts:
@@ -500,34 +600,25 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                 own = light_power(light) if light is not None else None
                 rad = (own if own is not None else float(np.mean(power.get(kind) or [default]))) / (math.pi * r * r)
                 sid = f"{o['id']}__glow"
-                xml.append(f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="{unit_disk_ply()}" />'
-                           f'\n    <transform name="to_world">\n      <scale value="{r:.6f}" />'
-                           f'\n      <rotate x="1" angle="90" />'  # +z (the disk's front) to -y: facing the floor
-                           f'\n      <translate x="{(lo[0] + hi[0]) / 2:.6f}" y="{lo[1]:.6f}" z="{(lo[2] + hi[2]) / 2:.6f}" />'
-                           f'\n    </transform>\n    <bsdf type="diffuse" />'
-                           f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
-                           f'\n    </emitter>\n  </shape>')
-                note = {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
-                        "emitter_intensity": 1.0, "emitter_shape": "lamp_opening",
-                        "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
-                        "metadata": {"lamp": o["id"], "glowing_area_m2": round(math.pi * r * r, 4),
-                                     "replaces": (light or {}).get("id"), "added_by": "opticalnav_sim lamp_lights_text"},
-                        "geometry": o.get("geometry")}
-                xml.append(f'\n  <!--opticalnav-obj:{json.dumps(note)}-->')
-                added.append(sid)
+                disk(sid, r, ((lo[0] + hi[0]) / 2, lo[1], (lo[2] + hi[2]) / 2), rad,
+                     {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+                      "emitter_intensity": 1.0, "emitter_shape": "lamp_opening",
+                      "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
+                      "metadata": {"lamp": o["id"], "glowing_area_m2": round(math.pi * r * r, 4),
+                                   "replaces": (light or {}).get("id"), "added_by": "opticalnav_sim lamp_lights_text"},
+                      "geometry": o.get("geometry")})
                 if light is not None:
                     gone.append(light["id"])
                 continue
             shades = sorted((m for m in shades if m.group(2) in info), key=lambda m: info[m.group(2)][1])[:1]
         elif len(shades) > 1 or light is not None:  # the shade: the highest bottom, a quarter of the lamp up at least
+            whole = [m for m in shades if m.group(2) in info] if kinds[o["id"]] == FIXTURE and len(shades) == 1 else []
             shades = sorted((m for m in shades if m.group(2) in info and info[m.group(2)][1] > 0.25 * height),
-                            key=lambda m: info[m.group(2)][1])[-1:]
+                            key=lambda m: info[m.group(2)][1])[-1:] or whole  # a fixture of one part: all of it
         if not shades or (light is None and len(shades) != 1):  # no telling which part glows: as it was
             continue
         area = sum(info.get(m.group(2), (0.0, 0.0))[0] for m in shades)
         if not area:  # a cylinder of the lamp's width, a third of its height, both sides
-            g = o.get("geometry") or {}
-            sx, sy, sz = (float(v) for v in g.get("size_m") or [0.2, 0.5, 0.2])
             area = 2 * math.pi * 0.5 * min(sx, sz) * sy / 3 * 2
         own = light_power(light) if light is not None else None
         rad = (own if own is not None else float(np.mean(power.get(kind) or [default]))) / max(area, 1e-4)
@@ -545,11 +636,38 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
             added.append(sid)
         if light is not None:
             gone.append(light["id"])
+    for light in orphans if lit else ():  # a light by no fixture: a round downlight where its square hung
+        m = shapes.get(light["id"])
+        own = light_power(light)
+        if m is None or own is None:
+            continue
+        at = re.search(r'<translate x="([-\d.e]+)" y="([-\d.e]+)" z="([-\d.e]+)"', m.group(3))
+        g = light.get("geometry") or {}
+        size = [float(v) for v in g.get("size_m") or [0.6, 0.08, 0.6]]
+        if at:
+            center = [float(v) for v in at.groups()]
+            center[1] -= size[1] / 2 if m.group(1) == "cube" else 0.0  # a box's bottom face
+        elif g.get("center"):
+            center = [float(g["center"][0]), float(g.get("base_height_m") or 0.0), float(g["center"][1])]
+        else:
+            continue
+        r = ORPHAN_DOWNLIGHT_R
+        rad = own / (math.pi * r * r)
+        sid = f"{light['id']}__downlight"
+        disk(sid, r, center, rad,
+             {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+              "emitter_intensity": 1.0, "emitter_shape": "downlight",
+              "label": f"light:fixture:CeilingDownlight:{light.get('label', light['id'])}",
+              "metadata": {"glowing_area_m2": round(math.pi * r * r, 4), "replaces": light["id"],
+                           "added_by": "opticalnav_sim lamp_lights_text (a light by no fixture)"},
+              "geometry": g})
+        gone.append(light["id"])
     for at, emitter in sorted(edits, reverse=True):  # from the end, so earlier offsets hold
         text = text[:at] + emitter + text[at:]
     for lid in gone:  # the replaced boxes, and their notes (light_groups / light_classes read the notes)
         text = re.sub(rf'\n  <shape type="[a-z_]+" id="{re.escape(lid)}">.*?\n  </shape>', "", text, count=1, flags=re.S)
-        text = text.replace(f"<!--opticalnav-obj:{raw[lid]}-->", "", 1)
+        if lid in raw:
+            text = text.replace(f"<!--opticalnav-obj:{raw[lid]}-->", "", 1)
     if xml:
         end = text.rindex("</scene>")
         text = text[:end] + "".join(xml) + "\n" + text[end:]
@@ -896,12 +1014,13 @@ class Resident:
 
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
-                 pool: dict | None = None, upgrade_flash: bool = False):
+                 pool: dict | None = None, upgrade_flash: bool = False, hidden: str = ""):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
         started = time.time()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
+        self.hidden = hidden  # shape id prefix camera rays pass through (path_nocaustics "hidden"; FILL_PREFIX)
         self.upgraded_flash = False  # an old one-pass flash rendered as the current protocol (upgrade_flash_text)
         if flash is not None and flash.get("synthetic") and flash_xml is None:
             # a scene packed without an active variant: the dataset's flash added, rendered as the current protocol
@@ -918,7 +1037,8 @@ class Resident:
 
         def mesh_bounds(kind: str, body: str):
             """A part's world bounding box: the shape loaded alone with its transform (as shape_vertices does)."""
-            body = re.sub(r'<ref\b[^>]*/>|<bsdf\b.*?</bsdf>|<bsdf\b[^>]*/>|<emitter\b.*?</emitter>', "", body, flags=re.S)
+            # the material and light out (a BSDF nests: twosided around roughconductor, so first <bsdf to last </bsdf>)
+            body = re.sub(r'<ref\b[^>]*/>|<bsdf\b.*</bsdf>|<bsdf\b[^>]*/>|<emitter\b.*?</emitter>', "", body, flags=re.S)
             body = re.sub(r'(<string name="filename" value=")(?!/)', rf'\g<1>{base_dir}/', body)
             box = mi.load_string(f'<shape version="3.0.0" type="{kind}">{body}<bsdf type="diffuse"/></shape>').bbox()
             return [float(v) for v in dr.ravel(box.min)], [float(v) for v in dr.ravel(box.max)]
@@ -1077,7 +1197,8 @@ class Resident:
         """path_nocaustics in an assist mode (or, for "own", as plain path: caustics kept, every emitter),
         with ``sky`` (default: daylight's near-infrared share) on the sky seen by a dual render's
         near-infrared slot. Without bandscale lights, "own" is the scene's own integrator (None)."""
-        if name == "own" and not self.band_keys and not self.max_depth and not self.rr_depth and self.caustics:
+        if name == "own" and not self.band_keys and not self.max_depth and not self.rr_depth and self.caustics \
+                and not self.hidden:
             return None
         sky = self.sky_nir if sky is None else float(sky)
         # the flash's near-specular cut (Look.flash_pdf); split cuts the flash's paths with it too
@@ -1099,6 +1220,8 @@ class Resident:
                          "assist_mode": "exclude" if name == "passive" else "only",
                          "caustics": name == "passive" and self.caustics}
             inner["sky_nir"] = sky
+            if self.hidden:
+                inner["hidden"] = self.hidden
             if self.rr_depth:
                 inner["rr_depth"] = int(self.rr_depth)
             if pdf is not None:
@@ -1849,6 +1972,8 @@ class Renderer:
         # path_nocaustics's "split" mode: an active frame on one path (an older plugin has none: two paths)
         self.has_split = self.has_nocaustics and self._has_plugin({"type": "path_nocaustics", "assist": ASSIST_PREFIX,
                                                                     "assist_mode": "split"})
+        # path_nocaustics's "hidden": the room softboxes stay out of the camera's view (an older plugin: they show)
+        self.has_hidden = self.has_nocaustics and self._has_plugin({"type": "path_nocaustics", "hidden": FILL_PREFIX})
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
         self.preloading: list[list[str]] = []  # [scan, variant, mode] of --preload loads not done yet (main)
         # environment maps a view may ask for by name (file stem): <pack>/envmaps unless --envmaps says otherwise
@@ -1995,7 +2120,8 @@ class Renderer:
             loaded = Resident(self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
                               flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
                               envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
-                              pool=self.pool(scan), upgrade_flash=self.has_nocaustics)
+                              pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
+                              hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "")
         self.cache[rkey] = loaded
         return loaded
 

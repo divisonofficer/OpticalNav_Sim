@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import os
 import sys
 import threading
@@ -607,19 +608,80 @@ def test_hand_built_lamps_pair_with_their_lights_by_position():
     lowest = {"cord": 0.25, "bulb": 0.0}  # the cord hangs above the dome, the bulb inside it
     info = lambda kind, f: (0.02, lowest[f.split("_")[-1][:-4]])  # noqa: E731
     out, added = server.lamp_lights_text(text, mesh_info=info)  # no bounds: the bulb, not the cord or the dome
-    assert added == [lamp + "__part_002_bulb"]
+    assert added == [lamp + "__part_002_bulb", "light_2_PointLampFactory_added_.spawn_asset_0__downlight"]
     assert 'id="light_1_PointLampFactory_pendant_.spawn_asset_3"' not in out  # its box is gone
-    assert 'id="light_2_PointLampFactory_added_.spawn_asset_0"' in out  # a light by no lamp stays
+    # a light by no lamp: a round downlight where its square hung, at the square's power
+    assert 'id="light_2_PointLampFactory_added_.spawn_asset_0"' not in out
+    assert 'id="light_2_PointLampFactory_added_.spawn_asset_0__downlight"' in out
     # with the dome's world box: a disk across its opening glows, facing down, with the box's power
     dome = ([3.8, 1.8, 0.8], [4.2, 2.0, 1.2])
     out, added = server.lamp_lights_text(text, mesh_info=info, mesh_bounds=lambda kind, body: dome)
-    assert added == [lamp + "__glow"] and 'id="light_1_PointLampFactory_pendant_.spawn_asset_3"' not in out
+    assert added == [lamp + "__glow", "light_2_PointLampFactory_added_.spawn_asset_0__downlight"] and 'id="light_1_PointLampFactory_pendant_.spawn_asset_3"' not in out
     disk = out.split(f'<shape type="ply" id="{lamp}__glow">')[1].split("</shape>")[0]
     assert '<rotate x="1" angle="90" />' in disk and 'y="1.800000"' in disk and 'x="4.000000"' in disk
     r = 0.47 * 0.4
     rad = float(disk.split('name="radiance" value="')[1].split()[0])
     assert math.isclose(rad * math.pi * r * r, 10 * 0.912, rel_tol=1e-3)  # the box cube's power (0.912 m2), from the disk
     assert "<emitter" not in out.split(f'id="{lamp}__part_002_bulb">')[1].split("</shape>")[0]
+
+
+def test_fixtures_no_rule_names_pair_with_their_lights_by_position():
+    """A kit's track spot and ceiling fixture: no lamp name, found under their lights; a light by no fixture is a
+    downlight; a scene without notes pairs by ids; nothing stays a square."""
+    def note(obj):
+        return f"\n  <!--opticalnav-obj:{json.dumps(obj)}-->"
+
+    def shape(sid, body, kind="ply"):
+        return f'\n  <shape type="{kind}" id="{sid}">\n    <string name="filename" value="assets/{sid}.ply" />{body}\n  </shape>'
+
+    def light(sid, x, z):
+        return (note({"id": sid, "is_emitter": True, "emitter_radiance": [1, 1, 1], "label": f"light:{sid}",
+                      "geometry": {"center": [x, z], "size_m": [0.6, 0.08, 0.6], "base_height_m": 2.44}})
+                + f'\n  <shape type="rectangle" id="{sid}">\n    <transform name="to_world"><scale x="0.3" y="0.3" />'
+                  f'<rotate x="1" angle="90" /><translate x="{x}" y="2.48" z="{z}" /></transform>'
+                  '<emitter type="area"><rgb name="radiance" value="1 1 1" /></emitter>\n  </shape>')
+
+    plastic, metal = '<bsdf type="pplastic"/>', '<bsdf type="roughconductor"/>'
+    spot, fixture = "TrackSpotFactory_7_.spawn_asset_10", "AboCeilingFixtureFactory_B07Q_.spawn_asset_0"
+    rail, shelf = "TrackRailFactory_7_.spawn_asset_5", "ShelfFactory_7_.spawn_asset_1"
+    text = ("<scene>"
+            + note({"id": spot, "label": "TrackSpotFactory(7).spawn_asset(10)",
+                    "geometry": {"center": [1.0, 1.0], "size_m": [0.08, 0.15, 0.08], "base_height_m": 2.69}})
+            + shape(spot, metal)
+            + note({"id": rail, "label": "TrackRailFactory(7).spawn_asset(5)",
+                    "geometry": {"center": [3.0, 1.0], "size_m": [8.0, 0.04, 0.04], "base_height_m": 2.69}})
+            + shape(rail, metal)
+            + note({"id": fixture, "label": "AboCeilingFixtureFactory(B07Q).spawn_asset(0)",
+                    "geometry": {"center": [5.0, 3.0], "size_m": [0.62, 0.05, 0.62], "base_height_m": 2.85}})
+            + shape(fixture, plastic) + shape(fixture + "__part_001_ir_led_panel_2", plastic)
+            + note({"id": shelf, "label": "ShelfFactory(7).spawn_asset(1)",  # under a light, but on the floor
+                    "geometry": {"center": [8.0, 8.0], "size_m": [1.0, 1.8, 0.4], "base_height_m": 0.0}})
+            + shape(shelf, plastic)
+            + light("light_1_PointLampFactory_track_.spawn_asset_10_4", 1.0, 1.0)
+            + light("light_2_PointLampFactory_added_.spawn_asset_0", 5.0, 3.0)
+            + light("light_3_PointLampFactory_kit_.spawn_asset_svc0", 8.0, 8.0) + "\n</scene>")
+    notes = [json.loads(n) for n in re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", text)]
+    _, kinds, paired, orphans = server.pair_lamp_lights(notes)
+    assert {k: v["id"][:7] for k, v in paired.items()} == {spot: "light_1", fixture: "light_2"}  # the spot, not the rail
+    assert kinds[spot] == kinds[fixture] == server.FIXTURE and [o["id"][:7] for o in orphans] == ["light_3"]
+    can = ([0.96, 2.54, 0.96], [1.04, 2.69, 1.04])
+    out, added = server.lamp_lights_text(text, mesh_info=lambda kind, f: (0.3, 0.0), mesh_bounds=lambda kind, body: can)
+    assert sorted(added) == sorted([spot + "__glow", fixture + "__part_001_ir_led_panel_2",
+                                    "light_3_PointLampFactory_kit_.spawn_asset_svc0__downlight"])
+    assert not re.search(r'<shape type="(rectangle|cube)" id="light_', out)  # no square left
+    glow = out.split(f'id="{spot}__glow">')[1].split("</shape>")[0]  # across the can's opening, facing down
+    assert 'y="2.540000"' in glow and '<rotate x="1" angle="90" />' in glow
+    down = out.split('id="light_3_PointLampFactory_kit_.spawn_asset_svc0__downlight">')[1].split("</shape>")[0]
+    r = server.ORPHAN_DOWNLIGHT_R
+    rad = float(down.split('name="radiance" value="')[1].split()[0])
+    assert 'y="2.480000"' in down and math.isclose(rad * math.pi * r * r, 0.36, rel_tol=1e-3)  # the square's power
+    assert "<emitter" not in out.split(f'id="{fixture}">')[1].split("</shape>")[0]  # the panel glows, not the body
+    # the oldest packs have no notes: lamps and lights pair by their seed and spawn ids
+    desk = "DeskLampFactory_7_.spawn_asset_10"
+    bare = re.sub(r"\n  <!--opticalnav-obj:.*?-->", "", light("light_1_PointLampFactory_7_.spawn_asset_10", 1.0, 1.0))
+    out, added = server.lamp_lights_text("<scene>" + shape(desk, plastic) + bare + "\n</scene>",
+                                         mesh_info=lambda kind, f: (0.3, 0.2))  # its shade: up from the desk
+    assert added == [desk] and 'id="light_1_' not in out and "<emitter" in out.split(f'id="{desk}">')[1]
 
 
 def test_viewer_mean_holds_back_fireflies():

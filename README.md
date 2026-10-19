@@ -189,7 +189,14 @@ Offsets are `[right, up, forward]` in the observer's level frame, so a pitched c
 **Lamps glow from the lamp.** robomituba's importer turns each Infinigen lamp light into a flat 0.6 × 0.08 × 0.6 m box at a desk or floor lamp's top, or into a 0.6 m square under a ceiling light. The server now moves each light's power (radiance × emitting area) onto the lamp's own glowing part when it loads the scene:
 
 * desk and floor lamps: the shade;
-* ceiling lights: every non-metal part.
+* ceiling lights: every non-metal part, or only the part named as the diffuser (`led`, `panel`, ...);
+* pendants and spots with a metal housing: a disk across the opening, facing down.
+
+A light is paired with its lamp by name (the lamp's factory seed and spawn id, or the nearest light of a hand-built kit named by role), then by position, whatever the lamp is called. In the second pass, a light still alone takes the nearest asset whose footprint holds it (10 cm to spare) and that sits within 0.6 m of it vertically: a kit's track spot or ceiling fixture. A light with no fixture at all becomes a round downlight (r 0.1 m) at the square's power. Scene files without `opticalnav-obj` notes pair by shape ids. So no light stays a square: the G cafe went from 26 squares to none, the P cafe from 3, and an old v0.2 apartment from 11.
+
+`tools/light_audit.py --pack <pack>` prints, for each scene, the lights paired by name, by position, and the orphans (lights with no fixture: `--strict` exits 1). `tools/build_pack.py` prints the same line for every scene it builds, so a new kit whose lights no rule matches shows up at import time, not as squares in the viewer.
+
+**Softboxes stay out of view.** The room softboxes (`light_softbox_*`, group `fill`) light the room, but camera rays pass through them: `path_nocaustics`'s `hidden` id prefix (`server.FILL_PREFIX`), as a Blender light with camera visibility off. The raster preview leaves their triangles out too. Reflections still show them. A Mitsuba build whose plugin lacks `hidden` shows them as before.
 
 The lit parts stay in the scene's lights (group `fixture`, same light class), so lighting modes darken them rather than removing them. `OPTICALNAV_BOX_LIGHTS=1` keeps the boxes. Lamps left dark ("꺼진 램프", `setLamps`) glow the same way, at the power of the scene's own lamp lights.
 

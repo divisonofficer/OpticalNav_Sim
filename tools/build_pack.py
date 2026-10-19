@@ -34,6 +34,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from opticalnav_sim import frames  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import light_audit  # noqa: E402
 
 FILENAME_RE = re.compile(r'(<string name="filename" value=")([^"]+)(")')
 POINTER_DIRS = {"base": "observations", "perturbed": "observations_perturbed",
@@ -514,6 +516,8 @@ def main() -> int:
                 build_scene(scene, project, repo_root, out, args.link)
             if args.share_bsdfs and not args.tasks_only:
                 print(f"[share] {scene}: {json.dumps(share_bsdfs(out / 'scenes' / scene))}", flush=True)
+            if not args.tasks_only and (out / "scenes" / scene / "base.xml").is_file():  # lights by no fixture
+                print(light_audit.line(light_audit.audit_scene(out / "scenes" / scene)), flush=True)
         except Exception as exc:  # noqa: BLE001 - one broken scene must not sink the pack
             failed.append(scene)
             print(f"[skip] {scene}: {type(exc).__name__}: {exc}", flush=True)

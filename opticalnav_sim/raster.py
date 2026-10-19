@@ -5,7 +5,8 @@ Everything comes from the scene in GPU memory (DLPack), never from the scene fil
 lifted by Resident._write_look), the pool's mirrors, the lamps' glowing parts and the light levels of the Look
 are the ones the path tracer sees.
 
-* Geometry: every mesh but the camera-assist shapes and null BSDFs, one vertex and one triangle buffer; glass
+* Geometry: every mesh but the camera-assist shapes, null BSDFs and the shapes the camera sees through (the room
+  softboxes: Resident.hidden, lights only), one vertex and one triangle buffer; glass
   (``dielectric``) is drawn as a second, see-through layer.
 * Materials: per BSDF, up to two leaves (``blendbsdf`` and its weight; ``twosided``, ``normalmap`` and other
   wrappers are looked through; ``normalmap`` is applied). A leaf is plastic or diffuse (its base colour under a
@@ -456,6 +457,11 @@ class RasterScene:
         self.attr = torch.cat([torch.cat(normals), torch.cat(uvs)], dim=1).contiguous()  # normal, uv
         tris, tri_shape = torch.cat(tris).to(torch.int32), torch.cat(tri_shape)
         glass = self.m_glass[self.shape_mat[tri_shape.long()]]
+        # shapes the camera sees through (the room softboxes, Resident.hidden): lights, never drawn
+        prefix = getattr(self.resident, "hidden", "")
+        unseen = torch.as_tensor([bool(prefix) and sid.startswith(prefix) for sid in self.shape_ids], device=dev)
+        drawn = ~unseen[tri_shape.long()]
+        tris, tri_shape, glass = tris[drawn], tri_shape[drawn], glass[drawn]
         self.tri_o, self.shape_o = tris[~glass].contiguous(), tri_shape[~glass].contiguous()
         self.tri_g, self.shape_g = tris[glass].contiguous(), tri_shape[glass].contiguous()
         self.n_tris, self.n_glass = int(tris.shape[0]), int(self.tri_g.shape[0])
@@ -990,6 +996,8 @@ class RasterScene:
         mvp = proj @ w2c
         clip = (self.pos_h @ mvp.T)[None].contiguous()
         tri_v, shape_v = self._in_view(mvp)
+        if tri_v.shape[0] == 0:  # nothing in view (a mirror facing out of a window): one triangle of no area
+            tri_v, shape_v = self.tri_o[:1, :1].expand(1, 3).contiguous(), self.shape_o[:1]
         rast, rast_db = drt.rasterize(self.ctx, clip, tri_v, (height, width))
         tid = rast[0, :, :, 3].reshape(-1)
         hit = torch.nonzero(tid > 0)[:, 0]
