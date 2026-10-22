@@ -37,13 +37,13 @@ python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504
 ```
 
-**Simulator scenes:** `opticalnav-sim-v1`, 5 staged scenes, 2.5 GB (4.3 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn).
+**Simulator scenes:** `opticalnav-sim-v1`, 11 staged scenes, 5.0 GB (7.2 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn).
 
 * `sim_apt_12644647` and `sim_apt_22572521_vanilla_r2`: apartments.
-* `sim_v2a_floorG_cafe_48400701` (small cafe), `sim_v2a_floorH_cafe_48400801` (large cafe) and `sim_v2a_floorM2_48500101` (market, 1,772 objects): Infinigen 2.0 floors. G and M are snapshots from before their source blends were saved again.
-* All five are base variant only, with spawn points but no navigation graph.
+* Nine Infinigen 2.0 floors: cafes G (small) and H (large), market M (1,772 objects), offices A2, B and C, GP clinic D3, physio clinic F3, warehouse J. G is the r54 version; M is a snapshot of r6.
+* All are base variant only, with spawn points but no navigation graph. The floors' spawn points were checked against renders (`tools/check_spawns.py`).
 * Walls, floors and ceilings are 2048 px; other textures are capped at 512 px, not the dataset's 128. The market's textures on small objects are cut further (`tools/shrink_textures.py`) and its meshes decimated, so it fits a 32 GB GPU.
-* Serve the packs together with a repeated `--pack`. The viewer's scene list shows what the server loaded.
+* Serve the packs together with a repeated `--pack`. The viewer's scene list shows what the server loaded. Fetch one scene with `--scene`.
 
 ```bash
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn --out packs/opticalnav-sim-v1
