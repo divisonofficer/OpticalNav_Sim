@@ -37,9 +37,10 @@ python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504
 ```
 
-**Simulator scenes:** `opticalnav-sim-v1`, 11 staged scenes, 5.0 GB (7.2 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn).
+**Simulator scenes:** `opticalnav-sim-v1`, 12 staged scenes, 5.2 GB (7.5 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn).
 
 * `sim_apt_12644647` and `sim_apt_22572521_vanilla_r2`: apartments.
+* `sim_v2a_cafeP_industrial_47309601`: a single-room industrial cafe.
 * Nine Infinigen 2.0 floors: cafes G (small) and H (large), market M (1,772 objects), offices A2, B and C, GP clinic D3, physio clinic F3, warehouse J. G is the r54 version; M is a snapshot of r6.
 * All are base variant only, with spawn points but no navigation graph. The floors' spawn points were checked against renders (`tools/check_spawns.py`).
 * Walls, floors and ceilings are 2048 px; other textures are capped at 512 px, not the dataset's 128. The market's textures on small objects are cut further (`tools/shrink_textures.py`) and its meshes decimated, so it fits a 32 GB GPU.
