@@ -644,6 +644,15 @@ On `infinigen_apartment_natural_v1_20268504`:
 
 The geometry no longer matches the dataset's reference frames exactly.
 
+**Start poses of graph-less scenes.** `build_pack.py` picks a scene's three spawn points from the authoring map's footprints, which cover the whole floor, so it took a grid corner: against a wall (0.2 to 0.9 m of open space in front), and in `sim_v2a_floorC` and `sim_v2a_floorA2` inside one, where every view was black. `tools/check_spawns.py` renders each candidate point of the three largest traversable regions (the server's raster preview, four headings, depth pass), scores a pose by its least open view (median depth, capped at 5 m) and takes the best one that the path tracer also renders lit:
+
+```bash
+python tools/check_spawns.py --pack packs/opticalnav-sim-v1 --server http://127.0.0.1:18770 \
+    --project <robomituba>/out/opticalnav/opticalnav-sim-v1 --scene SCENE [--apply]
+```
+
+Without `--apply` it prints old and new poses and their openness; with it, `scene.json` gets the new `spawn` (each with `open_m`) and keeps the old under `spawn_before`. On the nine floors the open space in front of the spawn points went from 0.17 to 0.9 m to 1.1 to 4.4 m. Run it once the server serves the pack.
+
 **Shrinking textures of small objects.** The GPU holds every texture as float32, so a scene of thousands of 512 px textures fills it before the BVH is built. `sim_v2a_floorM2_48500101` (a market, 1,772 objects) had 4,275 of them, 15 GB on a 32 GB card: frames took 10 to 112 s, a first mirror render 23 min, and the server died with CUDA out of memory when the raster preview started. `tools/shrink_textures.py` cuts each texture to its largest user's size:
 
 ```bash

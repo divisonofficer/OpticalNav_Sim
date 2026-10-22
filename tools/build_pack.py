@@ -338,9 +338,11 @@ def share_bsdfs(scene_dst: Path) -> dict:
     return stats
 
 
-def spawn_points(scene_dir: Path, eye_height: float, count: int = 3, step: int = 7) -> list[dict]:
-    """Start poses for a graph-less scene: in each of the largest traversable regions, the grid point farthest
-    from every non-structure object's footprint, at camera height, in the connectivity frame (x, -y_dataset, z).
+def spawn_candidates(scene_dir: Path, eye_height: float, count: int = 3, step: int = 7) -> list[list[dict]]:
+    """Start poses for a graph-less scene, per traversable region (the ``count`` largest): grid points ordered by
+    their distance from every non-structure object's footprint (farthest first), at camera height, in the
+    connectivity frame (x, -y_dataset, z). The first of each list is the default spawn (``spawn_points``);
+    tools/check_spawns.py takes the next when a render shows the first inside a wall.
     ponytail: rectangle footprints from the authoring map; a free-space grid would be exact."""
     authoring = json.loads((scene_dir / "authoring_map.json").read_text())
     rooms = sorted((r["geometry"]["bounds"] for r in authoring.get("regions") or []
@@ -360,10 +362,16 @@ def spawn_points(scene_dir: Path, eye_height: float, count: int = 3, step: int =
     out = []
     for x0, y0, x1, y1 in rooms[:count]:
         pts = [(x0 + (x1 - x0) * (i + 0.5) / step, y0 + (y1 - y0) * (j + 0.5) / step) for i in range(step) for j in range(step)]
-        x, y = max(pts, key=lambda p: clearance(*p))
-        out.append({"position": [round(x, 3), round(-y, 3), round(eye_height, 3)], "heading_deg": 0.0,
-                    "clearance_m": round(clearance(x, y), 2)})
+        pts.sort(key=lambda p: -clearance(*p))
+        out.append([{"position": [round(x, 3), round(-y, 3), round(eye_height, 3)], "heading_deg": 0.0,
+                     "clearance_m": round(clearance(x, y), 2)} for x, y in pts])
     return out
+
+
+def spawn_points(scene_dir: Path, eye_height: float, count: int = 3, step: int = 7) -> list[dict]:
+    """The default start poses: in each of the largest traversable regions, the grid point farthest from every
+    non-structure object's footprint (see spawn_candidates)."""
+    return [c[0] for c in spawn_candidates(scene_dir, eye_height, count, step)]
 
 
 def build_staged_scene(scene: str, project: Path, repo_root: Path, out: Path, mode: str) -> dict:
