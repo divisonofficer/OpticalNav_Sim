@@ -2,7 +2,7 @@
 """Decimate the heavy meshes of an already built (and compacted) pack scene, keeping their textures.
 
     source /home/jinnyeong/robomituba-build/mitsuba3/setpath.sh
-    python3.10 tools/decimate_meshes.py --pack packs/opticalnav-v0.2 [--scene SCENE ...] [--ratio R] [--dry-run]
+    python3.10 tools/decimate_meshes.py --pack packs/opticalnav-v0.2 [--scene SCENE ...] [--ratio R] [--min-faces N] [--dry-run]
 
 Needs Mitsuba (mesh I/O), pymeshlab and xatlas (``pip install pymeshlab xatlas``); run
 tools/compact_assets.py first.
@@ -12,7 +12,8 @@ This is the same reduction after the fact, for scenes already built without it:
 
 * Policy: robomituba's ``ir_semantic_lod_v1`` ladder on triangle count (meshes under 50k triangles kept;
   at most 30%, 10% from 250k, 3% from 1M, 1% from 5M; never under 2000 triangles). ``--ratio`` replaces the
-  ladder by one fraction. Shapes behind glass, mirror or metal BSDFs keep at least 60% (Fresnel and
+  ladder by one fraction; ``--min-faces`` moves the 50k line (a market's 277 product meshes of 20-50k hold
+  16 of its 24 M triangles). Shapes behind glass, mirror or metal BSDFs keep at least 60% (Fresnel and
   reflections follow the surface normal), and emitting shapes are left alone.
 * A mesh whose material samples textures through a continuous UV atlas: texture-aware quadric collapse
   (pymeshlab) on the mesh welded by position. UV seams stay seams, so the existing textures still fit.
@@ -395,7 +396,7 @@ def decimate_mesh(job: tuple) -> dict:
             "bytes_after": (scene_dir / new).stat().st_size + sum((scene_dir / t).stat().st_size for t in textures.values())}
 
 
-def plan(scene_dir: Path, fixed: float | None) -> list[tuple[str, float, str, tuple | None]]:
+def plan(scene_dir: Path, fixed: float | None, min_faces: int = MIN_FACES) -> list[tuple[str, float, str, tuple | None]]:
     """(mesh ref, target fraction, role, material (see decimate_mesh)) for each mesh worth reducing."""
     roles: dict[str, str] = {}
     materials: dict[str, set] = {}
@@ -410,7 +411,7 @@ def plan(scene_dir: Path, fixed: float | None) -> list[tuple[str, float, str, tu
         with (scene_dir / ref).open("rb") as fh:  # face count from the PLY header
             found = re.search(r"element face (\d+)", fh.read(1024).decode("latin-1"))
         faces = int(found.group(1)) if found else 0
-        if faces < MIN_FACES:
+        if faces < min_faces:
             continue
         ratio = fixed if fixed is not None else ladder(faces)
         if kind == "optical":
@@ -438,15 +439,17 @@ def rewrite_shape(body: str, mesh: str, row: dict) -> str:
     return body[:start] + ET.tostring(bsdf, encoding="unicode") + body[end:]
 
 
-def decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bool, keep_unused: bool) -> dict:
+def decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bool, keep_unused: bool,
+                   min_faces: int = MIN_FACES) -> dict:
     with scene_lock(scene_dir):  # one writer per scene (compact_assets.scene_lock)
-        return _decimate_scene(scene_dir, jobs, fixed, dry_run, keep_unused)
+        return _decimate_scene(scene_dir, jobs, fixed, dry_run, keep_unused, min_faces)
 
 
-def _decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bool, keep_unused: bool) -> dict:
+def _decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bool, keep_unused: bool,
+                    min_faces: int = MIN_FACES) -> dict:
     started = time.time()
     _mitsuba()
-    todo = plan(scene_dir, fixed)
+    todo = plan(scene_dir, fixed, min_faces)
     rows = []
     with ProcessPoolExecutor(max(1, jobs), mp_context=multiprocessing.get_context("spawn")) as pool:
         for row, (_, _, kind, _) in zip(pool.map(decimate_mesh, [(str(scene_dir), r, q, m) for r, q, _, m in todo]), todo):
@@ -479,7 +482,7 @@ def _decimate_scene(scene_dir: Path, jobs: int, fixed: float | None, dry_run: bo
                     (scene_dir / old).unlink(missing_ok=True)
     reduced = list(done.values())
     summary = {
-        "at": datetime.now(timezone.utc).isoformat(), "policy": f"ratio={fixed}" if fixed else "ir_semantic_lod_v1",
+        "at": datetime.now(timezone.utc).isoformat(), "policy": (f"ratio={fixed}" if fixed else "ir_semantic_lod_v1") + (f", min_faces={min_faces}" if min_faces != MIN_FACES else ""),
         "dry_run": dry_run, "meshes_reduced": len(reduced),
         "by_kind": {k: sum(1 for r in reduced if r["kind"] == k) for k in ("atlas_kept", "rebaked", "untextured")},
         "faces": [sum(r["faces_before"] for r in reduced), sum(r["faces_after"] for r in reduced)],
@@ -507,6 +510,9 @@ def main() -> int:
     ap.add_argument("--pack", required=True, type=Path)
     ap.add_argument("--scene", action="append", default=[], help="scene id (repeatable; default: every scene)")
     ap.add_argument("--ratio", type=float, default=None, help="one retained triangle fraction instead of the ladder")
+    ap.add_argument("--min-faces", type=int, default=MIN_FACES,
+                    help=f"meshes under this many triangles are kept (default {MIN_FACES}; a scene of many mid-size "
+                         "product meshes, like a market, holds most of its triangles below it)")
     ap.add_argument("--jobs", type=int, default=4, help="meshes reduced at once")
     ap.add_argument("--dry-run", action="store_true", help="measure and report, change nothing")
     ap.add_argument("--keep-unused", action="store_true", help="keep the full-resolution files no XML names any more")
@@ -517,7 +523,8 @@ def main() -> int:
     _mitsuba()
     scenes = args.scene or sorted(p.parent.name for p in (args.pack / "scenes").glob("*/scene.json"))
     for scene in scenes:
-        decimate_scene((args.pack / "scenes" / scene).resolve(), args.jobs, args.ratio, args.dry_run, args.keep_unused)
+        decimate_scene((args.pack / "scenes" / scene).resolve(), args.jobs, args.ratio, args.dry_run, args.keep_unused,
+                       args.min_faces)
     return 0
 
 

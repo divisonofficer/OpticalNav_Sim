@@ -196,7 +196,7 @@ A light is paired with its lamp by name (the lamp's factory seed and spawn id, o
 
 `tools/light_audit.py --pack <pack>` prints, for each scene, the lights paired by name, by position, and the orphans (lights with no fixture: `--strict` exits 1). `tools/build_pack.py` prints the same line for every scene it builds, so a new kit whose lights no rule matches shows up at import time, not as squares in the viewer.
 
-**Softboxes stay out of view.** The room softboxes (`light_softbox_*`, group `fill`) light the room, but camera rays pass through them: `path_nocaustics`'s `hidden` id prefix (`server.FILL_PREFIX`), as a Blender light with camera visibility off. The raster preview leaves their triangles out too. Reflections still show them. A Mitsuba build whose plugin lacks `hidden` shows them as before.
+**Softboxes stay out of view.** The room softboxes (`light_softbox_*`, group `fill`) light the room, but camera rays pass through them: `path_nocaustics`'s `hidden` id prefix (`server.FILL_PREFIX`), as a Blender light with camera visibility off. A softbox is only a light, not an object: a bounce ray goes through its back, and shadow rays ignore it, so the ceiling above it is lit like the rest (kept as an object it left a dark blob there). Its front still emits and shows in reflections. The raster preview leaves their triangles out too. A Mitsuba build whose plugin lacks `hidden` shows them as before. The plugin change is `patches/mitsuba-path_nocaustics-hidden.patch` (against Mitsuba 3.9.1's `src/integrators/path_nocaustics.cpp` with the `split` mode; apply it, rebuild `path_nocaustics`). It costs about 10% of a frame (H: 0.35 to 0.39 s).
 
 The lit parts stay in the scene's lights (group `fixture`, same light class), so lighting modes darken them rather than removing them. `OPTICALNAV_BOX_LIGHTS=1` keeps the boxes. Lamps left dark ("꺼진 램프", `setLamps`) glow the same way, at the power of the scene's own lamp lights.
 
@@ -621,11 +621,11 @@ Loading from a network share costs far more than any of this: 116 s instead of 3
 **Decimating a built scene.** robomituba reduces meshes at import (Blender, before the texture bake). Scenes built without that can be reduced afterwards with `tools/decimate_meshes.py`, after compaction. It needs `pip install pymeshlab xatlas`.
 
 ```bash
-python tools/decimate_meshes.py --pack packs/opticalnav-v0.2 --scene SCENE [--ratio R] [--dry-run] [--keep-unused]
+python tools/decimate_meshes.py --pack packs/opticalnav-v0.2 --scene SCENE [--ratio R] [--min-faces N] [--dry-run] [--keep-unused]
 ```
 
 * **Policy.** robomituba's `ir_semantic_lod_v1` ladder:
-  * Meshes under 50k triangles are kept.
+  * Meshes under 50k triangles are kept (`--min-faces` moves the line: a market of product meshes holds most of its triangles between 5k and 50k).
   * Larger meshes keep at most 30% of their triangles, 10% from 250k, 3% from 1M and 1% from 5M.
   * Glass, mirror and metal shapes keep at least 60%; emitters are left alone.
 * **How a mesh is reduced** depends on how its material reads the UVs:
@@ -642,6 +642,14 @@ On `infinigen_apartment_natural_v1_20268504`:
 * Renders match within Monte Carlo noise.
 
 The geometry no longer matches the dataset's reference frames exactly.
+
+**Shrinking textures of small objects.** The GPU holds every texture as float32, so a scene of thousands of 512 px textures fills it before the BVH is built. `sim_v2a_floorM2_48500101` (a market, 1,772 objects) had 4,275 of them, 15 GB on a 32 GB card: frames took 10 to 112 s, a first mirror render 23 min, and the server died with CUDA out of memory when the raster preview started. `tools/shrink_textures.py` cuts each texture to its largest user's size:
+
+```bash
+python tools/shrink_textures.py --pack packs/opticalnav-sim-v1 --scene SCENE [--px-per-m 512] [--min-px 128] [--dry-run]
+```
+
+A texture gets `px-per-m` texels per metre of the longest side of the largest object that uses it, rounded up to a power of two, at least `min-px`, never more than it has. A 0.2 m bottle gets 128 px, a 0.5 m crate 256 px, anything of a metre or more keeps 512, and walls, floors and ceilings (2048 px) are untouched. On the market, 3,548 of 3,886 textures shrank (13.7 to 3.7 GB as float32) and the scene folder went from 1.0 GB to 0.6 GB. Frames then took 0.5 s (from 10 to 112), a mirror render 0.5 s, and the raster preview works (it needs fewer than 2^24 triangles: the market has 24.4 M, 15.1 M after `decimate_meshes.py --min-faces 5000`). Run it after `decimate_meshes.py`; `scene.json` records the run under `texture_shrink`. Rebuild with `build_pack.py` and `compact_assets.py` to get the full-resolution textures back.
 
 The scene tools (compact_assets, decimate_meshes, and the server's compaction on start) take an exclusive lock on `<scene>/.compact.lock`. A second writer skips the scene instead of racing the first one.
 
