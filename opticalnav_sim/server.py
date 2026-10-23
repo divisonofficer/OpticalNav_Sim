@@ -35,7 +35,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -429,6 +429,8 @@ def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[di
     0. By the importer's own tag: a light whose note has ``metadata.fixture_id`` (apps/import_infinigen_scene.py,
        from the fixture mesh whose bounding box holds the light) takes that object. A light tagged ``null`` is
        one the importer found no fixture mesh for (kit_svc, sun, fill, windows): an orphan, whatever lies near.
+       Several lights tagged with one object (the importer merges a track rail or a row of hanging bars into one
+       mesh, so every spot on it names it) stay lights at their own places, as orphans: the mesh does not glow.
        A tag naming no object of the scene falls through to the rules below; a scene without tags only has them.
     1. By name: a lamp whose label names a lamp (_LAMP) takes the light of its factory seed and spawn id, else the
        nearest light with no seed of its own within 0.75 of its width (hand-built kits name lights by role:
@@ -444,13 +446,14 @@ def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[di
     kinds = {o["id"]: _LAMP.match(o["label"]).group(1) for o in lamps}
     paired: dict[str, dict] = {}
     objects = {o["id"]: o for o in notes if not o.get("is_emitter") and o.get("id")}
-    no_fixture = set()  # lights the importer tagged with no fixture
+    no_fixture = set()  # lights that stay where they are: tagged with no fixture, or sharing one with others
+    shared = Counter((L.get("metadata") or {}).get("fixture_id") for L in lights)
     for light in lights:
         md = light.get("metadata") or {}
         if "fixture_id" not in md:
             continue
         fid = md["fixture_id"]
-        if not fid:
+        if not fid or shared[fid] > 1:
             no_fixture.add(light["id"])
         elif fid in objects and fid not in paired:
             paired[fid] = light

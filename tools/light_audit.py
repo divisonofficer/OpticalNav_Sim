@@ -11,7 +11,7 @@ fixture mesh near them, which the server turns into round downlights (ORPHAN_DOW
 the room softboxes, which camera rays pass through (server.FILL_PREFIX, path_nocaustics ``hidden``).
 
 An orphan usually means the importer placed a light by no mesh, or a kit's fixture lies more than 0.1 m
-beside or 0.6 m above or below its light. ``--strict`` exits 1 when a scene has one; tools/build_pack.py
+beside or 0.6 m above or below its light. ``--strict`` exits 1 when a scene has one the importer never looked at (no ``fixture_id`` key: an older blend; a light tagged null, found no fixture mesh by the importer's own pass, is reported but passes); tools/build_pack.py
 prints the same line for every scene it builds.
 """
 from __future__ import annotations
@@ -39,17 +39,26 @@ def audit_scene(scene_dir: Path) -> dict:
     _, kinds, paired, orphans = server.pair_lamp_lights(notes or server.notes_from_shapes(shapes))
     tagged = sorted(k for k, light in paired.items() if (light.get("metadata") or {}).get("fixture_id") == k)
     by_position = sorted(k for k in paired if kinds[k] == server.FIXTURE and k not in tagged)
-    return {"scene": Path(scene_dir).name, "lights": len(paired) + len(orphans),
+    def key(o, name):
+        return (o.get("metadata") or {}).get(name, "absent")
+
+    # an orphan the importer tagged with a fixture shares it with other lights (a merged track): a light at its
+    # own place by design; tagged null, it has no fixture mesh; untagged, nobody looked (an older blend)
+    shared = sorted(o["id"] for o in orphans if key(o, "fixture_id") not in ("absent", None))
+    orphans = [o for o in orphans if o["id"] not in shared]
+    return {"scene": Path(scene_dir).name, "lights": len(paired) + len(orphans) + len(shared), "shared": len(shared),
             "by_tag": len(tagged), "by_name": len(paired) - len(by_position) - len(tagged),
             "by_position": len(by_position),
             "orphans": sorted(o["id"] for o in orphans),
+            "untagged": sorted(o["id"] for o in orphans if key(o, "fixture_id") == "absent"),
             "softboxes": sum(sid.startswith(server.FILL_PREFIX) for sid in shapes)}
 
 
 def line(row: dict) -> str:
     orphans = f" orphans {len(row['orphans'])}: {', '.join(row['orphans'])}" if row["orphans"] else ""
     return (f"[lights] {row['scene']}: {row['lights']} lights, {row['by_tag']} by the importer's tag, {row['by_name']} by "
-            f"name, {row['by_position']} by position; {row['softboxes']} softboxes hidden from the camera{orphans}")
+            f"name, {row['by_position']} by position, "
+            f"{row['shared']} on a fixture shared with other lights; {row['softboxes']} softboxes hidden from the camera{orphans}")
 
 
 def main() -> int:
@@ -64,7 +73,7 @@ def main() -> int:
             if args.scene and scene_dir.name not in args.scene:
                 continue
             row = audit_scene(scene_dir)
-            bad += bool(row["orphans"])
+            bad += bool(row["untagged"])
             print(line(row), flush=True)
     return 1 if args.strict and bad else 0
 

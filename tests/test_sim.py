@@ -707,6 +707,25 @@ def test_lights_tagged_with_their_fixture_by_the_importer_pair_by_the_tag():
     assert [o["id"][:7] for o in orphans] == ["light_2", "light_4"]  # tagged none; untagged, its asset was taken
 
 
+def test_lights_sharing_a_merged_fixture_stay_lights_at_their_own_places():
+    """A track rail merged into one mesh is named by every spot on it: the mesh must not glow, and each light is an
+    orphan (a downlight at its own place); a fixture with one light still pairs."""
+    def light(sid, x, fid):
+        return {"id": sid, "is_emitter": True, "emitter_radiance": [1, 1, 1], "label": f"light:{sid}", "metadata": {"fixture_id": fid},
+                "geometry": {"center": [x, 1.0], "size_m": [0.6, 0.08, 0.6], "base_height_m": 2.44}}
+
+    rail = {"id": "TrackLoopFactory_1_.spawn_asset_0", "label": "TrackLoopFactory(1).spawn_asset(0)",
+            "geometry": {"center": [3.0, 1.0], "size_m": [8.0, 0.04, 0.04], "base_height_m": 2.69}}
+    bar = {"id": "HangingBarsFactory_1_.spawn_asset_1", "label": "HangingBarsFactory(1).spawn_asset(1)",
+           "geometry": {"center": [9.0, 1.0], "size_m": [1.0, 0.04, 0.04], "base_height_m": 2.69}}
+    notes = [rail, bar, light("light_1_PointLampFactory_t_.spawn_asset_0", 1.0, rail["id"]),
+             light("light_2_PointLampFactory_t_.spawn_asset_1", 3.0, rail["id"]),
+             light("light_3_PointLampFactory_h_.spawn_asset_2", 9.0, bar["id"])]
+    _, _, paired, orphans = server.pair_lamp_lights(notes)
+    assert list(paired) == [bar["id"]]  # the one-light fixture pairs
+    assert [o["id"][:7] for o in orphans] == ["light_1", "light_2"]  # the rail's spots stay where they are
+
+
 def test_viewer_mean_holds_back_fireflies():
     from opticalnav_sim import gui
 
