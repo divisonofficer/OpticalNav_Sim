@@ -374,6 +374,40 @@ def spawn_points(scene_dir: Path, eye_height: float, count: int = 3, step: int =
     return [c[0] for c in spawn_candidates(scene_dir, eye_height, count, step)]
 
 
+def tag_fixtures(base_xml: Path, authoring_map: Path) -> int:
+    """Copy ``metadata.fixture_id`` of the authoring map's lights into the scene file's opticalnav-obj notes.
+    apps/import_infinigen_scene.py tags each light with the fixture mesh that holds it, but robomituba's scene
+    file writer leaves the note's metadata out, and the server reads only the scene file. Returns the number of
+    notes tagged; a map without tags (an older blend) changes nothing."""
+    if not authoring_map.is_file():
+        return 0
+    tags = {o["id"]: o["metadata"]["fixture_id"] for o in json.loads(authoring_map.read_text()).get("objects") or []
+            if o.get("is_emitter") and "fixture_id" in (o.get("metadata") or {})}
+    if not tags:
+        return 0
+    count = 0
+
+    def note(m):
+        nonlocal count
+        try:
+            obj = json.loads(m.group(1))
+        except ValueError:
+            return m.group(0)
+        if obj.get("id") not in tags:
+            return m.group(0)
+        obj["metadata"] = {**(obj.get("metadata") or {}), "fixture_id": tags[obj["id"]]}
+        count += 1
+        return f"<!--opticalnav-obj:{json.dumps(obj)}-->"
+
+    text = base_xml.read_text()
+    new = re.sub(r"<!--opticalnav-obj:(\{.*?\})-->", note, text)
+    if new != text:
+        tmp = base_xml.with_name(f"_{base_xml.name}.tmp")
+        tmp.write_text(new)
+        os.replace(tmp, base_xml)
+    return count
+
+
 def build_staged_scene(scene: str, project: Path, repo_root: Path, out: Path, mode: str) -> dict:
     """A scene staged without rendering (robomituba apps/stage_sim_scene.py writes sim_stage.json): base
     variant only, no graph, episodes or reference frames. Mirrors come from tools/build_perturbation_pool.py."""
@@ -383,6 +417,9 @@ def build_staged_scene(scene: str, project: Path, repo_root: Path, out: Path, mo
     dst = out / "scenes" / scene
     dst.mkdir(parents=True, exist_ok=True)
     refs = rewrite_xml(src, dst / "base.xml", repo_root, dst / "assets", mode)
+    tagged = tag_fixtures(dst / "base.xml", scene_dir / "authoring_map.json")
+    if tagged:
+        print(f"[tags] {scene}: {tagged} lights carry the importer's fixture_id", flush=True)
     if '<bsdf type="measured_polarized' in (dst / "base.xml").read_text():
         raise ValueError(f"{scene}: measured_polarized BSDF in a staged simulator scene")
     camera, mount = DEFAULT_CAMERA, DEFAULT_CAMERA["extras"]["robot_mount"]

@@ -726,6 +726,29 @@ def test_lights_sharing_a_merged_fixture_stay_lights_at_their_own_places():
     assert [o["id"][:7] for o in orphans] == ["light_1", "light_2"]  # the rail's spots stay where they are
 
 
+def test_build_pack_copies_the_importers_fixture_tags_into_the_scene_notes(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import build_pack
+
+    def note(obj):
+        return f"\n  <!--opticalnav-obj:{json.dumps(obj)}-->"
+
+    xml = tmp_path / "base.xml"
+    xml.write_text("<scene>" + note({"id": "light_1", "is_emitter": True}) + note({"id": "light_2", "is_emitter": True})
+                   + note({"id": "Chair", "is_emitter": False}) + "\n</scene>")
+    amap = tmp_path / "authoring_map.json"
+    amap.write_text(json.dumps({"objects": [
+        {"id": "light_1", "is_emitter": True, "metadata": {"fixture_id": "Strip_0", "other": 1}},
+        {"id": "light_2", "is_emitter": True, "metadata": {"fixture_id": None}},  # tagged: no fixture mesh
+        {"id": "Chair", "is_emitter": False, "metadata": {"fixture_id": "x"}}]}))
+    assert build_pack.tag_fixtures(xml, amap) == 2
+    notes = {n["id"]: n for n in map(json.loads, re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", xml.read_text()))}
+    assert notes["light_1"]["metadata"] == {"fixture_id": "Strip_0"} and notes["light_2"]["metadata"] == {"fixture_id": None}
+    assert "metadata" not in notes["Chair"]  # only lights are tagged
+    amap.write_text(json.dumps({"objects": [{"id": "light_1", "is_emitter": True, "metadata": {}}]}))  # an older blend
+    assert build_pack.tag_fixtures(xml, amap) == 0
+
+
 def test_viewer_mean_holds_back_fireflies():
     from opticalnav_sim import gui
 
