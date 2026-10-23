@@ -684,6 +684,29 @@ def test_fixtures_no_rule_names_pair_with_their_lights_by_position():
     assert added == [desk] and 'id="light_1_' not in out and "<emitter" in out.split(f'id="{desk}">')[1]
 
 
+def test_lights_tagged_with_their_fixture_by_the_importer_pair_by_the_tag():
+    """metadata.fixture_id names the fixture whatever it is called; null says the importer found none, so nothing
+    near it is taken; an unknown id falls through to the name and position rules."""
+    def light(sid, x, z, **md):
+        return {"id": sid, "is_emitter": True, "emitter_radiance": [1, 1, 1], "label": f"light:{sid}",
+                "metadata": md, "geometry": {"center": [x, z], "size_m": [0.6, 0.08, 0.6], "base_height_m": 2.44}}
+
+    def asset(sid, x, z):
+        return {"id": sid, "label": f"{sid}Factory(1).spawn_asset(0)",
+                "geometry": {"center": [x, z], "size_m": [0.3, 0.3, 0.3], "base_height_m": 2.5}}
+
+    far, near = asset("BeamBarFactory_1_.spawn_asset_0", 20.0, 20.0), asset("StripFactory_1_.spawn_asset_1", 1.0, 1.0)
+    notes = [far, near,
+             light("light_1_PointLampFactory_a_.spawn_asset_0", 1.0, 1.0, fixture_id=far["id"]),  # tag beats position
+             light("light_2_PointLampFactory_b_.spawn_asset_1", 1.0, 1.0, fixture_id=None),  # none: stays an orphan
+             light("light_3_PointLampFactory_c_.spawn_asset_2", 1.0, 1.0, fixture_id="NoSuchObject"),
+             light("light_4_PointLampFactory_d_.spawn_asset_3", 1.0, 1.0)]  # untagged (an older blend)
+    lamps, kinds, paired, orphans = server.pair_lamp_lights(notes)
+    assert paired[far["id"]]["id"].startswith("light_1") and kinds[far["id"]] == server.FIXTURE
+    assert paired[near["id"]]["id"].startswith("light_3")  # the unknown tag fell to position, nearest first
+    assert [o["id"][:7] for o in orphans] == ["light_2", "light_4"]  # tagged none; untagged, its asset was taken
+
+
 def test_viewer_mean_holds_back_fireflies():
     from opticalnav_sim import gui
 

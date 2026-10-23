@@ -6,7 +6,7 @@
 robomituba's importer turns every Infinigen light into a box (a 0.6 m square under a ceiling light, a flat
 cube on a desk lamp); the server's lamp_lights_text moves each box's power onto the lamp it belongs to
 (server.pair_lamp_lights: by name, then by position). Per scene this prints how many lights paired by name,
-how many by position (a fixture whose name no rule knows: a new kit's), and the orphans: lights with no
+how many by the importer's own tag (``metadata.fixture_id``), how many by position (a fixture whose name no rule knows: a new kit's), and the orphans: lights with no
 fixture mesh near them, which the server turns into round downlights (ORPHAN_DOWNLIGHT_R). It also counts
 the room softboxes, which camera rays pass through (server.FILL_PREFIX, path_nocaustics ``hidden``).
 
@@ -37,17 +37,19 @@ def audit_scene(scene_dir: Path) -> dict:
             continue
     shapes = {m.group(2): m for m in re.finditer(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>', text, re.S)}
     _, kinds, paired, orphans = server.pair_lamp_lights(notes or server.notes_from_shapes(shapes))
-    by_position = sorted(k for k in paired if kinds[k] == server.FIXTURE)
+    tagged = sorted(k for k, light in paired.items() if (light.get("metadata") or {}).get("fixture_id") == k)
+    by_position = sorted(k for k in paired if kinds[k] == server.FIXTURE and k not in tagged)
     return {"scene": Path(scene_dir).name, "lights": len(paired) + len(orphans),
-            "by_name": len(paired) - len(by_position), "by_position": len(by_position),
+            "by_tag": len(tagged), "by_name": len(paired) - len(by_position) - len(tagged),
+            "by_position": len(by_position),
             "orphans": sorted(o["id"] for o in orphans),
             "softboxes": sum(sid.startswith(server.FILL_PREFIX) for sid in shapes)}
 
 
 def line(row: dict) -> str:
     orphans = f" orphans {len(row['orphans'])}: {', '.join(row['orphans'])}" if row["orphans"] else ""
-    return (f"[lights] {row['scene']}: {row['lights']} lights, {row['by_name']} by name, {row['by_position']} by "
-            f"position; {row['softboxes']} softboxes hidden from the camera{orphans}")
+    return (f"[lights] {row['scene']}: {row['lights']} lights, {row['by_tag']} by the importer's tag, {row['by_name']} by "
+            f"name, {row['by_position']} by position; {row['softboxes']} softboxes hidden from the camera{orphans}")
 
 
 def main() -> int:

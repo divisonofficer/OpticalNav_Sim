@@ -426,6 +426,10 @@ def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[di
     """The importer's light boxes (``PointLampFactory`` ids, a 0.6 m square or flat cube each) and the lamps that
     glow with them: (lamps, lamp id -> kind, lamp id -> its light, the lights left with no fixture).
 
+    0. By the importer's own tag: a light whose note has ``metadata.fixture_id`` (apps/import_infinigen_scene.py,
+       from the fixture mesh whose bounding box holds the light) takes that object. A light tagged ``null`` is
+       one the importer found no fixture mesh for (kit_svc, sun, fill, windows): an orphan, whatever lies near.
+       A tag naming no object of the scene falls through to the rules below; a scene without tags only has them.
     1. By name: a lamp whose label names a lamp (_LAMP) takes the light of its factory seed and spawn id, else the
        nearest light with no seed of its own within 0.75 of its width (hand-built kits name lights by role:
        ``PointLampFactory_pendant_.spawn_asset_3``). A named lamp with no light stays a lamp (a dark one).
@@ -439,9 +443,30 @@ def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[di
     lamps = [o for o in notes if not o.get("is_emitter") and o.get("id") and _LAMP.match(str(o.get("label", "")))]
     kinds = {o["id"]: _LAMP.match(o["label"]).group(1) for o in lamps}
     paired: dict[str, dict] = {}
+    objects = {o["id"]: o for o in notes if not o.get("is_emitter") and o.get("id")}
+    no_fixture = set()  # lights the importer tagged with no fixture
+    for light in lights:
+        md = light.get("metadata") or {}
+        if "fixture_id" not in md:
+            continue
+        fid = md["fixture_id"]
+        if not fid:
+            no_fixture.add(light["id"])
+        elif fid in objects and fid not in paired:
+            paired[fid] = light
+            if fid not in kinds:
+                lamps.append(objects[fid])
+                kinds[fid] = _LAMP.match(str(objects[fid].get("label", ""))).group(1) \
+                    if _LAMP.match(str(objects[fid].get("label", ""))) else FIXTURE
+    tagged = {L["id"] for L in paired.values()}
+    loose = [o for o in loose if o["id"] not in tagged]
     for o in lamps:
+        if o["id"] in paired:
+            continue
         spawn = _SPAWN.search(o["id"])
         light = keyed.get(spawn.groups()) if spawn else None
+        if light is not None and light["id"] in tagged:
+            light = None
         g = o.get("geometry") or {}
         if light is None and loose and g.get("center"):
             near = min(loose, key=lambda L: math.dist(L["geometry"]["center"], g["center"]))
@@ -464,6 +489,9 @@ def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[di
     orphans = []
     for light in lights:
         if light["id"] in taken:
+            continue
+        if light["id"] in no_fixture:
+            orphans.append(light)
             continue
         g = light.get("geometry") or {}
         if not g.get("center"):
