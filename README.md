@@ -37,11 +37,11 @@ python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504
 ```
 
-**Simulator scenes:** `opticalnav-sim-v1`, 35 staged scenes, 10.9 GB (15.9 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn). List what is in it with `tools/fetch_pack.py --list`.
+**Simulator scenes:** `opticalnav-sim-v1`, 39 staged scenes, 12.1 GB (17.5 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn). List what is in it with `tools/fetch_pack.py --list`.
 
 * Apartments: `sim_apt_12644647`, `sim_apt_22572521_vanilla_r2`.
-* Infinigen 2.0 floors (12): cafes G and H, market M (1,772 objects; its meshes decimated and small-object textures cut, so it fits a 32 GB GPU), offices A2, B, C and O2, clinics D3, E3 and F3, warehouse J, shop I, and `pivotHouse` (a courtyard house; 43.8 M triangles decimated to about 3 M).
-* Single-room scenes (21), each with a walk of at least 5 m: cafes (cafeP industrial, nordic, chain, floral), shops (shopL grocery, convenience, boutique, pharmacy, boutiqueF flagship), offices (officeK open and highrise), warehouses (whL storage, whA2 packing), clinics (clinicC2 physio, clinicW dental), bookstoreR underground, museumR rotunda, rooftopR dining, winepubR cellar, cafeteriaS school.
+* Infinigen 2.0 floors (15): cafes G and H, hotel H3, lounge S29, apartment P2b, market M (1,772 objects; its meshes decimated and small-object textures cut, so it fits a 32 GB GPU), offices A2, B, C and O2, clinics D3, E3 and F3, warehouse J, shop I, and `pivotHouse` (a courtyard house; 43.8 M triangles decimated to about 3 M).
+* Single-room scenes (22), each with a walk of at least 5 m: cafes (cafeP industrial, nordic, chain, floral), shops (shopL grocery, convenience, boutique, pharmacy, boutiqueF flagship), offices (officeK open and highrise), warehouses (whL storage, whA2 packing), clinics (clinicC2 physio, clinicW dental), bookstoreR underground, museumR rotunda, rooftopR dining, winepubR cellar, cafeteriaS school, restaurantS stillroom.
 * All are base variant only, with spawn points but no navigation graph. The spawn points of all the Infinigen 2.0 scenes were chosen from renders (`tools/check_spawns.py` through the server, `tools/cpu_check.py` on the CPU).
 * Walls, floors and ceilings are 2048 px; other textures are capped at 512 px, not the dataset's 128.
 * Lights of the scenes imported with `fixture_id` tags (bookstore, H, G, J, museum and later) pair with their fixture by the tag; the earlier ones by name and position.
