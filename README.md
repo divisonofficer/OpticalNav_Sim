@@ -648,6 +648,8 @@ On `infinigen_apartment_natural_v1_20268504`:
 
 The geometry no longer matches the dataset's reference frames exactly.
 
+**Render test without the GPU.** `tools/cpu_check.py` tests a pack scene on the CPU (Mitsuba's `scalar_rgb`, no server, `CUDA_VISIBLE_DEVICES=` empty): the server's own scene preparation (lamps lit from their parts, tags), `path_nocaustics` with the softboxes hidden, RGB intensity only (no Stokes, mirrors or flash). It loads the scene, renders four headings from each spawn point and fails on a black or non-finite view, saves a contact sheet, and with `--apply-spawns` picks the start poses from depth the way `check_spawns.py` does. A scene loads in 6 to 190 s and its 4 to 12 views render in 1 to 8 s at 192x144, 32 spp. On the 22 scenes of the October 2026 batch, none failed.
+
 **Start poses of graph-less scenes.** `build_pack.py` picks a scene's three spawn points from the authoring map's footprints, which cover the whole floor, so it took a grid corner: against a wall (0.2 to 0.9 m of open space in front), and in `sim_v2a_floorC` and `sim_v2a_floorA2` inside one, where every view was black. `tools/check_spawns.py` renders each candidate point of the three largest traversable regions (the server's raster preview, four headings, depth pass), scores a pose by its least open view (median depth, capped at 5 m) and takes the best one that the path tracer also renders lit:
 
 ```bash
