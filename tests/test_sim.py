@@ -841,6 +841,42 @@ def test_scale_fill_text_scales_only_the_room_softboxes():
     assert server.scale_fill_text(text, 1.0).count("1.2000") == 0  # a gain of 1 writes the same values (3 3 3 stays)
 
 
+def test_a_spot_light_sets_its_glowing_disk_back_in_the_housing():
+    d90, g90 = server.cone_recess(0.19, 0.5, 90.0)
+    assert math.isclose(d90, 0.19, rel_tol=1e-3) and math.isclose(g90, 2.618, rel_tol=1e-3)  # depth = radius at 45 deg half angle
+    d30, g30 = server.cone_recess(0.19, 0.5, 30.0)
+    assert d30 > d90 and g30 == 3.0  # a narrower beam sits deeper; the gain is capped
+    assert server.cone_recess(0.19, 0.1, 30.0)[0] == 0.085  # never deeper than 85% of a short housing
+
+    def note(obj):
+        return f"\n  <!--opticalnav-obj:{json.dumps(obj)}-->"
+
+    def shape(sid, body):
+        return f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="assets/{sid}.ply" />{body}\n  </shape>'
+
+    lamp = "DomePendantFactory_3_.spawn_asset_3"
+    box = '<emitter type="area"><rgb name="radiance" value="10 10 10" /></emitter>'
+
+    def build(cone):
+        light = {"id": "light_1_PointLampFactory_pendant_.spawn_asset_3", "is_emitter": True, "emitter_radiance": [10, 10, 10],
+                 "geometry": {"center": [4.0, 1.0], "size_m": [0.6, 0.08, 0.6]}}
+        if cone:
+            light["metadata"] = {"light": {"type": "SPOT", "spot_size_deg": cone}}
+        text = ("<scene>" + note({"id": lamp, "label": "DomePendantFactory(3).spawn_asset(3)",
+                                  "geometry": {"center": [4.0, 1.0], "size_m": [0.4, 1.0, 0.4]}})
+                + shape(lamp, "<bsdf type=\"roughconductor\"/>") + note(light) + shape(light["id"], box) + "\n</scene>")
+        out, added = server.lamp_lights_text(text, mesh_info=lambda kind, f: (0.02, 0.0),
+                                             mesh_bounds=lambda kind, body: ([3.8, 1.8, 0.8], [4.2, 2.0, 1.2]))
+        disk = out.split(f'<shape type="ply" id="{lamp}__glow">')[1].split("</shape>")[0]
+        y = float(re.search(r'<translate x="[-\d.]+" y="([-\d.]+)"', disk).group(1))
+        return y, float(disk.split('name="radiance" value="')[1].split()[0])
+
+    y0, rad0 = build(None)
+    y1, rad1 = build(60.0)
+    assert math.isclose(y0, 1.8) and y1 > y0 and y1 <= 1.97  # set back into the 0.2 m housing (85%: 0.17 m)
+    assert rad1 > 1.5 * rad0  # the walls take flux: the disk is brighter to make up
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 

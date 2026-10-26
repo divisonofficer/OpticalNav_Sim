@@ -375,14 +375,16 @@ def spawn_points(scene_dir: Path, eye_height: float, count: int = 3, step: int =
 
 
 def tag_fixtures(base_xml: Path, authoring_map: Path) -> int:
-    """Copy ``metadata.fixture_id`` of the authoring map's lights into the scene file's opticalnav-obj notes.
+    """Copy ``metadata.fixture_id`` and ``metadata.light`` of the authoring map's lights into the scene file's opticalnav-obj notes.
     apps/import_infinigen_scene.py tags each light with the fixture mesh that holds it, but robomituba's scene
     file writer leaves the note's metadata out, and the server reads only the scene file. Returns the number of
     notes tagged; a map without tags (an older blend) changes nothing."""
     if not authoring_map.is_file():
         return 0
-    tags = {o["id"]: o["metadata"]["fixture_id"] for o in json.loads(authoring_map.read_text()).get("objects") or []
-            if o.get("is_emitter") and "fixture_id" in (o.get("metadata") or {})}
+    keep = ("fixture_id", "light")  # the importer's tag, and the Blender light's own parameters (metadata.light)
+    tags = {o["id"]: {k: o["metadata"][k] for k in keep if k in o["metadata"]}
+            for o in json.loads(authoring_map.read_text()).get("objects") or []
+            if o.get("is_emitter") and any(k in (o.get("metadata") or {}) for k in keep)}
     if not tags:
         return 0
     count = 0
@@ -395,7 +397,7 @@ def tag_fixtures(base_xml: Path, authoring_map: Path) -> int:
             return m.group(0)
         if obj.get("id") not in tags:
             return m.group(0)
-        obj["metadata"] = {**(obj.get("metadata") or {}), "fixture_id": tags[obj["id"]]}
+        obj["metadata"] = {**(obj.get("metadata") or {}), **tags[obj["id"]]}
         count += 1
         return f"<!--opticalnav-obj:{json.dumps(obj)}-->"
 

@@ -519,6 +519,22 @@ def pair_lamp_lights(notes: list[dict]) -> tuple[list[dict], dict, dict, list[di
     return lamps, kinds, paired, orphans
 
 
+def cone_recess(radius: float, height: float, cone_deg: float) -> tuple[float, float]:
+    """(depth, gain) to make a glowing disk of ``radius`` under a housing ``height`` tall shine in a cone of
+    ``cone_deg`` (a Blender spot's spot_size). The disk is set back inside the housing by the depth at which the
+    housing's mouth, the same radius, is seen under the cone's half angle (radius / tan(half)), at most 85% of the
+    housing's height; its walls then cut what leaves to a cone, with no emitter that has a direction (every
+    emitter here is a Lambertian area light, which the light levels, groups and bands all act on). The walls take
+    flux that Blender's spot keeps (a spot is a point light cut to its cone), so the radiance is raised by
+    1 / F, F the share of a Lambertian disk's flux that reaches a coaxial disk of the same radius across the
+    depth ( (X - sqrt(X^2 - 4)) / 2 with X = 2 + (depth / radius)^2 ), at most 3: the walls (metal) reflect some."""
+    half = math.radians(min(max(cone_deg, 5.0), 170.0) / 2.0)
+    depth = min(0.85 * max(height, 0.0), radius / math.tan(half))
+    x = 2.0 + (depth / max(radius, 1e-6)) ** 2
+    share = 0.5 * (x - math.sqrt(max(x * x - 4.0, 0.0)))
+    return depth, min(3.0, 1.0 / max(share, 1e-6))
+
+
 def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None) -> tuple[str, list[str]]:
     """Lamps glow from their own parts instead of from boxes. Infinigen spawns a light (``PointLampFactory``) with
     only some of its lamps; robomituba's importer turns those into a flat emitter cube (0.6 x 0.6 x 0.08 m) at a
@@ -630,8 +646,14 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                 r = 0.47 * float(min(hi[0] - lo[0], hi[2] - lo[2]))
                 own = light_power(light) if light is not None else None
                 rad = (own if own is not None else float(np.mean(power.get(kind) or [default]))) / (math.pi * r * r)
+                # a spot (metadata.light.spot_size_deg, from the importer): the disk sits back in the housing
+                cone = (((light or {}).get("metadata") or {}).get("light") or {}).get("spot_size_deg")
+                sink = 0.0
+                if cone and 5.0 <= float(cone) < 170.0:
+                    sink, gain = cone_recess(r, float(hi[1] - lo[1]), float(cone))
+                    rad *= gain
                 sid = f"{o['id']}__glow"
-                disk(sid, r, ((lo[0] + hi[0]) / 2, lo[1], (lo[2] + hi[2]) / 2), rad,
+                disk(sid, r, ((lo[0] + hi[0]) / 2, lo[1] + sink, (lo[2] + hi[2]) / 2), rad,
                      {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
                       "emitter_intensity": 1.0, "emitter_shape": "lamp_opening",
                       "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
