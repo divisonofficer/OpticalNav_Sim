@@ -669,6 +669,12 @@ python tools/open_doors.py --pack packs/opticalnav-sim-v1 [--scene SCENE] [--kee
 
 Both write `scene.json` (`glass_slabs`, `doors_opened`). Applied to the 44 scenes of the pack: 17 sheet meshes became slabs, O2 lost 7 frost bands and B and J one each, and 5 closed interior doors were opened (D3 2, market 1, pivotHouse 2). The glass partitions that a kit built across a door casing (floorC, cafeP_nordic) need the importer's `*_glassfix` blends, not these tools. The random mirror pool was checked and is not the cause of a bare-wall look: none of O2's 55 mirrors lies within 25 cm of a glass pane.
 
+**Grey textures as one channel.** The GPU holds every texture as float32, and roughness, metallic, occlusion and many albedo maps are grey (R = G = B) but stored as RGB PNGs. `tools/gray_textures.py` rewrites a texture whose channels agree within one 8-bit level everywhere (an RGB PNG without alpha, read by no normal map) as an 8-bit single-channel PNG, which Mitsuba reads as a monochrome bitmap, so it takes a third of the memory. On floorO2, 437 of 1,023 textures are grey: 1.42 GB less of 5.1 GB. Rendered from three views before and after, the mean differs by +0.016% and the pixel differences fall as 1 / block size (9.8% per pixel, 0.5% over 24 x 24 blocks): Monte Carlo noise, no bias; the converted scene also renders in the polarized GPU variant. Over the 44 scenes it saves 40.3 GB of GPU float32 in all. Rebuild a scene to undo it.
+
+```bash
+python tools/gray_textures.py --pack packs/opticalnav-sim-v1 [--scene SCENE] [--dry-run] [--keep-unused]
+```
+
 **Start poses of graph-less scenes.** `build_pack.py` picks a scene's three spawn points from the authoring map's footprints, which cover the whole floor, so it took a grid corner: against a wall (0.2 to 0.9 m of open space in front), and in `sim_v2a_floorC` and `sim_v2a_floorA2` inside one, where every view was black. `tools/check_spawns.py` renders each candidate point of the three largest traversable regions (the server's raster preview, four headings, depth pass), scores a pose by its least open view (median depth, capped at 5 m) and takes the best one that the path tracer also renders lit:
 
 ```bash

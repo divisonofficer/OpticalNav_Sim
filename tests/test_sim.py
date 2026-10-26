@@ -803,6 +803,35 @@ def test_filmic_curve_is_monotonic_and_deeper_in_the_shadows():
     assert tonemap.curve("filmic") is tonemap.filmic and tonemap.curve("reinhard") is tonemap.reinhard
 
 
+def test_gray_textures_become_one_channel_except_normal_maps_and_colour(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from PIL import Image
+
+    import gray_textures
+
+    (tmp_path / "assets").mkdir()
+    grey = np.tile(np.arange(64, dtype=np.uint8)[:, None, None], (1, 64, 3))
+    colour = grey.copy()
+    colour[..., 0] += 9
+    for name, arr in (("a_grey", grey), ("b_colour", colour), ("c_normal", grey), ("d_alpha", np.dstack([grey, grey[..., :1]]))):
+        Image.fromarray(arr).save(tmp_path / "assets" / f"{name}.png")
+
+    def tex(role, name):
+        return f'<texture name="{role}" type="bitmap"><string name="filename" value="assets/{name}.png" /></texture>'
+
+    (tmp_path / "base.xml").write_text("<scene>" + tex("alpha", "a_grey") + tex("diffuse_reflectance", "b_colour")
+                                      + tex("normalmap", "c_normal") + tex("diffuse_reflectance", "d_alpha") + "</scene>")
+    s = gray_textures.gray_scene(tmp_path)
+    assert s["grey"] == 1 and s["gpu_bytes_saved"] == 64 * 64 * 2 * 4
+    xml = (tmp_path / "base.xml").read_text()
+    new = [m for m in re.findall(r'value="(assets/[^"]+)"', xml) if "tex_" in m]
+    assert len(new) == 1 and Image.open(tmp_path / new[0]).mode == "L"
+    assert np.array_equal(np.asarray(Image.open(tmp_path / new[0])), grey[..., 0])  # the same values, one channel
+    assert not (tmp_path / "assets" / "a_grey.png").exists()  # the RGB file no XML names is gone
+    for kept in ("b_colour", "c_normal", "d_alpha"):  # colour, a normal map and an RGBA texture stay as they were
+        assert f"assets/{kept}.png" in xml
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
