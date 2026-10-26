@@ -952,6 +952,35 @@ def test_alpha_power_squares_roughness_numbers_and_textures(tmp_path, monkeypatc
     assert abs(value - (128 / 255) ** 2) < 1e-3  # a roughness of 0.5 is an alpha of 0.25
 
 
+def test_sheer_parts_get_the_materials_alpha(tmp_path, monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import struct
+    import sheer_parts
+
+    doc = json.dumps({"materials": [{"name": "drape"}, {"name": "track"}, {"name": "sheer"}],
+                      "meshes": [{"primitives": [{"material": 0}, {"material": 1}, {"material": 2}]}]}).encode()
+    doc += b" " * (-len(doc) % 4)
+    (tmp_path / "meshes").mkdir()
+    (tmp_path / "meshes" / "c.glb").write_bytes(b"glTF" + struct.pack("<II", 2, 20 + len(doc)) + struct.pack("<I", len(doc)) + b"JSON" + doc)
+    monkeypatch.setattr(sheer_parts, "ROBOMITUBA", tmp_path)
+    imports = tmp_path / "imports"
+    imports.mkdir()
+    (imports / "scn__authoring_map.json").write_text(json.dumps({
+        "materials": [{"material_id": "sheer", "params": {"pbr": {"alpha": 0.12}}}, {"material_id": "drape", "params": {"pbr": {"alpha": 1.0}}}],
+        "objects": [{"id": "Curtain_1_", "source_ref": "meshes/c.glb"}]}))
+    scene = tmp_path / "scn"
+    scene.mkdir()
+    shape = lambda sid: (f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="a.ply" />\n'
+                         '    <bsdf type="twosided">\n      <bsdf type="pplastic" />\n    </bsdf>\n  </shape>')
+    (scene / "base.xml").write_text("<scene>" + shape("Curtain_1_") + shape("Curtain_1___part_001_Curtain_1___1")
+                                    + shape("Curtain_1___part_002_Curtain_1___2") + "\n</scene>")
+    assert sheer_parts.sheer_scene(scene, imports=imports)["sheer_parts"] == 1  # primitive 2 only
+    out = (scene / "base.xml").read_text()
+    assert out.count('type="mask"') == 1 and 'name="opacity" value="0.1200"' in out
+    assert out.index('type="mask"') > out.index("Curtain_1___part_002")
+    assert sheer_parts.sheer_scene(scene, imports=imports)["sheer_parts"] == 0  # already masked
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
