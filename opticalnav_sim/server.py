@@ -592,11 +592,20 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         kind = shapes[light["id"]].group(1) if light["id"] in shapes else "cube"
         return rad * (sx * sz if kind in ("rectangle", "disk") else 2 * (sx * sz + sx * sy + sy * sz))
 
-    def disk(sid: str, r: float, center, rad: float, note: dict) -> None:
-        """A disk of radius r facing the floor, centred at ``center`` (x, y, z), glowing at ``rad``."""
+    def disk(sid: str, r: float, center, rad: float, note: dict, aim=None) -> None:
+        """A disk of radius r facing the floor (or ``aim``, a unit vector), centred at ``center`` (x, y, z), glowing
+        at ``rad``."""
+        tilt = ""
+        if aim is not None:  # turn the floor-facing normal (0, -1, 0) onto aim
+            axis = np.cross([0.0, -1.0, 0.0], aim)
+            sin = float(np.linalg.norm(axis))
+            if sin > 1e-3:
+                axis /= sin
+                angle = math.degrees(math.atan2(sin, float(np.dot([0.0, -1.0, 0.0], aim))))
+                tilt = (f'\n      <rotate x="{axis[0]:.6f}" y="{axis[1]:.6f}" z="{axis[2]:.6f}" angle="{angle:.4f}" />')
         xml.append(f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="{unit_disk_ply()}" />'
                    f'\n    <transform name="to_world">\n      <scale value="{r:.6f}" />'
-                   f'\n      <rotate x="1" angle="90" />'  # +z (the disk's front) to -y: facing the floor
+                   f'\n      <rotate x="1" angle="90" />{tilt}'  # +z (the disk's front) to -y: facing the floor
                    f'\n      <translate x="{center[0]:.6f}" y="{center[1]:.6f}" z="{center[2]:.6f}" />'
                    f'\n    </transform>\n    <bsdf type="diffuse" />'
                    f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
@@ -649,6 +658,12 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                 # a spot (metadata.light.spot_size_deg, from the importer): the disk sits back in the housing
                 cone = (((light or {}).get("metadata") or {}).get("light") or {}).get("spot_size_deg")
                 sink = 0.0
+                aim = (((light or {}).get("metadata") or {}).get("light") or {}).get("direction")
+                if aim is not None and len(aim) == 3:  # plan frame (x, y, z up) -> the scene's (x, up, y)
+                    aim = np.array([aim[0], aim[2], aim[1]], float)
+                    aim = aim / np.linalg.norm(aim) if np.linalg.norm(aim) > 1e-6 and aim[1] < -0.2 else None
+                else:
+                    aim = None
                 if cone and 5.0 <= float(cone) < 170.0:
                     sink, gain = cone_recess(r, float(hi[1] - lo[1]), float(cone))
                     rad *= gain
@@ -659,7 +674,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                       "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
                       "metadata": {"lamp": o["id"], "glowing_area_m2": round(math.pi * r * r, 4),
                                    "replaces": (light or {}).get("id"), "added_by": "opticalnav_sim lamp_lights_text"},
-                      "geometry": o.get("geometry")})
+                      "geometry": o.get("geometry")}, aim)
                 if light is not None:
                     gone.append(light["id"])
                 continue

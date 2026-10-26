@@ -857,17 +857,21 @@ def test_a_spot_light_sets_its_glowing_disk_back_in_the_housing():
     lamp = "DomePendantFactory_3_.spawn_asset_3"
     box = '<emitter type="area"><rgb name="radiance" value="10 10 10" /></emitter>'
 
-    def build(cone):
+    def build(cone, direction=None, disk_text=False):
         light = {"id": "light_1_PointLampFactory_pendant_.spawn_asset_3", "is_emitter": True, "emitter_radiance": [10, 10, 10],
                  "geometry": {"center": [4.0, 1.0], "size_m": [0.6, 0.08, 0.6]}}
         if cone:
             light["metadata"] = {"light": {"type": "SPOT", "spot_size_deg": cone}}
+            if direction:
+                light["metadata"]["light"]["direction"] = direction
         text = ("<scene>" + note({"id": lamp, "label": "DomePendantFactory(3).spawn_asset(3)",
                                   "geometry": {"center": [4.0, 1.0], "size_m": [0.4, 1.0, 0.4]}})
                 + shape(lamp, "<bsdf type=\"roughconductor\"/>") + note(light) + shape(light["id"], box) + "\n</scene>")
         out, added = server.lamp_lights_text(text, mesh_info=lambda kind, f: (0.02, 0.0),
                                              mesh_bounds=lambda kind, body: ([3.8, 1.8, 0.8], [4.2, 2.0, 1.2]))
         disk = out.split(f'<shape type="ply" id="{lamp}__glow">')[1].split("</shape>")[0]
+        if disk_text:
+            return disk
         y = float(re.search(r'<translate x="[-\d.]+" y="([-\d.]+)"', disk).group(1))
         return y, float(disk.split('name="radiance" value="')[1].split()[0])
 
@@ -875,6 +879,16 @@ def test_a_spot_light_sets_its_glowing_disk_back_in_the_housing():
     y1, rad1 = build(60.0)
     assert math.isclose(y0, 1.8) and y1 > y0 and y1 <= 1.97  # set back into the 0.2 m housing (85%: 0.17 m)
     assert rad1 > 1.5 * rad0  # the walls take flux: the disk is brighter to make up
+    assert "angle=\"" not in build(60.0, [0.0, 0.0, -1.0], True).split("<rotate x=\"1\"")[1].split("<translate")[0].replace('angle="90"', "")
+    # a tilted spot (plan frame x, y, up): the disk's normal turns from straight down onto the direction
+    aim = np.array([0.4, -0.3, -0.866])
+    aim /= np.linalg.norm(aim)
+    disk = build(60.0, list(aim), True)
+    r = re.search(r'<rotate x="([-\d.]+)" y="([-\d.]+)" z="([-\d.]+)" angle="([-\d.]+)"', disk.split('angle="90"')[1])
+    axis, a = np.array([float(v) for v in r.groups()[:3]]), math.radians(float(r.group(4)))
+    down = np.array([0.0, -1.0, 0.0])  # Rodrigues rotation of the floor-facing normal
+    turned = down * math.cos(a) + np.cross(axis, down) * math.sin(a) + axis * np.dot(axis, down) * (1 - math.cos(a))
+    assert np.allclose(turned, [aim[0], aim[2], aim[1]], atol=1e-3)  # scene frame (x, up, y)
 
 
 def test_viewer_passes_double_the_running_total():
