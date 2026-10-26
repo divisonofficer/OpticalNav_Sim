@@ -771,6 +771,45 @@ def scale_fill_text(text: str, gain: float) -> str:
     return re.sub(r'(\n  <shape type="[a-z_]+" id="([^"]+)">)(.*?)(\n  </shape>)', shape, text, flags=re.S)
 
 
+ALPHA_CACHE = Path(os.environ.get("OPTICALNAV_ALPHA_CACHE", "~/.cache/opticalnav_sim/alpha_power")).expanduser()
+ROUGH_BSDF = re.compile(r'(<bsdf type="(?:pplastic|roughconductor|roughdielectric|roughplastic)">)(.*?)(</bsdf>)', re.S)
+
+
+def powered_alpha_texture(path: Path, power: float) -> Path:
+    """A copy of a roughness texture with every value raised to ``power`` (16-bit grey PNG in ALPHA_CACHE,
+    named by the source's file name: textures are content-addressed), written once."""
+    out = ALPHA_CACHE / f"{path.stem}.p{power:g}.png"
+    if not out.is_file():
+        from PIL import Image
+
+        with Image.open(path) as im:
+            data = np.asarray(im)
+        if data.ndim == 3:  # a grey map stored as RGB(A): the colour channels' mean
+            data = data[..., :3].mean(axis=2)
+        scale = 65535.0 if data.dtype == np.uint16 else 255.0
+        grey = np.clip(np.rint((data.astype(np.float64) / scale) ** power * 65535.0), 0, 65535).astype(np.uint16)
+        ALPHA_CACHE.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(f".{os.getpid()}_{out.name}")
+        Image.fromarray(grey).save(tmp)  # mode I;16
+        os.replace(tmp, out)
+    return out
+
+
+def power_alpha_text(text: str, base_dir: Path, power: float = 2.0) -> str:
+    """Blender's Principled roughness r is a microfacet alpha of r**2; the importer wrote r as the alpha, so
+    every surface of its scenes came out twice as rough as in Blender (a floor of roughness 0.25 is alpha 0.25
+    here, 0.0625 there: its window reflections smeared into a haze). The alpha of every rough plastic,
+    conductor and dielectric of ``text``, a number or a roughness texture, raised to ``power``."""
+    def block(m):
+        body = re.sub(r'(<float name="alpha" value=")([-\d.eE]+)(")',
+                      lambda a: f"{a.group(1)}{float(a.group(2)) ** power:.6f}{a.group(3)}", m.group(2))
+        body = re.sub(r'(<texture name="alpha" type="bitmap">\s*<string name="filename" value=")([^"]+)(")',
+                      lambda a: a.group(1) + str(powered_alpha_texture(base_dir / a.group(2), power)) + a.group(3), body)
+        return m.group(1) + body + m.group(3)
+
+    return ROUGH_BSDF.sub(block, text)
+
+
 def scene_stats(mi, scene, text: str) -> dict:
     """What a loaded scene holds, for the viewer's scene tab: shapes, meshes, triangles, distinct BSDFs, image
     textures, emitters, and the scene text's size."""
@@ -1113,7 +1152,7 @@ class Resident:
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
                  pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0,
-                 blender_power: bool = False):
+                 blender_power: bool = False, alpha_power: float = 1.0):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
@@ -1146,6 +1185,8 @@ class Resident:
         # OPTICALNAV_BOX_LIGHTS=1: lit lamps keep the importer's boxes (the earlier look, for comparisons)
         text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"),
                                                   mesh_bounds=mesh_bounds, blender_power=blender_power)
+        if alpha_power != 1.0:  # the simulator's own scenes: the importer's roughness as Blender's alpha (r**2)
+            text = power_alpha_text(text, base_dir, alpha_power)
         if fill_gain != 1.0:  # the simulator's own scenes: the importer's room softboxes at a share of their radiance
             text = scale_fill_text(text, fill_gain)
         radiance = emitter_radiance(text)  # before the band transforms wrap them
@@ -2022,7 +2063,7 @@ class Renderer:
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
                  envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16,
                  default_sky: str | None = None, default_sky_rotate: float = 0.0, fill_gain: float = 1.0,
-                 default_depth: int = 0, lamp_power: str = "importer"):
+                 default_depth: int = 0, lamp_power: str = "importer", alpha_power: float = 1.0):
         import drjit as dr
         import mitsuba as mi
 
@@ -2089,6 +2130,7 @@ class Renderer:
         self.sun_deg = float(sun_deg)
         self.default_sky, self.default_sky_rotate = default_sky, float(default_sky_rotate)  # see sky_for
         self.fill_gain, self.default_depth = float(fill_gain), int(default_depth)  # the simulator's own scenes, see own_scene
+        self.alpha_power = float(alpha_power)
         self.lamp_power = lamp_power  # "blender": the simulator's own scenes light at their Blender watts
         self.freeze_spp = int(freeze_spp)
         for scan in self.meta:
@@ -2255,7 +2297,8 @@ class Renderer:
                               pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
                               hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
                               fill_gain=self.fill_gain if self.own_scene(scan, variant) else 1.0,
-                              blender_power=self.lamp_power == "blender" and self.own_scene(scan, variant))
+                              blender_power=self.lamp_power == "blender" and self.own_scene(scan, variant),
+                              alpha_power=self.alpha_power if self.own_scene(scan, variant) else 1.0)
         self.cache[rkey] = loaded
         return loaded
 
@@ -2922,6 +2965,11 @@ def main() -> int:
                     help="'blender': the lights of the simulator's own scenes that carry metadata.light.energy glow at "
                          "Blender's power (flux energy / pi) instead of the importer's box radiance, which is 3 to 10 "
                          "times weaker. The dataset's scenes keep theirs")
+    ap.add_argument("--alpha-power", type=float, default=1.0,
+                    help="raise the microfacet alpha of the simulator's own scenes (the importer wrote Blender's "
+                         "roughness r as alpha) to this power; 2 is Blender's r**2 (a glossy floor reflects the "
+                         "windows instead of smearing them). Roughness textures are copied once to "
+                         "~/.cache/opticalnav_sim/alpha_power. The dataset's scenes keep theirs")
     ap.add_argument("--fill-gain", type=float, default=1.0,
                     help="scale the radiance of the room softboxes (light_softbox_*, the importer's fill) of the "
                          "simulator's own scenes. Off, floorO2 loses 58% of its light; at 0.4-0.5 shadows and pools of "
@@ -2944,7 +2992,7 @@ def main() -> int:
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
     renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
-                        fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power,
+                        fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power, alpha_power=args.alpha_power,
                         freeze_spp=args.freeze_spp)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))

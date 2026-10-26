@@ -935,6 +935,23 @@ def test_metal_parts_take_their_objects_textures(tmp_path):
     assert out.split("Lonely_1_")[1].count('value="Al"') == 1
 
 
+def test_alpha_power_squares_roughness_numbers_and_textures(tmp_path, monkeypatch):
+    from PIL import Image
+
+    monkeypatch.setattr(server, "ALPHA_CACHE", tmp_path / "cache")
+    (tmp_path / "assets").mkdir()
+    Image.fromarray(np.full((4, 4), 128, np.uint8)).save(tmp_path / "assets" / "tex_r.png")
+    text = ('<bsdf type="twosided"><bsdf type="roughconductor"><string name="material" value="Al" />'
+            '<float name="alpha" value="0.5000" /></bsdf></bsdf>'
+            '<bsdf type="pplastic"><texture name="alpha" type="bitmap"><string name="filename" value="assets/tex_r.png" />'
+            '<boolean name="raw" value="true" /></texture><float name="specular_ior" value="0.5" /></bsdf>')
+    out = server.power_alpha_text(text, tmp_path, 2.0)
+    assert 'name="alpha" value="0.250000"' in out and 'name="specular_ior" value="0.5"' in out
+    new = Path(re.search(r'value="([^"]+tex_r\.p2\.png)"', out).group(1))
+    value = float(np.asarray(Image.open(new)).mean()) / 65535.0
+    assert abs(value - (128 / 255) ** 2) < 1e-3  # a roughness of 0.5 is an alpha of 0.25
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
