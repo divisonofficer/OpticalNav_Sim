@@ -535,6 +535,9 @@ def cone_recess(radius: float, height: float, cone_deg: float) -> tuple[float, f
     return depth, min(3.0, 1.0 / max(share, 1e-6))
 
 
+IMPORTER_WATTS = 0.025  # the importer's box radiance, colour-free, is 1 + IMPORTER_WATTS x the Blender light's watts
+
+
 def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None,
                      blender_power: bool = False) -> tuple[str, list[str]]:
     """Lamps glow from their own parts instead of from boxes. Infinigen spawns a light (``PointLampFactory``) with
@@ -572,7 +575,9 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     the room. The disk spreads it over ~6x the area and is sampled directly from below. Without a dome
     (or the callback) the pendant glows from its lowest non-metal part, the bulb (its highest is the cord).
 
-    ``blender_power``: a light with ``metadata.light.energy`` (Blender watts; not a SUN) glows at Blender's own
+    ``blender_power``: a light with ``metadata.light.energy`` (Blender watts; not a SUN), or in a scene imported before the
+    light export one whose watts the importer's radiance gives back (1 + 0.025 W, checked on 17 lights of 3 scenes
+    and on the 3 kinds of stillroom's lights against its Cycles dump), glows at Blender's own
     power: a radiant flux of energy / pi (a point light's intensity is energy / (4 pi^2) W/sr, an area light's radiance
     energy / (pi^2 area)); a spot keeps the point light's intensity inside its cone. The importer's box radiance came
     to 1/7.5 of that for floorG's 60 W area lights and 1/3.5 to 1/10 for its point lights (its spots match)."""
@@ -589,18 +594,35 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     shapes = {m.group(2): m for m in re.finditer(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>', text, re.S)}
     lamps, kinds, paired, orphans = pair_lamp_lights(notes or notes_from_shapes(shapes))
 
+    def blender_light(light: dict | None) -> tuple[str, float] | None:
+        """(type, Blender watts) of a light when ``blender_power``: from metadata.light, else read back from the
+        importer's box radiance (see IMPORTER_WATTS) for a scene imported before the light export; a SUN has no power
+        here."""
+        if not blender_power or not light:
+            return None
+        info = (light.get("metadata") or {}).get("light") or {}
+        if info.get("energy"):
+            return (info.get("type"), float(info["energy"])) if info.get("type") != "SUN" else None
+        rad = light.get("emitter_radiance")
+        if not rad or not str(light.get("id", "")).startswith("light_") or "softbox" in str(light["id"]):
+            return None
+        watts = (max(float(v) for v in rad) * float(light.get("emitter_intensity") or 1.0) - 1.0) / IMPORTER_WATTS
+        if watts <= 0:
+            return None
+        kind = "SPOT" if "_track_" in light["id"] else "AREA" if "_hung_" in light["id"] else "POINT"
+        return kind, watts
+
     def from_blender(light: dict | None) -> bool:
-        info = ((light or {}).get("metadata") or {}).get("light") or {}
-        return bool(blender_power and info.get("energy") and info.get("type") != "SUN")
+        return blender_light(light) is not None
 
     def light_power(light: dict) -> float | None:
         """Emitted power / pi of an importer's light box: radiance x its emitting area (``blender_power``: the
         light's own Blender energy / pi^2, the same measure)."""
-        info = (light.get("metadata") or {}).get("light") or {}
-        if from_blender(light):
+        known = blender_light(light)
+        if known is not None:
             # a spot keeps a point light's intensity inside its cone (energy / 4 pi^2 W/sr), which is what a
             # Lambertian disk's radiance x area gives on its axis
-            return float(info["energy"]) / ((4.0 if info.get("type") == "SPOT" else 1.0) * math.pi ** 2)
+            return known[1] / ((4.0 if known[0] == "SPOT" else 1.0) * math.pi ** 2)
         if not light.get("emitter_radiance"):
             return None
         sx, sy, sz = (float(v) for v in (light.get("geometry") or {}).get("size_m") or [0.6, 0.08, 0.6])
@@ -608,7 +630,18 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         kind = shapes[light["id"]].group(1) if light["id"] in shapes else "cube"
         return rad * (sx * sz if kind in ("rectangle", "disk") else 2 * (sx * sz + sx * sy + sy * sz))
 
-    def disk(sid: str, r: float, center, rad: float, note: dict, aim=None) -> None:
+    def tint(light: dict | None) -> tuple[float, float, float]:
+        """The colour of a light that glows at its Blender power (``blender_power``): its metadata.light.color,
+        else the importer's radiance over its largest channel (Blender's colour: the largest channel 1); white
+        otherwise (a lamp the scene has no light for, or the importer's own power)."""
+        if blender_light(light) is None:
+            return (1.0, 1.0, 1.0)
+        info = (light.get("metadata") or {}).get("light") or {}
+        col = np.asarray(info.get("color") or light.get("emitter_radiance") or [1.0] * 3, float)
+        col = col / max(float(col.max()), 1e-9) if not info.get("color") else col
+        return tuple(float(c) for c in col[:3])
+
+    def disk(sid: str, r: float, center, rad: float, note: dict, aim=None, col=(1.0, 1.0, 1.0)) -> None:
         """A disk of radius r facing the floor (or ``aim``, a unit vector), centred at ``center`` (x, y, z), glowing
         at ``rad``."""
         tilt = ""
@@ -624,7 +657,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                    f'\n      <rotate x="1" angle="90" />{tilt}'  # +z (the disk's front) to -y: facing the floor
                    f'\n      <translate x="{center[0]:.6f}" y="{center[1]:.6f}" z="{center[2]:.6f}" />'
                    f'\n    </transform>\n    <bsdf type="diffuse" />'
-                   f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
+                   f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad * col[0]:.4f} {rad * col[1]:.4f} {rad * col[2]:.4f}" />'
                    f'\n    </emitter>\n  </shape>')
         xml.append(f'\n  <!--opticalnav-obj:{json.dumps(note)}-->')
         added.append(sid)
@@ -684,13 +717,14 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                     sink, gain = cone_recess(r, float(hi[1] - lo[1]), float(cone))
                     rad *= 1.0 if from_blender(light) else gain  # Blender's spot cone loses the flux the walls take
                 sid = f"{o['id']}__glow"
+                col = tint(light)
                 disk(sid, r, ((lo[0] + hi[0]) / 2, lo[1] + sink, (lo[2] + hi[2]) / 2), rad,
-                     {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+                     {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad * c, 4) for c in col],
                       "emitter_intensity": 1.0, "emitter_shape": "lamp_opening",
                       "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
                       "metadata": {"lamp": o["id"], "glowing_area_m2": round(math.pi * r * r, 4),
                                    "replaces": (light or {}).get("id"), "added_by": "opticalnav_sim lamp_lights_text"},
-                      "geometry": o.get("geometry")}, aim)
+                      "geometry": o.get("geometry")}, aim, col)
                 if light is not None:
                     gone.append(light["id"])
                 continue
@@ -706,11 +740,12 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
             area = 2 * math.pi * 0.5 * min(sx, sz) * sy / 3 * 2
         own = light_power(light) if light is not None else None
         rad = (own if own is not None else float(np.mean(power.get(kind) or [default]))) / max(area, 1e-4)
+        col = tint(light)
         for shade in shades:
             sid = shade.group(2)
-            edits.append((shade.end(3), f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad:.4f} {rad:.4f} {rad:.4f}" />'
+            edits.append((shade.end(3), f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad * col[0]:.4f} {rad * col[1]:.4f} {rad * col[2]:.4f}" />'
                                         f'\n    </emitter>'))
-            note = {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+            note = {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad * c, 4) for c in col],
                     "emitter_intensity": 1.0, "emitter_shape": "lamp_part" if ceiling else "lamp_shade",
                     "label": f"light:{'fixture' if light is not None else 'lamp'}:{o['label']}",
                     "metadata": {"lamp": o["id"], "glowing_area_m2": round(area, 4), "replaces": (light or {}).get("id"),
@@ -738,13 +773,14 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         r = ORPHAN_DOWNLIGHT_R
         rad = own / (math.pi * r * r)
         sid = f"{light['id']}__downlight"
+        col = tint(light)
         disk(sid, r, center, rad,
-             {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
+             {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad * c, 4) for c in col],
               "emitter_intensity": 1.0, "emitter_shape": "downlight",
               "label": f"light:fixture:CeilingDownlight:{light.get('label', light['id'])}",
               "metadata": {"glowing_area_m2": round(math.pi * r * r, 4), "replaces": light["id"],
                            "added_by": "opticalnav_sim lamp_lights_text (a light by no fixture)"},
-              "geometry": g})
+              "geometry": g}, None, col)
         gone.append(light["id"])
     for at, emitter in sorted(edits, reverse=True):  # from the end, so earlier offsets hold
         text = text[:at] + emitter + text[at:]

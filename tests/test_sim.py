@@ -981,6 +981,31 @@ def test_sheer_parts_get_the_materials_alpha(tmp_path, monkeypatch):
     assert sheer_parts.sheer_scene(scene, imports=imports)["sheer_parts"] == 0  # already masked
 
 
+def test_blender_power_reads_watts_back_from_the_importer_radiance_and_keeps_the_colour():
+    lamp = "DomePendantFactory_3_.spawn_asset_3"
+
+    def build(radiance, name):
+        light = {"id": name, "is_emitter": True, "emitter_radiance": radiance, "emitter_intensity": 1.0,
+                 "geometry": {"center": [4.0, 1.0], "size_m": [0.6, 0.08, 0.6]}}  # no metadata.light: an older import
+        text = ("<scene>" + f"\n  <!--opticalnav-obj:{json.dumps({'id': lamp, 'label': 'DomePendantFactory(3).spawn_asset(3)', 'geometry': {'center': [4.0, 1.0], 'size_m': [0.4, 1.0, 0.4]}})}-->"
+                + f'\n  <shape type="ply" id="{lamp}">\n    <string name="filename" value="assets/a.ply" /><bsdf type="roughconductor"/>\n  </shape>'
+                + f"\n  <!--opticalnav-obj:{json.dumps(light)}-->"
+                + f'\n  <shape type="ply" id="{name}">\n    <string name="filename" value="assets/b.ply" /><emitter type="area"><rgb name="radiance" value="1 1 1" /></emitter>\n  </shape>\n</scene>')
+        out, _ = server.lamp_lights_text(text, mesh_info=lambda k, f: (0.02, 0.0),
+                                         mesh_bounds=lambda k, b: ([3.8, 1.8, 0.8], [4.2, 2.0, 1.2]), blender_power=True)
+        disk = out.split(f'<shape type="ply" id="{lamp}__glow">')[1].split("</shape>")[0]
+        return [float(v) for v in disk.split('name="radiance" value="')[1].split('"')[0].split()]
+
+    area = math.pi * (0.47 * 0.4) ** 2
+    # the importer writes (1 + 0.025 W) x colour: 60 W of (1, 0.718, 0.511) is 2.5 x colour, a point light's pendant
+    red, green, blue = build([2.5, 2.5 * 0.718, 2.5 * 0.511], "light_6_PointLampFactory_pendant_.spawn_asset_0")
+    assert math.isclose(red, 60.0 / math.pi ** 2 / area, rel_tol=1e-3)
+    assert math.isclose(green / red, 0.718, rel_tol=1e-3) and math.isclose(blue / red, 0.511, rel_tol=1e-3)
+    # a track spot: 12 W (1.3), the intensity of a spot (energy / 4 pi^2), no cone flux gain without metadata
+    spot = build([1.3, 1.3, 1.3], "light_9_PointLampFactory_track_.spawn_asset_10_2")[0]
+    assert math.isclose(spot, 12.0 / (4 * math.pi ** 2) / area, rel_tol=1e-3)
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
