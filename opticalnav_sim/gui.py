@@ -175,9 +175,12 @@ class Session:
 
     def __init__(self, sim: MatterSim.Simulator, scans: dict[str, list[str]], pass_spp: int = 16,
                  target_spp: int = 1024, turn_deg: float = 15.0, pitch_deg: float = 10.0, depth: int = 2,
+                 max_pass_spp: int = 128, tone_curve: str = "reinhard",
                  robust: bool = True):
         self.sim, self.scans = sim, scans
         self.pass_spp, self.target_spp = int(pass_spp), int(target_spp)
+        self.max_pass_spp = max(self.pass_spp, int(max_pass_spp))
+        self.tone_curve = tone_curve  # the display operator (tonemap.curve): 'reinhard' as the export pipeline, or 'filmic'
         self.turn, self.pitch = math.radians(turn_deg), math.radians(pitch_deg)
         self.depth = max(1, int(depth))
         sim.renderingEnabled = False  # MatterSim only tracks state; this session renders (see _view)
@@ -194,6 +197,7 @@ class Session:
         self.view: dict | None = None     # render request for the current camera
         self.gen_started = 0.0
         self.issued = self.inflight = self.passes = 0
+        self.spp_issued = self.spp_done = 0  # samples in the passes sent / accumulated (a pass has 1, 1, 2, 4, ... pass_spp)
         self.published = 0                # passes in the newest published frame of this gen
         self.acc: dict[str, np.ndarray] = {}  # per key, FIREFLY_BUCKETS sums of passes (see robust_mean)
         self.acc_n = [0] * FIREFLY_BUCKETS     # passes in each of them
@@ -431,12 +435,24 @@ class Session:
             self.gen += 1
             self.view, self.gen_started = view, time.time()
             self.issued = self.passes = self.published = 0
+            self.spp_issued = self.spp_done = 0
             self.acc, self.acc_n = {}, [0] * FIREFLY_BUCKETS
             self.error = ""
             self.started = True
             self.pose = pose
             self.version += 1
             self.cv.notify_all()
+
+    def _next_pass_spp(self) -> int:
+        """Samples of the next pass: the first is ``pass_spp``, each later one doubles what has been issued (the
+        running total goes 16, 32, 64, 128 ...: halves the noise at every pass instead of every other pass
+        late on), at most ``max_pass_spp`` so a move is never behind a long pass, and not past ``target_spp``.
+        A multiple of ``pass_spp`` (the server replays its 16 spp recording)."""
+        base = self.pass_spp
+        want = base if self.spp_issued == 0 else min(self.max_pass_spp, self.spp_issued)
+        want = max(base, want - want % base)
+        left = self.target_spp - self.spp_issued
+        return int(max(base, min(want, left - left % base))) if left >= base else int(base)
 
     def _wants_pass(self) -> bool:
         if self.view is None or self.error or self.inflight >= self.depth:
@@ -445,15 +461,18 @@ class Session:
             return True
         if self.view.get("renderer") == "raster":  # noiseless: one image is the frame
             return False
-        return self.auto and self.issued * self.pass_spp < self.target_spp
+        return self.auto and self.spp_issued < self.target_spp
 
     def _loop(self) -> None:
         while True:
             with self.cv:
                 while not self._wants_pass():
                     self.cv.wait()
-                gen, view, seed = self.gen, self.view, self.issued
+                gen, seed = self.gen, self.issued
+                spp = self._next_pass_spp()
+                view = dict(self.view, spp=spp)
                 self.issued += 1
+                self.spp_issued += spp
                 self.inflight += 1
             self._pool.submit(self._pass, gen, view, seed)
 
@@ -494,20 +513,22 @@ class Session:
                 passes = 1
                 mean = {k: np.asarray(out[k], dtype=np.float32) for k in ACCUMULATED if k in out}
             else:
-                b = self.passes % FIREFLY_BUCKETS
+                spp = int(view["spp"])
+                b = int(np.argmin(self.acc_n))  # the lightest bucket: passes differ in size, so not round-robin
                 for k in ACCUMULATED:
                     if k in out:
                         a = np.asarray(out[k], dtype=np.float32)
                         if k not in self.acc:
                             self.acc[k] = np.zeros((FIREFLY_BUCKETS,) + a.shape, np.float32)
-                        self.acc[k][b] += a
-                self.acc_n[b] += 1
+                        self.acc[k][b] += a * spp  # a pass is the mean of its samples: weight it by them
+                self.acc_n[b] += spp
                 self.passes += 1
+                self.spp_done += spp
                 passes = self.passes
                 if self.robust:
                     mean = robust_mean(self.acc, self.acc_n)
                 else:
-                    mean = {k: self.acc[k].sum(axis=0) / passes for k in ACCUMULATED if k in self.acc}
+                    mean = {k: self.acc[k].sum(axis=0) / self.spp_done for k in ACCUMULATED if k in self.acc}
         nir = [mean.get(f"nir_s{k}") for k in range(3)]
         if self.sim.denoise:
             # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
@@ -531,7 +552,7 @@ class Session:
             extra = {"nir_grey": nir[0], "nir_derived": stokes.derived_mono(nir[0], nir[1], nir[2])}
         # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
         frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
-                 "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": passes * view["spp"], "passes": passes,
+                 "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": self.spp_done if gen == self.gen else view["spp"], "passes": passes,
                  "variant": view["variant"], "depth": out.get("depth"),
                  "c2w": [round(float(v), 5) for v in np.asarray(view["camera_to_world"]).ravel()]}
         # Where a pass's time went (ms). gpu: the server waiting for the GPU after queuing the pass's kernels, the
@@ -759,7 +780,7 @@ class Session:
                 return jpeg(self._tonemapped(frame, band, float(ev.get(band, 0.0))))
             grey = np.repeat(frame["s0"][..., "rgb".index(band), None], 3, axis=2)
             tone = self._tone(frame["scan"], frame["variant"], frame["s0"])
-            return jpeg(tonemap.reinhard(grey, tone["exposure"] * 2.0 ** float(ev.get("rgb", 0.0)), tone["white"]))
+            return jpeg(tonemap.curve(self.tone_curve)(grey, tone["exposure"] * 2.0 ** float(ev.get("rgb", 0.0)), tone["white"]))
         derived = self._polarization(frame, "luma" if band == "rgb" else band)
         return jpeg(channel_image(dict(frame, derived=derived), view, scale))
 
@@ -770,7 +791,7 @@ class Session:
         else:
             radiance, key = np.repeat(frame["nir_grey"][..., None], 3, axis=2), (frame["scan"], frame["variant"] + "|nir")
         tone = self._tone(key[0], key[1], radiance, own_frame=band == "nir")
-        return tonemap.reinhard(radiance, tone["exposure"] * 2.0 ** ev, tone["white"])
+        return tonemap.curve(self.tone_curve)(radiance, tone["exposure"] * 2.0 ** ev, tone["white"])
 
     def refit_tone(self) -> None:
         """Fit both bands' tone to the frame on screen now (instead of the dataset frames, or the band's first
@@ -1109,6 +1130,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18780)
     ap.add_argument("--pass-spp", type=int, default=16, help="samples per render pass (moves show one pass)")
     ap.add_argument("--target-spp", type=int, default=1024, help="stop accumulating at this many samples")
+    ap.add_argument("--tone-curve", choices=["reinhard", "filmic"], default="filmic",
+                    help="display curve: filmic (default; shadows deeper, highlights roll off later) or the export "
+                         "pipeline's extended Reinhard")
+    ap.add_argument("--max-pass-spp", type=int, default=128,
+                    help="longest pass: the passes double (16, 16, 32, 64, 128 samples, totals 16 ... 256 ...) up to this")
     ap.add_argument("--resolution", default="512x384", help="render size WIDTHxHEIGHT (the viewer can change it)")
     ap.add_argument("--rr-depth", type=int, default=2,
                     help="Russian roulette from this path depth (0: Mitsuba's 5). 2 measured on vanilla_r2, 512x384, "
@@ -1145,6 +1171,7 @@ def main() -> int:
     if info.get("resident") or info.get("preloading"):
         sim.setVariant((info.get("resident") or info["preloading"])[0][1])
     session = Session(sim, info["scans"], args.pass_spp, args.target_spp, args.turn_deg, args.pitch_deg, args.depth,
+                      max_pass_spp=args.max_pass_spp, tone_curve=args.tone_curve,
                       robust=not args.plain_mean)
     session.envmaps = list(info.get("envmaps", []))
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant")}

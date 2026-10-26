@@ -793,6 +793,33 @@ def test_viewer_mean_holds_back_fireflies():
     assert np.allclose(two["s0"], acc["s0"][:2].mean(axis=0))
 
 
+def test_filmic_curve_is_monotonic_and_deeper_in_the_shadows():
+    from opticalnav_sim import tonemap
+
+    ramp = np.repeat(np.linspace(0, 40, 400, dtype=np.float32)[None, :, None], 3, axis=2)
+    f, r = tonemap.filmic(ramp, 1.0, 4.0)[0, :, 0].astype(int), tonemap.reinhard(ramp, 1.0, 4.0)[0, :, 0].astype(int)
+    assert f[0] == 0 and f[-1] == 255 and (np.diff(f) >= 0).all()
+    assert f[5] < r[5]  # a dark tone: deeper than Reinhard
+    assert tonemap.curve("filmic") is tonemap.filmic and tonemap.curve("reinhard") is tonemap.reinhard
+
+
+def test_viewer_passes_double_the_running_total():
+    from opticalnav_sim import gui
+
+    s = gui.Session.__new__(gui.Session)
+    s.pass_spp, s.max_pass_spp, s.target_spp, s.spp_issued = 16, 128, 1024, 0
+    sizes, totals = [], []
+    while s.spp_issued < s.target_spp:
+        n = s._next_pass_spp()
+        sizes.append(n)
+        s.spp_issued += n
+        totals.append(s.spp_issued)
+    assert totals[:5] == [16, 32, 64, 128, 256] and sizes == [16, 16, 32, 64, 128] + [128] * 6  # 16, 32, 64, 128 ...
+    assert totals[-1] == 1024 and all(n % 16 == 0 for n in sizes)  # the server replays its 16 spp recording
+    s.pass_spp, s.target_spp, s.spp_issued = 16, 40, 32  # a target that is not a power of two: no overshoot of a whole pass
+    assert s._next_pass_spp() == 16
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

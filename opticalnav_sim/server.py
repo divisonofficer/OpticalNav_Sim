@@ -817,6 +817,7 @@ def light_classes(text: str) -> dict[str, str]:
     return out
 
 
+SCENE_SKY = (0.55, 0.57, 0.60)  # the constant sky of every scene file (environment: constant)
 ENV_RES = (1024, 512)  # every environment map is resampled to this, so swapping maps never re-records
 DUAL_MARGIN = 3  # pixels a side each slot of a dual (visible | near-infrared) render has to spare at the seam
 _BLANK_ENV: list[Path] = []
@@ -1950,7 +1951,8 @@ class Renderer:
 
     def __init__(self, pack, variant: str | None, max_resident: int, freeze: str = "auto",
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
-                 envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16):
+                 envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16,
+                 default_sky: str | None = None, default_sky_rotate: float = 0.0):
         import drjit as dr
         import mitsuba as mi
 
@@ -2013,7 +2015,9 @@ class Renderer:
         self.envmaps = {f.stem: f for f in sorted(folder.glob("*")) if f.suffix.lower() in (".exr", ".hdr")} \
             if folder.is_dir() else {}
         self.env_cache: dict[str, np.ndarray] = {}
+        self.sky_gain: dict[str, float] = {}
         self.sun_deg = float(sun_deg)
+        self.default_sky, self.default_sky_rotate = default_sky, float(default_sky_rotate)  # see sky_for
         self.freeze_spp = int(freeze_spp)
         for scan in self.meta:
             synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
@@ -2032,6 +2036,26 @@ class Renderer:
         """The scene's perturbation pool (scenes/<scan>/perturbation_pool.json), if built."""
         path = self.scene_dir(scan) / "perturbation_pool.json"
         return json.loads(path.read_text()) if path.is_file() else None
+
+    def sky_for(self, scan: str, variant: str) -> tuple[str, float, float] | None:
+        """(map, gain, rotation) of the default sky for a view that asks for the scene's own environment, or None.
+
+        A scene staged without a render (the simulator's own scenes, ``staged_without_render_v1``) has only a
+        flat constant sky (radiance 0.55 0.57 0.60): no sun, no gradient, no horizon, so light through a window
+        has no direction and no shadow. They get ``--default-sky`` instead, an HDR sky with its sun (spread over
+        --sun-deg), scaled so its mean radiance equals the constant's (the interior lights were set against it,
+        so the exterior stays as bright overall). The dataset's scenes keep their own sky: their frames are
+        compared with the stored ones."""
+        if not self.default_sky or self.default_sky not in self.envmaps:
+            return None
+        if self.meta[scan]["variants"].get(variant, {}).get("protocol") != "staged_without_render_v1":
+            return None
+        if self.default_sky not in self.sky_gain:
+            data = self.env_image(self.default_sky)
+            rows = np.cos(np.linspace(np.pi / 2, -np.pi / 2, data.shape[0], dtype=np.float32))[:, None]  # solid angle
+            mean = float(((data @ stokes.LUMA) * rows).sum() / (rows.sum() * data.shape[1]))
+            self.sky_gain[self.default_sky] = float(np.mean(SCENE_SKY)) / max(mean, 1e-6)
+        return self.default_sky, self.sky_gain[self.default_sky], self.default_sky_rotate
 
     def env_image(self, name: str) -> np.ndarray:
         """An environment map of the --envmaps directory at ENV_RES (loaded once)."""
@@ -2243,6 +2267,8 @@ class Renderer:
             raise ValueError("lights / env scale out of range")
         if env_map != "original" and env_map not in self.envmaps:
             raise ValueError(f"unknown environment map {env_map!r} (have {sorted(self.envmaps)})")
+        if env_map == "original" and (sky := self.sky_for(scan, variant)) is not None:  # the simulator's scenes: a real sky
+            env_map, env_scale, env_rot = sky[0], env_scale * sky[1], env_rot + sky[2]
         bands, flash_band = str(view.get("bands", "rgb")), str(view.get("flash_band", "rgb"))
         if bands not in ("rgb", "nir", "both") or flash_band not in ("rgb", "nir", "both"):
             raise ValueError("bands and flash_band are 'rgb', 'nir' or 'both'")
@@ -2806,6 +2832,11 @@ def main() -> int:
     ap.add_argument("--sun-deg", type=float, default=8.0,
                     help="spread an environment map's sun over a Gaussian of this many degrees, keeping its power: "
                          "sunlight through window glass otherwise renders as fireflies (0: as the file has it)")
+    ap.add_argument("--default-sky", default=None, metavar="MAP",
+                    help="an --envmaps map (file stem) used as the sky of the simulator's own scenes (staged without "
+                         "a render) when a view asks for the scene's own environment; scaled to the constant sky's "
+                         "mean radiance. e.g. kloofendal_48d_partly_cloudy_puresky. The dataset's scenes keep theirs")
+    ap.add_argument("--default-sky-rotate", type=float, default=0.0, help="turn that sky about the vertical (degrees)")
     ap.add_argument("--envmaps", type=Path, default=None,
                     help="folder of .exr/.hdr environment maps a view may name (default: <pack>/envmaps)")
     ap.add_argument("--kernel-history", action="store_true",
@@ -2820,7 +2851,7 @@ def main() -> int:
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
     renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
-                        kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg,
+                        kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
                         freeze_spp=args.freeze_spp)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))

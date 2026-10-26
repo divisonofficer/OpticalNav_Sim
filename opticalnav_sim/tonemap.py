@@ -36,6 +36,28 @@ def reinhard(radiance: np.ndarray, exposure: float, white: float) -> np.ndarray:
     return np.clip(np.round(_srgb(y) * 255.0), 0, 255).astype(np.uint8)
 
 
+def filmic(radiance: np.ndarray, exposure: float, white: float) -> np.ndarray:
+    """A filmic S-curve (Narkowicz's fit of the ACES reference rendering transform) per channel, then sRGB:
+    uint8 HxWx3. Against ``reinhard`` it keeps more contrast in the mid tones (shadows deeper, wood and cloth
+    richer) and rolls the highlights off later and harder, so a window stays a window instead of a white
+    patch. ``white`` is the exposed luminance that lands near paper white, as in reinhard."""
+    x = np.clip(np.nan_to_num(np.asarray(radiance, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0),
+                0.0, 1e4) * float(exposure)
+    x = x * (1.5 / max(float(white), 1e-6))  # ``white`` lands at 1.5 on the curve, 0.93 of paper white
+    y = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+    return np.clip(np.round(_srgb(np.clip(y, 0.0, 1.0)) * 255.0), 0, 255).astype(np.uint8)
+
+
+CURVES = {"reinhard": reinhard, "filmic": filmic}
+
+
+def curve(name: str):
+    """The display operator called ``name`` ('reinhard', the export pipeline's; or 'filmic')."""
+    if name not in CURVES:
+        raise ValueError(f"tone curve must be one of {sorted(CURVES)}")
+    return CURVES[name]
+
+
 def global_params(radiance_frames, stride: int = 4) -> dict[str, float]:
     """(exposure, white) from the positive luminance of one or more linear RGB frames."""
     pool = np.concatenate([np.asarray(f, dtype=np.float32)[::stride, ::stride].reshape(-1, 3) @ LUMA
