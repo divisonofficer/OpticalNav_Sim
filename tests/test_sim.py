@@ -915,6 +915,26 @@ def test_blender_power_lights_a_lamp_at_its_blender_watts():
     assert math.isclose(build("SUN", 5.0, True), build("SUN", 5.0, False))  # a sun's energy is W/m2: left alone
 
 
+def test_metal_parts_take_their_objects_textures(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import metal_textures
+
+    def shape(sid, bsdf):
+        return f'\n  <shape type="ply" id="{sid}">\n    <string name="filename" value="assets/a.ply" />\n    {bsdf}\n  </shape>'
+
+    plastic = ('<bsdf type="pplastic"><texture name="diffuse_reflectance" type="bitmap"><string name="filename" '
+               'value="assets/tex_a.png" /></texture><texture name="alpha" type="bitmap"><string name="filename" '
+               'value="assets/tex_r.png" /><boolean name="raw" value="true" /></texture></bsdf>')
+    steel = '<bsdf type="roughconductor">\n <string name="material" value="Al" />\n <float name="alpha" value="0.6000" />\n</bsdf>'
+    (tmp_path / "base.xml").write_text("<scene>" + shape("Counter_6_.spawn_asset_6__part_001_x__1", plastic)
+                                       + shape("Counter_6_.spawn_asset_6__part_002_x__2", steel)
+                                       + shape("Lonely_1_.spawn_asset_1", steel) + "\n</scene>")
+    assert metal_textures.metal_scene(tmp_path)["metal_parts"] == 1  # the counter's steel; a part with no textured sibling stays
+    out = (tmp_path / "base.xml").read_text()
+    assert out.count('name="specular_reflectance"') == 1 and 'value="assets/tex_a.png"' in out.split("Lonely_1_")[0].split("part_002")[1]
+    assert out.split("Lonely_1_")[1].count('value="Al"') == 1
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
