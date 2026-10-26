@@ -535,7 +535,8 @@ def cone_recess(radius: float, height: float, cone_deg: float) -> tuple[float, f
     return depth, min(3.0, 1.0 / max(share, 1e-6))
 
 
-def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None) -> tuple[str, list[str]]:
+def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None,
+                     blender_power: bool = False) -> tuple[str, list[str]]:
     """Lamps glow from their own parts instead of from boxes. Infinigen spawns a light (``PointLampFactory``) with
     only some of its lamps; robomituba's importer turns those into a flat emitter cube (0.6 x 0.6 x 0.08 m) at a
     desk or floor lamp's top and a 0.6 m square under a ceiling light, and the other lamps stay dark. A lamp is
@@ -569,7 +570,12 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     ``mesh_bounds(shape_type, shape_body)`` (a part's world bounding box). Its bulb, the first try, held the
     light box's power in ~0.02 m2: a source that bright and small left fireflies on every glossy surface of
     the room. The disk spreads it over ~6x the area and is sampled directly from below. Without a dome
-    (or the callback) the pendant glows from its lowest non-metal part, the bulb (its highest is the cord)."""
+    (or the callback) the pendant glows from its lowest non-metal part, the bulb (its highest is the cord).
+
+    ``blender_power``: a light with ``metadata.light.energy`` (Blender watts; not a SUN) glows at Blender's own
+    power: a radiant flux of energy / pi (a point light's intensity is energy / (4 pi^2) W/sr, an area light's radiance
+    energy / (pi^2 area)); a spot keeps the point light's intensity inside its cone. The importer's box radiance came
+    to 1/7.5 of that for floorG's 60 W area lights and 1/3.5 to 1/10 for its point lights (its spots match)."""
     raw: dict[str, str] = {}  # note id -> the note as written, to drop a replaced box's note
     notes = []
     for note in re.findall(r"<!--opticalnav-obj:(\{.*?\})-->", text):
@@ -583,8 +589,18 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     shapes = {m.group(2): m for m in re.finditer(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>', text, re.S)}
     lamps, kinds, paired, orphans = pair_lamp_lights(notes or notes_from_shapes(shapes))
 
+    def from_blender(light: dict | None) -> bool:
+        info = ((light or {}).get("metadata") or {}).get("light") or {}
+        return bool(blender_power and info.get("energy") and info.get("type") != "SUN")
+
     def light_power(light: dict) -> float | None:
-        """Emitted power / pi of an importer's light box: radiance x its emitting area."""
+        """Emitted power / pi of an importer's light box: radiance x its emitting area (``blender_power``: the
+        light's own Blender energy / pi^2, the same measure)."""
+        info = (light.get("metadata") or {}).get("light") or {}
+        if from_blender(light):
+            # a spot keeps a point light's intensity inside its cone (energy / 4 pi^2 W/sr), which is what a
+            # Lambertian disk's radiance x area gives on its axis
+            return float(info["energy"]) / ((4.0 if info.get("type") == "SPOT" else 1.0) * math.pi ** 2)
         if not light.get("emitter_radiance"):
             return None
         sx, sy, sz = (float(v) for v in (light.get("geometry") or {}).get("size_m") or [0.6, 0.08, 0.6])
@@ -666,7 +682,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
                     aim = None
                 if cone and 5.0 <= float(cone) < 170.0:
                     sink, gain = cone_recess(r, float(hi[1] - lo[1]), float(cone))
-                    rad *= gain
+                    rad *= 1.0 if from_blender(light) else gain  # Blender's spot cone loses the flux the walls take
                 sid = f"{o['id']}__glow"
                 disk(sid, r, ((lo[0] + hi[0]) / 2, lo[1] + sink, (lo[2] + hi[2]) / 2), rad,
                      {"id": sid, "type": "landmark", "is_emitter": True, "emitter_radiance": [round(rad, 4)] * 3,
@@ -1096,7 +1112,8 @@ class Resident:
 
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
-                 pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0):
+                 pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0,
+                 blender_power: bool = False):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
@@ -1128,7 +1145,7 @@ class Resident:
         import drjit as dr
         # OPTICALNAV_BOX_LIGHTS=1: lit lamps keep the importer's boxes (the earlier look, for comparisons)
         text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"),
-                                                  mesh_bounds=mesh_bounds)
+                                                  mesh_bounds=mesh_bounds, blender_power=blender_power)
         if fill_gain != 1.0:  # the simulator's own scenes: the importer's room softboxes at a share of their radiance
             text = scale_fill_text(text, fill_gain)
         radiance = emitter_radiance(text)  # before the band transforms wrap them
@@ -2005,7 +2022,7 @@ class Renderer:
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
                  envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16,
                  default_sky: str | None = None, default_sky_rotate: float = 0.0, fill_gain: float = 1.0,
-                 default_depth: int = 0):
+                 default_depth: int = 0, lamp_power: str = "importer"):
         import drjit as dr
         import mitsuba as mi
 
@@ -2072,6 +2089,7 @@ class Renderer:
         self.sun_deg = float(sun_deg)
         self.default_sky, self.default_sky_rotate = default_sky, float(default_sky_rotate)  # see sky_for
         self.fill_gain, self.default_depth = float(fill_gain), int(default_depth)  # the simulator's own scenes, see own_scene
+        self.lamp_power = lamp_power  # "blender": the simulator's own scenes light at their Blender watts
         self.freeze_spp = int(freeze_spp)
         for scan in self.meta:
             synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
@@ -2236,7 +2254,8 @@ class Renderer:
                               envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
                               pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
                               hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
-                              fill_gain=self.fill_gain if self.own_scene(scan, variant) else 1.0)
+                              fill_gain=self.fill_gain if self.own_scene(scan, variant) else 1.0,
+                              blender_power=self.lamp_power == "blender" and self.own_scene(scan, variant))
         self.cache[rkey] = loaded
         return loaded
 
@@ -2899,6 +2918,10 @@ def main() -> int:
                          "a render) when a view asks for the scene's own environment; scaled to the constant sky's "
                          "mean radiance. e.g. kloofendal_48d_partly_cloudy_puresky. The dataset's scenes keep theirs")
     ap.add_argument("--default-sky-rotate", type=float, default=0.0, help="turn that sky about the vertical (degrees)")
+    ap.add_argument("--lamp-power", choices=("importer", "blender"), default="importer",
+                    help="'blender': the lights of the simulator's own scenes that carry metadata.light.energy glow at "
+                         "Blender's power (flux energy / pi) instead of the importer's box radiance, which is 3 to 10 "
+                         "times weaker. The dataset's scenes keep theirs")
     ap.add_argument("--fill-gain", type=float, default=1.0,
                     help="scale the radiance of the room softboxes (light_softbox_*, the importer's fill) of the "
                          "simulator's own scenes. Off, floorO2 loses 58% of its light; at 0.4-0.5 shadows and pools of "
@@ -2921,7 +2944,7 @@ def main() -> int:
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
     renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
-                        fill_gain=args.fill_gain, default_depth=args.default_depth,
+                        fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power,
                         freeze_spp=args.freeze_spp)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))

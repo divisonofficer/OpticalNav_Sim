@@ -891,6 +891,30 @@ def test_a_spot_light_sets_its_glowing_disk_back_in_the_housing():
     assert np.allclose(turned, [aim[0], aim[2], aim[1]], atol=1e-3)  # scene frame (x, up, y)
 
 
+def test_blender_power_lights_a_lamp_at_its_blender_watts():
+    lamp = "DomePendantFactory_3_.spawn_asset_3"
+    box = '<emitter type="area"><rgb name="radiance" value="1 1 1" /></emitter>'
+
+    def build(kind, energy, blender):
+        light = {"id": "light_1_PointLampFactory_pendant_.spawn_asset_3", "is_emitter": True, "emitter_radiance": [1, 1, 1],
+                 "geometry": {"center": [4.0, 1.0], "size_m": [0.6, 0.08, 0.6]},
+                 "metadata": {"light": {"type": kind, "energy": energy}}}
+        text = ("<scene>" + f"\n  <!--opticalnav-obj:{json.dumps({'id': lamp, 'label': 'DomePendantFactory(3).spawn_asset(3)', 'geometry': {'center': [4.0, 1.0], 'size_m': [0.4, 1.0, 0.4]}})}-->"
+                + f'\n  <shape type="ply" id="{lamp}">\n    <string name="filename" value="assets/a.ply" /><bsdf type="roughconductor"/>\n  </shape>'
+                + f"\n  <!--opticalnav-obj:{json.dumps(light)}-->"
+                + f'\n  <shape type="ply" id="{light["id"]}">\n    <string name="filename" value="assets/b.ply" />{box}\n  </shape>\n</scene>')
+        out, _ = server.lamp_lights_text(text, mesh_info=lambda k, f: (0.02, 0.0),
+                                         mesh_bounds=lambda k, b: ([3.8, 1.8, 0.8], [4.2, 2.0, 1.2]), blender_power=blender)
+        disk = out.split(f'<shape type="ply" id="{lamp}__glow">')[1].split("</shape>")[0]
+        return float(disk.split('name="radiance" value="')[1].split()[0])
+
+    area = math.pi * (0.47 * 0.4) ** 2
+    assert math.isclose(build("POINT", 60.0, True), 60.0 / math.pi ** 2 / area, rel_tol=1e-3)  # flux energy / pi
+    assert math.isclose(build("SPOT", 12.0, True), 12.0 / (4 * math.pi ** 2) / area, rel_tol=1e-3)  # spot: intensity
+    assert build("POINT", 60.0, False) != build("POINT", 60.0, True)  # the importer's own box radiance otherwise
+    assert math.isclose(build("SUN", 5.0, True), build("SUN", 5.0, False))  # a sun's energy is W/m2: left alone
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
