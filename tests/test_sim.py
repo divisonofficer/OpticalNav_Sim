@@ -832,6 +832,15 @@ def test_gray_textures_become_one_channel_except_normal_maps_and_colour(tmp_path
         assert f"assets/{kept}.png" in xml
 
 
+def test_scale_fill_text_scales_only_the_room_softboxes():
+    text = ('<scene>\n  <shape type="ply" id="light_softbox_hall_0">\n    <emitter type="area"><rgb name="radiance" value="3 3 3" /></emitter>'
+            '\n  </shape>\n  <shape type="ply" id="lamp_1">\n    <emitter type="area"><rgb name="radiance" value="2.5 2 1.5" /></emitter>'
+            '\n  </shape>\n</scene>')
+    out = server.scale_fill_text(text, 0.4)
+    assert 'value="1.2000 1.2000 1.2000"' in out and 'value="2.5 2 1.5"' in out  # the softbox only
+    assert server.scale_fill_text(text, 1.0).count("1.2000") == 0  # a gain of 1 writes the same values (3 3 3 stays)
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 

@@ -705,6 +705,19 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     return text, added
 
 
+def scale_fill_text(text: str, gain: float) -> str:
+    """The room softboxes' (``light_softbox_*``) emitter radiance times ``gain``, in a scene file's text."""
+    def shape(m):
+        if not m.group(2).startswith(FILL_PREFIX):
+            return m.group(0)
+        body = re.sub(r'(<rgb name="radiance" value=")([^"]+)(")',
+                      lambda r: r.group(1) + " ".join(f"{float(v) * gain:.4f}" for v in r.group(2).split()) + r.group(3),
+                      m.group(3))
+        return m.group(1) + body + m.group(4)
+
+    return re.sub(r'(\n  <shape type="[a-z_]+" id="([^"]+)">)(.*?)(\n  </shape>)', shape, text, flags=re.S)
+
+
 def scene_stats(mi, scene, text: str) -> dict:
     """What a loaded scene holds, for the viewer's scene tab: shapes, meshes, triangles, distinct BSDFs, image
     textures, emitters, and the scene text's size."""
@@ -1046,7 +1059,7 @@ class Resident:
 
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
-                 pool: dict | None = None, upgrade_flash: bool = False, hidden: str = ""):
+                 pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
@@ -1079,6 +1092,8 @@ class Resident:
         # OPTICALNAV_BOX_LIGHTS=1: lit lamps keep the importer's boxes (the earlier look, for comparisons)
         text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"),
                                                   mesh_bounds=mesh_bounds)
+        if fill_gain != 1.0:  # the simulator's own scenes: the importer's room softboxes at a share of their radiance
+            text = scale_fill_text(text, fill_gain)
         radiance = emitter_radiance(text)  # before the band transforms wrap them
         self.classes = light_classes(text)  # shape id -> 'led' | 'incandescent'
         self.groups = light_groups(text)  # shape id -> 'fixture' | 'fill' | 'lamp' (lighting modes remove whole groups)
@@ -1952,7 +1967,8 @@ class Renderer:
     def __init__(self, pack, variant: str | None, max_resident: int, freeze: str = "auto",
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
                  envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16,
-                 default_sky: str | None = None, default_sky_rotate: float = 0.0):
+                 default_sky: str | None = None, default_sky_rotate: float = 0.0, fill_gain: float = 1.0,
+                 default_depth: int = 0):
         import drjit as dr
         import mitsuba as mi
 
@@ -2018,6 +2034,7 @@ class Renderer:
         self.sky_gain: dict[str, float] = {}
         self.sun_deg = float(sun_deg)
         self.default_sky, self.default_sky_rotate = default_sky, float(default_sky_rotate)  # see sky_for
+        self.fill_gain, self.default_depth = float(fill_gain), int(default_depth)  # the simulator's own scenes, see own_scene
         self.freeze_spp = int(freeze_spp)
         for scan in self.meta:
             synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
@@ -2037,6 +2054,11 @@ class Renderer:
         path = self.scene_dir(scan) / "perturbation_pool.json"
         return json.loads(path.read_text()) if path.is_file() else None
 
+    def own_scene(self, scan: str, variant: str = "base") -> bool:
+        """A scene staged without a render (``staged_without_render_v1``): the simulator's own, with no dataset
+        frames to match, so its look defaults (sky, fill, depth) may differ from the dataset's."""
+        return self.meta[scan]["variants"].get(variant, {}).get("protocol") == "staged_without_render_v1"
+
     def sky_for(self, scan: str, variant: str) -> tuple[str, float, float] | None:
         """(map, gain, rotation) of the default sky for a view that asks for the scene's own environment, or None.
 
@@ -2048,7 +2070,7 @@ class Renderer:
         compared with the stored ones."""
         if not self.default_sky or self.default_sky not in self.envmaps:
             return None
-        if self.meta[scan]["variants"].get(variant, {}).get("protocol") != "staged_without_render_v1":
+        if not self.own_scene(scan, variant):
             return None
         if self.default_sky not in self.sky_gain:
             data = self.env_image(self.default_sky)
@@ -2176,7 +2198,8 @@ class Renderer:
                               flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
                               envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
                               pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
-                              hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "")
+                              hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
+                              fill_gain=self.fill_gain if self.own_scene(scan, variant) else 1.0)
         self.cache[rkey] = loaded
         return loaded
 
@@ -2288,6 +2311,8 @@ class Renderer:
             raise ValueError("flash_offset is [right, up, forward] in metres, each within 2")
         flash_offset = (flash_offset + (0.0,))[:3]
         max_depth = int(view.get("max_depth") or 0)  # every pass's path length cap; 0 or absent: the scene's own
+        if not max_depth and self.default_depth and self.own_scene(scan, variant):
+            max_depth = self.default_depth
         rr_depth = int(view.get("rr_depth") or 0)  # Russian roulette from this depth; 0 or absent: Mitsuba's 5
         if not 0 <= rr_depth <= 64:
             raise ValueError("rr_depth must be 0 (Mitsuba's 5) .. 64")
@@ -2837,6 +2862,13 @@ def main() -> int:
                          "a render) when a view asks for the scene's own environment; scaled to the constant sky's "
                          "mean radiance. e.g. kloofendal_48d_partly_cloudy_puresky. The dataset's scenes keep theirs")
     ap.add_argument("--default-sky-rotate", type=float, default=0.0, help="turn that sky about the vertical (degrees)")
+    ap.add_argument("--fill-gain", type=float, default=1.0,
+                    help="scale the radiance of the room softboxes (light_softbox_*, the importer's fill) of the "
+                         "simulator's own scenes. Off, floorO2 loses 58% of its light; at 0.4-0.5 shadows and pools of "
+                         "light from the fixtures stand out. The dataset's scenes keep theirs")
+    ap.add_argument("--default-depth", type=int, default=0,
+                    help="path length of the simulator's own scenes when a view asks for the scene's own (0: its "
+                         "own, 6): a pane of glass is two bounces now, a window and a room three more")
     ap.add_argument("--envmaps", type=Path, default=None,
                     help="folder of .exr/.hdr environment maps a view may name (default: <pack>/envmaps)")
     ap.add_argument("--kernel-history", action="store_true",
@@ -2852,6 +2884,7 @@ def main() -> int:
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
     renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
+                        fill_gain=args.fill_gain, default_depth=args.default_depth,
                         freeze_spp=args.freeze_spp)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
