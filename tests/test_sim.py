@@ -749,6 +749,32 @@ def test_build_pack_copies_the_importers_fixture_tags_into_the_scene_notes(tmp_p
     assert build_pack.tag_fixtures(xml, amap) == 0
 
 
+def test_open_doors_opens_closed_interior_doors_only():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import numpy as np
+
+    import open_doors
+
+    def box(lo, hi):
+        return np.array(lo, float), np.array(hi, float)
+
+    boxes = {
+        "outer.wall": box([0, 0, 0], [20, 3, 10]),  # the building's walls: x 0-20, z 0-10
+        # an interior wall along x at z=5 (thin in z): a casing 1.1 m wide, leaf closed across it
+        "DoorCasingFactory_1_.spawn_asset_0": box([8, 0, 4.95], [9.1, 2.2, 5.05]),
+        "LiteDoorFactory_1_.spawn_asset_0": box([8.1, 0, 4.98], [9.0, 2.1, 5.02]),
+        # a second casing, its leaf swung open (thin along x, wide along z)
+        "DoorCasingFactory_2_.spawn_asset_1": box([14, 0, 4.95], [15.1, 2.2, 5.05]),
+        "LiteDoorFactory_2_.spawn_asset_1": box([14.0, 0, 4.2], [14.1, 2.1, 5.1]),
+        # a closed door in the outer wall (x=0): stays closed
+        "DoorCasingFactory_3_.spawn_asset_2": box([-0.05, 0, 2], [0.05, 2.2, 3.1]),
+        "LiteDoorFactory_3_.spawn_asset_2": box([-0.02, 0, 2.1], [0.02, 2.1, 3.0]),
+    }
+    found = open_doors.closed_doors(boxes)
+    assert [d["key"] for d in found] == ["1_0"] and found[0]["shapes"] == ["LiteDoorFactory_1_.spawn_asset_0"]
+    assert [d["key"] for d in open_doors.closed_doors(boxes, exterior=True)] == ["1_0", "3_2"]
+
+
 def test_viewer_mean_holds_back_fireflies():
     from opticalnav_sim import gui
 

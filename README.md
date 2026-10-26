@@ -650,6 +650,19 @@ The geometry no longer matches the dataset's reference frames exactly.
 
 **Render test without the GPU.** `tools/cpu_check.py` tests a pack scene on the CPU (Mitsuba's `scalar_rgb`, no server, `CUDA_VISIBLE_DEVICES=` empty): the server's own scene preparation (lamps lit from their parts, tags), `path_nocaustics` with the softboxes hidden, RGB intensity only (no Stokes, mirrors or flash). It loads the scene, renders four headings from each spawn point and fails on a black or non-finite view, saves a contact sheet, and with `--apply-spawns` picks the start poses from depth the way `check_spawns.py` does. A scene loads in 6 to 190 s and its 4 to 12 views render in 1 to 8 s at 192x144, 32 spp. On the 22 scenes of the October 2026 batch, none failed.
 
+**Glass, frost and doors of Infinigen offices.** Three things in the imported scenes made the glass partitions wrong, each fixed after the fact by a tool run on a built scene (rebuild it to undo):
+
+* **Single-sheet glass bends what it shows.** Partitions, window panes and big glass panes are one zero-thickness sheet with `dielectric` (ior 1.5). A dielectric refracts a ray and sends it on bent; with no back face to leave through, a ray crossing the sheet at 40 degrees left it 23 degrees off (measured on floorO2's partition), so everything behind the glass was shifted and warped. `thindielectric` would go straight but has no polarized variant (its source says so: the reflection would lose its polarization). `tools/slab_glass.py` gives each sheet mesh under 3 mm a thickness of 6 mm: its triangles twice, 6 mm apart along the normal, the back copy turned inside out. A ray enters by one face and leaves by the other, parallel to where it came, and both faces use the polarized `dielectric`. The importer's newer generators build 6 mm slabs themselves, and a mesh already 3 mm thick is left alone.
+* **Frosted film is an opaque band.** `GlassPartitionFrost_*` (the privacy film, 1.65 m high, coplanar with the glass) comes in as white plastic, so the office looked like a bare wall from one side. `tools/open_doors.py` removes it (`--keep-frost` keeps it).
+* **A closed leaf fills its doorway.** The same tool removes the leaf shapes of a door (`LiteDoorFactory_<seed>_.spawn_asset_<n>`) that stands closed in its casing (`DoorCasingFactory_<seed>_.spawn_asset_<n>`); a door swung open stays, and a door in the building's outer wall stays closed (`--exterior` opens it).
+
+```bash
+python tools/slab_glass.py --pack packs/opticalnav-sim-v1 [--scene SCENE] [--thickness 0.006] [--dry-run]
+python tools/open_doors.py --pack packs/opticalnav-sim-v1 [--scene SCENE] [--keep-frost] [--exterior] [--dry-run]
+```
+
+Both write `scene.json` (`glass_slabs`, `doors_opened`). Applied to the 44 scenes of the pack: 17 sheet meshes became slabs, O2 lost 7 frost bands and B and J one each, and 5 closed interior doors were opened (D3 2, market 1, pivotHouse 2). The glass partitions that a kit built across a door casing (floorC, cafeP_nordic) need the importer's `*_glassfix` blends, not these tools. The random mirror pool was checked and is not the cause of a bare-wall look: none of O2's 55 mirrors lies within 25 cm of a glass pane.
+
 **Start poses of graph-less scenes.** `build_pack.py` picks a scene's three spawn points from the authoring map's footprints, which cover the whole floor, so it took a grid corner: against a wall (0.2 to 0.9 m of open space in front), and in `sim_v2a_floorC` and `sim_v2a_floorA2` inside one, where every view was black. `tools/check_spawns.py` renders each candidate point of the three largest traversable regions (the server's raster preview, four headings, depth pass), scores a pose by its least open view (median depth, capped at 5 m) and takes the best one that the path tracer also renders lit:
 
 ```bash
