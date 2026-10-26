@@ -2992,25 +2992,28 @@ def main() -> int:
     ap.add_argument("--sun-deg", type=float, default=8.0,
                     help="spread an environment map's sun over a Gaussian of this many degrees, keeping its power: "
                          "sunlight through window glass otherwise renders as fireflies (0: as the file has it)")
-    ap.add_argument("--default-sky", default=None, metavar="MAP",
+    ap.add_argument("--default-sky", default="urban_street_01", metavar="MAP",
                     help="an --envmaps map (file stem) used as the sky of the simulator's own scenes (staged without "
                          "a render) when a view asks for the scene's own environment; scaled to the constant sky's "
-                         "mean radiance. e.g. kloofendal_48d_partly_cloudy_puresky. The dataset's scenes keep theirs")
+                         "mean radiance. Default urban_street_01: a street behind the windows (kloofendal_48d_partly_cloudy_puresky "
+                         "was a white sheet). The dataset's scenes keep theirs")
     ap.add_argument("--default-sky-rotate", type=float, default=0.0, help="turn that sky about the vertical (degrees)")
-    ap.add_argument("--lamp-power", choices=("importer", "blender"), default="importer",
+    ap.add_argument("--lamp-power", choices=("importer", "blender"), default="blender",
                     help="'blender': the lights of the simulator's own scenes that carry metadata.light.energy glow at "
                          "Blender's power (flux energy / pi) instead of the importer's box radiance, which is 3 to 10 "
                          "times weaker. The dataset's scenes keep theirs")
-    ap.add_argument("--alpha-power", type=float, default=1.0,
+    ap.add_argument("--alpha-power", type=float, default=2.0,
                     help="raise the microfacet alpha of the simulator's own scenes (the importer wrote Blender's "
                          "roughness r as alpha) to this power; 2 is Blender's r**2 (a glossy floor reflects the "
                          "windows instead of smearing them). Roughness textures are copied once to "
                          "~/.cache/opticalnav_sim/alpha_power. The dataset's scenes keep theirs")
-    ap.add_argument("--fill-gain", type=float, default=1.0,
+    ap.add_argument("--fill-gain", type=float, default=2.0,
                     help="scale the radiance of the room softboxes (light_softbox_*, the importer's fill) of the "
-                         "simulator's own scenes. Off, floorO2 loses 58% of its light; at 0.4-0.5 shadows and pools of "
-                         "light from the fixtures stand out. The dataset's scenes keep theirs")
-    ap.add_argument("--default-depth", type=int, default=0,
+                         "simulator's own scenes (default 2: against Cycles at AgX exposure 1, floorG, lphigh and stillroom come "
+                         "within 1.15-1.85x of its brightness; at 1.0 within 1.4-2.3x, at 0 the fill's share "
+                         "of the light and the noise it keeps down are gone). 1: the importer's own. The dataset's "
+                         "scenes keep theirs")
+    ap.add_argument("--default-depth", type=int, default=10,
                     help="path length of the simulator's own scenes when a view asks for the scene's own (0: its "
                          "own, 6): a pane of glass is two bounces now, a window and a room three more")
     ap.add_argument("--envmaps", type=Path, default=None,
