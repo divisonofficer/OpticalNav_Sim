@@ -37,7 +37,7 @@ python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1
 python tools/fetch_pack.py --from https://drive.google.com/drive/folders/15R3yz1y2VCdmBkJn_TE0O6gz6H6OzQtI --out packs/opticalnav-v0.2 --scene infinigen_apartment_natural_v1_20268504
 ```
 
-**Simulator scenes:** `opticalnav-sim-v1`, 39 staged scenes, 12.1 GB (17.5 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn). List what is in it with `tools/fetch_pack.py --list`.
+**Simulator scenes:** `opticalnav-sim-v1`, 40 staged scenes, 11.5 GB (17.0 GB unpacked), in [this Google Drive folder](https://drive.google.com/drive/folders/1YnQO7sus4iPxiQVbwVwQMx7D0jyaLgRn). List what is in it with `tools/fetch_pack.py --list`.
 
 * Apartments: `sim_apt_12644647`, `sim_apt_22572521_vanilla_r2`.
 * Infinigen 2.0 floors (15): cafes G and H, hotel H3, lounge S29, apartment P2b, market M (1,772 objects; its meshes decimated and small-object textures cut, so it fits a 32 GB GPU), offices A2, B, C and O2, clinics D3, E3 and F3, warehouse J, shop I, and `pivotHouse` (a courtyard house; 43.8 M triangles decimated to about 3 M).
