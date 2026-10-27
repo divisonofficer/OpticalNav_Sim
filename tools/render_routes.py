@@ -100,12 +100,22 @@ def render_scene(client: RenderClient, pack: Path, scene: str, routes: dict, out
                 "mode": "polar", **({"bands": "both"} if fmt == "exr" else {})}
 
     client.render([view(todo[0][2], 0, 16)])  # the scene loads and records at a small spp first
+    failed_path = out / "failed_frames.json"  # frame -> failures: three failures and a frame is left out
+    failed = json.loads(failed_path.read_text()) if failed_path.is_file() else {}
     t0, n = time.time(), 0
     for rid, k, pose in todo:
+        key = f"{scene}/{rid}/{k}"
+        if failed.get(key, 0) >= 3:
+            continue
         rgb = out / "images" / rid / "rgb" / f"{k:04d}.jpg"
         pol = out / "images" / rid / "pol" / f"{k:04d}.png"
         seed = zlib.crc32(f"{rid}/{k}".encode()) % 40000 * 100003
-        result = client.render([view(pose, seed, spp)], "float32")[0]
+        try:
+            result = client.render([view(pose, seed, spp)], "float32")[0]
+        except Exception:  # the server may be gone: count the failure, and let the caller restart it and run again
+            failed[key] = failed.get(key, 0) + 1
+            failed_path.write_text(json.dumps(failed))
+            raise
         if fmt == "exr":
             exr = out / "images" / rid / "exr" / f"{k:04d}.exr"
             exr.parent.mkdir(parents=True, exist_ok=True)
