@@ -1750,7 +1750,7 @@ class Resident:
             while done < total:
                 n = min(SPP_CHUNK[self.mode], total - done)
                 img = np.array(self.render_passes(self.scene, dual if dual is not None else self.sensor, its, n,
-                                                  int(seed) + 104729 * i), dtype=np.float64) * n
+                                                  (int(seed) + 104729 * i) & 0xFFFFFFFF), dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
             return (acc / total).astype(np.float32), breakdown
@@ -1783,9 +1783,9 @@ class Resident:
                               score=self.score)
         try:
             args = self.frozen_args[key]
-            img = self.frozen[key](*args, dr.opaque(mi.UInt32, int(seed) * repeats))  # replays, launching the kernels
+            img = self.frozen[key](*args, dr.opaque(mi.UInt32, (int(seed) * repeats) & 0xFFFFFFFF))  # replays (the seed wraps in 32 bits: a seed of 4e9 x 64 repeats overflowed), launching the kernels
             for i in range(1, repeats):  # same distribution as one render at spp x repeats
-                img = img + self.frozen[key](*args, dr.opaque(mi.UInt32, int(seed) * repeats + i))
+                img = img + self.frozen[key](*args, dr.opaque(mi.UInt32, (int(seed) * repeats + i) & 0xFFFFFFFF))
         finally:
             progress.FREEZE.end(False)
         if repeats > 1:
@@ -1977,7 +1977,7 @@ class Resident:
             while done < total:
                 n = min(per_pass, total - done)
                 img = np.array(mi.render(self.scene, sensor=sensor, integrator=integrator, spp=n,
-                                         seed=int(seed) + 104729 * i), dtype=np.float64) * n
+                                         seed=(int(seed) + 104729 * i) & 0xFFFFFFFF), dtype=np.float64) * n
                 acc = img if acc is None else acc + img
                 done, i = done + n, i + 1
             img = (acc / total).astype(np.float32)
