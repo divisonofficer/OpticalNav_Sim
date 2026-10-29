@@ -124,7 +124,7 @@ def run(args) -> int:
     stop.unlink(missing_ok=True)
     scenes = args.scene or sorted(p.stem for p in args.routes.glob("*.json"))
     log(f"supervisor start: {len(scenes)} scenes, format {args.format}, out {args.out}")
-    failures = 0
+    failures = restarts = last_done = 0
     while not stop.exists():
         if shutil.disk_usage(args.out).free < args.min_free_gb * 1e9:
             log(f"stop: less than {args.min_free_gb} GB free on the disk of {args.out}")
@@ -160,10 +160,15 @@ def run(args) -> int:
             left = sum(t - d for d, t in counts.values())
             log(f"render_routes done; {left} of the frames of the route files are not rendered (failed three times, or --limit)")
             return 0
-        failures += 1
-        log(f"render_routes exited {proc.returncode} (run {failures}): restarting the server")
+        counts = frame_counts(args.routes, args.out, scenes, args.format)
+        done_now = sum(d for d, _ in counts.values())
+        failures = 0 if done_now > last_done else failures + 1  # restarts in a row that made no progress
+        last_done = done_now
+        restarts += 1
+        log(f"render_routes exited {proc.returncode} (restart {restarts}, {failures} without progress, {done_now} frames done): "
+            "restarting the server")
         if failures >= args.max_restarts:
-            log(f"stop: {failures} restarts")
+            log(f"stop: {failures} restarts in a row without a new frame")
             return 4
         start_server(args, log)
         time.sleep(5)
@@ -214,7 +219,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18770)
     ap.add_argument("--scene", action="append", default=[])
     ap.add_argument("--limit", type=int, default=None, help="a test: only the first N missing frames of each scene")
-    ap.add_argument("--max-restarts", type=int, default=200)
+    ap.add_argument("--max-restarts", type=int, default=10, help="restarts in a row that wrote no new frame before it stops")
     ap.add_argument("--min-free-gb", type=float, default=50.0)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
