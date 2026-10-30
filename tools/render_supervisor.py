@@ -35,6 +35,9 @@ import time
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from render_routes import load_failed  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[1]
 MITSUBA = Path("/home/jinnyeong/robomituba-build/mitsuba3-3.9.1")
 PYTHON = "/usr/bin/python3.10"
@@ -85,7 +88,7 @@ def start_server(args, log) -> bool:
     logs = args.out / "logs"
     cmd = [PYTHON, "-u", "-m", "opticalnav_sim.server", "--pack", str(args.pack), "--no-compact", "--port", str(args.port),
            "--modes", "polar", "--max-resident", "1", "--envmaps", str(args.envmaps)]
-    with open(logs / "server.log", "ab") as f:
+    with open(logs / f"server{'' if args.worker == 0 else '.' + str(args.worker)}.log", "ab") as f:
         subprocess.Popen(cmd, cwd=REPO, env=env(args.gpu), stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(120):
         time.sleep(2)
@@ -109,21 +112,25 @@ def frame_counts(routes: Path, out: Path, scenes: list[str], fmt: str) -> dict[s
 
 def run(args) -> int:
     (args.out / "logs").mkdir(parents=True, exist_ok=True)
-    lock = open(args.out / ".supervisor.lock", "w")
+    sfx = "" if args.worker == 0 else f".{args.worker}"  # the files of worker i: supervisor.i.log, render.i.log, ...
+    args.port += args.worker
+    lock = open(args.out / f".supervisor{sfx}.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("a supervisor already runs on this --out", flush=True)
         return 1
-    logf = open(args.out / "logs" / "supervisor.log", "a", buffering=1)
+    logf = open(args.out / "logs" / f"supervisor{sfx}.log", "a", buffering=1)
 
     def log(msg: str) -> None:
         logf.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n")
 
     stop = args.out / "STOP"
-    stop.unlink(missing_ok=True)
+    if args.worker == 0 and not args.keep_stop:
+        stop.unlink(missing_ok=True)
+    time.sleep(30 * args.worker)  # the workers load their scene one after the other
     scenes = args.scene or sorted(p.stem for p in args.routes.glob("*.json"))
-    log(f"supervisor start: {len(scenes)} scenes, format {args.format}, out {args.out}")
+    log(f"supervisor start: {len(scenes)} scenes, format {args.format}, out {args.out}, worker {args.worker}, port {args.port}")
     failures = restarts = last_done = 0
     while not stop.exists():
         if shutil.disk_usage(args.out).free < args.min_free_gb * 1e9:
@@ -137,7 +144,7 @@ def run(args) -> int:
             continue
         cmd = [PYTHON, "-u", str(REPO / "tools/render_routes.py"), "--server", f"http://127.0.0.1:{args.port}",
                "--pack", str(args.pack), "--routes", str(args.routes), "--out", str(args.out), "--format", args.format,
-               "--spp", str(args.spp), "--variant", args.variant]
+               "--spp", str(args.spp), "--variant", args.variant, "--worker", str(args.worker)]
         for scene in scenes:
             cmd += ["--scene", scene]
         if args.preview:
@@ -145,7 +152,7 @@ def run(args) -> int:
         log("render_routes start")
         if args.limit:
             cmd += ["--limit", str(args.limit)]
-        with open(args.out / "logs" / "render.log", "ab") as f:
+        with open(args.out / "logs" / f"render{sfx}.log", "ab") as f:
             proc = subprocess.Popen(cmd, cwd=REPO, env=env(None), stdout=f, stderr=subprocess.STDOUT)
             while proc.poll() is None:
                 if stop.exists():  # stop: end the renderer now (finished frames stay)
@@ -183,24 +190,40 @@ def status(args) -> int:
     for scene, (d, t) in counts.items():
         print(f"{scene[7:44]:38s} {d:6d} / {t:6d}  {100 * d / max(t, 1):5.1f} %")
     print(f"{'TOTAL':38s} {done:6d} / {total:6d}  {100 * done / max(total, 1):5.1f} %")
-    last = None
-    log = args.out / "logs" / "render.log"
-    if log.is_file():
-        for line in log.read_text(errors="replace").splitlines()[-200:]:
+    import re
+    speeds = []
+    for log in sorted((args.out / "logs").glob("render*.log")):
+        last = None
+        for line in log.read_text(errors="replace").splitlines()[-300:]:
             if "s/frame" in line:
                 last = line
-    if last:
-        print("last speed:", last)
-        try:
-            spf = float(last.rsplit(",", 1)[1].split("s/frame")[0])
-            print(f"time left at {spf:.1f} s/frame: {spf * (total - done) / 3600:.0f} h ({spf * (total - done) / 86400:.1f} days)")
-        except (ValueError, IndexError):
-            pass
-    sup = args.out / "logs" / "supervisor.log"
-    if sup.is_file():
-        print("supervisor:", sup.read_text().splitlines()[-1] if sup.read_text() else "")
+        if last:
+            print(f"{log.name}: last speed: {last}")
+            m = re.search(r"([\d.]+) s/frame", last)
+            if m and float(m.group(1)) > 0:  # a run that rendered nothing logs "0 frames in 0 s (0.00 s/frame)"
+                speeds.append(float(m.group(1)))
+    hist_path = args.out / "logs" / "status_history.json"
+    hist = json.loads(hist_path.read_text()) if hist_path.is_file() else []
+    now = time.time()
+    if not hist or now - hist[-1][0] > 600:
+        hist.append([now, done])
+        hist_path.write_text(json.dumps(hist[-500:]))
+    measured = None
+    old = [h for h in hist if now - h[0] >= 1800]
+    if old:
+        t0, d0 = old[-1]
+        measured = (done - d0) / ((now - t0) / 3600)
+        print(f"measured over the last {(now - t0) / 3600:.1f} h: {measured:.0f} frames/h")
+    if speeds:
+        pure = sum(3600 / v for v in speeds)
+        rate = measured or pure
+        print(f"renderers {len(speeds)}, frame speed {', '.join(f'{v:.1f}' for v in speeds)} s/frame ({pure:.0f} frames/h without restarts)")
+        print(f"time left at {rate:.0f} frames/h: {(total - done) / rate:.0f} h ({(total - done) / rate / 24:.1f} days)")
+    for sup in sorted((args.out / "logs").glob("supervisor*.log")):
+        text = sup.read_text().splitlines()
+        print(f"{sup.name}:", text[-1] if text else "")
     print(f"free on disk: {shutil.disk_usage(args.out).free / 1e9:.0f} GB; failed frames: "
-          f"{len(json.loads((args.out / 'failed_frames.json').read_text())) if (args.out / 'failed_frames.json').is_file() else 0}")
+          f"{len(load_failed(args.out))}")
     return 0
 
 
@@ -219,6 +242,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18770)
     ap.add_argument("--scene", action="append", default=[])
     ap.add_argument("--limit", type=int, default=None, help="a test: only the first N missing frames of each scene")
+    ap.add_argument("--workers", type=int, default=1, help="renderers at once, each with its own server on port "
+                    "--port + i; they share the frame list through claim files, so one reloading its scene does not "
+                    "stop the others")
+    ap.add_argument("--worker", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--keep-stop", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--max-restarts", type=int, default=10, help="restarts in a row that wrote no new frame before it stops")
     ap.add_argument("--min-free-gb", type=float, default=50.0)
     args = ap.parse_args()
@@ -234,10 +262,20 @@ def main() -> int:
         return status(args)
     if args.command == "start":  # detach
         (args.out / "logs").mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, str(Path(__file__).resolve()), "run", *sys.argv[2:]]
-        with open(args.out / "logs" / "supervisor.out", "ab") as f:
-            subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-        print(f"started in the background; status: python3 tools/render_supervisor.py status --routes {args.routes} --out {args.out}")
+        rest, skip = [], False
+        for a in sys.argv[2:]:
+            if skip:
+                skip = False
+            elif a == "--workers":
+                skip = True
+            elif not a.startswith("--workers="):
+                rest.append(a)
+        (args.out / "STOP").unlink(missing_ok=True)
+        for i in range(args.workers):
+            cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--worker", str(i), "--keep-stop", *rest]
+            with open(args.out / "logs" / f"supervisor{'' if i == 0 else '.' + str(i)}.out", "ab") as f:
+                subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+        print(f"{args.workers} worker(s) started in the background; status: python3 tools/render_supervisor.py status --routes {args.routes} --out {args.out}")
         return 0
     return run(args)
 
