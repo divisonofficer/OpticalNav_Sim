@@ -1,8 +1,8 @@
 """Cycles render worker: runs inside Blender (``blender -b scene.blend --python cycles_worker.py -- CMD_FD REPLY_FD``).
 
 The scene is loaded once. Each request is one JSON line on the command pipe, answered by one JSON line on the reply
-pipe (Blender's own stdout is noisy, so the replies have their own pipe). The image is a float32 RGBA file the
-server reads and deletes. Not importable outside Blender (``bpy``); cycles_backend.py starts it.
+pipe (Blender's own stdout is noisy, so the replies have their own pipe). The image is an uncompressed float32 EXR
+at ``out`` that the server reads and deletes. Not importable outside Blender (``bpy``); cycles_backend.py starts it.
 
 Requests: ``{"op": "render", "matrix": [16] (Blender camera to world, row major), "width", "height", "hfov_deg",
 "spp", "seed", "denoise", "device", "out"}``, ``{"op": "ping"}``, ``{"op": "quit"}``.
@@ -16,9 +16,6 @@ import traceback
 import bpy
 import numpy as np
 from mathutils import Matrix
-
-
-EXR = os.path.join("/dev/shm" if os.path.isdir("/dev/shm") else "/tmp", f"opticalnav_cycles_{os.getpid()}.exr")
 
 
 def setup(device: str) -> None:
@@ -40,6 +37,7 @@ def setup(device: str) -> None:
     sc.render.resolution_percentage = 100
     sc.render.image_settings.file_format = "OPEN_EXR"
     sc.render.image_settings.color_depth = "32"
+    sc.render.image_settings.exr_codec = "NONE"  # a frame goes through /dev/shm and back: compressing it only costs time
     sc.view_settings.view_transform = "Standard"  # linear values only are read; the viewer tonemaps them
     cam = bpy.data.objects.new("OPTICALNAV_CAM", bpy.data.cameras.new("OPTICALNAV_CAM"))
     sc.collection.objects.link(cam)
@@ -64,20 +62,16 @@ def render(req: dict) -> dict:
     sc.cycles.use_denoising = bool(req.get("denoise"))
     if sc.cycles.use_denoising:
         sc.cycles.denoiser = "OPTIX"
-    # background Blender keeps no Render Result in memory: the frame goes through a float EXR (scene linear), read back
-    sc.render.filepath = EXR
+    # background Blender keeps no Render Result in memory: the frame is written as a float EXR (scene linear, uncompressed,
+    # top row first) that the server reads. Loading it back into Blender (bpy.data.images.load/remove) made every
+    # following render re-sync the scene: +67 ms a frame on PH19
+    sc.render.filepath = req["out"]
     sc.render.use_file_extension = False
+    t1 = time.perf_counter()
     bpy.ops.render.render(write_still=True)
-    image = bpy.data.images.load(EXR, check_existing=False)
-    try:
-        w, h = image.size
-        pixels = np.empty(w * h * 4, dtype=np.float32)
-        image.pixels.foreach_get(pixels)
-    finally:
-        bpy.data.images.remove(image)
-        os.unlink(EXR)
-    pixels.reshape(h, w, 4)[::-1].tofile(req["out"])  # Blender's rows run bottom to top
-    return {"ok": True, "width": w, "height": h, "render_s": round(time.perf_counter() - t0, 4)}
+    t2 = time.perf_counter()
+    return {"ok": True, "width": int(req["width"]), "height": int(req["height"]), "render_s": round(t2 - t0, 4),
+            "parts": {"setup_s": round(t1 - t0, 4), "render_op_s": round(t2 - t1, 4)}}
 
 
 def main() -> None:
@@ -87,7 +81,9 @@ def main() -> None:
     setup(device)
     # the first GPU render compiles the kernels for this card (minutes, once; Blender caches them): done before "ready"
     render({"width": 32, "height": 24, "hfov_deg": 60.0, "spp": 1, "seed": 0,
-            "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1.5, 0, 0, 0, 1], "out": os.devnull})
+            "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1.5, 0, 0, 0, 1],
+            "out": os.path.join("/dev/shm" if os.path.isdir("/dev/shm") else "/tmp", f"opticalnav_cycles_warm_{os.getpid()}.exr")})
+    os.unlink(os.path.join("/dev/shm" if os.path.isdir("/dev/shm") else "/tmp", f"opticalnav_cycles_warm_{os.getpid()}.exr"))
     reply.write(json.dumps({"ok": True, "ready": True, "device": device, "scene": bpy.data.filepath,
                             "objects": len(bpy.data.objects), "lights": sum(o.type == "LIGHT" for o in bpy.data.objects)}) + "\n")
     reply.flush()

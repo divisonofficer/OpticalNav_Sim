@@ -1214,3 +1214,27 @@ def test_synthetic_variants_of_an_own_scene_are_own_scenes():
     assert {"perturbed", "active_polar"} <= set(meta["variants"])
     assert all(r.own_scene("own", v) for v in ("base", "perturbed", "active_polar"))
     assert not r.own_scene("dataset", "base")
+
+
+def test_cycles_reads_blenders_uncompressed_exr(tmp_path):
+    """cycles_backend.read_exr parses the worker's EXR (uncompressed 32-bit scanlines, channels A, B, G, R) without OpenEXR."""
+    import struct
+    from opticalnav_sim import cycles_backend as cb
+    w, h = 5, 3
+    rgb = np.random.default_rng(0).random((h, w, 3)).astype("<f4")
+    alpha = np.ones((h, w), "<f4")
+
+    def attr(name, kind, payload):
+        return name.encode() + b"\0" + kind.encode() + b"\0" + struct.pack("<i", len(payload)) + payload
+    chans = b"".join(n.encode() + b"\0" + struct.pack("<iBBBBii", 2, 0, 0, 0, 0, 1, 1) for n in "ABGR") + b"\0"
+    box = struct.pack("<iiii", 0, 0, w - 1, h - 1)
+    header = (attr("channels", "chlist", chans) + attr("compression", "compression", b"\0") + attr("dataWindow", "box2i", box)
+              + attr("displayWindow", "box2i", box) + b"\0")
+    base = 8 + len(header) + 8 * h
+    blocks, table = b"", b""
+    for y in range(h):
+        table += struct.pack("<Q", base + len(blocks))
+        blocks += struct.pack("<ii", y, 4 * w * 4) + b"".join(p.tobytes() for p in (alpha[y], rgb[y, :, 2], rgb[y, :, 1], rgb[y, :, 0]))
+    path = tmp_path / "f.exr"
+    path.write_bytes(b"v/1\x01" + struct.pack("<i", 2) + header + table + blocks)
+    assert np.array_equal(cb.read_exr(str(path)), rgb)

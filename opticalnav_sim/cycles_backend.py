@@ -112,7 +112,7 @@ class CyclesWorker:
                denoise: bool = False, options: dict | None = None) -> tuple[np.ndarray, dict]:
         """Linear RGB, float32 (height, width, 3), and the worker's timing. ``options``: Cycles settings for this frame
         (``scene.cycles.<name>``: filter_glossy, sample_clamp_indirect ...); they stay set for the next frames."""
-        fd, path = tempfile.mkstemp(prefix="opticalnav_cycles_", suffix=".f32", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        fd, path = tempfile.mkstemp(prefix="opticalnav_cycles_", suffix=".exr", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
         os.close(fd)
         req = {"op": "render", "matrix": blender_camera(c2w, self.origin_offset).ravel().tolist(), "width": int(width),
                "height": int(height), "hfov_deg": float(hfov_deg), "spp": int(spp), "seed": int(seed),
@@ -124,8 +124,7 @@ class CyclesWorker:
                 reply = self._read()
             if not reply.get("ok"):
                 raise CyclesError(reply.get("error", "render failed"))
-            rgba = np.fromfile(path, dtype=np.float32).reshape(int(reply["height"]), int(reply["width"]), 4)
-            return np.ascontiguousarray(rgba[..., :3]), reply
+            return read_exr(path), reply
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -145,6 +144,41 @@ class CyclesWorker:
                     f.close()
                 except OSError:
                     pass
+
+
+def read_exr(path: str) -> np.ndarray:
+    """Linear RGB, float32 (height, width, 3), of the worker's EXR: Blender's uncompressed (``exr_codec NONE``) 32-bit
+    scanline file, parsed here so the server needs no OpenEXR. Each scanline block is its row number, its byte size and
+    the channels (alphabetical: A, B, G, R) one after the other."""
+    data = Path(path).read_bytes()
+    if data[:4] != b"v/1\x01":
+        raise CyclesError("not an OpenEXR file")
+    pos, attrs = 8, {}
+    while data[pos] != 0:
+        end = data.index(b"\0", pos)
+        name = data[pos:end].decode()
+        end2 = data.index(b"\0", end + 1)
+        size = int.from_bytes(data[end2 + 1:end2 + 5], "little")
+        attrs[name] = data[end2 + 5:end2 + 5 + size]
+        pos = end2 + 5 + size
+    pos += 1
+    if attrs["compression"][0] != 0:
+        raise CyclesError("the EXR is compressed (exr_codec must be NONE)")
+    x0, y0, x1, y1 = np.frombuffer(attrs["dataWindow"], dtype="<i4")
+    w, h = int(x1 - x0 + 1), int(y1 - y0 + 1)
+    names, c, chan = [], attrs["channels"], 0
+    while c[chan] != 0:
+        end = c.index(b"\0", chan)
+        names.append(c[chan:end].decode())
+        if int.from_bytes(c[end + 1:end + 5], "little") != 2:  # 2: FLOAT (1: HALF, 0: UINT)
+            raise CyclesError("the EXR is not 32-bit float (color_depth must be 32)")
+        chan = end + 1 + 16
+    order = sorted(names)
+    pos += 8 * h  # the offset table: one entry a scanline block
+    block = 8 + len(order) * w * 4
+    rows = np.frombuffer(data, dtype=np.uint8, count=block * h, offset=pos).reshape(h, block)
+    planes = np.ascontiguousarray(rows[:, 8:]).view("<f4").reshape(h, len(order), w)
+    return np.stack([planes[:, order.index(c)] for c in "RGB"], axis=-1)
 
 
 def is_oom(exc: BaseException) -> bool:
