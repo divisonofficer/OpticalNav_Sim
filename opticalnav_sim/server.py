@@ -791,7 +791,64 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     if xml:
         end = text.rindex("</scene>")
         text = text[:end] + "".join(xml) + "\n" + text[end:]
+    if blender_power:
+        text = boxes_at_blender_power(text, notes)
     return text, added
+
+
+def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
+    """The importer's light boxes that no lamp took over (``light_*`` shapes with an area emitter: a corridor's ceiling
+    panels ``light_0_al``, say) at Blender's power as well: radiance = energy / (pi^2 x emitting area), times the
+    light's colour (a spot: energy / 4 pi^2). The energy is the light's metadata.light.energy, else read back from the
+    box's radiance (1 + IMPORTER_WATTS x watts, as for the lamps). Fill softboxes are left alone."""
+    meta = {n["id"]: ((n.get("metadata") or {}).get("light") or {}) for n in notes if n.get("id")}
+    energy = {k: (v.get("energy"), v.get("type")) for k, v in meta.items()}
+
+    def shape(m):
+        sid, body = m.group(2), m.group(3)
+        if not sid.startswith("light_") or sid.startswith(FILL_PREFIX) or "<emitter" not in body:
+            return m.group(0)
+        rad = re.search(r'(<rgb name="radiance" value=")([^"]+)(")', body)
+        sc = re.search(r'<scale x="([\d.]+)" y="([\d.]+)"(?: z="([\d.]+)")? />', body)
+        if rad is None or sc is None:
+            return m.group(0)
+        values = [float(v) for v in rad.group(2).split()]
+        watts, kind = energy.get(sid, (None, None))
+        if not watts:
+            watts = (max(values) - 1.0) / IMPORTER_WATTS
+        if watts <= 0 or kind == "SUN":
+            return m.group(0)
+        sx, sy = 2 * float(sc.group(1)), 2 * float(sc.group(2))
+        kind_of_shape, shape_text = m.group(1), m.group(0)
+        info = meta.get(sid, {})
+        size = info.get("area_size_m")
+        if info.get("type") == "AREA" and size and info.get("area_shape") in ("DISK", "SQUARE", "RECTANGLE", "ELLIPSE"):
+            # the light's own shape and size instead of the importer's 0.6 m square: a Blender area light's size is the
+            # side of a square, the diameter of a disk or an ellipse's axes
+            if info["area_shape"] in ("DISK", "ELLIPSE"):
+                rx, ry = float(size[0]) / 2, float(size[-1]) / 2
+                kind_of_shape = "disk"
+                area = math.pi * rx * ry
+            else:
+                rx, ry = float(size[0]) / 2, float(size[-1]) / 2
+                kind_of_shape = "rectangle"
+                area = 4 * rx * ry
+            shape_text = shape_text.replace(f'<shape type="{m.group(1)}"', f'<shape type="{kind_of_shape}"', 1)
+            shape_text = shape_text.replace(sc.group(0), f'<scale x="{rx:.6f}" y="{ry:.6f}" />', 1)
+            pos = info.get("position")
+            if pos and len(pos) == 3:  # plan frame (x, y, up) -> the scene's height
+                shape_text = re.sub(r'(<translate x="[-\d.]+" y=")[-\d.]+(")', lambda t: f"{t.group(1)}{float(pos[2]):.6f}{t.group(2)}", shape_text, count=1)
+        elif m.group(1) == "cube":
+            sz = 2 * float(sc.group(3) or sc.group(2))
+            area = 2 * (sx * sy + sx * sz + sy * sz)
+        else:
+            area = sx * sy
+        colour = np.asarray(values) / max(max(values), 1e-9)
+        level = watts / ((4.0 if kind == "SPOT" or "_track_" in sid else 1.0) * math.pi ** 2 * max(area, 1e-6))
+        new = " ".join(f"{level * c:.4f}" for c in colour)
+        return shape_text.replace(rad.group(0), rad.group(1) + new + rad.group(3), 1)
+
+    return re.sub(r'(?:\n  <shape type="([a-z_]+)" id="([^"]+)">)(.*?)(?:\n  </shape>)', lambda m: shape(m), text, flags=re.S)
 
 
 def scale_fill_text(text: str, gain: float) -> str:

@@ -1006,6 +1006,38 @@ def test_blender_power_reads_watts_back_from_the_importer_radiance_and_keeps_the
     assert math.isclose(spot, 12.0 / (4 * math.pi ** 2) / area, rel_tol=1e-3)
 
 
+def test_unpaired_light_boxes_glow_at_blender_power_and_flat_whites_take_their_colour(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import flat_colors
+
+    box = ('\n  <shape type="rectangle" id="light_0_al">\n    <transform name="to_world">\n      <scale x="0.300000" y="0.300000" />\n'
+           '      <rotate x="1" angle="90" />\n    </transform>\n    <emitter type="area">\n'
+           '      <rgb name="radiance" value="2.1250 2.0000 1.8000" />\n    </emitter>\n  </shape>')
+    out = server.boxes_at_blender_power("<scene>" + box + "\n</scene>", [])
+    level = float(re.search(r'name="radiance" value="([\d.]+)', out).group(1))
+    assert math.isclose(level, 45.0 / (math.pi ** 2 * 0.36) * 1.0, rel_tol=1e-3)  # (2.125 - 1) / 0.025 W over 0.36 m2
+    # a Blender disk area light is a disk of its own size, at its own height (not the importer's 0.6 m square)
+    note = {"id": "light_0_al", "metadata": {"light": {"type": "AREA", "energy": 45.0, "area_shape": "DISK", "area_size_m": [0.18, 0.18],
+                                                      "position": [8.75, 4.45, 2.56]}}}
+    box2 = box.replace("<rotate", '<translate x="8.75" y="2.6" z="4.45" />\n      <rotate')
+    out = server.boxes_at_blender_power("<scene>" + box2 + "\n</scene>", [note])
+    assert '<shape type="disk" id="light_0_al">' in out and 'scale x="0.090000" y="0.090000"' in out and 'y="2.560000"' in out
+    assert math.isclose(float(re.search(r'name="radiance" value="([\d.]+)', out).group(1)), 45.0 / (math.pi ** 2 * math.pi * 0.09 ** 2), rel_tol=1e-3)
+    # a plastic part with the white placeholder takes its material's colour, from the authoring map
+    scene = tmp_path / "scn"
+    scene.mkdir()
+    (scene / "base.xml").write_text('<scene>\n  <shape type="ply" id="wall">\n    <bsdf type="twosided">\n      <bsdf type="pplastic">\n'
+                                    '        <rgb name="diffuse_reflectance" value="1 1 1" />\n        <float name="alpha" value="0.9" />\n'
+                                    '      </bsdf>\n    </bsdf>\n  </shape>\n</scene>')
+    imports = tmp_path / "imports"
+    imports.mkdir()
+    (imports / "scn__authoring_map.json").write_text(json.dumps({
+        "materials": [{"material_id": "m", "render_binding": {"base_color_factor": [0.55, 0.52, 0.47], "bsdf_strategy": "pplastic"}}],
+        "objects": [{"id": "wall", "material": "m"}]}))
+    assert flat_colors.colour_scene(scene, imports)["coloured"] == 1
+    assert 'value="0.5500 0.5200 0.4700"' in (scene / "base.xml").read_text()
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
