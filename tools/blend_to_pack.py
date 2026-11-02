@@ -27,6 +27,7 @@ the repo; Blender starts like the render server starts it (OPTICALNAV_BLENDER, t
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import math
@@ -40,6 +41,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 INSIDE = os.environ.get("OPTICALNAV_B2M_INSIDE") == "1"  # set for the Blender process this script starts
 IMPORTS = Path("/jarvis/project/robomituba/out/infinigen_imports")
+ALPHA_MIN = 0.01  # a roughness under 0.1 (a puddle's 0.02: alpha 0.0004) is a near-delta lobe the path tracer cannot sample: black patches
 IMPORTER_WATTS = 0.025  # the importer's light boxes glow at (1 + 0.025 W) x colour (server.IMPORTER_WATTS)
 
 
@@ -426,7 +428,7 @@ def run_inside(cfg: dict) -> None:
             arr, tag, ext = (np.clip(v.a, 0, 1) * 255 + 0.5).astype(np.uint8), "n", "png"
         else:  # roughness / metallic / alpha: smooth, 1024 px is enough (the driver shrinks them)
             g = np.clip(v.a[..., 0] if v.a.ndim == 3 else v.a, 0, 1)
-            arr, tag, ext = ((g ** 2 if squared else g) * 65535 + 0.5).astype(np.uint16), "s2" if squared else "s", "png"
+            arr, tag, ext = ((np.maximum(g ** 2, ALPHA_MIN) if squared else g) * 65535 + 0.5).astype(np.uint16), "s2" if squared else "s", "png"
         stem = f"tex_{hashlib.sha1(arr.tobytes() + tag.encode()).hexdigest()[:20]}_{tag[0]}"
         if not (assets / f"{stem}.{ext}").exists() and not (assets / f"{stem}.npy").exists():
             np.save(assets / f"{stem}.npy", arr)
@@ -457,7 +459,7 @@ def run_inside(cfg: dict) -> None:
             if kind == "colour":
                 c = (c * 3)[:3] if len(c) == 1 else c[:3]
                 return f'{ind}<rgb name="{name}" value="{rgb(c)}" />\n', c
-            return f'{ind}<float name="{name}" value="{f(c[0] ** 2 if squared else c[0])}" />\n', c[0]
+            return f'{ind}<float name="{name}" value="{f(max(c[0] ** 2, ALPHA_MIN) if squared else c[0])}" />\n', c[0]
         stat["textured"] = stat.get("textured", 0) + 1
         return write_tex(name, v, kind, ind, stat, squared), None
 
@@ -691,10 +693,29 @@ def run_inside(cfg: dict) -> None:
         return json.dumps(n, separators=(",", ":"))
 
     view_layer = bpy.context.view_layer
-    for o in scene.objects:
-        if o.type != "MESH" or o.hide_render or o.name not in view_layer.objects:
+    # a big mesh drawn three or more times (linked duplicates, a tree instanced on the vertices of a ground: PH37's two tree meshes of
+    # 29,000 polygons, 986 times, are 29 M of its 30 M triangles) is written once in object space as a Mitsuba shapegroup, each use an
+    # ``instance`` with its matrix; mirrored copies, emitters, alpha cutouts and world-space textures stay separate shapes. A small one
+    # (a 300-polygon leaf card: 7,800 instances made Dr.Jit's frozen recording take over 450 s, its tracing grows with the shape
+    # count) is expanded, and Mitsuba merges meshes of one material into a few
+    def mesh_key(ev_, o_):
+        return (o_.data.name, tuple(s.material.name if s.material else None for s in o_.material_slots))
+    use_counts: dict = collections.Counter()
+    for inst_ in dg.object_instances:
+        if inst_.object.type == "MESH" and (inst_.is_instance or (not inst_.object.original.hide_render and inst_.object.original.name in view_layer.objects)):
+            use_counts[mesh_key(inst_.object, inst_.object.original)] += 1
+    groups: dict = {}  # (mesh key, material slot) -> shapegroup id
+    A4 = np.eye(4)
+    A4[:3, :3], A4[:3, 3] = L, T
+    # every drawn instance, not just scene.objects: trees, vines and grass are leaf / branch objects instanced on the vertices or faces of a
+    # parent (PH37: 1,976 instances; scene.objects alone left them out), each with its own matrix
+    for inst in dg.object_instances:
+        ev = inst.object
+        o = ev.original
+        if ev.type != "MESH":
             continue
-        ev = o.evaluated_get(dg)
+        if not inst.is_instance and (o.hide_render or o.name not in view_layer.objects):
+            continue
         me = ev.to_mesh()
         try:
             me.calc_loop_triangles()
@@ -720,13 +741,27 @@ def run_inside(cfg: dict) -> None:
                 uv = uv.reshape(-1, 2)
             else:
                 uv = np.zeros((len(me.loops), 2), np.float32)
-            W = np.array(ev.matrix_world, dtype=np.float64)
+            W = np.array(inst.matrix_world, dtype=np.float64)
             W3 = W[:3, :3]
             flip = np.linalg.det(W3) < 0
             nmat = np.linalg.inv(W3).T
             slots = [s.material for s in o.material_slots] or [None]
             report["objects"] += 1
             parts = sorted(set(tmat.tolist()))
+            key = mesh_key(ev, o)
+            # one shapegroup holds every material part of the mesh, one ``instance`` per use: all parts must qualify
+            grp = (use_counts[key] >= 3 and len(me.polygons) >= int(cfg["instance_min_polys"]) and not o.modifiers and not flip)
+            for k in parts if grp else ():
+                mat_ = slots[min(k, len(slots) - 1)]
+                if mat_ is None:
+                    grp = False
+                    break
+                _, em_ = material(mat_)
+                ms_ = report["materials"].get(mat_.name, {})
+                if em_ is not None or ms_.get("coord") == "WORLD" or ms_.get("alpha_texture"):
+                    grp = False
+                    break
+            obj_parts: list = []
             for k in parts:
                 sel = np.nonzero(tmat == k)[0]
                 idx = tl.reshape(-1, 3)[sel]
@@ -766,6 +801,13 @@ def run_inside(cfg: dict) -> None:
                         uvs = X[..., :2].reshape(-1, 2)
                 else:
                     uvs = uv[flat].astype(np.float64)
+                if grp:
+                    loc = np.concatenate([co[lv[flat]], nrm[flat] / np.maximum(np.linalg.norm(nrm[flat], axis=1, keepdims=True), 1e-12),
+                                          uvs], axis=1).astype(np.float32)
+                    f_, inv_ = weld(loc)
+                    ul = loc[f_]
+                    obj_parts.append((write_ply(ul[:, :3], ul[:, 3:6], ul[:, 6:8], inv_.reshape(-1, 3)), bsdf))
+                    continue
                 data = np.concatenate([P, N, uvs], axis=1).astype(np.float32)
                 first, inverse = weld(data)
                 tris = inverse.reshape(-1, 3)
@@ -828,6 +870,19 @@ def run_inside(cfg: dict) -> None:
                     report["two_sided_emitters"] = report.get("two_sided_emitters", 0) + 1
                 report["shapes"] += 1
                 report["triangles"] += len(tris)
+            if grp and obj_parts:
+                if key not in groups:
+                    gid = unique_id(f"group_{o.data.name}")
+                    inner = "".join(f'    <shape type="ply">\n      <string name="filename" value="{gp}" />\n{gb}    </shape>\n' for gp, gb in obj_parts)
+                    shapes_xml.append(f'\n  <shape type="shapegroup" id="{gid}">\n{inner}  </shape>')
+                    groups[key] = gid
+                    report["shapegroups"] = report.get("shapegroups", 0) + 1
+                mw = A4 @ W
+                sid = unique_id(f"{o.name}__inst")
+                shapes_xml.append(f'\n  <shape type="instance" id="{sid}">\n    <ref id="{groups[key]}" />\n'
+                                  f'    <transform name="to_world"><matrix value="{" ".join(f(v) for v in mw.ravel())}" /></transform>\n  </shape>')
+                report["instances"] = report.get("instances", 0) + 1
+                report["shapes"] += 1
         finally:
             ev.to_mesh_clear()
 
@@ -957,6 +1012,9 @@ def main() -> int:
     ap.add_argument("--blend", type=Path)
     ap.add_argument("--origin-offset", type=float, nargs=3)
     ap.add_argument("--max-texture", type=int, default=4096)
+    ap.add_argument("--instance-min-polys", type=int, default=2000,
+                    help="a mesh drawn 3+ times becomes a shapegroup with instances only from this many polygons (smaller ones are "
+                         "expanded: fewer shapes for Dr.Jit to trace)")
     ap.add_argument("--link-blend", action="store_true",
                     help="development: scene.json points at the source .blend instead of a packed copy (seconds, not minutes, for a big one)")
     ap.add_argument("--sky-rotation", type=float, default=270.0,
@@ -984,7 +1042,7 @@ def main() -> int:
     out = pack / "scenes" / scene_id
     out.mkdir(parents=True, exist_ok=True)
     cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset) if offset else None, "max_texture": args.max_texture,
-           "print_max_strength": args.print_max_strength,
+           "print_max_strength": args.print_max_strength, "instance_min_polys": args.instance_min_polys,
            "template_xml": str(template / "base.xml")}
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
                LD_LIBRARY_PATH=f"{cb.DRIVER_DIRS}:{cb.BLENDER.parent / 'lib'}:{cb.lib_dir()}")
