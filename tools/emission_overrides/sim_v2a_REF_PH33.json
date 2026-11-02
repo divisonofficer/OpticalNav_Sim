@@ -1,0 +1,9 @@
+{
+  "source": "phone_scenes/PH33/r002/build_r002.py, line 32: emit(name, colour, strength); a Blender Emission shader's radiance is colour x strength",
+  "materials": {
+    "ph33_blue_led": {"color": [0.18, 0.40, 1.0], "strength": 12.0},
+    "ph33_white_led": {"color": [0.85, 0.92, 1.0], "strength": 12.0},
+    "ph33_sconce": {"color": [1.0, 0.72, 0.4], "strength": 40.0},
+    "ph33_downlight": {"color": [1.0, 0.95, 0.88], "strength": 25.0}
+  }
+}
