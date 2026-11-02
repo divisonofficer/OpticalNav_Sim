@@ -43,8 +43,16 @@ MITSUBA = Path("/home/jinnyeong/robomituba-build/mitsuba3-3.9.1")
 PYTHON = "/usr/bin/python3.10"
 
 
+# On this WSL the OptiX stub of /usr/lib/wsl/lib has no optixQueryFunctionTable ("Could not initialize OptiX!"); a real
+# libnvoptix.so.1 (580.95.05) and its companions sit in ~/driver-dist, and must come first in the library path.
+OPTIX_DIR = Path("/home/jinnyeong/driver-dist")
+
+
 def env(gpu: int | None) -> dict:
-    e = dict(os.environ, PYTHONPATH=f"{MITSUBA}/python:{REPO}", LD_LIBRARY_PATH=f"/usr/lib/wsl/lib:{MITSUBA}")
+    libs = f"/usr/lib/wsl/lib:{MITSUBA}"
+    if (OPTIX_DIR / "libnvoptix.so.1").is_file():
+        libs = f"{OPTIX_DIR}:{libs}"
+    e = dict(os.environ, PYTHONPATH=f"{MITSUBA}/python:{REPO}", LD_LIBRARY_PATH=libs)
     if gpu is not None:
         e["CUDA_VISIBLE_DEVICES"] = str(gpu)
     return e
