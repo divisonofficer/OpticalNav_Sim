@@ -803,6 +803,7 @@ def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
     box's radiance (1 + IMPORTER_WATTS x watts, as for the lamps). Fill softboxes are left alone."""
     meta = {n["id"]: ((n.get("metadata") or {}).get("light") or {}) for n in notes if n.get("id")}
     energy = {k: (v.get("energy"), v.get("type")) for k, v in meta.items()}
+    housings: list[str] = []  # the tubes that cut a spot's emitter to its cone, added after the shapes
 
     def shape(m):
         sid, body = m.group(2), m.group(3)
@@ -822,6 +823,37 @@ def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
         kind_of_shape, shape_text = m.group(1), m.group(0)
         info = meta.get(sid, {})
         size = info.get("area_size_m")
+        cone = info.get("spot_size_deg")
+        pos = info.get("position")
+        if info.get("type") == "SPOT" and cone and 5.0 <= float(cone) < 170.0 and pos and len(pos) == 3 and info.get("direction"):
+            # a spot: a small disk at the light's place facing its direction, inside an absorbing tube as long as the
+            # cone needs (the tube's mouth cuts the disk's Lambertian emission to the spot's cone, as the recess of a
+            # fixture does), at the spot's intensity (energy / 4 pi^2 W/sr) on its axis
+            r = min(max(float(info.get("radius_m") or 0.05), 0.02), 0.15)
+            half = math.radians(float(cone) / 2.0)
+            length = min(2.0 * r / math.tan(half), 0.6)
+            d = np.array([info["direction"][0], info["direction"][2], info["direction"][1]], float)
+            d /= max(float(np.linalg.norm(d)), 1e-9)
+            tilt = ""
+            axis = np.cross([0.0, -1.0, 0.0], d)
+            sin = float(np.linalg.norm(axis))
+            if sin > 1e-3:
+                angle = math.degrees(math.atan2(sin, float(np.dot([0.0, -1.0, 0.0], d))))
+                axis /= sin
+                tilt = f'\n      <rotate x="{axis[0]:.6f}" y="{axis[1]:.6f}" z="{axis[2]:.6f}" angle="{angle:.4f}" />'
+            c = [float(pos[0]), float(pos[2]), float(pos[1])]
+            e = [c[i] + length * d[i] for i in range(3)]
+            colour = np.asarray(values) / max(max(values), 1e-9)
+            level = float(watts) / (4.0 * math.pi ** 2 * math.pi * r * r)
+            new = " ".join(f"{level * x:.4f}" for x in colour)
+            housings.append(
+                f'\n  <shape type="cylinder" id="{sid}__housing">\n    <point name="p0" x="{c[0]:.6f}" y="{c[1]:.6f}" z="{c[2]:.6f}" />'
+                f'\n    <point name="p1" x="{e[0]:.6f}" y="{e[1]:.6f}" z="{e[2]:.6f}" />\n    <float name="radius" value="{r:.6f}" />'
+                '\n    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n  </shape>')
+            return (f'\n  <shape type="disk" id="{sid}">\n    <transform name="to_world">\n      <scale value="{r:.6f}" />'
+                    f'\n      <rotate x="1" angle="90" />{tilt}\n      <translate x="{c[0]:.6f}" y="{c[1]:.6f}" z="{c[2]:.6f}" />'
+                    f'\n    </transform>\n    <bsdf type="diffuse" />\n    <emitter type="area">\n      <rgb name="radiance" value="{new}" />'
+                    '\n    </emitter>\n  </shape>')
         if info.get("type") == "AREA" and size and info.get("area_shape") in ("DISK", "SQUARE", "RECTANGLE", "ELLIPSE"):
             # the light's own shape and size instead of the importer's 0.6 m square: a Blender area light's size is the
             # side of a square, the diameter of a disk or an ellipse's axes
@@ -848,7 +880,11 @@ def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
         new = " ".join(f"{level * c:.4f}" for c in colour)
         return shape_text.replace(rad.group(0), rad.group(1) + new + rad.group(3), 1)
 
-    return re.sub(r'(?:\n  <shape type="([a-z_]+)" id="([^"]+)">)(.*?)(?:\n  </shape>)', lambda m: shape(m), text, flags=re.S)
+    out = re.sub(r'(?:\n  <shape type="([a-z_]+)" id="([^"]+)">)(.*?)(?:\n  </shape>)', lambda m: shape(m), text, flags=re.S)
+    if housings:
+        end = out.rindex("</scene>")
+        out = out[:end] + "".join(housings) + "\n" + out[end:]
+    return out
 
 
 def scale_fill_text(text: str, gain: float) -> str:

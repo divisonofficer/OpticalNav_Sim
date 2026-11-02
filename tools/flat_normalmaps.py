@@ -12,8 +12,10 @@ bright line on a wall that moves with the camera). Removing the ``normalmap`` wr
 glossy floor and wall.
 
 A normal map whose three channels each have a standard deviation under ``--max-std`` (default 0.02: no detail) and a mean
-tilting the normal by more than ``--min-tilt`` degrees (default 3) is dropped from every shape that uses it; one that is
-neutral (a harmless constant) or has detail is left alone. The XMLs are rewritten, the PNGs no XML names any more are
+tilting the normal by more than ``--min-tilt`` degrees (default 3) is dropped from every shape that uses it, and so is
+one whose mean normal is tilted more than ``--max-mean-tilt`` degrees (default 20) whatever its detail: a real
+tangent-space map averages close to (0.5, 0.5, 1.0) (sim_v2a_REF_PH33's baked maps average (0.75, 0.25, 0.84), 46 degrees
+off, with a standard deviation of 0.04). A neutral map, or one with detail and a mean near neutral, is left alone. The XMLs are rewritten, the PNGs no XML names any more are
 unlinked, and scene.json records the run under ``flat_normalmaps``. Rebuild the scene to undo it.
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ NORMALMAP = re.compile(r'<bsdf type="normalmap">\s*<texture name="normalmap" typ
                        r'value="([^"]+)" />.*?</texture>\s*(<bsdf type="[a-z]+">.*?</bsdf>)\s*</bsdf>', re.S)
 
 
-def verdict(path: Path, max_std: float, min_tilt: float) -> tuple[bool, float, float]:
+def verdict(path: Path, max_std: float, min_tilt: float, max_mean_tilt: float = 20.0) -> tuple[bool, float, float]:
     """(drop it, tilt in degrees of the mean normal, largest channel std)."""
     with Image.open(path) as im:
         a = np.asarray(im.convert("RGB"), np.float32) / 255.0
@@ -44,16 +46,17 @@ def verdict(path: Path, max_std: float, min_tilt: float) -> tuple[bool, float, f
     std = float(flat.std(axis=0).max())
     n = flat.mean(axis=0) * 2 - 1
     tilt = float(np.degrees(np.arccos(np.clip(n[2] / max(np.linalg.norm(n), 1e-9), -1, 1))))
-    return std <= max_std and tilt >= min_tilt, tilt, std
+    return (std <= max_std and tilt >= min_tilt) or tilt >= max_mean_tilt, tilt, std
 
 
-def flat_scene(scene_dir: Path, dry_run: bool = False, max_std: float = 0.02, min_tilt: float = 3.0) -> dict:
+def flat_scene(scene_dir: Path, dry_run: bool = False, max_std: float = 0.02, min_tilt: float = 3.0,
+               max_mean_tilt: float = 20.0) -> dict:
     with scene_lock(scene_dir):
         drop: dict[str, tuple[float, float]] = {}
         for f in sorted(scene_dir.glob("*.xml")):
             for ref in set(re.findall(r'<texture name="normalmap" type="bitmap">\s*<string name="filename" value="([^"]+)"', f.read_text())):
                 if ref not in drop and (scene_dir / ref).is_file():
-                    bad, tilt, std = verdict(scene_dir / ref, max_std, min_tilt)
+                    bad, tilt, std = verdict(scene_dir / ref, max_std, min_tilt, max_mean_tilt)
                     if bad:
                         drop[ref] = (round(tilt, 1), round(std, 4))
         parts = 0
@@ -93,11 +96,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max-std", type=float, default=0.02)
     ap.add_argument("--min-tilt", type=float, default=3.0)
+    ap.add_argument("--max-mean-tilt", type=float, default=20.0,
+                    help="a map whose mean normal is tilted more than this is dropped whatever its detail")
     args = ap.parse_args()
     scenes = args.scene or sorted(p.parent.name for p in (args.pack / "scenes").glob("*/base.xml"))
     total = 0
     for name in scenes:
-        s = flat_scene((args.pack / "scenes" / name).resolve(), args.dry_run, args.max_std, args.min_tilt)
+        s = flat_scene((args.pack / "scenes" / name).resolve(), args.dry_run, args.max_std, args.min_tilt, args.max_mean_tilt)
         if s["maps"]:
             total += s["maps"]
             print(f"{name}: {s['maps']} constant normal maps (tilt degrees, std): {list(s['details'].values())[:4]}"

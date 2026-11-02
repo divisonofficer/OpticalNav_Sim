@@ -1038,6 +1038,22 @@ def test_unpaired_light_boxes_glow_at_blender_power_and_flat_whites_take_their_c
     assert 'value="0.5500 0.5200 0.4700"' in (scene / "base.xml").read_text()
 
 
+def test_an_unpaired_spot_light_is_a_small_disk_in_a_tube_that_cuts_its_cone():
+    note = {"id": "light_18_blue_pool", "metadata": {"light": {
+        "type": "SPOT", "energy": 1000.0, "color": [0.18, 0.38, 1.0], "position": [5.75, 28.15, 3.242],
+        "direction": [0.0, 0.0, -1.0], "spot_size_deg": 58.0, "spot_blend": 0.9, "radius_m": 0.1}}}
+    box = ('\n  <shape type="rectangle" id="light_18_blue_pool">\n    <transform name="to_world">\n      <scale x="0.300000" y="0.300000" />\n'
+           '      <rotate x="1" angle="90" />\n      <translate x="5.75" y="3.28" z="28.15" />\n    </transform>\n    <emitter type="area">\n'
+           '      <rgb name="radiance" value="1.8 3.8 10" />\n    </emitter>\n  </shape>')
+    out = server.boxes_at_blender_power("<scene>" + box + "\n</scene>", [note])
+    assert '<shape type="disk" id="light_18_blue_pool">' in out and 'scale value="0.100000"' in out
+    tube = out.split('id="light_18_blue_pool__housing">')[1].split("</shape>")[0]
+    length = float(re.search(r'name="p1" x="[\d.]+" y="([\d.]+)"', tube).group(1))
+    assert math.isclose(3.242 - length, 2 * 0.1 / math.tan(math.radians(29.0)), rel_tol=1e-3)  # the tube hangs down to cut the cone
+    radiance = [float(v) for v in re.search(r'name="radiance" value="([^"]+)"', out).group(1).split()]
+    assert math.isclose(radiance[2], 1000.0 / (4 * math.pi ** 2 * math.pi * 0.01), rel_tol=1e-3) and radiance[0] < radiance[2]  # the light's colour
+
+
 def test_viewer_passes_double_the_running_total():
     from opticalnav_sim import gui
 
