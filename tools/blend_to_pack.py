@@ -252,6 +252,43 @@ def run_inside(cfg: dict) -> None:
             return V(c=np.asarray(out, dtype=np.float32))
         return V(a=np.asarray(out, dtype=np.float32), uv=arr.uv, coord=arr.coord, proj=arr.proj)
 
+    # a colour attribute (vertex colours: leaves coloured per leaf, baked occlusion) is read as its mean over the objects that use the material:
+    # Mitsuba would need a per-vertex texture, and a constant keeps the material's tone (PH37's leaves were white with the attribute as 1.0)
+    cur_mat: list = [None]
+    mat_users: dict = collections.defaultdict(list)
+    for ob_ in bpy.data.objects:
+        if ob_.type == "MESH":
+            for s_ in ob_.material_slots:
+                if s_.material is not None:
+                    mat_users[s_.material.name].append(ob_)
+    attr_cache: dict = {}
+
+    def attr_mean(m, name: str):
+        key = (m.name if m else None, name)
+        if key not in attr_cache:
+            acc, cnt = np.zeros(3), 0
+            for ob_ in mat_users.get(m.name, []) if m else []:
+                ca = ob_.data.color_attributes.get(name) if name else None
+                if ca is not None and len(ca.data):
+                    arr = np.empty(len(ca.data) * 4, np.float32)
+                    ca.data.foreach_get("color", arr)
+                    arr = arr.reshape(-1, 4)[:, :3]
+                    acc, cnt = acc + arr.sum(0), cnt + len(arr)
+            attr_cache[key] = acc / cnt if cnt else None
+        return attr_cache[key]
+
+    group_ctx: list = []  # the Group nodes being looked into, innermost last: a Group Input socket is the outer node's input of that name
+
+    def group_shader(g):
+        """The shader node feeding a Group node's output inside its node tree."""
+        outs = [n for n in g.node_tree.nodes if n.type == "GROUP_OUTPUT"]
+        for o_ in outs:
+            for i in o_.inputs:
+                s = skip_reroute(i)
+                if i.name == "Shader" and s.is_linked:
+                    return s.links[0].from_node
+        return None
+
     def value_of(sock, depth: int = 0) -> V | None:
         sock = skip_reroute(sock)
         if not sock.is_linked:
@@ -265,6 +302,15 @@ def run_inside(cfg: dict) -> None:
 
         def inp(name, i=None):
             return value_of(n.inputs[name if i is None else i], depth + 1)
+        if t == "GROUP_INPUT":
+            if not group_ctx:
+                return None
+            outer = group_ctx.pop()
+            try:
+                s_ = outer.inputs.get(out)
+                return value_of(s_, depth + 1) if s_ is not None else None
+            finally:
+                group_ctx.append(outer)
         if t == "TEX_IMAGE":
             if n.image is None:
                 return None
@@ -278,9 +324,12 @@ def run_inside(cfg: dict) -> None:
         if t in ("TEX_NOISE", "TEX_VORONOI", "TEX_MUSGRAVE", "TEX_WHITE_NOISE", "TEX_WAVE", "TEX_MAGIC", "TEX_GRADIENT", "TEX_CHECKER", "SEPXYZ",
                  "TEX_COORD", "NEW_GEOMETRY", "OBJECT_INFO", "AMBIENT_OCCLUSION", "LAYER_WEIGHT", "FRESNEL", "BEVEL"):
             return const(0.5)  # a procedural pattern: its mean
-        if t == "ATTRIBUTE":  # a vertex colour (baked occlusion): neutral, it varies per vertex
-            warn("attribute node read as 1.0 (a vertex colour)")
-            return const(1.0)
+        if t == "ATTRIBUTE":
+            mean = attr_mean(cur_mat[0], n.attribute_name)
+            if mean is None:
+                warn("attribute node read as 1.0 (no colour attribute of that name)")
+                return const(1.0)
+            return const(list(mean)) if out == "Color" else const(float(mean.mean()))
         if t in ("COMBINE_COLOR", "COMBINE_RGB"):
             parts = [value_of(i, depth + 1) for i in n.inputs[:3]]
             if None in parts:
@@ -293,7 +342,7 @@ def run_inside(cfg: dict) -> None:
             return const(list(n.outputs[0].default_value))
         if t == "VALUE":
             return const(float(n.outputs[0].default_value))
-        if t in ("SEPARATE_COLOR", "SEPARATE_RGB"):
+        if t in ("SEPARATE_COLOR", "SEPARATE_RGB", "SEPRGB"):
             v = inp(0)
             if v is None:
                 return None
@@ -552,6 +601,7 @@ def run_inside(cfg: dict) -> None:
         if (m.name, cutout) in cache:
             return cache[(m.name, cutout)]
         cutting[0] = cutout
+        cur_mat[0] = m
         stat: dict = {"name": m.name}
         out_node = next((n for n in m.node_tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None) if m.use_nodes else None
         shader = skip_reroute(out_node.inputs["Surface"]).links[0].from_node if out_node and skip_reroute(out_node.inputs["Surface"]).is_linked else None
@@ -560,6 +610,17 @@ def run_inside(cfg: dict) -> None:
         if shader is not None and shader.type == "MIX_SHADER":  # Transparent + Principled (glass that shadow rays pass): the Principled
             branches = [skip_reroute(i).links[0].from_node for i in shader.inputs[1:] if skip_reroute(i).is_linked]
             shader = next((b for b in branches if b.type != "BSDF_TRANSPARENT"), shader)
+        group_ctx.clear()
+        for _ in range(8):  # groups and mixes inside groups (PH37's trees: Group -> Mix(Diffuse, Translucent)): the first non-transparent branch
+            if shader is not None and shader.type == "GROUP" and shader.node_tree is not None:
+                group_ctx.append(shader)
+                shader = group_shader(shader)
+                stat["group"] = True
+            elif shader is not None and shader.type == "MIX_SHADER":
+                branches = [skip_reroute(i).links[0].from_node for i in shader.inputs[1:] if skip_reroute(i).is_linked]
+                shader = next((b for b in branches if b.type != "BSDF_TRANSPARENT"), None)
+            else:
+                break
         if shader is not None and shader.type == "BSDF_PRINCIPLED":
             core, emission = principled(shader, stat)
             res = (core, emission)
@@ -581,6 +642,12 @@ def run_inside(cfg: dict) -> None:
                 emission = emission_xml(shader.inputs["Color"], st, "      ")
                 stat["class"] = "emission"
                 res = ('    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n', emission)
+        elif shader is not None and shader.type in ("BSDF_DIFFUSE", "BSDF_TRANSLUCENT", "BSDF_TOON", "BSDF_VELVET", "SUBSURFACE_SCATTERING"):
+            col_sock = shader.inputs.get("Color") or shader.inputs.get("Base Color")
+            dif, _ = spec(col_sock, "diffuse_reflectance", "        ", "colour", stat)
+            res = ('    <bsdf type="twosided">\n      <bsdf type="pplastic">\n        <float name="int_ior" value="1.5000" />\n'
+                   f'{dif}        <float name="alpha" value="0.4900" />\n      </bsdf>\n    </bsdf>\n', None)
+            stat["class"] = f"pplastic ({shader.type.lower()})"
         else:
             stat["class"] = f"fallback:{shader.type if shader is not None else 'none'}"
         cutting[0] = False
@@ -705,6 +772,9 @@ def run_inside(cfg: dict) -> None:
         if inst_.object.type == "MESH" and (inst_.is_instance or (not inst_.object.original.hide_render and inst_.object.original.name in view_layer.objects)):
             use_counts[mesh_key(inst_.object, inst_.object.original)] += 1
     groups: dict = {}  # (mesh key, material slot) -> shapegroup id
+    group_xml: dict = {}  # shapegroup id -> its xml, written only if one of its instances is kept
+    pending_inst: list = []  # (distance to the nearest author camera, group id, matrix, object name)
+    cam_pos = np.array([np.array(o_.matrix_world)[:3, 3] for o_ in scene.objects if o_.type == "CAMERA"]).reshape(-1, 3)
     A4 = np.eye(4)
     A4[:3, :3], A4[:3, 3] = L, T
     # every drawn instance, not just scene.objects: trees, vines and grass are leaf / branch objects instanced on the vertices or faces of a
@@ -874,17 +944,29 @@ def run_inside(cfg: dict) -> None:
                 if key not in groups:
                     gid = unique_id(f"group_{o.data.name}")
                     inner = "".join(f'    <shape type="ply">\n      <string name="filename" value="{gp}" />\n{gb}    </shape>\n' for gp, gb in obj_parts)
-                    shapes_xml.append(f'\n  <shape type="shapegroup" id="{gid}">\n{inner}  </shape>')
+                    group_xml[gid] = f'\n  <shape type="shapegroup" id="{gid}">\n{inner}  </shape>'
                     groups[key] = gid
-                    report["shapegroups"] = report.get("shapegroups", 0) + 1
-                mw = A4 @ W
-                sid = unique_id(f"{o.name}__inst")
-                shapes_xml.append(f'\n  <shape type="instance" id="{sid}">\n    <ref id="{groups[key]}" />\n'
-                                  f'    <transform name="to_world"><matrix value="{" ".join(f(v) for v in mw.ravel())}" /></transform>\n  </shape>')
-                report["instances"] = report.get("instances", 0) + 1
-                report["shapes"] += 1
+                dist = float(np.linalg.norm(cam_pos - W[:3, 3], axis=1).min()) if len(cam_pos) else 0.0
+                pending_inst.append((dist, groups[key], A4 @ W, o.name))
         finally:
             ev.to_mesh_clear()
+
+    # the instances kept: the ones nearest an author camera, up to the budget (Dr.Jit's frozen recording gives each instance variables of its
+    # own: PH37's 999 tree instances took the server's RAM from 7.7 to 22 GB and the OOM killer ended it)
+    pending_inst.sort(key=lambda x: x[0])
+    kept = pending_inst[:int(cfg["max_instances"])]
+    for gid in dict.fromkeys(g for _, g, _, _ in kept):
+        shapes_xml.append(group_xml[gid])
+        report["shapegroups"] = report.get("shapegroups", 0) + 1
+    for _, gid, mw, oname in kept:
+        sid = unique_id(f"{oname}__inst")
+        shapes_xml.append(f'\n  <shape type="instance" id="{sid}">\n    <ref id="{gid}" />\n'
+                          f'    <transform name="to_world"><matrix value="{" ".join(f(v) for v in mw.ravel())}" /></transform>\n  </shape>')
+        report["instances"] = report.get("instances", 0) + 1
+        report["shapes"] += 1
+    if len(pending_inst) > len(kept):
+        report["instances_dropped"] = len(pending_inst) - len(kept)
+        warn(f"{len(pending_inst) - len(kept)} of {len(pending_inst)} instances dropped (farthest from the author cameras; --max-instances)")
 
     # ------------------------------------------------ lights (the importer's boxes: the server reads them as before)
     lights_xml: list[str] = []
@@ -1015,6 +1097,9 @@ def main() -> int:
     ap.add_argument("--instance-min-polys", type=int, default=2000,
                     help="a mesh drawn 3+ times becomes a shapegroup with instances only from this many polygons (smaller ones are "
                          "expanded: fewer shapes for Dr.Jit to trace)")
+    ap.add_argument("--max-instances", type=int, default=300,
+                    help="instances of shapegroups kept, the nearest to the .blend's cameras first (default 300: the server's RAM grows "
+                         "with them during Dr.Jit's recording; 999 tree instances were an out-of-memory kill)")
     ap.add_argument("--link-blend", action="store_true",
                     help="development: scene.json points at the source .blend instead of a packed copy (seconds, not minutes, for a big one)")
     ap.add_argument("--sky-rotation", type=float, default=270.0,
@@ -1042,7 +1127,7 @@ def main() -> int:
     out = pack / "scenes" / scene_id
     out.mkdir(parents=True, exist_ok=True)
     cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset) if offset else None, "max_texture": args.max_texture,
-           "print_max_strength": args.print_max_strength, "instance_min_polys": args.instance_min_polys,
+           "print_max_strength": args.print_max_strength, "instance_min_polys": args.instance_min_polys, "max_instances": args.max_instances,
            "template_xml": str(template / "base.xml")}
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
                LD_LIBRARY_PATH=f"{cb.DRIVER_DIRS}:{cb.BLENDER.parent / 'lib'}:{cb.lib_dir()}")
