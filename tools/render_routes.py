@@ -82,8 +82,41 @@ def encode_pol(out: dict) -> np.ndarray:
     return np.stack([dolp * 255, aolp * 255, np.clip(s0 / max(np.percentile(s0, 99), 1e-6), 0, 1) * 255], -1).astype(np.uint8)
 
 
+def claim(path: Path) -> bool:
+    """Take a frame for this process: an O_EXCL ``<frame>.claim`` file holding the pid (a claim of a dead pid is taken
+    over), so several renderers, each with its own server, share one frame list."""
+    c = Path(str(path) + ".claim")
+    for _ in range(2):
+        try:
+            fd = os.open(c, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                pid = int(c.read_text().strip() or 0)
+            except (OSError, ValueError):
+                pid = 0
+            if pid and Path(f"/proc/{pid}").exists():
+                return False
+            c.unlink(missing_ok=True)
+    return False
+
+
+def load_failed(out: Path) -> dict:
+    """The failure counts of every renderer (``failed_frames.json``, ``failed_frames.<worker>.json``) added up."""
+    total: dict = {}
+    for f in out.glob("failed_frames*.json"):
+        try:
+            for k, v in json.loads(f.read_text()).items():
+                total[k] = total.get(k, 0) + v
+        except (OSError, ValueError):
+            pass
+    return total
+
+
 def render_scene(client: RenderClient, pack: Path, scene: str, routes: dict, out: Path, variant: str, spp: int,
-                 limit: int | None, fmt: str = "kit", preview: bool = False) -> int:
+                 limit: int | None, fmt: str = "kit", preview: bool = False, worker: int = 0) -> int:
     camera = json.loads((pack / "scenes" / scene / "scene.json").read_text())["camera"]
     todo = [(rid, k, p) for rid in sorted(routes) for k, p in enumerate(routes[rid]["poses"])
             if not done(out / "images" / rid / "rgb" / f"{k:04d}.jpg", fmt)]
@@ -100,12 +133,19 @@ def render_scene(client: RenderClient, pack: Path, scene: str, routes: dict, out
                 "mode": "polar", **({"bands": "both"} if fmt == "exr" else {})}
 
     client.render([view(todo[0][2], 0, 16)])  # the scene loads and records at a small spp first
-    failed_path = out / "failed_frames.json"  # frame -> failures: three failures and a frame is left out
-    failed = json.loads(failed_path.read_text()) if failed_path.is_file() else {}
+    failed_path = out / ("failed_frames.json" if worker == 0 else f"failed_frames.{worker}.json")  # frame -> failures
+    mine: dict = json.loads(failed_path.read_text()) if failed_path.is_file() else {}
+    failed = load_failed(out)  # three failures (all renderers together) and a frame is left out
     t0, n = time.time(), 0
     for rid, k, pose in todo:
         key = f"{scene}/{rid}/{k}"
         if failed.get(key, 0) >= 3:
+            continue
+        target = out / "images" / rid / ("exr" if fmt == "exr" else "rgb") / f"{k:04d}.{'exr' if fmt == 'exr' else 'jpg'}"
+        if target.is_file() and target.stat().st_size > 0:
+            continue  # another renderer finished it
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not claim(target):
             continue
         rgb = out / "images" / rid / "rgb" / f"{k:04d}.jpg"
         pol = out / "images" / rid / "pol" / f"{k:04d}.png"
@@ -113,8 +153,10 @@ def render_scene(client: RenderClient, pack: Path, scene: str, routes: dict, out
         try:
             result = client.render([view(pose, seed, spp)], "float32")[0]
         except Exception:  # the server may be gone: count the failure, and let the caller restart it and run again
+            mine[key] = mine.get(key, 0) + 1
             failed[key] = failed.get(key, 0) + 1
-            failed_path.write_text(json.dumps(failed))
+            failed_path.write_text(json.dumps(mine))
+            Path(str(target) + ".claim").unlink(missing_ok=True)
             raise
         if fmt == "exr":
             exr = out / "images" / rid / "exr" / f"{k:04d}.exr"
@@ -131,6 +173,7 @@ def render_scene(client: RenderClient, pack: Path, scene: str, routes: dict, out
             os.replace(str(pol) + ".part", pol)
             Image.fromarray(result["rgb"]).save(str(rgb) + ".part", "JPEG", quality=95)
             os.replace(str(rgb) + ".part", rgb)  # the rgb file lands last: a frame is done when it exists
+        Path(str(target) + ".claim").unlink(missing_ok=True)
         n += 1
         if n % 100 == 0:
             print(f"{scene}: {n}/{len(todo)} frames, {(time.time() - t0) / n:.2f} s/frame", flush=True)
@@ -149,6 +192,8 @@ def main() -> int:
     ap.add_argument("--scene", action="append", default=[])
     ap.add_argument("--format", choices=("kit", "exr"), default="kit",
                     help="kit: the kit's JPEG and PNG; exr: one 16-bit EXR with the RGB and near-infrared Stokes channels")
+    ap.add_argument("--worker", type=int, default=0, help="this renderer's number when several (each with its own "
+                    "server) share the frame list through claim files")
     ap.add_argument("--preview", action="store_true", help="with --format exr, also the RGB JPEG")
     ap.add_argument("--limit", type=int, default=None, help="only the first N missing frames of each scene")
     args = ap.parse_args()
@@ -167,7 +212,7 @@ def main() -> int:
     for scene in scenes:
         routes = json.loads((args.routes / f"{scene}.json").read_text())
         total += render_scene(client, args.pack, scene, routes, args.out, args.variant, args.spp, args.limit,
-                             args.format, args.preview)
+                             args.format, args.preview, args.worker)
     print(f"done: {total} frames", flush=True)
     return 0
 
