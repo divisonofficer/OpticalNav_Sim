@@ -59,6 +59,8 @@ def render(req: dict) -> dict:
     sc.cycles.samples = int(req["spp"])
     sc.cycles.seed = int(req["seed"]) & 0x7FFFFFFF
     sc.cycles.use_animated_seed = False
+    for name, value in (req.get("options") or {}).items():  # Cycles settings of this frame (sc.cycles.<name>), e.g. filter_glossy
+        setattr(sc.cycles, name, value)
     sc.cycles.use_denoising = bool(req.get("denoise"))
     if sc.cycles.use_denoising:
         sc.cycles.denoiser = "OPTIX"

@@ -109,13 +109,14 @@ class CyclesWorker:
         return self.proc.poll() is None
 
     def render(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, spp: int, seed: int,
-               denoise: bool = False) -> tuple[np.ndarray, dict]:
-        """Linear RGB, float32 (height, width, 3), and the worker's timing."""
+               denoise: bool = False, options: dict | None = None) -> tuple[np.ndarray, dict]:
+        """Linear RGB, float32 (height, width, 3), and the worker's timing. ``options``: Cycles settings for this frame
+        (``scene.cycles.<name>``: filter_glossy, sample_clamp_indirect ...); they stay set for the next frames."""
         fd, path = tempfile.mkstemp(prefix="opticalnav_cycles_", suffix=".f32", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
         os.close(fd)
         req = {"op": "render", "matrix": blender_camera(c2w, self.origin_offset).ravel().tolist(), "width": int(width),
                "height": int(height), "hfov_deg": float(hfov_deg), "spp": int(spp), "seed": int(seed),
-               "denoise": bool(denoise), "out": path}
+               "denoise": bool(denoise), "options": options or {}, "out": path}
         try:
             with self.lock:
                 self._cmd.write(json.dumps(req) + "\n")
