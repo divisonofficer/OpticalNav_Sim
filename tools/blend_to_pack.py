@@ -434,6 +434,7 @@ def run_inside(cfg: dict) -> None:
         return (float(np.asarray(v.c).ravel()[0]), True) if v is not None and v.a is None else (default, False)
 
     alpha_of: dict[str, V] = {}  # material name -> its alpha texture (cutouts are cut from it)
+    emission_img: dict[str, tuple[V, float]] = {}  # material name -> (its emission image, strength): the glowing part is cut from it
     cutting = [False]  # while True, an alpha texture does not make a mask: the shape's geometry is cut instead
 
     def principled(node, stat: dict) -> tuple[str, list | None]:
@@ -537,6 +538,8 @@ def run_inside(cfg: dict) -> None:
                 stat["class"] = "print (image emission)"
                 report["emission_prints"] = report.get("emission_prints", 0) + 1
             else:
+                if img is not None and img.a is not None:
+                    emission_img[m.name] = (img, st)
                 emission = emission_xml(shader.inputs["Color"], st, "      ")
                 stat["class"] = "emission"
                 res = ('    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n', emission)
@@ -736,6 +739,18 @@ def run_inside(cfg: dict) -> None:
                         bsdf, emission = material(mat, cutout=True)
                         report["cutouts"] = report.get("cutouts", 0) + 1
                         report["cutout_quads"] = report.get("cutout_quads", 0) + n_quads
+                digits = None
+                if emission and mat is not None and mat.name in emission_img and len(u) == 4:
+                    # a lit sign (the room numerals, strength 14): the plate stays dark, the bright texels glow as opaque rectangles cut
+                    # from the image (a textured emitter breaks Dr.Jit's frozen recording), on both sides as Cycles' Emission is
+                    pic, strength = emission_img[mat.name]
+                    lum = pic.a.mean(-1)
+                    on = lum > 0.5 * lum.max()
+                    cut = cut_quad(u, V(a=np.repeat(on[..., None].astype(np.float32), 3, axis=-1), uv=pic.uv))
+                    if cut is not None:
+                        digits = (cut[0], cut[1], [float(x) * strength for x in pic.a[on].mean(0)])
+                        bsdf, emission = '    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n', None
+                        report["glowing_cutouts"] = report.get("glowing_cutouts", 0) + 1
                 path = write_ply(u[:, :3], u[:, 3:6], u[:, 6:8], tris)
                 sid = unique_id(o.name if len(parts) == 1 else f"{o.name}__part_{k}_")
                 lo, hi = u[:, :3].min(0), u[:, :3].max(0)
@@ -745,7 +760,21 @@ def run_inside(cfg: dict) -> None:
                 emit = f'    <emitter type="area">\n{emission[0]}    </emitter>\n' if emission else ""
                 shapes_xml.append(f'\n  <!--opticalnav-obj:{note_xml}-->\n  <shape type="ply" id="{sid}">\n'
                                   f'    <string name="filename" value="{path}" />\n{bsdf}{emit}  </shape>')
-                if emission and float((hi - lo).min()) < 0.03:
+                if digits is not None:
+                    gu, gt, grad = digits
+                    nn = gu[:, 3:6].mean(0)
+                    nn /= max(np.linalg.norm(nn), 1e-9)
+                    gem = f'    <emitter type="area">\n      <rgb name="radiance" value="{rgb(grad)}" />\n    </emitter>\n'
+                    dark = '    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n'
+                    for side, sgn in (("a", 1.0), ("b", -1.0)):
+                        sid3 = unique_id(f"{sid}__glow_{side}")
+                        pos3 = gu[:, :3] + sgn * 0.0005 * nn
+                        pth = write_ply(pos3, sgn * gu[:, 3:6], gu[:, 6:8], np.ascontiguousarray(gt if sgn > 0 else gt[:, ::-1]))
+                        note3 = note(sid3, o.name, mat.name, [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
+                                     [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), grad)
+                        shapes_xml.append(f'\n  <!--opticalnav-obj:{note3}-->\n  <shape type="ply" id="{sid3}">\n'
+                                          f'    <string name="filename" value="{pth}" />\n{dark}{gem}  </shape>')
+                elif emission and float((hi - lo).min()) < 0.03:
                     # Cycles' Emission is two-sided (checked: a plane reads 5.0 from both sides), Mitsuba's area emitter is not: a thin
                     # emitter (a painting, a sign, a screen) gets a copy that faces the other way
                     sid2 = unique_id(f"{sid}__back")
@@ -785,7 +814,9 @@ def run_inside(cfg: dict) -> None:
                 "sun_angle_deg": math.degrees(d.angle) if d.type == "SUN" else None,
                 "use_shadow": bool(getattr(d, "use_shadow", True))}
         radiance = [round(c * (1.0 + IMPORTER_WATTS * float(d.energy)), 5) for c in col]
-        sid = unique_id(f"light_{i}_{o.name}")
+        # a Blender light is not seen by the camera when its Ray Visibility > Camera is off (every light of PH19 and PH33): the
+        # server's ``hidden`` prefix lets camera rays through such a box, which lights the room without a white square on the ceiling
+        sid = unique_id(f"light_hidden_{i}_{o.name}" if not o.visible_camera else f"light_{i}_{o.name}")
         n = {"id": sid, "type": "landmark", "label": f"light:{o.name}", "placement": "point", "material": "infinigen_default",
              "source_ref": None, "is_emitter": True, "emitter_radiance": radiance, "emitter_intensity": 1.0,
              "emitter_shape": "ceiling_panel", "emitter_polarized": False, "emitter_polarizer_angle_deg": 0.0, "emitter_pattern": None,

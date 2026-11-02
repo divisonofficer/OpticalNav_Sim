@@ -121,6 +121,9 @@ ASSIST_PREFIX = "camera_assist"  # the flash rectangle (and the old protocol's p
 # lets camera rays through them, so they light the room without white squares under every ceiling (Blender's
 # camera visibility off, as the dataset meant them).
 FILL_PREFIX = "light_softbox_"
+# The lights of a scene converted from its .blend (tools/blend_to_pack.py) whose Blender Ray Visibility > Camera is off (all of
+# PH19's and PH33's): the same camera-transparent lights, under their own prefix, so they stay "fixtures", not "fill".
+HIDDEN_LIGHT_PREFIX = "light_hidden_"
 ASSIST_SHAPE = re.compile(r'\s*<shape type="rectangle" id="camera_assist_[a-z]+">.*?</shape>', re.S)
 SENSOR_BLOCK = re.compile(r"\s*<sensor\b.*?</sensor>", re.S)
 COMMENT = re.compile(r"\s*<!--.*?-->", re.S)
@@ -2504,7 +2507,8 @@ class Renderer:
                 flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
                 envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
                 pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
-                hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
+                hidden=((HIDDEN_LIGHT_PREFIX if self.direct_scene(scan) else FILL_PREFIX)
+                        if getattr(self, "has_hidden", False) else ""),
                 fill_gain=self.fill_gain if own else 1.0,
                 blender_power=self.lamp_power == "blender" and own,
                 alpha_power=self.alpha_power if own and not self.direct_scene(scan) else 1.0,
