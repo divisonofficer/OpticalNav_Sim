@@ -526,9 +526,20 @@ def run_inside(cfg: dict) -> None:
             res = (core, emission)
         elif shader is not None and shader.type == "EMISSION":
             st, _ = scalar_const(shader.inputs["Strength"], 1.0)
-            emission = emission_xml(shader.inputs["Color"], st, "      ")
-            stat["class"] = "emission"
-            res = ('    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n', emission)
+            img = value_of(shader.inputs["Color"])
+            if img is not None and img.a is not None and st <= float(cfg["print_max_strength"]):
+                # a picture the author showed by Emission (PH33's banners at strength 1, its wayfinding signs at 3) stands in for a print: in the
+                # room's light it is a diffuse, slightly glossy surface, so it polarizes like one (an emitter's light is unpolarized: DoLP 0).
+                # Image emissions stronger than --print-max-strength (the room numerals, 14) stay emitters, flattened to their mean
+                alb, _ = spec(shader.inputs["Color"], "diffuse_reflectance", "        ", "colour", stat)
+                res = ('    <bsdf type="twosided">\n      <bsdf type="pplastic">\n        <float name="int_ior" value="1.5000" />\n'
+                       f'{alb}        <float name="alpha" value="0.3000" />\n      </bsdf>\n    </bsdf>\n', None)
+                stat["class"] = "print (image emission)"
+                report["emission_prints"] = report.get("emission_prints", 0) + 1
+            else:
+                emission = emission_xml(shader.inputs["Color"], st, "      ")
+                stat["class"] = "emission"
+                res = ('    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n', emission)
         else:
             stat["class"] = f"fallback:{shader.type if shader is not None else 'none'}"
         cutting[0] = False
@@ -692,7 +703,7 @@ def run_inside(cfg: dict) -> None:
                 coord = mstat.get("coord", "UV")
                 if coord in ("OBJECT", "GENERATED") and mstat.get("proj"):
                     # the image is looked up by the object's own coordinates: the Mapping applied here, then FLAT (x, y) or BOX (the axis
-                    # pair of the triangle's dominant normal axis: x -> (y, z), y -> (x, z), z -> (y, x), as Cycles does)
+                    # pair and signs Cycles uses for the triangle's dominant normal axis, below)
                     pr = mstat["proj"]
                     base = co[lv[idx]]  # (triangles, 3 corners, xyz)
                     if coord == "GENERATED":  # the object's bounding box, 0..1
@@ -700,9 +711,16 @@ def run_inside(cfg: dict) -> None:
                         base = (base - lo_) / np.maximum(hi_ - lo_, 1e-9)
                     X = base @ np.array(pr["M"]).reshape(3, 3).T + np.array(pr["loc"])
                     if pr["projection"] == "BOX":
-                        axis = np.abs(nrm[idx].mean(1)).argmax(1)
-                        pair = np.array([[1, 2], [0, 2], [1, 0]])[axis]  # (triangles, 2)
-                        uvs = np.take_along_axis(X, np.repeat(pair[:, None, :], 3, axis=1), axis=2).reshape(-1, 2)
+                        # measured on a cube in Cycles (6 faces, a u = R / v = G gradient image): seen from outside u grows to the right,
+                        #   +x: u = +y   -x: u = -y   +y: u = -x   -y: u = +x   +z: u = -y   -z: u = +y;   v = z on the x and y faces, x on z
+                        fn = nrm[idx].mean(1)
+                        axis = np.abs(fn).argmax(1)
+                        s = np.sign(np.take_along_axis(fn, axis[:, None], 1))[:, 0]
+                        s[s == 0] = 1.0
+                        ax_ = axis[:, None]
+                        uu = np.where(ax_ == 0, s[:, None] * X[..., 1], np.where(ax_ == 1, -s[:, None] * X[..., 0], -s[:, None] * X[..., 1]))
+                        vv = np.where(ax_ == 2, X[..., 0], X[..., 2])
+                        uvs = np.stack([uu, vv], axis=-1).reshape(-1, 2)
                     else:
                         uvs = X[..., :2].reshape(-1, 2)
                 else:
@@ -731,7 +749,11 @@ def run_inside(cfg: dict) -> None:
                     # Cycles' Emission is two-sided (checked: a plane reads 5.0 from both sides), Mitsuba's area emitter is not: a thin
                     # emitter (a painting, a sign, a screen) gets a copy that faces the other way
                     sid2 = unique_id(f"{sid}__back")
-                    path2 = write_ply(u[:, :3], -u[:, 3:6], u[:, 6:8], np.ascontiguousarray(tris[:, ::-1]))
+                    # displaced 0.5 mm along its own facing: coplanar with the original, a ray from that side hit the original first
+                    # (which emits the other way) and the painting stayed black
+                    nback = -u[:, 3:6].mean(0)
+                    nback /= max(np.linalg.norm(nback), 1e-9)
+                    path2 = write_ply(u[:, :3] + 0.0005 * nback, -u[:, 3:6], u[:, 6:8], np.ascontiguousarray(tris[:, ::-1]))
                     note2 = note(sid2, o.name, mat.name if mat else "default", [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
                                  [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), emission[1])
                     shapes_xml.append(f'\n  <!--opticalnav-obj:{note2}-->\n  <shape type="ply" id="{sid2}">\n'
@@ -830,6 +852,9 @@ def main() -> int:
     ap.add_argument("--blend", type=Path)
     ap.add_argument("--origin-offset", type=float, nargs=3)
     ap.add_argument("--max-texture", type=int, default=4096)
+    ap.add_argument("--print-max-strength", type=float, default=5.0,
+                    help="an Emission shader coloured by an image, up to this strength, becomes a lit print (image albedo, polarizing) "
+                         "instead of an emitter (default 5: banners 1, wayfinding signs 3; the room numerals, 14, glow)")
     args = ap.parse_args()
     import attach_blend
     from opticalnav_sim import cycles_backend as cb
@@ -845,6 +870,7 @@ def main() -> int:
     out = pack / "scenes" / scene_id
     out.mkdir(parents=True, exist_ok=True)
     cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset), "max_texture": args.max_texture,
+           "print_max_strength": args.print_max_strength,
            "template_xml": str(template / "base.xml")}
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
                LD_LIBRARY_PATH=f"{cb.DRIVER_DIRS}:{cb.BLENDER.parent / 'lib'}:{cb.lib_dir()}")
