@@ -1202,3 +1202,15 @@ def test_attach_blend_finds_the_promoted_file(tmp_path):
     assert attach_blend.find_source("sim_v2a_REF_PH19", tsv) == blend
     assert attach_blend.find_source("sim_v2a_REF_PH20", tsv) is None  # listed, but the file is gone
     assert attach_blend.find_source("sim_v2a_REF_PH99", tsv) is None
+
+
+def test_synthetic_variants_of_an_own_scene_are_own_scenes():
+    """The viewer's flash switch asks for active_polar, a variant the server makes up (protocol active_polar_flash...):
+    on a scene staged without a render it must still get the own-scene looks (light boxes at Blender power, sky, fill)."""
+    r = object.__new__(server.Renderer)
+    meta = {"variants": {"base": {"xml": "base.xml", "protocol": "staged_without_render_v1"}}}
+    server.synthesize_variants(meta, True, True)
+    r.meta = {"own": meta, "dataset": {"variants": {"base": {"xml": "b.xml", "protocol": "dataset_v1"}}}}
+    assert {"perturbed", "active_polar"} <= set(meta["variants"])
+    assert all(r.own_scene("own", v) for v in ("base", "perturbed", "active_polar"))
+    assert not r.own_scene("dataset", "base")

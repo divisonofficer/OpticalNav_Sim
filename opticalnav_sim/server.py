@@ -2342,7 +2342,11 @@ class Renderer:
     def own_scene(self, scan: str, variant: str = "base") -> bool:
         """A scene staged without a render (``staged_without_render_v1``): the simulator's own, with no dataset
         frames to match, so its look defaults (sky, fill, depth) may differ from the dataset's."""
-        return self.meta[scan]["variants"].get(variant, {}).get("protocol") == "staged_without_render_v1"
+        variants = self.meta[scan]["variants"]
+        entry = variants.get(variant, {})
+        if entry.get("synthetic"):  # "perturbed", "active_polar": the viewer's flash and mirrors on the base scene file
+            entry = variants.get("base", {})
+        return entry.get("protocol") == "staged_without_render_v1"
 
     def sky_for(self, scan: str, variant: str) -> tuple[str, float, float] | None:
         """(map, gain, rotation) of the default sky for a view that asks for the scene's own environment, or None.
