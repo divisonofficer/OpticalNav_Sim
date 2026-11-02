@@ -1238,3 +1238,23 @@ def test_cycles_reads_blenders_uncompressed_exr(tmp_path):
     path = tmp_path / "f.exr"
     path.write_bytes(b"v/1\x01" + struct.pack("<i", 2) + header + table + blocks)
     assert np.array_equal(cb.read_exr(str(path)), rgb)
+
+
+def test_direct_scenes_light_at_blenders_measured_power():
+    """Measured against Cycles (a lone light over a Lambertian plane): an area light's radiance is W / (pi A) and a point or spot
+    light's intensity W / (4 pi) W/sr, pi times the importer-era formulas. watt_gain=pi (the scenes converted from their .blend)
+    gives the measured value, 1 keeps the old one."""
+    xml = ('<scene version="3.0.0">\n  <!--opticalnav-obj:{"id":"light_0_al","type":"landmark","label":"light:al","is_emitter":true,'
+           '"emitter_radiance":[2.125,2.125,2.125],"emitter_intensity":1.0,"geometry":{"center":[0,0],"size_m":[0.6,0.08,0.6],'
+           '"base_height_m":2.5},"metadata":{"light":{"type":"AREA","energy":45.0,"color":[1,1,1],"position":[0,0,2.5],'
+           '"direction":[0,0,-1],"area_shape":"DISK","area_size_m":[0.18,0.18]}}}-->\n'
+           '  <shape type="rectangle" id="light_0_al">\n    <transform name="to_world">\n      <scale x="0.300000" y="0.300000" />\n'
+           '      <rotate x="1" angle="90" />\n      <translate x="0" y="2.51" z="0" />\n    </transform>\n'
+           '    <emitter type="area">\n      <rgb name="radiance" value="2.125 2.125 2.125" />\n    </emitter>\n  </shape>\n</scene>\n')
+    area = math.pi * 0.09 ** 2
+
+    def radiance(gain):
+        text, _ = server.lamp_lights_text(xml, None, True, None, True, watt_gain=gain)
+        return float(re.search(r'<rgb name="radiance" value="([\d.]+)', text).group(1))
+    assert math.isclose(radiance(math.pi), 45.0 / (math.pi * area), rel_tol=2e-3)
+    assert math.isclose(radiance(1.0), 45.0 / (math.pi ** 2 * area), rel_tol=2e-3)

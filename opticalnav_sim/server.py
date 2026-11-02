@@ -174,6 +174,9 @@ SYNTHETIC_FLASH = {"distance_m": 0.2, "size_world": [0.12, 0.08], "radiance": 25
 SYNTHETIC_POOL_SHARE = (1.0, 0, False)  # a synthetic perturbed variant's mirrors: robomituba's density 1, no glass
 
 
+OWN_PROTOCOLS = ("staged_without_render_v1", "blend_direct_v1")  # the simulator's own scenes (Renderer.own_scene)
+
+
 def synthesize_variants(meta: dict, has_pool: bool, has_nocaustics: bool) -> list[str]:
     """Give a scene packed with its base variant alone the variants the viewer switches among, on the same scene
     file (so on the same resident scene): "perturbed" shows its perturbation pool's share at density 1
@@ -539,7 +542,7 @@ IMPORTER_WATTS = 0.025  # the importer's box radiance, colour-free, is 1 + IMPOR
 
 
 def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=None,
-                     blender_power: bool = False) -> tuple[str, list[str]]:
+                     blender_power: bool = False, watt_gain: float = 1.0) -> tuple[str, list[str]]:
     """Lamps glow from their own parts instead of from boxes. Infinigen spawns a light (``PointLampFactory``) with
     only some of its lamps; robomituba's importer turns those into a flat emitter cube (0.6 x 0.6 x 0.08 m) at a
     desk or floor lamp's top and a 0.6 m square under a ceiling light, and the other lamps stay dark. A lamp is
@@ -622,7 +625,7 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         if known is not None:
             # a spot keeps a point light's intensity inside its cone (energy / 4 pi^2 W/sr), which is what a
             # Lambertian disk's radiance x area gives on its axis
-            return known[1] / ((4.0 if known[0] == "SPOT" else 1.0) * math.pi ** 2)
+            return known[1] * watt_gain / ((4.0 if known[0] == "SPOT" else 1.0) * math.pi ** 2)
         if not light.get("emitter_radiance"):
             return None
         sx, sy, sz = (float(v) for v in (light.get("geometry") or {}).get("size_m") or [0.6, 0.08, 0.6])
@@ -792,15 +795,20 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
         end = text.rindex("</scene>")
         text = text[:end] + "".join(xml) + "\n" + text[end:]
     if blender_power:
-        text = boxes_at_blender_power(text, notes)
+        text = boxes_at_blender_power(text, notes, watt_gain)
     return text, added
 
 
-def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
+def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0) -> str:
     """The importer's light boxes that no lamp took over (``light_*`` shapes with an area emitter: a corridor's ceiling
     panels ``light_0_al``, say) at Blender's power as well: radiance = energy / (pi^2 x emitting area), times the
     light's colour (a spot: energy / 4 pi^2). The energy is the light's metadata.light.energy, else read back from the
-    box's radiance (1 + IMPORTER_WATTS x watts, as for the lamps). Fill softboxes are left alone."""
+    box's radiance (1 + IMPORTER_WATTS x watts, as for the lamps). Fill softboxes are left alone.
+
+    ``watt_gain``: measured against Cycles (a lone light over a Lambertian plane, tools/blend_to_pack.py's check), Blender's
+    area light radiates a flux of its watts (radiance W / (pi A)) and its point and spot lights W / (4 pi) W/sr: pi times what
+    the formulas above give. The scenes converted straight from their .blend (``blend_direct_v1``) get pi; the importer's
+    scenes keep 1, their fill and sky having been tuned against it."""
     meta = {n["id"]: ((n.get("metadata") or {}).get("light") or {}) for n in notes if n.get("id")}
     energy = {k: (v.get("energy"), v.get("type")) for k, v in meta.items()}
     housings: list[str] = []  # the tubes that cut a spot's emitter to its cone, added after the shapes
@@ -844,7 +852,7 @@ def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
             c = [float(pos[0]), float(pos[2]), float(pos[1])]
             e = [c[i] + length * d[i] for i in range(3)]
             colour = np.asarray(values) / max(max(values), 1e-9)
-            level = float(watts) / (4.0 * math.pi ** 2 * math.pi * r * r)
+            level = float(watts) * watt_gain / (4.0 * math.pi ** 2 * math.pi * r * r)
             new = " ".join(f"{level * x:.4f}" for x in colour)
             housings.append(
                 f'\n  <shape type="cylinder" id="{sid}__housing">\n    <point name="p0" x="{c[0]:.6f}" y="{c[1]:.6f}" z="{c[2]:.6f}" />'
@@ -876,7 +884,7 @@ def boxes_at_blender_power(text: str, notes: list[dict]) -> str:
         else:
             area = sx * sy
         colour = np.asarray(values) / max(max(values), 1e-9)
-        level = watts / ((4.0 if kind == "SPOT" or "_track_" in sid else 1.0) * math.pi ** 2 * max(area, 1e-6))
+        level = watts * watt_gain / ((4.0 if kind == "SPOT" or "_track_" in sid else 1.0) * math.pi ** 2 * max(area, 1e-6))
         new = " ".join(f"{level * c:.4f}" for c in colour)
         return shape_text.replace(rad.group(0), rad.group(1) + new + rad.group(3), 1)
 
@@ -1281,7 +1289,7 @@ class Resident:
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
                  pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0,
-                 blender_power: bool = False, alpha_power: float = 1.0):
+                 blender_power: bool = False, alpha_power: float = 1.0, watt_gain: float = 1.0):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
@@ -1313,7 +1321,7 @@ class Resident:
         import drjit as dr
         # OPTICALNAV_BOX_LIGHTS=1: lit lamps keep the importer's boxes (the earlier look, for comparisons)
         text, self.lamp_lights = lamp_lights_text(text, mesh_info, lit=not os.environ.get("OPTICALNAV_BOX_LIGHTS"),
-                                                  mesh_bounds=mesh_bounds, blender_power=blender_power)
+                                                  mesh_bounds=mesh_bounds, blender_power=blender_power, watt_gain=watt_gain)
         if alpha_power != 1.0:  # the simulator's own scenes: the importer's roughness as Blender's alpha (r**2)
             text = power_alpha_text(text, base_dir, alpha_power)
         if fill_gain != 1.0:  # the simulator's own scenes: the importer's room softboxes at a share of their radiance
@@ -2346,7 +2354,12 @@ class Renderer:
         entry = variants.get(variant, {})
         if entry.get("synthetic"):  # "perturbed", "active_polar": the viewer's flash and mirrors on the base scene file
             entry = variants.get("base", {})
-        return entry.get("protocol") == "staged_without_render_v1"
+        return entry.get("protocol") in OWN_PROTOCOLS
+
+    def direct_scene(self, scan: str) -> bool:
+        """A scene converted straight from its .blend (tools/blend_to_pack.py): its alpha is already Blender's roughness
+        squared, so ``--alpha-power`` is not applied again."""
+        return self.meta[scan]["variants"].get("base", {}).get("protocol") == "blend_direct_v1"
 
     def sky_for(self, scan: str, variant: str) -> tuple[str, float, float] | None:
         """(map, gain, rotation) of the default sky for a view that asks for the scene's own environment, or None.
@@ -2494,7 +2507,8 @@ class Renderer:
                 hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
                 fill_gain=self.fill_gain if own else 1.0,
                 blender_power=self.lamp_power == "blender" and own,
-                alpha_power=self.alpha_power if own else 1.0)
+                alpha_power=self.alpha_power if own and not self.direct_scene(scan) else 1.0,
+                watt_gain=math.pi if self.direct_scene(scan) else 1.0)
         self.cache[rkey] = loaded
         return loaded
 
