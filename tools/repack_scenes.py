@@ -10,7 +10,7 @@ needed either):
 2. ``build_pack.py`` rebuilds it from ``out/opticalnav/opticalnav-sim-v1`` (the staged scene: robomituba's
    ``stage_sim_scene.py`` is NOT run here, so a texture size chosen at staging, e.g. ``--texture-max 4096``, stays),
 3. ``compact_assets.py`` and ``build_perturbation_pool.py``,
-4. the repairs: ``metal_textures.py``, ``sheer_parts.py``, ``gray_textures.py`` (and, only with the flags,
+4. the repairs: ``metal_textures.py``, ``sheer_parts.py``, ``flat_colors.py``, ``gray_textures.py`` (and, only with the flags,
    ``slab_glass.py`` and ``open_doors.py``: a scene staged from a glass-fixed blend already has its glass slabs and
    door openings), then ``light_audit.py``,
 5. with ``--keep-spawns`` (default on) the old scene.json's start poses are copied into the new one: the geometry did
@@ -66,6 +66,7 @@ def repack(scene: str, glass_slabs: bool, open_doors: bool, keep_spawns: bool, e
         steps.append(("open_doors", [py, "tools/open_doors.py", *pack]))
     steps += [("metal_textures", [py, "tools/metal_textures.py", *pack]),
               ("sheer_parts", [py, "tools/sheer_parts.py", *pack]),
+              ("flat_colors", [py, "tools/flat_colors.py", *pack]),
               ("gray_textures", [py, "tools/gray_textures.py", *pack]),
               ("light_audit", [py, "tools/light_audit.py", *pack])]
     for label, cmd in steps:
