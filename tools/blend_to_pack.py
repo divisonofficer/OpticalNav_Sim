@@ -106,10 +106,11 @@ def run_inside(cfg: dict) -> None:
     # Math ...), so a composite the importer had to bake through Cycles is computed here from the image's own pixels. A noise
     # texture counts as its mean (0.5): the dirt's average tone stays, its grain does not.
     class V:
-        __slots__ = ("c", "a", "uv", "coord", "src")
+        __slots__ = ("c", "a", "uv", "coord", "src", "proj")
 
-        def __init__(self, c=None, a=None, uv=None, coord="UV", src=None):
-            self.c, self.a, self.uv, self.coord, self.src = c, a, uv, coord, src  # src: the Image of an untouched colour read
+        def __init__(self, c=None, a=None, uv=None, coord="UV", src=None, proj=None):
+            # src: the Image of an untouched colour read; proj: for Object / Generated coordinates, how the image is projected
+            self.c, self.a, self.uv, self.coord, self.src, self.proj = c, a, uv, coord, src, proj
 
     IDENT = [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0]
     px_cache: dict[str, "np.ndarray"] = {}
@@ -139,30 +140,49 @@ def run_inside(cfg: dict) -> None:
             px_cache[key] = a
         return px_cache[key]
 
-    def coords_of(node) -> tuple[list, str] | None:
-        """(3x3 uv matrix, coordinate source: UV | OBJECT | GENERATED) an Image Texture's Vector input amounts to; None if it is
-        something a mesh cannot carry (camera, window, normal ...)."""
+    def coords_of(node) -> tuple[list, str, dict | None] | None:
+        """(2D uv matrix, coordinate source UV | OBJECT | GENERATED, projection) an Image Texture's Vector input amounts to; None if
+        it is something a mesh cannot carry (camera, window, normal ...). For Object / Generated coordinates the Mapping node is
+        a 3D transform applied to the coordinate before the image's projection (FLAT: x, y; BOX: the axis pair of the face's
+        dominant normal axis), so it is returned as ``proj`` and the uv matrix is the identity."""
         sock = skip_reroute(node.inputs["Vector"])
         if not sock.is_linked:
-            return IDENT, "UV"
+            return IDENT, "UV", None
         src = sock.links[0].from_node
-        mat = IDENT
+        mapping = None
         if src.type == "MAPPING":
             if any(src.inputs[n].is_linked for n in ("Location", "Rotation", "Scale")) or src.vector_type not in ("POINT", "TEXTURE"):
                 return None
-            loc, rot, sc = (np.array(src.inputs[n].default_value, dtype=float) for n in ("Location", "Rotation", "Scale"))
-            c, s = math.cos(rot[2]), math.sin(rot[2])
-            mat = [sc[0] * c, -sc[1] * s, loc[0], sc[0] * s, sc[1] * c, loc[1], 0, 0, 1.0]
+            mapping = src
             sock = skip_reroute(src.inputs["Vector"])
             if not sock.is_linked:
-                return mat, "UV"
-            src = sock.links[0].from_node
-            name = sock.links[0].from_socket.name
+                src, name = None, "UV"
+            else:
+                src, name = sock.links[0].from_node, sock.links[0].from_socket.name
         else:
             name = sock.links[0].from_socket.name
-        if src.type == "TEX_COORD" and name in ("UV", "Object", "Generated"):
-            return mat, name.upper()
-        return None
+        if src is not None and not (src.type == "TEX_COORD" and name in ("UV", "Object", "Generated")):
+            return None
+        coord = name.upper() if src is not None else "UV"
+        if coord == "UV":
+            if mapping is None:
+                return IDENT, "UV", None
+            loc, rot, sc = (np.array(mapping.inputs[n].default_value, dtype=float) for n in ("Location", "Rotation", "Scale"))
+            c, s = math.cos(rot[2]), math.sin(rot[2])
+            return [sc[0] * c, -sc[1] * s, loc[0], sc[0] * s, sc[1] * c, loc[1], 0, 0, 1.0], "UV", None
+        M, loc = np.eye(3), np.zeros(3)
+        if mapping is not None:
+            lo, ro, so = (np.array(mapping.inputs[n].default_value, dtype=float) for n in ("Location", "Rotation", "Scale"))
+            cx, cy, cz = np.cos(ro)
+            sx, sy, sz = np.sin(ro)
+            R = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]) @ np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ \
+                np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+            if mapping.vector_type == "POINT":  # vec' = R (S vec) + loc
+                M, loc = R @ np.diag(so), lo
+            else:  # TEXTURE: the inverse
+                M = np.diag(1 / so) @ R.T
+                loc = -M @ lo
+        return IDENT, coord, {"coord": coord, "M": M.ravel().tolist(), "loc": loc.tolist(), "projection": node.projection}
 
     def const(v) -> V:
         a = np.array(v if hasattr(v, "__len__") else [v] * 3, dtype=np.float32)[:3]
@@ -199,7 +219,7 @@ def run_inside(cfg: dict) -> None:
         out = f(*vals)
         if arr is None:
             return V(c=np.asarray(out, dtype=np.float32))
-        return V(a=np.asarray(out, dtype=np.float32), uv=arr.uv, coord=arr.coord)
+        return V(a=np.asarray(out, dtype=np.float32), uv=arr.uv, coord=arr.coord, proj=arr.proj)
 
     def value_of(sock, depth: int = 0) -> V | None:
         sock = skip_reroute(sock)
@@ -223,10 +243,21 @@ def run_inside(cfg: dict) -> None:
                 return None
             a = image_array(n.image)
             a = a[..., 3:4].repeat(3, axis=2) if out == "Alpha" else a[..., :3]
-            return V(a=a, uv=co[0], coord=co[1], src=n.image if out == "Color" else None)
+            return V(a=a, uv=co[0], coord=co[1], src=n.image if out == "Color" else None, proj=co[2])
         if t in ("TEX_NOISE", "TEX_VORONOI", "TEX_MUSGRAVE", "TEX_WHITE_NOISE", "TEX_WAVE", "TEX_MAGIC", "TEX_GRADIENT", "TEX_CHECKER", "SEPXYZ",
                  "TEX_COORD", "NEW_GEOMETRY", "OBJECT_INFO", "AMBIENT_OCCLUSION", "LAYER_WEIGHT", "FRESNEL", "BEVEL"):
             return const(0.5)  # a procedural pattern: its mean
+        if t == "ATTRIBUTE":  # a vertex colour (baked occlusion): neutral, it varies per vertex
+            warn("attribute node read as 1.0 (a vertex colour)")
+            return const(1.0)
+        if t in ("COMBINE_COLOR", "COMBINE_RGB"):
+            parts = [value_of(i, depth + 1) for i in n.inputs[:3]]
+            if None in parts:
+                return None
+            return combine(lambda r, g, b: np.stack([np.asarray(r)[..., 0] if np.ndim(r) == 3 else np.asarray(r).ravel()[0] * np.ones(1)[0],
+                                                     np.asarray(g)[..., 0] if np.ndim(g) == 3 else np.asarray(g).ravel()[0] * np.ones(1)[0],
+                                                     np.asarray(b)[..., 0] if np.ndim(b) == 3 else np.asarray(b).ravel()[0] * np.ones(1)[0]], axis=-1),
+                           *parts)
         if t == "RGB":
             return const(list(n.outputs[0].default_value))
         if t == "VALUE":
@@ -259,7 +290,7 @@ def run_inside(cfg: dict) -> None:
                 return lerp(fc, x, res)
             return combine(hsv, c)
         if t in ("MIX_RGB", "MIX"):
-            if t == "MIX" and n.data_type != "RGBA":
+            if t == "MIX" and n.data_type == "VECTOR":
                 return None
             # the Mix node has a Factor / A / B for each data type under the same names: the enabled ones are this type's
             live = [i for i in n.inputs if i.enabled]
@@ -328,11 +359,27 @@ def run_inside(cfg: dict) -> None:
         warn(f"node {t}")
         return None
 
+    def emission_xml(color_sock, strength: float, ind: str) -> tuple[str, list] | None:
+        """(the emitter's radiance element, its mean radiance) of an Emission colour socket. An image (a painting, a screen, a sign)
+        is flattened to its mean: a textured area emitter makes Dr.Jit's frozen recording fail in the polarized CUDA variant
+        (20 of PH33's emitters; replaced by constants it renders)."""
+        v = value_of(color_sock)
+        if v is None:
+            return None
+        if v.a is None:
+            rad = [float(c) * strength for c in np.asarray(v.c).ravel()[:3]]
+        else:
+            rad = [float(x) * strength for x in v.a.reshape(-1, 3).mean(0)]
+            report["textured_emission_flattened"] = report.get("textured_emission_flattened", 0) + 1
+        return f'{ind}<rgb name="radiance" value="{rgb(rad)}" />\n', rad
+
     def write_tex(name: str, v: V, kind: str, ind: str, stat: dict, squared: bool = False) -> str:
         """A bitmap texture of an array value. An untouched image keeps its own bytes; else colours go out as 8-bit sRGB, normal
         maps as 8-bit raw, scalars as 16-bit (saved as .npy: the driver makes the PNG)."""
         if stat.setdefault("coord", v.coord) != v.coord:
             warn(f"material mixes {stat['coord']} and {v.coord} texture coordinates")
+        if v.proj is not None:
+            stat.setdefault("proj", v.proj)
         if v.src is not None and kind in ("colour", "normal"):
             path = image_file(v.src)
             if path:
@@ -398,10 +445,10 @@ def run_inside(cfg: dict) -> None:
         ior = float(node.inputs["IOR"].default_value) if not node.inputs["IOR"].is_linked else 1.5
         emission = None
         es = node.inputs["Emission Strength"]
-        if not es.is_linked and float(es.default_value) > 0 and not node.inputs["Emission Color"].is_linked:
-            col = list(node.inputs["Emission Color"].default_value)[:3]
-            if any(c > 0 for c in col):
-                emission = [c * float(es.default_value) for c in col]
+        if not es.is_linked and float(es.default_value) > 0:
+            emission = emission_xml(node.inputs["Emission Color"], float(es.default_value), "      ")
+            if emission is not None and max(emission[1]) <= 0:
+                emission = None
         if trans >= 0.5:
             rv, _ = scalar_const(rough, 0.1)
             stat["class"] = "dielectric"
@@ -478,13 +525,15 @@ def run_inside(cfg: dict) -> None:
             core, emission = principled(shader, stat)
             res = (core, emission)
         elif shader is not None and shader.type == "EMISSION":
-            col = list(shader.inputs["Color"].default_value)[:3]
-            emission = [c * float(shader.inputs["Strength"].default_value) for c in col]
+            st, _ = scalar_const(shader.inputs["Strength"], 1.0)
+            emission = emission_xml(shader.inputs["Color"], st, "      ")
             stat["class"] = "emission"
             res = ('    <bsdf type="diffuse">\n      <rgb name="reflectance" value="0.02 0.02 0.02" />\n    </bsdf>\n', emission)
         else:
             stat["class"] = f"fallback:{shader.type if shader is not None else 'none'}"
         cutting[0] = False
+        if emission is not None:
+            stat["emission"] = [round(float(x), 4) for x in emission[1]]
         if not cutout:
             report["materials"][m.name] = {k: v for k, v in stat.items() if k != "name"}
         cache[(m.name, cutout)] = res
@@ -639,12 +688,23 @@ def run_inside(cfg: dict) -> None:
                 N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
                 mat = slots[min(k, len(slots) - 1)]
                 bsdf, emission = material(mat)
-                coord = report["materials"].get(mat.name, {}).get("coord", "UV") if mat else "UV"
-                if coord == "OBJECT":  # the image is looked up by the object's own coordinates: the uv is (x, y), the to_uv matrix is Mapping
-                    uvs = co[lv[flat]][:, :2]
-                elif coord == "GENERATED":  # the bounding box of the object, 0..1
-                    lo_, hi_ = co.min(0), co.max(0)
-                    uvs = ((co[lv[flat]] - lo_) / np.maximum(hi_ - lo_, 1e-9))[:, :2]
+                mstat = report["materials"].get(mat.name, {}) if mat else {}
+                coord = mstat.get("coord", "UV")
+                if coord in ("OBJECT", "GENERATED") and mstat.get("proj"):
+                    # the image is looked up by the object's own coordinates: the Mapping applied here, then FLAT (x, y) or BOX (the axis
+                    # pair of the triangle's dominant normal axis: x -> (y, z), y -> (x, z), z -> (y, x), as Cycles does)
+                    pr = mstat["proj"]
+                    base = co[lv[idx]]  # (triangles, 3 corners, xyz)
+                    if coord == "GENERATED":  # the object's bounding box, 0..1
+                        lo_, hi_ = co.min(0), co.max(0)
+                        base = (base - lo_) / np.maximum(hi_ - lo_, 1e-9)
+                    X = base @ np.array(pr["M"]).reshape(3, 3).T + np.array(pr["loc"])
+                    if pr["projection"] == "BOX":
+                        axis = np.abs(nrm[idx].mean(1)).argmax(1)
+                        pair = np.array([[1, 2], [0, 2], [1, 0]])[axis]  # (triangles, 2)
+                        uvs = np.take_along_axis(X, np.repeat(pair[:, None, :], 3, axis=1), axis=2).reshape(-1, 2)
+                    else:
+                        uvs = X[..., :2].reshape(-1, 2)
                 else:
                     uvs = uv[flat].astype(np.float64)
                 data = np.concatenate([P, N, uvs], axis=1).astype(np.float32)
@@ -662,11 +722,21 @@ def run_inside(cfg: dict) -> None:
                 sid = unique_id(o.name if len(parts) == 1 else f"{o.name}__part_{k}_")
                 lo, hi = u[:, :3].min(0), u[:, :3].max(0)
                 note_xml = note(sid, o.name, mat.name if mat else "default", [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
-                                [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), emission)
-                emit = (f'    <emitter type="area">\n      <rgb name="radiance" value="{rgb(emission)}" />\n    </emitter>\n'
-                        if emission else "")
+                                [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]),
+                                emission[1] if emission else None)
+                emit = f'    <emitter type="area">\n{emission[0]}    </emitter>\n' if emission else ""
                 shapes_xml.append(f'\n  <!--opticalnav-obj:{note_xml}-->\n  <shape type="ply" id="{sid}">\n'
                                   f'    <string name="filename" value="{path}" />\n{bsdf}{emit}  </shape>')
+                if emission and float((hi - lo).min()) < 0.03:
+                    # Cycles' Emission is two-sided (checked: a plane reads 5.0 from both sides), Mitsuba's area emitter is not: a thin
+                    # emitter (a painting, a sign, a screen) gets a copy that faces the other way
+                    sid2 = unique_id(f"{sid}__back")
+                    path2 = write_ply(u[:, :3], -u[:, 3:6], u[:, 6:8], np.ascontiguousarray(tris[:, ::-1]))
+                    note2 = note(sid2, o.name, mat.name if mat else "default", [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
+                                 [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), emission[1])
+                    shapes_xml.append(f'\n  <!--opticalnav-obj:{note2}-->\n  <shape type="ply" id="{sid2}">\n'
+                                      f'    <string name="filename" value="{path2}" />\n{bsdf}{emit}  </shape>')
+                    report["two_sided_emitters"] = report.get("two_sided_emitters", 0) + 1
                 report["shapes"] += 1
                 report["triangles"] += len(tris)
         finally:
