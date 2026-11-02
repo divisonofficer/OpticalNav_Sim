@@ -1159,3 +1159,46 @@ def test_room_map_drawn_in_the_r2r_frame():
     assert out["rooms"][0]["centroid"] == [1.0, -2.0] and out["rooms"][0]["polygons"][0][2] == [2.0, -3.0]
     assert out["connections"] == [{"rooms": ["bedroom_0/0", "hallway_0/0"], "kind": "Door", "midpoint": [2.0, -2.0],
                                    "width_m": 0.9}]  # a passage without a midpoint has nowhere to be drawn
+
+
+def test_cycles_frame_maps_blender_to_mitsuba():
+    """sim_v2a_REF_PH19: Blender light (2, 0, 2.32) is the importer's light_0 at plan (8.75, 4.45, 2.56), Mitsuba (8.75, 2.56, 4.45);
+    the light at Blender y = -1.5 sits at plan y 5.95 (the importer flips y: plan y = oy - by)."""
+    from opticalnav_sim import cycles_backend as cb
+    to_mitsuba = np.linalg.inv(cb.mitsuba_to_blender((6.75, 4.45, 0.24)))
+    assert np.allclose(to_mitsuba @ [2.0, 0.0, 2.32, 1.0], [8.75, 2.56, 4.45, 1.0])
+    assert np.allclose(to_mitsuba @ [-3.0, -1.5, 2.32, 1.0], [3.75, 2.56, 5.95, 1.0])
+    assert np.isclose(np.linalg.det(cb.mitsuba_to_blender((1, 2, 3))[:3, :3]), 1.0)  # a rotation: nothing mirrored
+    # the camera of the pack's PH19 spawn (heading 90: looking along plan +x) looks along Blender +x, level to 8.5 degrees down
+    c2w = frames.camera_at_position((8.0, -4.45, 1.5), math.radians(90.0), 0.0, MOUNT)
+    cam = cb.blender_camera(c2w, (6.75, 4.45, 0.24))
+    assert np.allclose(cam[:3, 3], [1.25, 0.0, 1.26])
+    forward = -cam[:3, 2]
+    assert forward[0] > 0.98 and abs(forward[1]) < 1e-9 and forward[2] < 0
+    assert np.allclose(cam[:3, 0], [0.0, -1.0, 0.0])  # right: Blender -y (plan +y)
+    assert np.isclose(np.linalg.det(cam[:3, :3]), 1.0)
+
+
+def test_cycles_view_needs_a_blend_and_rgb(tmp_path):
+    """A view asking for renderer cycles is refused for a scene without a .blend and for the near-infrared band."""
+    r = object.__new__(server.Renderer)
+    r.meta = {"plain": {"variants": {"base": {}}}, "withblend": {"variants": {"base": {}}, "blend": {"file": "b.blend", "origin_offset": [0, 0, 0]}}}
+    r.pack_of, r.pack = {}, tmp_path
+    assert r.blend_of("plain") is None and r.blend_of("withblend") is None  # no file on disk
+    (tmp_path / "scenes" / "withblend").mkdir(parents=True)
+    (tmp_path / "scenes" / "withblend" / "b.blend").write_bytes(b"BLENDER")
+    path, offset = r.blend_of("withblend")
+    assert path.name == "b.blend" and offset == (0.0, 0.0, 0.0)
+
+
+def test_attach_blend_finds_the_promoted_file(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import attach_blend
+    blend = tmp_path / "PH19_passed_r004.blend"
+    blend.write_bytes(b"BLENDER")
+    tsv = tmp_path / "promoted.tsv"
+    tsv.write_text(f"indoor_outdoor\tid\tround\tpromoted_at\tpassed_blend\nindoor\tREF_PH19\tr004\t2026-10-31\t{blend}\n"
+                   f"indoor\tREF_PH20\tr001\t2026-10-31\t{tmp_path / 'missing.blend'}\n")
+    assert attach_blend.find_source("sim_v2a_REF_PH19", tsv) == blend
+    assert attach_blend.find_source("sim_v2a_REF_PH20", tsv) is None  # listed, but the file is gone
+    assert attach_blend.find_source("sim_v2a_REF_PH99", tsv) is None

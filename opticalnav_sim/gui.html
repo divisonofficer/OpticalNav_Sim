@@ -50,7 +50,7 @@ details.settings > summary { display: none; }
 .cards .card { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 .card-act { margin-left: auto; font-weight: 500; padding: 3px 10px; }
 .seg.card-act { padding: 2px; flex-wrap: nowrap; }
-body.raster .mitsuba-only, body:not(.raster) .raster-only { display: none; }
+body.raster .mitsuba-only, body.cycles .mitsuba-only, body:not(.raster) .raster-only, body.raster .noisy-only { display: none; }
 .toggles { display: flex; flex-wrap: wrap; gap: 8px 16px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(185px, 1fr)); gap: 8px 12px; }
 .fields.one { grid-template-columns: minmax(0, 1fr); }
@@ -226,11 +226,11 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
     </section>
     <section class="card">
-      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button></span></h2>
+      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="cycles" aria-pressed="false" title="Cycles: 장면의 .blend를 Blender Cycles로 렌더합니다(RGB만, 편광 없음). 카메라·해상도·spp는 다른 렌더러와 같고, 멈추면 패스를 쌓는 방식도 같습니다. 조명·하늘·플래시 등 Mitsuba 설정은 적용되지 않고 .blend 안의 것을 씁니다. 디노이저는 쓸 수 있습니다. 장면 폴더에 .blend가 있어야 켤 수 있습니다.">Cycles</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button></span></h2>
       <div class="toggles">
         <label class="tg mitsuba-only" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
         <label class="tg mitsuba-only" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
-        <label class="tg mitsuba-only" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
+        <label class="tg noisy-only" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
         <label class="tg mitsuba-only" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
         <label class="tg" for="warp" title="움직이는 동안 다음 프레임이 끝나기 전까지 마지막 프레임을 새 카메라 쪽으로 옮겨 보여 줍니다. 렌더 서버가 같이 보내는 깊이로 프레임을 입체 격자로 만들어 새 시점에서 그립니다(WebGL): 회전과 이동 모두 맞고, 가려져 있던 곳은 늘이지 않고 다음 프레임까지 검게 비워 둡니다. 프레임을 섞지 않아 흐려지지 않고, 멈추면 렌더한 그대로입니다."><input type="checkbox" class="sw" id="warp" checked> 이동 보간</label>
       </div>
@@ -967,7 +967,12 @@ function renderSky() {
   const raster = S.render_mode === "raster";  // (S.renderer: the render server's state)
   if (document.activeElement !== $("rasteraa")) $("rasteraa").value = S.raster_aa || "off";
   document.body.classList.toggle("raster", raster);
-  for (const b of $("engine").querySelectorAll("button")) b.setAttribute("aria-pressed", String((b.dataset.engine === "raster") === raster));
+  document.body.classList.toggle("cycles", S.render_mode === "cycles");
+  const blends = ((S.server_info || {}).cycles || {}).scans || [];  // scenes whose pack carries a .blend
+  for (const b of $("engine").querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.engine === (S.render_mode || "path")));
+    if (b.dataset.engine === "cycles") b.disabled = !blends.includes(S.scene) && S.render_mode !== "cycles";
+  }
   if (document.activeElement !== $("res")) $("res").value = `${S.width}x${S.height}`;
   if (document.activeElement !== $("caustics")) $("caustics").checked = S.caustics !== false;
   if (document.activeElement !== $("split")) $("split").checked = S.active_split !== false;
@@ -1285,7 +1290,7 @@ $("warp").addEventListener("change", warpPanes);
 $("rrdepth").addEventListener("change", () => configure({ rr_depth: Number($("rrdepth").value) }, "RR 시작 깊이"));
 $("rasteraa").addEventListener("change", () => configure({ raster_aa: $("rasteraa").value }, "안티에일리어싱"));
 for (const b of $("engine").querySelectorAll("button")) {
-  b.addEventListener("click", () => configure({ renderer: b.dataset.engine }, b.dataset.engine === "raster" ? "래스터 미리보기" : "Mitsuba 경로 추적"));
+  b.addEventListener("click", () => configure({ renderer: b.dataset.engine }, { raster: "래스터 미리보기", cycles: "Cycles 렌더" }[b.dataset.engine] || "Mitsuba 경로 추적"));
 }
 $("res").addEventListener("change", () => configure({ resolution: $("res").value.split("x").map(Number) }, "해상도"));
 $("bands").addEventListener("change", () => configure({ bands: $("bands").value }, "대역 변경"));

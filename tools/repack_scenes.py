@@ -12,7 +12,7 @@ needed either):
 3. ``compact_assets.py`` and ``build_perturbation_pool.py``,
 4. the repairs: ``metal_textures.py``, ``sheer_parts.py``, ``flat_colors.py``, ``gray_textures.py`` (and, only with the flags,
    ``slab_glass.py`` and ``open_doors.py``: a scene staged from a glass-fixed blend already has its glass slabs and
-   door openings), then ``light_audit.py``,
+   door openings), then ``light_audit.py`` and ``attach_blend.py`` (the scene's .blend, for the Cycles backend, travels with the pack),
 5. with ``--keep-spawns`` (default on) the old scene.json's start poses are copied into the new one: the geometry did
    not move, and the new ``build_pack`` picks grid corners. ``check_spawns.py`` with a running server is the better pick.
 
@@ -69,7 +69,8 @@ def repack(scene: str, glass_slabs: bool, open_doors: bool, keep_spawns: bool, e
               ("flat_colors", [py, "tools/flat_colors.py", *pack]),
               ("flat_normalmaps", [py, "tools/flat_normalmaps.py", *pack]),
               ("gray_textures", [py, "tools/gray_textures.py", *pack]),
-              ("light_audit", [py, "tools/light_audit.py", *pack])]
+              ("light_audit", [py, "tools/light_audit.py", *pack]),
+              ("attach_blend", [py, "tools/attach_blend.py", *pack])]
     for label, cmd in steps:
         if not run(label, cmd, env):
             print(f"  FAILED at {label}", flush=True)

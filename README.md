@@ -721,6 +721,18 @@ rclone link <remote>:dataset/opticalnav_sim/opticalnav-v0.2   # a link anyone ca
 
 `--verified-only` leaves out the three scenes whose variants were matched by object ids (`scene.json` "inferred"). Hard links are stored as files, so each archive unpacks on its own. A Drive folder link lists at most 50 files for gdown, which is plenty for one archive per scene. `<remote>` is an rclone remote of storage type `drive`, set up once with `rclone config`. On WSL2 the browser step opens a localhost URL that Windows reaches.
 
+## Cycles backend (the scene's .blend, rendered by Blender)
+
+A third renderer next to Mitsuba's path tracer and the raster preview: a view with `"renderer": "cycles"` (`sim.setRenderer("cycles")`, the viewer's **Cycles** button) renders the scene's own `.blend` with Blender Cycles on the GPU (OptiX). RGB only: `s0` is the radiance, `s1`..`s3` are zero. The camera is the simulator's (pose, horizontal field of view, size) and so is the sample policy: the viewer sends passes of 16, 16, 32, 64, 128 ... spp, each with its own seed, and accumulates them when the camera stops, as it does for Mitsuba. What does not carry over is everything Mitsuba-side (its lights, sky, flash, lighting groups, near-infrared, polarization): the `.blend`'s own lights and world are used. The viewer's denoiser switch still works (it denoises the accumulated mean).
+
+**The `.blend` travels with the pack.** `tools/attach_blend.py --pack packs/opticalnav-sim-v1 [--scene S]` opens the scene's promoted `.blend` (robomituba's `promoted_ref_scenes_*.tsv`, by id) in Blender, packs every external image and the sky HDR into it and saves `scenes/<scene>/blend/scene.blend` (PH19 15 MB, PH33 94 MB); `scene.json` gets `"blend": {"file", "origin_offset", "source", "images_packed", "images_missing"}`. `tools/repack_scenes.py` runs it last, so a repacked scene keeps its `.blend`; share the scene folder as before and the `.blend` goes with it. The server lists the scenes that have one under `cycles.scans` in `GET /v1/info`; asking for Cycles on another scene is a 400.
+
+**Frame.** The importer put a Blender point `b` at the plan position `(bx + ox, oy - by, bz + oz)` and the simulator's Mitsuba world is `(x, height, y)` of the plan: `Mitsuba = (bx + ox, bz + oz, oy - by)`, a rotation (`origin_offset` is the authoring map's). `cycles_backend.blender_camera` turns a `camera_to_world` into the Blender camera; checked on PH19's 12 lights (tests) and, side by side with Mitsuba at one pose, on PH19 and PH33 (the same doors, lights, extinguisher, signs and LED strips in the same places).
+
+**Process.** One Blender (`blender -b scene.blend --python opticalnav_sim/cycles_worker.py`) for the last scene asked for; a request is one JSON line, the frame comes back as a float32 file in `/dev/shm`. Measured on the RTX 5090: Blender up in 10-14 s per scene (the first start after a driver or Blender change compiles the Blackwell kernels, about 5 minutes, then Blender caches them), 512x384 at 16 / 64 / 256 spp in 0.14 / 0.2 / 0.5 s, 0.7 s per 256 spp pass through the server. `OPTICALNAV_BLENDER` points to another Blender (default: robomituba's infinigen copy; its `lib/` has no soname links, `cycles_backend.lib_dir()` makes them once in `~/.cache/opticalnav_sim/blender_libs`); `OPTICALNAV_DRIVER_DIRS` the WSL driver dirs (default `~/driver-dist:/usr/lib/wsl/lib`, as for the OptiX note above).
+
+**One GPU, two renderers.** `--cycles-gpu share` (default): Blender and the resident Mitsuba scenes stay loaded together; whichever runs out of GPU memory takes it from the other (Blender is stopped, or the Mitsuba scenes and Dr.Jit's cache are dropped) and retries once. `--cycles-gpu exclusive`: using one frees the other at once. By hand: `curl -X POST :18770/v1/gpu/free -d '{"backend": "cycles"}'` (`"mitsuba"`, or `"all"`) answers with what was freed and the GPU's memory. `--cycles-device CUDA` for a card without OptiX.
+
 ## Sharing a server
 
 The server listens on `127.0.0.1` by default. To serve other machines, give it a token. It then refuses any request without `Authorization: Bearer <token>`, and it will not bind beyond localhost without one. Clients read the token from `OPTICALNAV_SIM_TOKEN`.
@@ -740,6 +752,7 @@ The protocol is plain HTTP and the token travels unencrypted. Across untrusted n
 | `GET /v1/scans` | scan ids |
 | `GET /v1/scans/<scan>/meta` | camera rig, Stokes basis, variants, graph and episode counts |
 | `GET /v1/scans/<scan>/connectivity` | connectivity JSON |
+| `POST /v1/gpu/free` | Takes `{"backend": "cycles" \| "mitsuba" \| "all"}`; frees that renderer's GPU memory, returns what was freed and the GPU's memory |
 | `POST /v1/render` | Takes `{"views": [{scan, variant, camera_to_world 4x4, width, height, hfov_deg, spp, seed}], "stokes_dtype"}` and returns NPZ with `rgb_i`, `s0_i`..`s3_i` |
 
 ## Limitations

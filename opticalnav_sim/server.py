@@ -2192,7 +2192,8 @@ class Renderer:
                  rgb_variant: str | None = None, modes: tuple[str, ...] = ("polar",), kernel_history: bool = False,
                  envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16,
                  default_sky: str | None = None, default_sky_rotate: float = 0.0, fill_gain: float = 1.0,
-                 default_depth: int = 0, lamp_power: str = "importer", alpha_power: float = 1.0):
+                 default_depth: int = 0, lamp_power: str = "importer", alpha_power: float = 1.0,
+                 cycles_gpu: str = "share", cycles_device: str = "OPTIX"):
         import drjit as dr
         import mitsuba as mi
 
@@ -2262,12 +2263,70 @@ class Renderer:
         self.alpha_power = float(alpha_power)
         self.lamp_power = lamp_power  # "blender": the simulator's own scenes light at their Blender watts
         self.freeze_spp = int(freeze_spp)
+        # the Cycles backend (cycles_backend.py): one Blender process, for the last scene asked for. "share": it and the
+        # Mitsuba scenes stay on the GPU together, each freed for the other when the GPU runs out of memory;
+        # "exclusive": asking for one frees the other at once
+        self.cycles_gpu, self.cycles_device = cycles_gpu, cycles_device
+        self.cycles = None  # (scan, CyclesWorker)
         for scan in self.meta:
             synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
                                 self.has_nocaustics)
 
     def scene_dir(self, scan: str) -> Path:
         return self.pack_of.get(scan, self.pack) / "scenes" / scan
+
+    def blend_of(self, scan: str) -> tuple[Path, tuple] | None:
+        """(the scene's .blend, its origin offset) when scene.json carries one (tools/attach_blend.py), else None."""
+        blend = self.meta[scan].get("blend")
+        if not blend:
+            return None
+        path = self.scene_dir(scan) / blend["file"]
+        return (path, tuple(blend["origin_offset"])) if path.is_file() else None
+
+    def cycles_worker(self, scan: str):
+        """The Blender process of a scene's .blend, started when needed (the one of another scene is closed first)."""
+        from . import cycles_backend
+        if self.cycles is not None and self.cycles[0] == scan and self.cycles[1].alive():
+            return self.cycles[1]
+        self.free_cycles()
+        blend = self.blend_of(scan)
+        if blend is None:
+            raise ValueError(f"{scan} has no .blend (tools/attach_blend.py)")
+        if self.cycles_gpu == "exclusive":
+            self.free_mitsuba()
+        with ACTIVITY.doing(f"loading {scan} in Blender"):
+            try:
+                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device)
+            except cycles_backend.CyclesError as exc:
+                if not cycles_backend.is_oom(exc):
+                    raise
+                self.free_mitsuba()  # the GPU is full: hand the Mitsuba scenes' memory back and try again
+                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device)
+        self.cycles = (scan, worker)
+        print(f"[cycles] {scan}: {blend[0].name} loaded in {worker.load_s:.0f}s {worker.info}", flush=True)
+        return worker
+
+    def free_cycles(self) -> bool:
+        """Stop the Blender process (its GPU memory goes back); True when there was one."""
+        if self.cycles is None:
+            return False
+        scan, worker = self.cycles
+        self.cycles = None
+        worker.close()
+        print(f"[cycles] {scan} freed", flush=True)
+        return True
+
+    def free_mitsuba(self) -> bool:
+        """Drop every resident Mitsuba scene and Dr.Jit's cached GPU buffers (main thread; from elsewhere it queues)."""
+        if threading.current_thread() is not threading.main_thread():
+            return self.executor.submit(self.free_mitsuba).result()
+        had = bool(self.cache)
+        self.cache.clear()
+        gc.collect()
+        self.dr.flush_malloc_cache()
+        if had:
+            print("[mitsuba] resident scenes freed", flush=True)
+        return had
 
     def reload_meta(self, scan: str) -> None:
         """Read a scene's scene.json again (after compact_on_start rewrote it); its plans go with the old one."""
@@ -2402,6 +2461,8 @@ class Renderer:
             self.cache.move_to_end(rkey)
             return self.cache[rkey]
         scan, xml, flash_xml, mode = rkey
+        if self.cycles is not None and self.cycles_gpu == "exclusive":
+            self.free_cycles()
         while len(self.cache) >= self.max_resident:
             self.cache.popitem(last=False)
             gc.collect()
@@ -2420,16 +2481,32 @@ class Renderer:
                 if plan[0] == rkey:
                     hideable |= plan[3]
         with ACTIVITY.doing(f"loading {scan} {variant}"):
-            loaded = Resident(self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
-                              flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
-                              envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
-                              pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
-                              hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
-                              fill_gain=self.fill_gain if self.own_scene(scan, variant) else 1.0,
-                              blender_power=self.lamp_power == "blender" and self.own_scene(scan, variant),
-                              alpha_power=self.alpha_power if self.own_scene(scan, variant) else 1.0)
+            own = self.own_scene(scan, variant)
+            loaded = self._load_resident(
+                self.mi, base / xml, mode, flash=flash, freeze=self.freeze,
+                flash_xml=base / flash_xml if flash_xml else None, hideable=hideable,
+                envs=self.env_image, freeze_spp=self.freeze_spp, nir=self.has_rgb2nir,
+                pool=self.pool(scan), upgrade_flash=self.has_nocaustics,
+                hidden=FILL_PREFIX if getattr(self, "has_hidden", False) else "",
+                fill_gain=self.fill_gain if own else 1.0,
+                blender_power=self.lamp_power == "blender" and own,
+                alpha_power=self.alpha_power if own else 1.0)
         self.cache[rkey] = loaded
         return loaded
+
+    def _load_resident(self, *args, **kwargs) -> Resident:
+        """Resident(...), but a load that runs the GPU out of memory while the Blender process holds some gives that back
+        and tries once more."""
+        try:
+            return Resident(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - Dr.Jit raises RuntimeError("... out of memory ...")
+            from . import cycles_backend
+            if self.cycles is None or not cycles_backend.is_oom(exc):
+                raise
+            self.free_cycles()
+            gc.collect()
+            self.dr.flush_malloc_cache()
+            return Resident(*args, **kwargs)
 
     def _denoise(self, mode: str, img: np.ndarray) -> np.ndarray:
         """OptiX AI denoiser on one non-negative HxWx3 radiance image (runs on the mode's worker)."""
@@ -2564,9 +2641,13 @@ class Renderer:
                        bool(dict(mirrors).get("glass_blocking", False)))
             if not (0.0 <= mirrors[0] <= 100.0 and 0 <= mirrors[1] <= 64):
                 raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
-        renderer = str(view.get("renderer", "path"))  # "raster": the rasterized preview (raster.py)
-        if renderer not in ("path", "raster"):
-            raise ValueError("renderer must be 'path' or 'raster'")
+        renderer = str(view.get("renderer", "path"))  # "raster": the rasterized preview (raster.py); "cycles": its .blend
+        if renderer not in ("path", "raster", "cycles"):
+            raise ValueError("renderer must be 'path', 'raster' or 'cycles'")
+        if renderer == "cycles" and self.blend_of(scan) is None:
+            raise ValueError(f"{scan} has no .blend for the Cycles backend (tools/attach_blend.py)")
+        if renderer == "cycles" and bands == "nir":
+            raise ValueError("the Cycles backend renders RGB only")
         raster_aa = str(view.get("raster_aa", "off"))  # the preview's antialiasing (raster.AA_MODES)
         if raster_aa not in ("off", "edge", "ssaa2"):
             raise ValueError("raster_aa must be 'off', 'edge' or 'ssaa2'")
@@ -2583,6 +2664,8 @@ class Renderer:
                                                                         flash_scale, flash_pdf, flash_offset, max_depth,
                                                                         caustics, split, nir_range, rr_depth,
                                                                         renderer, raster_aa) = key
+        if renderer == "cycles":  # a Blender process, not a Mitsuba scene: nothing of the path tracer is loaded for it
+            return self._cycles_start(key, cams, started - submitted)
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
@@ -2686,6 +2769,37 @@ class Renderer:
                 return assemble()
             return assemble
         return finish
+
+    def _cycles_start(self, key: tuple, cams: list, queue_s: float):
+        """_start for the Cycles backend: the Blender process is brought up here (main thread: in "exclusive" it frees the
+        Mitsuba scenes first); the frames are rendered by the second half, on the request's thread, so the Mitsuba
+        renders go on meanwhile. RGB only: S0 is the radiance, S1 to S3 are zero (Cycles is not polarized)."""
+        scan, mode, width, height, hfov, spp, seed, denoise = key[0], key[2], key[3], key[4], key[5], key[6], key[7], key[8]
+        worker = self.cycles_worker(scan)
+
+        def assemble():
+            from . import cycles_backend
+            t0 = time.perf_counter()
+            outs, gpu_s = [], 0.0
+            for i, c2w in enumerate(cams):
+                try:
+                    img, rep = worker.render(c2w, width, height, hfov, spp, seed + i, denoise)
+                except cycles_backend.CyclesError as exc:
+                    if not cycles_backend.is_oom(exc):
+                        raise
+                    self.free_mitsuba()  # the GPU is full: the Mitsuba scenes' memory goes back, once more
+                    img, rep = worker.render(c2w, width, height, hfov, spp, seed + i, denoise)
+                gpu_s += rep.get("render_s", 0.0)
+                if mode == "rgb":
+                    outs.append({"radiance": img})
+                else:
+                    zero = np.zeros_like(img)
+                    outs.append({"rgb_src": img, "s0": img, "s1": zero, "s2": zero, "s3": zero})
+            render_s = time.perf_counter() - t0
+            kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": gpu_s, "queue_s": queue_s,
+                       "launch_s": 0.0, "split_s": 0.0}
+            return outs, kernels, render_s, 0.0
+        return lambda: assemble
 
     def _raster_start(self, key: tuple, resident, cams: list, look, follow: bool, queue_s: float, bands: str,
                       depth: bool, aa: str = "off"):
@@ -2908,6 +3022,10 @@ def make_handler(renderer: Renderer, token: str | None = None):
                         "active_split": getattr(renderer, "has_split", False),
                         "nir_defaults": NIR_DEFAULTS,
                         "drjit_freeze": renderer.freeze, "spp_chunk": SPP_CHUNK,
+                        # scenes the Cycles backend can render (their .blend travels in the pack), what Blender holds
+                        "cycles": {"scans": sorted(s for s in renderer.meta if getattr(renderer, "blend_of", lambda _: None)(s)),
+                                   "gpu": getattr(renderer, "cycles_gpu", None), "device": getattr(renderer, "cycles_device", None),
+                                   "loaded": (getattr(renderer, "cycles", None) or [None])[0]},
                         "scans": {s: renderer.variants(s) for s in renderer.meta},
                         "resident": [list(k) + [round(r.load_s, 1)] for k, r, _ in renderer.served()],
                         "preloading": list(getattr(renderer, "preloading", [])),
@@ -2983,6 +3101,19 @@ def make_handler(renderer: Renderer, token: str | None = None):
             route = self.path.split("?")[0].rstrip("/")
             if route == "/v1/denoise":
                 return self._denoise_post()
+            if route == "/v1/gpu/free":  # {"backend": "cycles" | "mitsuba" | "all"}: hand that renderer's GPU memory back
+                try:
+                    body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                    which = body.get("backend", "all")
+                    if which not in ("cycles", "mitsuba", "all"):
+                        raise ValueError("backend must be 'cycles', 'mitsuba' or 'all'")
+                    freed = {"cycles": renderer.free_cycles() if which in ("cycles", "all") else False,
+                             "mitsuba": renderer.free_mitsuba() if which in ("mitsuba", "all") else False}
+                    return self._json(200, {"freed": freed, "gpu": gpu_memory()})
+                except ValueError as exc:
+                    return self._json(400, {"error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
             if route != "/v1/render":
                 return self._json(404, {"error": f"no route {self.path}"})
             try:
@@ -3109,6 +3240,12 @@ def main() -> int:
     ap.add_argument("--default-depth", type=int, default=10,
                     help="path length of the simulator's own scenes when a view asks for the scene's own (0: its "
                          "own, 6): a pane of glass is two bounces now, a window and a room three more")
+    ap.add_argument("--cycles-gpu", choices=("share", "exclusive"), default="share",
+                    help="the Cycles backend (a view's renderer 'cycles', the scene's .blend in Blender) and the Mitsuba scenes "
+                         "on one GPU. 'share': both stay loaded, and one that runs out of GPU memory takes it from the other "
+                         "(Blender is stopped, or the resident scenes dropped) and retries. 'exclusive': using one frees the "
+                         "other at once. POST /v1/gpu/free frees either by hand")
+    ap.add_argument("--cycles-device", choices=("OPTIX", "CUDA"), default="OPTIX", help="Cycles' compute device")
     ap.add_argument("--envmaps", type=Path, default=None,
                     help="folder of .exr/.hdr environment maps a view may name (default: <pack>/envmaps)")
     ap.add_argument("--kernel-history", action="store_true",
@@ -3125,7 +3262,7 @@ def main() -> int:
     renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
                         fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power, alpha_power=args.alpha_power,
-                        freeze_spp=args.freeze_spp)
+                        freeze_spp=args.freeze_spp, cycles_gpu=args.cycles_gpu, cycles_device=args.cycles_device)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
     threading.Thread(target=server.serve_forever, daemon=True).start()

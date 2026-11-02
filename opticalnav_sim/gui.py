@@ -334,7 +334,7 @@ class Session:
         if "rr_depth" in settings:  # 0: Mitsuba's 5 (MatterSim.setRussianRouletteDepth)
             self.sim.setRussianRouletteDepth(int(settings["rr_depth"]))
             restart = True
-        if "renderer" in settings:  # "path" or "raster" (MatterSim.setRenderer)
+        if "renderer" in settings:  # "path", "raster" or "cycles" (MatterSim.setRenderer)
             self.sim.setRenderer(str(settings["renderer"]))
             restart = True
         if "raster_aa" in settings:  # MatterSim.setRasterAntialiasing
@@ -1174,7 +1174,7 @@ def main() -> int:
                       max_pass_spp=args.max_pass_spp, tone_curve=args.tone_curve,
                       robust=not args.plain_mean)
     session.envmaps = list(info.get("envmaps", []))
-    session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant")}
+    session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token))
     resident = [r[0] for r in info.get("resident", [])]

@@ -98,7 +98,7 @@ class Simulator:
         self.camera_offset = (0.0, 0.0, 0.0)  # setCameraOffset
         self.max_depth = 0  # setMaxDepth: 0 is the scene's own
         self.rr_depth = 0  # setRussianRouletteDepth: 0 is Mitsuba's 5
-        self.renderer = "path"  # setRenderer: "path" (Mitsuba) or "raster" (the rasterized preview)
+        self.renderer = "path"  # setRenderer: "path" (Mitsuba), "raster" (the rasterized preview) or "cycles" (the scene's .blend)
         self.raster_aa = "edge"  # setRasterAntialiasing: the preview's antialiasing
         self.caustics = True  # setCaustics
         self.nir_range = (0.5, 1.0)  # setNirRange
@@ -274,9 +274,12 @@ class Simulator:
     def setRenderer(self, name: str) -> None:
         """"path": Mitsuba's path tracer (the default). "raster": the render server's rasterized preview (direct light
         from point lights with shadow maps, an ambient term for the rest, no polarization yet): one noiseless image
-        a frame for moving about; spp and the path settings do not apply."""
-        if name not in ("path", "raster"):
-            raise ValueError("renderer must be 'path' or 'raster'")
+        a frame for moving about; spp and the path settings do not apply. "cycles": Blender's Cycles renders the scene's
+        own .blend (the pack carries it: scene.json "blend"), RGB only, with the camera, size and spp of the other
+        renderers; the lights, sky, flash and polarization of the Mitsuba scene do not apply. setDenoise turns Cycles'
+        OptiX denoiser on."""
+        if name not in ("path", "raster", "cycles"):
+            raise ValueError("renderer must be 'path', 'raster' or 'cycles'")
         self.renderer = str(name)
 
     def setRasterAntialiasing(self, mode: str) -> None:
