@@ -67,6 +67,7 @@ def repack(scene: str, glass_slabs: bool, open_doors: bool, keep_spawns: bool, e
     steps += [("metal_textures", [py, "tools/metal_textures.py", *pack]),
               ("sheer_parts", [py, "tools/sheer_parts.py", *pack]),
               ("flat_colors", [py, "tools/flat_colors.py", *pack]),
+              ("flat_normalmaps", [py, "tools/flat_normalmaps.py", *pack]),
               ("gray_textures", [py, "tools/gray_textures.py", *pack]),
               ("light_audit", [py, "tools/light_audit.py", *pack])]
     for label, cmd in steps:
