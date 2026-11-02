@@ -52,12 +52,30 @@ def run_inside(cfg: dict) -> None:
     out = Path(cfg["out"])
     assets = out / "assets"
     assets.mkdir(parents=True, exist_ok=True)
-    ox, oy, oz = cfg["origin_offset"]
-    L = np.array([[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]])  # Blender -> Mitsuba, rotation part
-    T = np.array([ox, oz, oy])
     report = {"objects": 0, "shapes": 0, "triangles": 0, "materials": {}, "warnings": [], "lights": 0}
     bpy.ops.wm.open_mainfile(filepath=cfg["blend"])
     scene = bpy.context.scene
+    if cfg["origin_offset"] is None:
+        # no importer offset (a scene the old pipeline never imported): the plan frame starts at the scene's bounding box, so x, y and height
+        # are non-negative like the other scenes' (plan x = bx + ox, plan y = oy - by, height = bz + oz)
+        lo_all, hi_all = np.full(3, np.inf), np.full(3, -np.inf)
+        for o in scene.objects:
+            if o.type == "MESH" and not o.hide_render:
+                corners = np.array([np.array(o.matrix_world @ __import__("mathutils").Vector(c)) for c in o.bound_box])
+                lo_all, hi_all = np.minimum(lo_all, corners.min(0)), np.maximum(hi_all, corners.max(0))
+        cfg["origin_offset"] = [round(float(-lo_all[0]), 3), round(float(hi_all[1]), 3), round(float(-lo_all[2]), 3)]
+    ox, oy, oz = cfg["origin_offset"]
+    report["origin_offset"] = cfg["origin_offset"]
+    L = np.array([[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]])  # Blender -> Mitsuba, rotation part
+    T = np.array([ox, oz, oy])
+    report["cameras"] = []
+    for o in scene.objects:  # the authors' viewpoints: spawn poses (R2R frame: x, -y_plan; heading = 180 - yaw, yaw looks along (sin, cos) of plan (x, y))
+        if o.type == "CAMERA":
+            wm = np.array(o.matrix_world)
+            fwd = -wm[:3, 2]
+            yaw = math.degrees(math.atan2(fwd[0], -fwd[1]))
+            report["cameras"].append({"name": o.name, "position": [round(float(wm[0, 3] + ox), 3), round(float(wm[1, 3] - oy), 3), round(float(wm[2, 3] + oz), 3)],
+                                      "heading_deg": round((180.0 - yaw) % 360.0, 1)})
     dg = bpy.context.evaluated_depsgraph_get()
 
     def warn(msg: str) -> None:
@@ -161,9 +179,14 @@ def run_inside(cfg: dict) -> None:
                 src, name = sock.links[0].from_node, sock.links[0].from_socket.name
         else:
             name = sock.links[0].from_socket.name
-        if src is not None and not (src.type == "TEX_COORD" and name in ("UV", "Object", "Generated")):
+        if src is not None and src.type == "UVMAP":  # the UV Map node: the mesh's uv (a named map: the active one is used)
+            src, name = None, "UV"
+        if src is not None and src.type == "NEW_GEOMETRY" and name == "Position":  # the Geometry node's Position: world space
+            coord = "WORLD"
+        elif src is not None and not (src.type == "TEX_COORD" and name in ("UV", "Object", "Generated")):
             return None
-        coord = name.upper() if src is not None else "UV"
+        else:
+            coord = name.upper() if src is not None else "UV"
         if coord == "UV":
             if mapping is None:
                 return IDENT, "UV", None
@@ -212,10 +235,16 @@ def run_inside(cfg: dict) -> None:
             return np.abs(a - b)
         return b  # MIX
 
+    def fit(a: "np.ndarray", shape: tuple) -> "np.ndarray":
+        """``a`` (h, w, c) resampled (nearest) to ``shape`` (H, W): two images of different sizes meeting in one node."""
+        h, w = a.shape[:2]
+        return a[(np.arange(shape[0]) * h // shape[0])][:, (np.arange(shape[1]) * w // shape[1])]
+
     def combine(f, *vs: "V") -> V:
-        """f applied to the constants / arrays of vs (one array's mapping is kept)."""
-        arr = next((v for v in vs if v.a is not None), None)
-        vals = [v.a if v.a is not None else v.c for v in vs]
+        """f applied to the constants / arrays of vs (the biggest array's mapping is kept; smaller ones are resampled to it)."""
+        arrs = [v for v in vs if v.a is not None]
+        arr = max(arrs, key=lambda v: v.a.shape[0] * v.a.shape[1]) if arrs else None
+        vals = [(fit(v.a, arr.a.shape[:2]) if v.a is not None else v.c) for v in vs]
         out = f(*vals)
         if arr is None:
             return V(c=np.asarray(out, dtype=np.float32))
@@ -298,9 +327,10 @@ def run_inside(cfg: dict) -> None:
             if None in (fac, a_, b_):
                 return None
             kind = n.blend_type
-            fv = fac.a if fac.a is not None else fac.c
-            fv = np.asarray(fv)[..., :1] if fac.a is not None else float(np.asarray(fv).ravel()[0])
-            return combine(lambda x, y: lerp(fv, x, blend(kind, x, y)), a_, b_)
+            def mix(f_, x, y):
+                f_ = np.asarray(f_)[..., :1] if np.ndim(f_) == 3 else float(f_.ravel()[0])
+                return lerp(f_, x, blend(kind, x, y))
+            return combine(mix, fac, a_, b_)
         if t == "MAP_RANGE":
             v, a0, a1, b0, b1 = (inp(k) for k in ("Value", "From Min", "From Max", "To Min", "To Max"))
             if None in (v, a0, a1, b0, b1) or n.data_type != "FLOAT":
@@ -335,6 +365,12 @@ def run_inside(cfg: dict) -> None:
                 return None
             a_, b_ = 1 + float(co_.c[0]), float(br.c[0]) - float(co_.c[0]) * 0.5
             return combine(lambda x: np.maximum(a_ * x + b_, 0), c)
+        if t == "RGBTOBW":
+            c = inp("Color")
+            if c is None:
+                return None
+            return combine(lambda x: np.tensordot(np.asarray(x, dtype=np.float32), np.array([0.2126, 0.7152, 0.0722], np.float32), axes=([-1], [0]))[..., None]
+                           * np.ones(3, np.float32), c)
         if t == "INVERT":
             fac, c = inp("Fac"), inp("Color")
             if None in (fac, c):
@@ -704,11 +740,13 @@ def run_inside(cfg: dict) -> None:
                 bsdf, emission = material(mat)
                 mstat = report["materials"].get(mat.name, {}) if mat else {}
                 coord = mstat.get("coord", "UV")
-                if coord in ("OBJECT", "GENERATED") and mstat.get("proj"):
+                if coord in ("OBJECT", "GENERATED", "WORLD") and mstat.get("proj"):
                     # the image is looked up by the object's own coordinates: the Mapping applied here, then FLAT (x, y) or BOX (the axis
                     # pair and signs Cycles uses for the triangle's dominant normal axis, below)
                     pr = mstat["proj"]
                     base = co[lv[idx]]  # (triangles, 3 corners, xyz)
+                    if coord == "WORLD":  # Blender's world space (the Geometry node's Position), before the Mitsuba frame
+                        base = base @ W3.T + W[:3, 3]
                     if coord == "GENERATED":  # the object's bounding box, 0..1
                         lo_, hi_ = co.min(0), co.max(0)
                         base = (base - lo_) / np.maximum(hi_ - lo_, 1e-9)
@@ -838,8 +876,41 @@ def run_inside(cfg: dict) -> None:
         if child.tag in ("integrator", "sensor", "emitter"):
             child.tail = None
             keep.append("  " + ET.tostring(child, encoding="unicode").strip())
+    # suns: a directional emitter (Cycles' sun strength is its irradiance on a surface facing it: measured 3.0 for 3.0)
+    for o in scene.objects:
+        if o.type == "LIGHT" and o.data.type == "SUN" and not o.hide_render:
+            travel = L @ (np.array(o.matrix_world)[:3, :3] @ np.array([0.0, 0.0, -1.0]))
+            travel /= np.linalg.norm(travel)
+            col = [float(c) * float(o.data.energy) for c in o.data.color]
+            keep.append(f'  <emitter type="directional">\n    <vector name="direction" x="{f(travel[0])}" y="{f(travel[1])}" z="{f(travel[2])}" />\n'
+                        f'    <rgb name="irradiance" value="{rgb(col)}" />\n  </emitter>')
+            report["suns"] = report.get("suns", 0) + 1
     xml = '<scene version="3.0.0">\n' + "\n".join(keep) + "\n" + "".join(shapes_xml) + "".join(lights_xml) + "\n</scene>\n"
     (out / "base.xml").write_text(xml)
+    # the world (HDRI, sky texture, a gradient with noise ...) as one equirectangular EXR, rendered by Cycles with everything else hidden:
+    # the camera looks along -x with +z up, which is Blender's own world lookup (u = atan2(y, -x) / 2 pi + 0.5)
+    if cfg.get("sky", True) and scene.world is not None:
+        (out / "sky").mkdir(exist_ok=True)
+        cam = bpy.data.objects.new("OPTICALNAV_WORLD_CAM", bpy.data.cameras.new("OPTICALNAV_WORLD_CAM"))
+        scene.collection.objects.link(cam)
+        cam.data.type = "PANO"
+        cam.data.panorama_type = "EQUIRECTANGULAR"
+        from mathutils import Matrix
+        cam.matrix_world = Matrix([[0, 0, 1, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+        scene.camera = cam
+        for o in scene.objects:
+            if o is not cam:
+                o.hide_render = True
+        r = scene.render
+        r.engine, r.resolution_x, r.resolution_y, r.resolution_percentage = "CYCLES", 1024, 512, 100
+        scene.cycles.device, scene.cycles.samples, scene.cycles.use_denoising = "CPU", 24, False
+        scene.cycles.max_bounces = 0
+        r.film_transparent, r.use_compositing, r.use_sequencer = False, False, False
+        r.image_settings.file_format, r.image_settings.color_depth, r.image_settings.exr_codec = "OPEN_EXR", "32", "NONE"
+        scene.view_settings.view_transform = "Standard"
+        r.filepath, r.use_file_extension = str(out / "sky" / "world.exr"), False
+        bpy.ops.render.render(write_still=True)
+        report["sky"] = "sky/world.exr"
     report["seconds"] = round(time.perf_counter() - t_start, 1)
     (out / "convert_report.json").write_text(json.dumps(report, indent=1))
     print(f"[blend_to_pack] {report['objects']} objects -> {report['shapes']} shapes, {report['triangles']} triangles, "
@@ -878,11 +949,19 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pack", required=True, type=Path)
-    ap.add_argument("--scene", required=True, help="the scene to take the .blend, origin offset, camera rig and spawns from")
+    ap.add_argument("--scene", help="a pack scene to take the .blend, origin offset, camera rig and spawns from (without it: --blend and "
+                                    "--scene-id, the offset from the scene's bounding box, spawns from the .blend's cameras)")
+    ap.add_argument("--template", default="sim_v2a_REF_PH19", help="the pack scene whose camera rig, Stokes basis and integrator a scene "
+                                                                  "without --scene takes")
     ap.add_argument("--scene-id", help="the new scene (default: sim_v3_ + the scene's id without sim_v2a_)")
     ap.add_argument("--blend", type=Path)
     ap.add_argument("--origin-offset", type=float, nargs=3)
     ap.add_argument("--max-texture", type=int, default=4096)
+    ap.add_argument("--link-blend", action="store_true",
+                    help="development: scene.json points at the source .blend instead of a packed copy (seconds, not minutes, for a big one)")
+    ap.add_argument("--sky-rotation", type=float, default=270.0,
+                    help="degrees the world map is turned about the vertical when the server looks it up (Blender's and Mitsuba's "
+                         "equirectangular conventions differ by a quarter turn)")
     ap.add_argument("--print-max-strength", type=float, default=5.0,
                     help="an Emission shader coloured by an image, up to this strength, becomes a lit print (image albedo, polarizing) "
                          "instead of an emitter (default 5: banners 1, wayfinding signs 3; the room numerals, 14, glow)")
@@ -891,16 +970,20 @@ def main() -> int:
     from opticalnav_sim import cycles_backend as cb
 
     pack = args.pack.resolve()
-    template = pack / "scenes" / args.scene
+    own_template = bool(args.scene)  # the scene's own pack folder: its blend, offset, spawns (else the generic template's rig only)
+    template = pack / "scenes" / (args.scene or args.template)
     meta = json.loads((template / "scene.json").read_text())
-    blend = args.blend or (template / meta["blend"]["file"] if meta.get("blend") else attach_blend.find_source(args.scene, attach_blend.TSV))
-    offset = args.origin_offset or (meta.get("blend") or {}).get("origin_offset")
-    if blend is None or offset is None:
-        raise SystemExit("no .blend / origin offset (run tools/attach_blend.py first, or pass --blend and --origin-offset)")
+    if own_template:
+        blend = args.blend or (template / meta["blend"]["file"] if meta.get("blend") else attach_blend.find_source(args.scene, attach_blend.TSV))
+        offset = args.origin_offset or (meta.get("blend") or {}).get("origin_offset")
+    else:
+        blend, offset = args.blend, args.origin_offset  # offset None: from the bounding box
+    if blend is None or (own_template and offset is None) or (not own_template and not args.scene_id):
+        raise SystemExit("no .blend / origin offset (--scene S, or --blend FILE --scene-id ID)")
     scene_id = args.scene_id or "sim_v3_" + args.scene.removeprefix("sim_v2a_")
     out = pack / "scenes" / scene_id
     out.mkdir(parents=True, exist_ok=True)
-    cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset), "max_texture": args.max_texture,
+    cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset) if offset else None, "max_texture": args.max_texture,
            "print_max_strength": args.print_max_strength,
            "template_xml": str(template / "base.xml")}
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
@@ -910,6 +993,7 @@ def main() -> int:
         (out / stale).unlink(missing_ok=True)  # a failed run must not look like the last one's
     for old_asset in (out / "assets").glob("*"):
         old_asset.unlink()  # content-addressed names: what this run does not write is not wanted
+    (out / "sky" / "world.exr").unlink(missing_ok=True)
     r = subprocess.run([str(cb.BLENDER), "-b", "--python-exit-code", "1", "--python", str(Path(__file__).resolve())], env=env,
                        capture_output=True, text=True)
     print("\n".join(l for l in r.stdout.splitlines() if l.startswith("[blend_to_pack]")))
@@ -918,20 +1002,37 @@ def main() -> int:
         return 1
     postprocess_assets(out / "assets", args.max_texture)
     # scene.json: the template's, with this scene's ids
+    report = json.loads((out / "convert_report.json").read_text())
+    offset = report["origin_offset"]
     meta["scan"] = scene_id
     meta["variants"] = {"base": {**meta["variants"]["base"], "xml": "base.xml", "protocol": "blend_direct_v1"}}
-    meta["converter"] = {"tool": "blend_to_pack", "source": str(blend), "seconds": round(time.time() - t0, 1),
-                         "report": json.loads((out / "convert_report.json").read_text())}
-    blend_dir = out / "blend"
-    blend_dir.mkdir(exist_ok=True)
-    if (template / "blend" / "scene.blend").is_file():
-        (blend_dir / "scene.blend").write_bytes((template / "blend" / "scene.blend").read_bytes())
-        meta["blend"] = {**meta.get("blend", {}), "file": "blend/scene.blend", "origin_offset": list(offset)}
-    for k in ("flat_colors", "flat_normalmaps", "gray_textures", "asset_compaction", "emissive_parts", "staged"):
+    meta["converter"] = {"tool": "blend_to_pack", "source": str(blend), "seconds": round(time.time() - t0, 1), "report": report}
+    for k in ("flat_colors", "flat_normalmaps", "gray_textures", "asset_compaction", "emissive_parts", "staged", "spawn_before", "blend", "sky"):
         meta.pop(k, None)
+    if report.get("sky"):
+        meta["sky"] = {"file": report["sky"], "gain": 1.0, "rotation_deg": args.sky_rotation}
+    if not own_template:  # the authors' camera positions are the spawns (up to 12), nothing of the template's scene
+        cams = report["cameras"][:12] or [{"position": [0.0, 0.0, 1.5], "heading_deg": 0.0, "name": "origin"}]
+        meta["spawn"] = [{"position": c["position"], "heading_deg": c["heading_deg"], "clearance_m": 0.0, "note": c["name"]} for c in cams]
+        meta["graph"], meta["episodes"], meta["reference_views"] = None, {}, []
+    elif meta.get("spawn"):
+        pass  # the template's own spawns
     (out / "scene.json").write_text(json.dumps(meta, indent=1))
+    # the .blend travels with the scene (images packed): attach_blend, or the template's packed copy when it is the same file
+    if args.link_blend:
+        m2 = json.loads((out / "scene.json").read_text())
+        m2["blend"] = {"file": str(Path(blend).resolve()), "origin_offset": list(offset), "linked": True}
+        (out / "scene.json").write_text(json.dumps(m2, indent=1))
+    elif own_template and (template / "blend" / "scene.blend").is_file() and template.name != scene_id:
+        (out / "blend").mkdir(exist_ok=True)
+        (out / "blend" / "scene.blend").write_bytes((template / "blend" / "scene.blend").read_bytes())
+        m2 = json.loads((out / "scene.json").read_text())
+        m2["blend"] = {"file": "blend/scene.blend", "origin_offset": list(offset)}
+        (out / "scene.json").write_text(json.dumps(m2, indent=1))
+    else:
+        print(attach_blend.attach(pack, scene_id, blend, attach_blend.TSV, attach_blend.IMPORTS, False, offset=offset))
     conn = pack / "connectivity"
-    if (conn / f"{args.scene}_connectivity.json").is_file():
+    if own_template and (conn / f"{args.scene}_connectivity.json").is_file():
         (conn / f"{scene_id}_connectivity.json").write_text((conn / f"{args.scene}_connectivity.json").read_text().replace(args.scene, scene_id))
     print(f"{scene_id}: done in {time.time() - t0:.0f} s -> {out}")
     return 0

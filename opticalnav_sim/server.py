@@ -2282,6 +2282,14 @@ class Renderer:
         for scan in self.meta:
             synthesize_variants(self.meta[scan], (self.scene_dir(scan) / "perturbation_pool.json").is_file(),
                                 self.has_nocaustics)
+            self.register_sky(scan)
+
+    def register_sky(self, scan: str) -> None:
+        """The world a scene converted from its .blend carries (scene.json "sky": the Blender world rendered as an equirectangular
+        EXR, strength included) as an environment map named ``<scan>:sky``."""
+        sky = self.meta[scan].get("sky")
+        if sky and (self.scene_dir(scan) / sky["file"]).is_file():
+            self.envmaps[f"{scan}:sky"] = self.scene_dir(scan) / sky["file"]
 
     def scene_dir(self, scan: str) -> Path:
         return self.pack_of.get(scan, self.pack) / "scenes" / scan
@@ -2373,6 +2381,9 @@ class Renderer:
         --sun-deg), scaled so its mean radiance equals the constant's (the interior lights were set against it,
         so the exterior stays as bright overall). The dataset's scenes keep their own sky: their frames are
         compared with the stored ones."""
+        sky = self.meta[scan].get("sky")
+        if sky and f"{scan}:sky" in self.envmaps and self.direct_scene(scan):
+            return f"{scan}:sky", float(sky.get("gain", 1.0)), float(sky.get("rotation_deg", 0.0))  # its own world, as Blender has it
         if not self.default_sky or self.default_sky not in self.envmaps:
             return None
         if not self.own_scene(scan, variant):

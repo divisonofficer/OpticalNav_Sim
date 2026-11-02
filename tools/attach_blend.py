@@ -33,10 +33,16 @@ def pack_inside(src: str, dst: str, report: str) -> None:
     import bpy
     bpy.ops.wm.open_mainfile(filepath=src)
     missing = []
-    for im in bpy.data.images:
-        if im.source == "FILE" and not im.packed_file and not Path(bpy.path.abspath(im.filepath)).is_file():
+    for im in list(bpy.data.images):  # one by one: pack_all fails as a whole on a file that is gone
+        if im.source != "FILE" or im.packed_file:
+            continue
+        if not Path(bpy.path.abspath(im.filepath)).is_file():
             missing.append(im.filepath)
-    bpy.ops.file.pack_all()
+            continue
+        try:
+            im.pack()
+        except RuntimeError:
+            missing.append(im.filepath)
     packed = sum(1 for im in bpy.data.images if im.packed_file)
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=dst, compress=True, copy=True)
@@ -52,7 +58,7 @@ def find_source(scene: str, tsv: Path) -> Path | None:
     return None
 
 
-def attach(pack: Path, scene: str, blend: Path | None, tsv: Path, imports: Path, dry_run: bool) -> str:
+def attach(pack: Path, scene: str, blend: Path | None, tsv: Path, imports: Path, dry_run: bool, offset: list | None = None) -> str:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from compact_assets import scene_lock
@@ -63,7 +69,8 @@ def attach(pack: Path, scene: str, blend: Path | None, tsv: Path, imports: Path,
     if src is None:
         return f"{scene}: no .blend in {tsv.name} (--blend FILE)"
     amap = imports / f"{scene}__authoring_map.json"
-    offset = json.loads(amap.read_text())["metadata"].get("origin_offset") if amap.is_file() else None
+    if offset is None:
+        offset = json.loads(amap.read_text())["metadata"].get("origin_offset") if amap.is_file() else None
     if offset is None:
         return f"{scene}: no origin_offset (authoring map {amap})"
     if dry_run:
