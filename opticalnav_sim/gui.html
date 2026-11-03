@@ -146,6 +146,7 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
 .sysinfo { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px var(--mono); color: var(--muted); margin-left: auto; }
 .sysinfo span + span::before { content: "|"; margin-right: 14px; color: var(--rule); }
 .busy { color: var(--warn); }
+.err.info { background: var(--panel-2, #14202a); color: var(--ink, #dde); border-color: var(--accent, #3fc9d4); bottom: 112px; }
 .err { position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: min(900px, calc(100vw - 32px)); z-index: 5;
   color: var(--bad); white-space: pre-wrap; font: 12.5px var(--mono); background: var(--panel); border: 1px solid var(--bad); border-radius: 8px; padding: 8px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
 /* desktop: the page fits the window */
@@ -365,6 +366,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
   <div class="sysinfo" id="sysinfo"></div>
 </footer>
 <div class="err" id="error" hidden></div>
+<div class="err info" id="info" hidden></div>
 <dialog id="help" aria-labelledby="help-title">
   <div class="help-head"><h2 id="help-title">조작법</h2><button type="button" class="flash" id="help-close" aria-label="닫기">닫기 (Esc)</button></div>
   <div class="help-body">
@@ -926,6 +928,21 @@ function syncSliders() {
   });
 }
 
+let openingSeen = null;
+function showOpening() {  // a .blend being converted: the server's own status says what Blender is doing; the scene list is rebuilt when it is done
+  const o = S && S.opening, box = $("info");
+  if (o && !o.error) {
+    const act = (S.renderer && S.renderer.activity) || {};
+    const name = o.id.replace(/^blend_/, "");
+    box.hidden = false;
+    box.textContent = `${name} 변환 중… ${Math.round(o.elapsed_s)} s (Blender가 .blend를 읽어 Mitsuba 씬을 만듭니다. 처음 한 번만, 크기에 따라 수십 초~몇 분. 그동안 현재 씬은 그대로 쓸 수 있습니다)`;
+    openingSeen = o.id;
+  } else {
+    box.hidden = true;
+    if (o && o.error) showError(`.blend 열기 실패: ${o.error}`);
+    if (openingSeen) { openingSeen = null; fillScenes(S.scene); }
+  }
+}
 function showError(text) { $("error").hidden = !text; $("error").textContent = text || ""; }
 
 function apply(st) {
@@ -937,6 +954,7 @@ function apply(st) {
   }
   warpPanes();
   if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: startScene() }, "첫 프레임"); return; }  // GUI server restarted
+  showOpening();
   showError(S.error ? `렌더 실패: ${S.error}` + (/frozen|not permitted|record/.test(S.error)
     ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "") : "");
   const key = JSON.stringify([S.scene, S.position, S.heading_deg, S.elevation_deg, S.height_m, S.viewpoint, S.candidates.length, S.variant, S.bands]);
@@ -1303,15 +1321,12 @@ $("refit").addEventListener("click", () => configure({ refit_tone: true }, "노�
 }));
 $("scene").addEventListener("change", async () => {
   const opt = $("scene").selectedOptions[0], sc = $("scene").value;
-  graph = null;
-  if (opt && opt.dataset.blend) {  // a .blend not converted yet: the server converts it, then the scene starts
-    $("scene").disabled = true;
-    showError(`${sc.replace(/^blend_/, "")} 변환 중… (Blender, 처음 한 번만)`);
-    try { apply(await api("/api/open_blend", { id: sc })); showError(""); fillScenes(S.scene); }
-    catch (e) { showError(`.blend 열기 실패: ${e.message}`); fillScenes(S.scene); }
-    $("scene").disabled = false;
+  if (opt && opt.dataset.blend) {  // a .blend not converted yet: the server converts it in the background, then the scene starts
+    try { apply(await api("/api/open_blend", { id: sc })); } catch (e) { showError(`.blend 열기 실패: ${e.message}`); }
+    fillScenes(S.scene);  // back to the scene still shown until the new one starts
     return;
   }
+  graph = null;
   send("/api/start", { scene: sc }, "씬 전환");
 });
 $("flash").addEventListener("click", toggleFlash);

@@ -179,6 +179,7 @@ class Session:
                  robust: bool = True):
         self.sim, self.scans = sim, scans
         self.pass_spp, self.target_spp = int(pass_spp), int(target_spp)
+        self.opening: dict | None = None  # a .blend being converted and started (open_blend)
         self.max_pass_spp = max(self.pass_spp, int(max_pass_spp))
         self.tone_curve = tone_curve  # the display operator (tonemap.curve): 'reinhard' as the export pipeline, or 'filmic'
         self.turn, self.pitch = math.radians(turn_deg), math.radians(pitch_deg)
@@ -235,12 +236,30 @@ class Session:
             self.blends = []
 
     def open_blend(self, ident: str) -> dict:
-        """Have the render server convert (once; seconds to minutes) and serve a .blend, then start its scene. Not under ``lock``: the
-        page keeps its state meanwhile and the server's /v1/status says ``converting ...``."""
-        info = self.sim._client.open_blend(ident)
-        self.scans[info["scan"]] = info["variants"]
-        self.refresh_blends()
-        return self.run("start", self.start, info["scan"])
+        """Have the render server convert (once; seconds to minutes) and serve a .blend, then start its scene: in a thread, the page
+        polls ``opening`` in the state (a long request would end with the browser's patience, and a reload would lose it)."""
+        with self.cv:
+            if self.opening and not self.opening.get("error"):
+                return self.status()  # one at a time
+            self.opening = {"id": ident, "t0": time.time(), "error": ""}
+            self.version += 1
+            self.cv.notify_all()
+        threading.Thread(target=self._open_blend_job, args=(ident,), name="open-blend", daemon=True).start()
+        return self.status()
+
+    def _open_blend_job(self, ident: str) -> None:
+        try:
+            info = self.sim._client.open_blend(ident)
+            self.scans[info["scan"]] = info["variants"]
+            self.refresh_blends()
+            self.run("start", self.start, info["scan"])
+            result = None
+        except Exception as exc:  # noqa: BLE001 - shown on the page
+            result = {"id": ident, "t0": self.opening["t0"] if self.opening else time.time(), "error": f"{type(exc).__name__}: {exc}"}
+        with self.cv:
+            self.opening = result
+            self.version += 1
+            self.cv.notify_all()
 
     def start(self, scene: str, viewpoint: str | None = None, heading: float | None = None) -> None:
         graph = self.sim._graph(scene)
@@ -637,7 +656,8 @@ class Session:
                 timing["screen_ms"] = round(float(np.median(screens)), 1)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
-            out = {"scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
+            out = {"opening": ({**self.opening, "elapsed_s": round(time.time() - self.opening["t0"], 1)} if self.opening else None),
+                   "scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
