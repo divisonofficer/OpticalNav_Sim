@@ -1147,6 +1147,7 @@ def main() -> int:
     ap.add_argument("--max-instances", type=int, default=300,
                     help="instances of shapegroups kept, the nearest to the .blend's cameras first (default 300: the server's RAM grows "
                          "with them during Dr.Jit's recording; 999 tree instances were an out-of-memory kill)")
+    ap.add_argument("--no-map", action="store_true", help="skip the bird's-eye map render (10 to 30 s on the CPU)")
     ap.add_argument("--link-blend", action="store_true",
                     help="development: scene.json points at the source .blend instead of a packed copy (seconds, not minutes, for a big one)")
     ap.add_argument("--sky-rotation", type=float, default=270.0,
@@ -1176,7 +1177,7 @@ def main() -> int:
     out = pack / "scenes" / scene_id
     out.mkdir(parents=True, exist_ok=True)
     cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset) if offset else None, "max_texture": args.max_texture,
-           "print_max_strength": args.print_max_strength, "instance_min_polys": args.instance_min_polys, "max_instances": args.max_instances,
+           "print_max_strength": args.print_max_strength, "instance_min_polys": args.instance_min_polys, "max_instances": args.max_instances, "map": not args.no_map,
            "template_xml": str(template / "base.xml")}
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
                LD_LIBRARY_PATH=f"{cb.DRIVER_DIRS}:{cb.BLENDER.parent / 'lib'}:{cb.lib_dir()}")

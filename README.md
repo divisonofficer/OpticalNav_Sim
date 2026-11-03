@@ -768,7 +768,7 @@ export OPTICALNAV_BLEND_TSV=/bean/.../promoted_ref_scenes_20261102.tsv          
 
 The viewer's scene list then ends with a group **.blend 불러오기**; choosing one has the server convert it (the server's status shows `converting <id> in Blender`) and start it at the file's own cameras. `GET /v1/blends` lists the offered files (id, path, ready), `POST /v1/blend {"id" | "path"}` converts and serves one (`RenderClient.blends()` / `open_blend()`). The scene's `scene.json` points at the `.blend` itself (`--link-blend`), so the Cycles renderer renders the same file; to ship a scene, run `tools/blend_to_pack.py` without `--link-blend` (the `.blend` is packed into the scene folder).
 
-**Bird's-eye map.** The converter renders the scene from above (`map/birdeye.png`, orthographic, Cycles on the CPU, everything above 2.4 m over the floor hidden: ceilings, roofs, tree crowns) around the author cameras and the place's geometry, and `scene.json` gets `"map": {"file", "bounds": [x0, y0, x1, y1]}` in the R2R frame the map draws. The viewer draws it under the viewpoint dots (the author cameras are the scene's spawn points). `--no-map`... is not an option yet: the render takes 10 to 30 s (CPU).
+**Bird's-eye map.** The converter renders the scene from above (`map/birdeye.png`, orthographic, Cycles on the CPU, everything above 2.4 m over the floor hidden: ceilings, roofs, tree crowns) around the author cameras and the place's geometry, and `scene.json` gets `"map": {"file", "bounds": [x0, y0, x1, y1]}` in the R2R frame the map draws. The viewer draws it under the viewpoint dots (the author cameras are the scene's spawn points). The render takes 10 to 30 s (CPU); `tools/blend_to_pack.py --no-map` skips it.
 
 ## Cycles backend (the scene's .blend, rendered by Blender)
 
