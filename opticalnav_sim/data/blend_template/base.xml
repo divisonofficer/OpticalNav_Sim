@@ -1,0 +1,24 @@
+<scene version="3.0.0">
+  <integrator type="stokes">
+    <vector name="reference_axis" x="0.0" y="1.0" z="0.0" />
+    <integrator type="path">
+      <integer name="max_depth" value="6" />
+    </integrator>
+  </integrator>
+  <sensor type="perspective" id="sensor">
+    <float name="fov" value="60.0" />
+    <transform name="to_world">
+      <lookat origin="20.5 1.0 4.6" target="20.5 1.0 5.6" up="0 1 0" />
+    </transform>
+    <sampler type="independent">
+      <integer name="sample_count" value="64" />
+    </sampler>
+    <film type="hdrfilm">
+      <integer name="width" value="640" />
+      <integer name="height" value="480" />
+    </film>
+  </sensor>
+  <emitter type="constant">
+    <rgb name="radiance" value="0.55 0.57 0.6" />
+  </emitter>
+</scene>

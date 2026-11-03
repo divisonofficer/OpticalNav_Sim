@@ -755,6 +755,21 @@ Then restart the render server (it reads the pack's scenes at start) and pick th
 
 **Blender's light power, measured.** Against Cycles (a lone light over a Lambertian plane, world black): an area light's radiance is `W / (pi A)` (disk, square and rectangle all within 1% of it), a point or spot light's intensity `W / (4 pi)` W/sr, a sun's irradiance its strength. The formulas the server used for the importer's scenes are `W / (pi^2 A)` and `W / (4 pi^2)`, pi times too weak; the fill softboxes and the sky hid it there, and those scenes keep them (their fill gain and sky were tuned against them). Scenes with the protocol `blend_direct_v1` get `watt_gain = pi`. A closed 6 x 6 m room with one 45 W disk: Mitsuba / Cycles 0.28 before, 0.81 to 0.92 after; PH19's median radiance over four poses: 1.19 to 1.28 times Cycles' (the importer's pack: 1.4 to 4.5 times).
 
+## Scenes straight from `.blend` files
+
+The render server can serve a `.blend` without a hand-made pack: it converts the file with `tools/blend_to_pack.py` into the *blend pack* (`packs/blend-cache`, scenes `blend_<file name>`) and caches the result (until the file, or the converter, changes).
+
+```bash
+python -m opticalnav_sim.server --blend /path/a.blend --blend /path/b.blend            # converted at start (seconds to minutes the first time)
+python -m opticalnav_sim.server --blend-tsv promoted_ref_scenes.tsv                    # offered in the viewer's scene list, converted when chosen
+python -m opticalnav_sim.server --blend-dir /path/to/blends                            # the same for every *.blend in a folder
+export OPTICALNAV_BLEND_TSV=/bean/.../promoted_ref_scenes_20261102.tsv                  # default list (also OPTICALNAV_BLEND_DIRS, ':'-separated)
+```
+
+The viewer's scene list then ends with a group **.blend 불러오기**; choosing one has the server convert it (the server's status shows `converting <id> in Blender`) and start it at the file's own cameras. `GET /v1/blends` lists the offered files (id, path, ready), `POST /v1/blend {"id" | "path"}` converts and serves one (`RenderClient.blends()` / `open_blend()`). The scene's `scene.json` points at the `.blend` itself (`--link-blend`), so the Cycles renderer renders the same file; to ship a scene, run `tools/blend_to_pack.py` without `--link-blend` (the `.blend` is packed into the scene folder).
+
+**Bird's-eye map.** The converter renders the scene from above (`map/birdeye.png`, orthographic, Cycles on the CPU, everything above 2.4 m over the floor hidden: ceilings, roofs, tree crowns) around the author cameras and the place's geometry, and `scene.json` gets `"map": {"file", "bounds": [x0, y0, x1, y1]}` in the R2R frame the map draws. The viewer draws it under the viewpoint dots (the author cameras are the scene's spawn points). `--no-map`... is not an option yet: the render takes 10 to 30 s (CPU).
+
 ## Cycles backend (the scene's .blend, rendered by Blender)
 
 A third renderer next to Mitsuba's path tracer and the raster preview: a view with `"renderer": "cycles"` (`sim.setRenderer("cycles")`, the viewer's **Cycles** button) renders the scene's own `.blend` with Blender Cycles on the GPU (OptiX). RGB only: `s0` is the radiance, `s1`..`s3` are zero. The camera is the simulator's (pose, horizontal field of view, size) and so is the sample policy: the viewer sends passes of 16, 16, 32, 64, 128 ... spp, each with its own seed, and accumulates them when the camera stops, as it does for Mitsuba. What does not carry over is everything Mitsuba-side (its lights, sky, flash, lighting groups, near-infrared, polarization): the `.blend`'s own lights and world are used. The viewer's denoiser switch still works (it denoises the accumulated mean).

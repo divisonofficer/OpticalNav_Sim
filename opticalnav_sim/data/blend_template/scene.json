@@ -1,0 +1,46 @@
+{
+ "camera": {
+  "sensor_id": "polar_cam",
+  "width": 512,
+  "height": 384,
+  "hfov_deg": 90.0,
+  "mount": {
+   "parent_frame": "base_link",
+   "xyz_m": [
+    0.0,
+    1.5,
+    0.1
+   ],
+   "rpy_deg": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  "nominal_pitch_rad": -0.14888994760949728,
+  "dataset_spp": null
+ },
+ "stokes": {
+  "basis": "world_gravity_y_v1",
+  "reference_axis": [
+   0.0,
+   1.0,
+   0.0
+  ],
+  "components": [
+   "s0",
+   "s1",
+   "s2",
+   "s3"
+  ],
+  "channels": "linear RGB per component"
+ },
+ "frames": "connectivity/state frame: (x, -y_dataset, height), z-up; heading = pi - dataset_yaw",
+ "scan": "template",
+ "variants": {
+  "base": {
+   "xml": "base.xml",
+   "protocol": "blend_direct_v1"
+  }
+ }
+}

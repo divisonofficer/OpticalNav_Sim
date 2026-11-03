@@ -434,6 +434,22 @@ async function api(path, body) {
   return data;
 }
 
+// the scene list: the served scenes, then the .blend files the server offers (converted when chosen: tools/blend_to_pack.py)
+function fillScenes(current) {
+  const sel = $("scene"), scenes = Object.keys(S.scans).sort();
+  fillSelect(sel, scenes, current);
+  const blends = (S.blends || []).filter((b) => !(b.id in S.scans));
+  if (blends.length) {
+    const group = document.createElement("optgroup");
+    group.label = ".blend 불러오기 (처음 열 때 변환, 수십 초~몇 분)";
+    for (const b of blends) {
+      const o = document.createElement("option");
+      o.value = b.id; o.dataset.blend = "1"; o.textContent = `${b.id.replace(/^blend_/, "")}  (.blend)`;
+      group.appendChild(o);
+    }
+    sel.appendChild(group);
+  }
+}
 function fillSelect(sel, values, current) {
   sel.innerHTML = "";
   for (const v of values) {
@@ -510,7 +526,7 @@ async function boot() {
   S = await api("/api/state");
   const scenes = Object.keys(S.scans).sort();
   const first = S.scene || S.default_scene || scenes[0];  // prefer the scene the render server already holds
-  fillSelect($("scene"), scenes, first);
+  fillScenes(first);
   fillSelect($("pass"), PASS, S.pass_spp);
   fillSelect($("target"), TARGET, S.target_spp);
   makeSliders();
@@ -1056,12 +1072,27 @@ function mapTransform(canvas) {
   const grow = (x, y) => { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); };
   for (let i = 0; i < graph.x.length; i++) grow(graph.x[i], graph.y[i]);
   for (const room of (graph.rooms || {}).rooms || []) for (const poly of room.polygons) for (const [x, y] of poly) grow(x, y);
+  if (graph.image) { const [bx0, by0, bx1, by1] = graph.image.bounds; grow(bx0, by0); grow(bx1, by1); }
   const s = Math.min((w - 2 * pad) / Math.max(x1 - x0, 1e-3), (h - 2 * pad) / Math.max(y1 - y0, 1e-3));
   const ox = (w - s * (x1 - x0)) / 2 - s * x0, oy = (h + s * (y1 - y0)) / 2 + s * y0;
   return { to: (x, y) => [ox + s * x, oy - s * y], from: (px, py) => [(px - ox) / s, (oy - py) / s], scale: s };
 }
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
+// bird's-eye backdrop of a scene converted from its .blend (the scene from above, ceilings hidden), under the graph
+let backdrop = { url: null, img: null };
+function drawBackdrop(g, T) {
+  const im = graph && graph.image;
+  if (!im) return;
+  if (backdrop.url !== im.url) {
+    backdrop = { url: im.url, img: new Image() };
+    backdrop.img.onload = () => drawMap();
+    backdrop.img.src = im.url;
+  }
+  if (!backdrop.img.complete || !backdrop.img.naturalWidth) return;
+  const [x0, y0, x1, y1] = im.bounds, [px0, py0] = T.to(x0, y1), [px1, py1] = T.to(x1, y0);
+  g.globalAlpha = 0.9; g.drawImage(backdrop.img, px0, py0, px1 - px0, py1 - py0); g.globalAlpha = 1;
+}
 function drawMap() {
   const c = $("map"), g = c.getContext("2d");
   const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
@@ -1070,6 +1101,7 @@ function drawMap() {
   g.clearRect(0, 0, c.width, c.height);
   if (!graph || !S) return;
   const T = mapTransform(c);
+  drawBackdrop(g, T);
   drawRooms(g, T, dpr);
   g.fillStyle = css("--muted"); g.globalAlpha = 0.55;
   const dot = Math.max(1.5, 1.8 * dpr);
@@ -1269,7 +1301,19 @@ $("refit").addEventListener("click", () => configure({ refit_tone: true }, "노�
   for (const band of ["rgb", "nir"]) { $(`ev-${band}`).value = 0; showEv(band); }
   showImages();
 }));
-$("scene").addEventListener("change", () => { const sc = $("scene").value; graph = null; send("/api/start", { scene: sc }, "씬 전환"); });
+$("scene").addEventListener("change", async () => {
+  const opt = $("scene").selectedOptions[0], sc = $("scene").value;
+  graph = null;
+  if (opt && opt.dataset.blend) {  // a .blend not converted yet: the server converts it, then the scene starts
+    $("scene").disabled = true;
+    showError(`${sc.replace(/^blend_/, "")} 변환 중… (Blender, 처음 한 번만)`);
+    try { apply(await api("/api/open_blend", { id: sc })); showError(""); fillScenes(S.scene); }
+    catch (e) { showError(`.blend 열기 실패: ${e.message}`); fillScenes(S.scene); }
+    $("scene").disabled = false;
+    return;
+  }
+  send("/api/start", { scene: sc }, "씬 전환");
+});
 $("flash").addEventListener("click", toggleFlash);
 $("mirrors").addEventListener("click", toggleMirrors);
 $("lighting").addEventListener("change", () => configure({ lighting: $("lighting").value }, "조명 변경"));

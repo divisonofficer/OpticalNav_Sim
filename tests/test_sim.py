@@ -1258,3 +1258,26 @@ def test_direct_scenes_light_at_blenders_measured_power():
         return float(re.search(r'<rgb name="radiance" value="([\d.]+)', text).group(1))
     assert math.isclose(radiance(math.pi), 45.0 / (math.pi * area), rel_tol=2e-3)
     assert math.isclose(radiance(1.0), 45.0 / (math.pi ** 2 * area), rel_tol=2e-3)
+
+
+def test_blend_scenes_ids_lists_and_cache_stamp(tmp_path):
+    """.blend scenes: ids from file names, the listed files of a dir and of robomituba's tsv, and the conversion stamp (size, mtime, converter)."""
+    from opticalnav_sim import blend_scenes
+    f = tmp_path / "PH19 passed r4.blend"
+    f.write_bytes(b"BLENDER")
+    assert blend_scenes.scene_id(f) == "blend_PH19_passed_r4"
+    assert blend_scenes.parse_spec(f"mine={f}") == ("mine", f.resolve())
+    tsv = tmp_path / "list.tsv"
+    tsv.write_text(f"indoor_outdoor\tid\tround\tpromoted_at\tpassed_blend\nindoor\tREF_X1\tr1\t2026\t{f}\n")
+    assert blend_scenes.listed([str(tmp_path)], [str(tsv)]) == {"blend_PH19_passed_r4": f.resolve(), "blend_REF_X1": f}
+    pack = tmp_path / "pack"
+    scene = pack / "scenes" / "s1"
+    scene.mkdir(parents=True)
+    (scene / "base.xml").write_text("<scene/>")
+    assert not blend_scenes.up_to_date(pack, "s1", f)  # no stamp yet
+    st = f.stat()
+    (scene / ".source.json").write_text(json.dumps({"blend": str(f.resolve()), "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                                                    "converter": blend_scenes.converter_version()}))
+    assert blend_scenes.up_to_date(pack, "s1", f.resolve())
+    f.write_bytes(b"BLENDER2")  # the file changed: converted again
+    assert not blend_scenes.up_to_date(pack, "s1", f.resolve())

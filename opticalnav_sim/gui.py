@@ -227,6 +227,21 @@ class Session:
             fn(*args)
         return self.status()
 
+    def refresh_blends(self) -> None:
+        """The .blend files the render server offers (--blend-dir / --blend-tsv); none from an older server."""
+        try:
+            self.blends = self.sim._client.blends()
+        except Exception:  # noqa: BLE001
+            self.blends = []
+
+    def open_blend(self, ident: str) -> dict:
+        """Have the render server convert (once; seconds to minutes) and serve a .blend, then start its scene. Not under ``lock``: the
+        page keeps its state meanwhile and the server's /v1/status says ``converting ...``."""
+        info = self.sim._client.open_blend(ident)
+        self.scans[info["scan"]] = info["variants"]
+        self.refresh_blends()
+        return self.run("start", self.start, info["scan"])
+
     def start(self, scene: str, viewpoint: str | None = None, heading: float | None = None) -> None:
         graph = self.sim._graph(scene)
         if viewpoint is None:
@@ -622,7 +637,7 @@ class Session:
                 timing["screen_ms"] = round(float(np.median(screens)), 1)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
-            out = {"scans": self.scans, "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
+            out = {"scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
@@ -837,8 +852,22 @@ class Session:
         with self.lock:
             g = self.sim._graph(scene)
         keep = [i for i, ok in enumerate(g.included) if ok]
-        return {"scene": scene, "x": [round(g.pos[i][0], 3) for i in keep], "y": [round(g.pos[i][1], 3) for i in keep],
-                "rooms": self.room_map(scene)}
+        out = {"scene": scene, "x": [round(g.pos[i][0], 3) for i in keep], "y": [round(g.pos[i][1], 3) for i in keep],
+               "rooms": self.room_map(scene)}
+        bird = self.birdeye(scene)
+        if bird:  # a scene converted from its .blend: the scene from above, the map's backdrop
+            out["image"] = {"url": f"/api/mapimage?scene={scene}", "bounds": bird["bounds"]}
+        return out
+
+    def birdeye(self, scene: str) -> dict | None:
+        """scene.json's ``map`` (tools/blend_to_pack.py): the bird's-eye image and its bounds [x0, y0, x1, y1] in the map's R2R frame."""
+        with contextlib.suppress(Exception):
+            meta = self.sim._scene_meta(scene)
+            if meta.get("map"):
+                path = self.scene_dir(scene) / meta["map"]["file"]
+                if path.is_file():
+                    return {"path": path, "bounds": meta["map"]["bounds"]}
+        return None
 
     def scene_dir(self, scene: str) -> Path:
         """The scene's pack directory on this machine: as the render server reports it (it may serve several
@@ -920,6 +949,8 @@ def dispatch(session: Session, path: str, body: dict) -> dict:
         return session.run("goto", session.goto, float(body["x"]), float(body["y"]))
     if path == "configure":
         return session.run("configure", session.configure, body)
+    if path == "open_blend":
+        return session.open_blend(str(body["id"]))
     if path == "refine":
         return session.run("pass", session.refine, int(body["frame_id"]))
     raise KeyError(f"no route /api/{path}")
@@ -981,6 +1012,11 @@ def make_handler(session: Session, token: str | None = None):
                     return self._json(200, session.sim._client.stats(q["scene"]))
                 if parts == ["api", "graph"]:
                     return self._json(200, session.graph(q["scene"]))
+                if parts == ["api", "mapimage"]:
+                    bird = session.birdeye(q["scene"])
+                    if bird is None:
+                        return self._json(404, {"error": "no bird's-eye map"})
+                    return self._send(200, Path(bird["path"]).read_bytes(), "image/png")
                 if parts == ["api", "probe"]:
                     return self._json(200, session.probe(int(q["frame"]), int(q["x"]), int(q["y"]), q.get("pol", "luma")))
                 if len(parts) == 4 and parts[:2] == ["api", "frame"] and parts[3].endswith(".jpg"):
@@ -1122,7 +1158,7 @@ def make_handler(session: Session, token: str | None = None):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pack", required=True, type=Path, action="append",
+    ap.add_argument("--pack", type=Path, action="append", default=[],
                     help="scene pack (repeatable, as the render server's): graphs are read from the first one's "
                          "connectivity/, the other packs' from the render server")
     ap.add_argument("--server", default=None, help="render server URL (default $OPTICALNAV_SIM_URL)")
@@ -1153,6 +1189,9 @@ def main() -> int:
     sim = MatterSim.Simulator()
     if args.server:
         sim.setDatasetPath(args.server)
+    if not args.pack:  # no pack given: the blend pack (scenes the render server converted from .blend files)
+        from . import blend_scenes
+        args.pack = [blend_scenes.DEFAULT_PACK]
     sim.setNavGraphPath(str(args.pack[0] / "connectivity"))
     sim.setCameraResolution(*(int(v) for v in args.resolution.lower().split("x")))
     sim.setRussianRouletteDepth(args.rr_depth)
@@ -1174,6 +1213,7 @@ def main() -> int:
                       max_pass_spp=args.max_pass_spp, tone_curve=args.tone_curve,
                       robust=not args.plain_mean)
     session.envmaps = list(info.get("envmaps", []))
+    session.refresh_blends()
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token))

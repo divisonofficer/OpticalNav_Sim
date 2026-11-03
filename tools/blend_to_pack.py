@@ -1024,6 +1024,53 @@ def run_inside(cfg: dict) -> None:
             report["suns"] = report.get("suns", 0) + 1
     xml = '<scene version="3.0.0">\n' + "\n".join(keep) + "\n" + "".join(shapes_xml) + "".join(lights_xml) + "\n</scene>\n"
     (out / "base.xml").write_text(xml)
+    # the viewer's bird's-eye map: the scene from above (orthographic, Cycles on the CPU), everything above a standing person's head hidden
+    # (ceilings, roofs, tree crowns), around the author cameras; scene.json "map" gets the file and its bounds in the R2R frame the map draws
+    if cfg.get("map", True):
+        from mathutils import Matrix, Vector
+        cams_ = [np.array(o_.matrix_world)[:3, 3] for o_ in scene.objects if o_.type == "CAMERA"]
+        c_ = np.array(cams_) if cams_ else None
+        floor_z = float(np.median(c_[:, 2])) - 1.5 if cams_ else float(-oz)
+        near_lo = c_[:, :2].min(0) - 60.0 if cams_ else np.array([-1e9, -1e9])
+        near_hi = c_[:, :2].max(0) + 60.0 if cams_ else np.array([1e9, 1e9])
+        pts_lo, pts_hi = [], []
+        for o_ in scene.objects:
+            if o_.type in ("MESH", "CURVE", "SURFACE", "FONT") and not o_.hide_render:
+                bb_ = np.array([np.array(o_.matrix_world @ Vector(c)) for c in o_.bound_box])
+                if bb_[:, 2].min() > floor_z + 2.4:
+                    o_.hide_render = True  # above a standing person's head: ceilings, roofs, crowns
+                elif (bb_[:, :2].max(0) - bb_[:, :2].min(0)).max() < 120.0 and (bb_[:, :2].min(0) >= near_lo).all() and (bb_[:, :2].max(0) <= near_hi).all():
+                    pts_lo.append(bb_[:, :2].min(0))  # a part of the place itself (not a ground plane or the hills)
+                    pts_hi.append(bb_[:, :2].max(0))
+        if cams_:
+            pts_lo.append(c_[:, :2].min(0))
+            pts_hi.append(c_[:, :2].max(0))
+        lo_xy = np.min(pts_lo, axis=0) - 5.0 if pts_lo else np.array([-ox, oy - 60.0])
+        hi_xy = np.max(pts_hi, axis=0) + 5.0 if pts_hi else np.array([-ox + 60.0, oy])
+        span = float(min(max(hi_xy[0] - lo_xy[0], hi_xy[1] - lo_xy[1], 30.0), 260.0))
+        mid = (lo_xy + hi_xy) / 2
+        half = span / 2
+        (out / "map").mkdir(exist_ok=True)
+        mcam = bpy.data.objects.new("OPTICALNAV_MAP_CAM", bpy.data.cameras.new("OPTICALNAV_MAP_CAM"))
+        scene.collection.objects.link(mcam)
+        mcam.data.type, mcam.data.ortho_scale = "ORTHO", span
+        mcam.matrix_world = Matrix.Translation((float(mid[0]), float(mid[1]), 400.0))  # looking down -z, +y up the image
+        mcam.data.clip_end = 1000.0
+        scene.camera = mcam
+        r = scene.render
+        r.engine, r.resolution_x, r.resolution_y, r.resolution_percentage = "CYCLES", 1024, 1024, 100
+        scene.cycles.device, scene.cycles.samples, scene.cycles.use_denoising, scene.cycles.max_bounces = "CPU", 24, False, 2
+        r.film_transparent, r.use_compositing, r.use_sequencer = False, False, False
+        r.image_settings.file_format, r.image_settings.color_mode = "PNG", "RGB"
+        scene.view_settings.view_transform = "Standard"
+        scene.view_settings.exposure = 0.0
+        r.filepath, r.use_file_extension = str(out / "map" / "birdeye.png"), False
+        bpy.ops.render.render(write_still=True)
+        # bounds [x0, y0, x1, y1] in the R2R frame: x = bx + ox, y = by - oy (the image's top row is the largest by)
+        report["map"] = {"file": "map/birdeye.png", "bounds": [round(float(mid[0] - half + ox), 2), round(float(mid[1] - half - oy), 2),
+                                                               round(float(mid[0] + half + ox), 2), round(float(mid[1] + half - oy), 2)]}
+        for o_ in scene.objects:
+            o_.hide_render = False  # the sky render below hides them all again; keep the state simple
     # the world (HDRI, sky texture, a gradient with noise ...) as one equirectangular EXR, rendered by Cycles with everything else hidden:
     # the camera looks along -x with +z up, which is Blender's own world lookup (u = atan2(y, -x) / 2 pi + 0.5)
     if cfg.get("sky", True) and scene.world is not None:
@@ -1115,6 +1162,8 @@ def main() -> int:
     pack = args.pack.resolve()
     own_template = bool(args.scene)  # the scene's own pack folder: its blend, offset, spawns (else the generic template's rig only)
     template = pack / "scenes" / (args.scene or args.template)
+    if not (template / "scene.json").is_file() and not own_template:
+        template = REPO / "opticalnav_sim" / "data" / "blend_template"  # a pack without a PH19 scene: the built-in camera rig, Stokes basis and integrator
     meta = json.loads((template / "scene.json").read_text())
     if own_template:
         blend = args.blend or (template / meta["blend"]["file"] if meta.get("blend") else attach_blend.find_source(args.scene, attach_blend.TSV))
@@ -1136,6 +1185,7 @@ def main() -> int:
         (out / stale).unlink(missing_ok=True)  # a failed run must not look like the last one's
     for old_asset in (out / "assets").glob("*"):
         old_asset.unlink()  # content-addressed names: what this run does not write is not wanted
+    (out / "map" / "birdeye.png").unlink(missing_ok=True)
     (out / "sky" / "world.exr").unlink(missing_ok=True)
     r = subprocess.run([str(cb.BLENDER), "-b", "--python-exit-code", "1", "--python", str(Path(__file__).resolve())], env=env,
                        capture_output=True, text=True)
@@ -1154,6 +1204,9 @@ def main() -> int:
         meta.pop(k, None)
     if report.get("sky"):
         meta["sky"] = {"file": report["sky"], "gain": 1.0, "rotation_deg": args.sky_rotation}
+    meta.pop("map", None)
+    if report.get("map"):
+        meta["map"] = report["map"]
     if not own_template:  # the authors' camera positions are the spawns (up to 12), nothing of the template's scene
         cams = report["cameras"][:12] or [{"position": [0.0, 0.0, 1.5], "heading_deg": 0.0, "name": "origin"}]
         meta["spawn"] = [{"position": c["position"], "heading_deg": c["heading_deg"], "clearance_m": 0.0, "note": c["name"]} for c in cams]

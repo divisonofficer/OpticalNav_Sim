@@ -2284,6 +2284,39 @@ class Renderer:
                                 self.has_nocaustics)
             self.register_sky(scan)
 
+    blend_pack: Path | None = None
+    blend_files: dict = {}  # id -> .blend offered in the viewer's scene list (--blend-dir / --blend-tsv), converted when chosen
+
+    def register_scene(self, pack: Path, scan: str) -> None:
+        """Serve a scene that appeared after the start (one just converted from its .blend)."""
+        if pack not in self.packs:
+            self.packs.append(pack)
+        self.meta[scan] = json.loads((pack / "scenes" / scan / "scene.json").read_text())
+        self.pack_of[scan] = pack
+        self.plans = {k: v for k, v in self.plans.items() if k[0] != scan}
+        synthesize_variants(self.meta[scan], (pack / "scenes" / scan / "perturbation_pool.json").is_file(), self.has_nocaustics)
+        self.register_sky(scan)
+
+    def blend_list(self) -> list[dict]:
+        """Every .blend the viewer may pick: id, file, and whether its scene is already served."""
+        out = {sid: {"id": sid, "path": str(path), "ready": sid in self.meta} for sid, path in self.blend_files.items()}
+        for scan, meta in self.meta.items():  # served ones, whatever their pack, with their source file
+            if meta.get("blend", {}).get("linked") or meta.get("converter"):
+                out.setdefault(scan, {"id": scan, "path": (meta.get("converter") or {}).get("source") or meta["blend"]["file"], "ready": True})
+        return sorted(out.values(), key=lambda b: b["id"])
+
+    def open_blend(self, sid_or_path: str) -> str:
+        """Convert (once) and serve a .blend by listed id or file path; returns the scene id."""
+        from . import blend_scenes
+        if sid_or_path in self.blend_files:
+            sid, blend = sid_or_path, Path(self.blend_files[sid_or_path])
+        else:
+            sid, blend = blend_scenes.parse_spec(sid_or_path)
+        with ACTIVITY.doing(f"converting {sid} in Blender"):
+            blend_scenes.ensure(self.blend_pack, sid, blend)
+        self.register_scene(self.blend_pack, sid)  # also when it was converted again: its scene.json is read anew
+        return sid
+
     def register_sky(self, scan: str) -> None:
         """The world a scene converted from its .blend carries (scene.json "sky": the Blender world rendered as an equirectangular
         EXR, strength included) as an environment map named ``<scan>:sky``."""
@@ -3065,6 +3098,8 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     })
                 if parts == ["v1", "scans"]:
                     return self._json(200, sorted(renderer.meta))
+                if parts == ["v1", "blends"]:
+                    return self._json(200, renderer.blend_list() if hasattr(renderer, "blend_list") else [])
                 if len(parts) == 4 and parts[:2] == ["v1", "scans"] and parts[2] in renderer.meta:
                     scan = parts[2]
                     if parts[3] == "meta":
@@ -3134,6 +3169,17 @@ def make_handler(renderer: Renderer, token: str | None = None):
             route = self.path.split("?")[0].rstrip("/")
             if route == "/v1/denoise":
                 return self._denoise_post()
+            if route == "/v1/blend":  # {"id": listed id | "path": file}: convert once, serve, answer the scene id
+                try:
+                    body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                    scan = renderer.open_blend(str(body.get("id") or body["path"]))
+                    return self._json(200, {"scan": scan, "variants": renderer.variants(scan)})
+                except (KeyError, ValueError) as exc:
+                    return self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+                except SystemExit as exc:
+                    return self._json(500, {"error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
             if route == "/v1/gpu/free":  # {"backend": "cycles" | "mitsuba" | "all"}: hand that renderer's GPU memory back
                 try:
                     body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
@@ -3207,7 +3253,8 @@ def compact_on_start(renderer: Renderer, skip=()) -> None:
     spec = importlib.util.spec_from_file_location("compact_assets", tool)
     compact = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(compact)  # needs_compaction is a text scan; nothing of Mitsuba is imported
-    todo = [s for s in sorted(renderer.meta) if s not in skip and compact.needs_compaction(renderer.scene_dir(s))]
+    todo = [s for s in sorted(renderer.meta) if s not in skip and not renderer.direct_scene(s)  # a converted .blend is served as it is
+            and compact.needs_compaction(renderer.scene_dir(s))]
     print(f"[compact] {len(todo)} of {len(renderer.meta)} scenes need compacting: {todo}", flush=True)
     for scan in todo:
         started = time.time()
@@ -3223,9 +3270,19 @@ def compact_on_start(renderer: Renderer, skip=()) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pack", required=True, action="append",
+    ap.add_argument("--pack", action="append", default=[],
                     help="scene pack directory (tools/build_pack.py output); repeat to serve several (a scene name "
                          "in two packs comes from the first)")
+    ap.add_argument("--blend", action="append", default=[], metavar="[ID=]FILE",
+                    help="serve a scene straight from its .blend (repeatable): converted once by tools/blend_to_pack.py into the blend "
+                         "pack (seconds to minutes the first time, then cached until the file changes), the id blend_<file name>; "
+                         "the Cycles renderer renders the same file")
+    ap.add_argument("--blend-dir", action="append", default=[], metavar="DIR",
+                    help="offer every *.blend directly in DIR in the viewer's scene list (converted when chosen, not at start)")
+    ap.add_argument("--blend-tsv", action="append", default=[], metavar="FILE",
+                    help="offer the .blend files of a promoted_ref_scenes tsv (columns id, passed_blend) the same way")
+    ap.add_argument("--blend-pack", type=Path, default=None,
+                    help="where converted .blend scenes are kept (default packs/blend-cache); scenes already in it are served too")
     ap.add_argument("--no-compact", action="store_true",
                     help="serve scenes as they are: by default a scene not yet compacted (tools/compact_assets.py: "
                          "OBJ meshes, textures not named by content) is compacted once at start, before it loads")
@@ -3292,10 +3349,26 @@ def main() -> int:
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
-    renderer = Renderer([Path(p).resolve() for p in args.pack], args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
+    from . import blend_scenes
+    packs = [Path(p).resolve() for p in args.pack]
+    args.blend_dir = list(args.blend_dir) + [d for d in os.environ.get("OPTICALNAV_BLEND_DIRS", "").split(":") if d]
+    args.blend_tsv = list(args.blend_tsv) + [f for f in os.environ.get("OPTICALNAV_BLEND_TSV", "").split(":") if f]
+    blend_pack = Path(args.blend_pack or blend_scenes.DEFAULT_PACK).resolve()
+    if args.blend:
+        blend_scenes.prepare(args.blend, blend_pack)
+    if (blend_pack / "scenes").is_dir() and blend_pack not in packs:
+        packs.append(blend_pack)  # scenes converted earlier stay available
+    if not packs and not (args.blend_dir or args.blend_tsv):
+        raise SystemExit("nothing to serve: --blend FILE, --blend-dir DIR, --blend-tsv FILE or --pack DIR")
+    if not packs:  # only a list of .blend files: the blend pack, empty until one is chosen
+        (blend_pack / "scenes").mkdir(parents=True, exist_ok=True)
+        packs.append(blend_pack)
+    renderer = Renderer(packs, args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
                         fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power, alpha_power=args.alpha_power,
                         freeze_spp=args.freeze_spp, cycles_gpu=args.cycles_gpu, cycles_device=args.cycles_device)
+    renderer.blend_pack = blend_pack
+    renderer.blend_files = blend_scenes.listed(args.blend_dir, args.blend_tsv)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
     threading.Thread(target=server.serve_forever, daemon=True).start()

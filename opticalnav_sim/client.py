@@ -80,6 +80,15 @@ class RenderClient:
     def scans(self) -> list[str]:
         return self._json("/v1/scans")
 
+    def blends(self) -> list[dict]:
+        """The .blend files the server offers (id, path, ready)."""
+        return self._json("/v1/blends")
+
+    def open_blend(self, id_or_path: str) -> dict:
+        """Have the server convert (once) and serve a .blend: ``{"scan", "variants"}``. Takes seconds to minutes the first time."""
+        key = "id" if not str(id_or_path).startswith("/") and "=" not in str(id_or_path) else "path"
+        return json.loads(self._request("POST", "/v1/blend", json.dumps({key: id_or_path}).encode())[0])
+
     def meta(self, scan: str) -> dict:
         return self._json(f"/v1/scans/{scan}/meta")
 
