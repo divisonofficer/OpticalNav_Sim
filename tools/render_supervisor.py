@@ -107,6 +107,17 @@ def start_server(args, log) -> bool:
     return False
 
 
+def start_server_safe(args, log) -> bool:
+    """start_server, but a mount that does not answer for a moment (OSError 112 "Host is down" on /jarvis killed a supervisor
+    once, with its worker) only costs a wait and another try."""
+    try:
+        return start_server(args, log)
+    except OSError as exc:
+        log(f"starting the server failed ({exc}): waiting a minute")
+        time.sleep(60)
+        return False
+
+
 def frame_counts(routes: Path, out: Path, scenes: list[str], fmt: str) -> dict[str, tuple[int, int]]:
     ext = "exr/{k:04d}.exr" if fmt == "exr" else "rgb/{k:04d}.jpg"
     counts = {}
@@ -144,7 +155,7 @@ def run(args) -> int:
         if shutil.disk_usage(args.out).free < args.min_free_gb * 1e9:
             log(f"stop: less than {args.min_free_gb} GB free on the disk of {args.out}")
             return 2
-        if not answering(args.port) and not start_server(args, log):
+        if not answering(args.port) and not start_server_safe(args, log):
             failures += 1
             if failures >= 5:
                 log("stop: the server failed to start 5 times")
@@ -185,7 +196,7 @@ def run(args) -> int:
         if failures >= args.max_restarts:
             log(f"stop: {failures} restarts in a row without a new frame")
             return 4
-        start_server(args, log)
+        start_server_safe(args, log)
         time.sleep(5)
     log("stopped (STOP file)")
     return 0
