@@ -19,6 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 CONVERTER = REPO / "tools" / "blend_to_pack.py"
 DEFAULT_PACK = REPO / "packs" / "blend-cache"
+PROGRESS: dict[str, dict] = {}  # scene id -> {"fraction", "stage", "t0"} of a conversion in progress (the server's /v1/status shows it)
 
 
 def converter_version() -> str:
@@ -60,10 +61,21 @@ def ensure(pack: Path, sid: str, blend: Path, force: bool = False) -> float:
     pack.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     print(f"[blend] converting {blend.name} -> {sid} (the first time takes seconds to minutes)", flush=True)
-    done = subprocess.run([sys.executable, str(CONVERTER), "--pack", str(pack), "--blend", str(blend), "--scene-id", sid, "--link-blend"],
-                          capture_output=True, text=True)
-    if done.returncode or not (pack / "scenes" / sid / "base.xml").is_file():
-        raise SystemExit(f"--blend: converting {blend} failed:\n{(done.stdout + done.stderr)[-1500:]}")
+    PROGRESS[sid] = {"fraction": 0.01, "stage": "시작", "t0": t0}
+    proc = subprocess.Popen([sys.executable, str(CONVERTER), "--pack", str(pack), "--blend", str(blend), "--scene-id", sid, "--link-blend"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail: list[str] = []
+    try:
+        for line in proc.stdout:
+            m = re.match(r"\[progress\] ([0-9.]+) (.*)", line)
+            if m:
+                PROGRESS[sid] = {"fraction": float(m.group(1)), "stage": m.group(2).strip(), "t0": t0}
+            tail = (tail + [line])[-40:]
+        proc.wait()
+    finally:
+        PROGRESS.pop(sid, None)
+    if proc.returncode or not (pack / "scenes" / sid / "base.xml").is_file():
+        raise SystemExit(f"--blend: converting {blend} failed:\n{''.join(tail)[-1500:]}")
     st = blend.stat()
     (pack / "scenes" / sid / ".source.json").write_text(json.dumps(
         {"blend": str(blend), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "converter": converter_version()}))

@@ -80,6 +80,11 @@ def run_inside(cfg: dict) -> None:
                                       "heading_deg": round((180.0 - yaw) % 360.0, 1)})
     dg = bpy.context.evaluated_depsgraph_get()
 
+    def progress(frac: float, stage: str) -> None:
+        print(f"[progress] {frac:.3f} {stage}", flush=True)  # the driver forwards these lines (the render server's status, the viewer's bar)
+
+    progress(0.04, ".blend 읽는 중")
+
     def warn(msg: str) -> None:
         if msg not in report["warnings"]:
             report["warnings"].append(msg)
@@ -771,6 +776,7 @@ def run_inside(cfg: dict) -> None:
     for inst_ in dg.object_instances:
         if inst_.object.type == "MESH" and (inst_.is_instance or (not inst_.object.original.hide_render and inst_.object.original.name in view_layer.objects)):
             use_counts[mesh_key(inst_.object, inst_.object.original)] += 1
+    n_total, n_done = max(sum(use_counts.values()), 1), [0]
     groups: dict = {}  # (mesh key, material slot) -> shapegroup id
     group_xml: dict = {}  # shapegroup id -> its xml, written only if one of its instances is kept
     pending_inst: list = []  # (distance to the nearest author camera, group id, matrix, object name)
@@ -787,6 +793,9 @@ def run_inside(cfg: dict) -> None:
         if not inst.is_instance and (o.hide_render or o.name not in view_layer.objects):
             continue
         me = ev.to_mesh()
+        n_done[0] += 1
+        if n_done[0] % 25 == 0:
+            progress(0.06 + 0.52 * n_done[0] / n_total, f"메시·재질 변환 {n_done[0]}/{n_total}")
         try:
             me.calc_loop_triangles()
             nt = len(me.loop_triangles)
@@ -951,6 +960,7 @@ def run_inside(cfg: dict) -> None:
         finally:
             ev.to_mesh_clear()
 
+    progress(0.6, "인스턴스·조명")
     # the instances kept: the ones nearest an author camera, up to the budget (Dr.Jit's frozen recording gives each instance variables of its
     # own: PH37's 999 tree instances took the server's RAM from 7.7 to 22 GB and the OOM killer ended it)
     pending_inst.sort(key=lambda x: x[0])
@@ -1027,6 +1037,7 @@ def run_inside(cfg: dict) -> None:
     # the viewer's bird's-eye map: the scene from above (orthographic, Cycles on the CPU), everything above a standing person's head hidden
     # (ceilings, roofs, tree crowns), around the author cameras; scene.json "map" gets the file and its bounds in the R2R frame the map draws
     if cfg.get("map", True):
+        progress(0.64, "버드아이 지도 렌더")
         from mathutils import Matrix, Vector
         cams_ = [np.array(o_.matrix_world)[:3, 3] for o_ in scene.objects if o_.type == "CAMERA"]
         c_ = np.array(cams_) if cams_ else None
@@ -1074,6 +1085,7 @@ def run_inside(cfg: dict) -> None:
     # the world (HDRI, sky texture, a gradient with noise ...) as one equirectangular EXR, rendered by Cycles with everything else hidden:
     # the camera looks along -x with +z up, which is Blender's own world lookup (u = atan2(y, -x) / 2 pi + 0.5)
     if cfg.get("sky", True) and scene.world is not None:
+        progress(0.8, "하늘 렌더")
         (out / "sky").mkdir(exist_ok=True)
         cam = bpy.data.objects.new("OPTICALNAV_WORLD_CAM", bpy.data.cameras.new("OPTICALNAV_WORLD_CAM"))
         scene.collection.objects.link(cam)
@@ -1095,6 +1107,7 @@ def run_inside(cfg: dict) -> None:
         r.filepath, r.use_file_extension = str(out / "sky" / "world.exr"), False
         bpy.ops.render.render(write_still=True)
         report["sky"] = "sky/world.exr"
+    progress(0.86, "씬 파일 쓰는 중")
     report["seconds"] = round(time.perf_counter() - t_start, 1)
     (out / "convert_report.json").write_text(json.dumps(report, indent=1))
     print(f"[blend_to_pack] {report['objects']} objects -> {report['shapes']} shapes, {report['triangles']} triangles, "
@@ -1188,12 +1201,18 @@ def main() -> int:
         old_asset.unlink()  # content-addressed names: what this run does not write is not wanted
     (out / "map" / "birdeye.png").unlink(missing_ok=True)
     (out / "sky" / "world.exr").unlink(missing_ok=True)
-    r = subprocess.run([str(cb.BLENDER), "-b", "--python-exit-code", "1", "--python", str(Path(__file__).resolve())], env=env,
-                       capture_output=True, text=True)
-    print("\n".join(l for l in r.stdout.splitlines() if l.startswith("[blend_to_pack]")))
-    if r.returncode or not (out / "base.xml").is_file():
-        print((r.stdout + r.stderr)[-2500:])
+    proc = subprocess.Popen([str(cb.BLENDER), "-b", "--python-exit-code", "1", "--python", str(Path(__file__).resolve())], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail: list[str] = []
+    for line in proc.stdout:
+        if line.startswith("[progress]") or line.startswith("[blend_to_pack]"):
+            print(line.rstrip(), flush=True)  # the caller (blend_scenes.ensure) reads the progress lines
+        tail = (tail + [line])[-60:]
+    proc.wait()
+    if proc.returncode or not (out / "base.xml").is_file():
+        print("".join(tail)[-2500:])
         return 1
+    print("[progress] 0.88 텍스처 정리", flush=True)
     postprocess_assets(out / "assets", args.max_texture)
     # scene.json: the template's, with this scene's ids
     report = json.loads((out / "convert_report.json").read_text())
@@ -1227,6 +1246,7 @@ def main() -> int:
         m2["blend"] = {"file": "blend/scene.blend", "origin_offset": list(offset)}
         (out / "scene.json").write_text(json.dumps(m2, indent=1))
     else:
+        print("[progress] 0.94 .blend 패킹", flush=True)
         print(attach_blend.attach(pack, scene_id, blend, attach_blend.TSV, attach_blend.IMPORTS, False, offset=offset))
     conn = pack / "connectivity"
     if own_template and (conn / f"{args.scene}_connectivity.json").is_file():

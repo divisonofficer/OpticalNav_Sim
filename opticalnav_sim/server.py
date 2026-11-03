@@ -3068,8 +3068,10 @@ def make_handler(renderer: Renderer, token: str | None = None):
             try:
                 if parts == ["v1", "status"]:  # cheap; answers while a render, load or recording runs
                     served = renderer.served()
+                    from . import blend_scenes
                     return self._json(200, {
                         "activity": ACTIVITY.snapshot(), "freeze": renderer.freeze, "freeze_spp": renderer.freeze_spp,
+                        "converting": {k: dict(x) for k, x in list(blend_scenes.PROGRESS.items())},  # .blend conversions: fraction, stage
                         # every variant a resident scene renders (an active variant and its flash-off twin share one)
                         "resident": [list(k) for k, _, _ in served],
                         "preloading": list(getattr(renderer, "preloading", [])),  # --preload scenes still loading

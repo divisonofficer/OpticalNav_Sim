@@ -170,6 +170,11 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
 .sysinfo { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px var(--mono); color: var(--muted); margin-left: auto; }
 .sysinfo span + span::before { content: "|"; margin-right: 14px; color: var(--rule); }
 .busy { color: var(--warn); }
+.pbar { height: 6px; margin: 8px 0 4px; background: var(--panel-3); border-radius: 3px; overflow: hidden; min-width: 360px; }
+.pbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .5s ease; }
+.pbar.indet i { width: 35% !important; animation: slide 1.3s ease-in-out infinite; }
+@keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+.pstage { font-size: 11.5px; color: var(--muted); }
 .err.info { background: var(--panel-2, #14202a); color: var(--ink, #dde); border-color: var(--accent, #3fc9d4); bottom: 112px; }
 .err { position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: min(900px, calc(100vw - 32px)); z-index: 5;
   color: var(--bad); white-space: pre-wrap; font: 12.5px var(--mono); background: var(--panel); border: 1px solid var(--bad); border-radius: 8px; padding: 8px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
@@ -394,7 +399,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
   <div class="ghead"><h3>씬 선택</h3><input id="gsearch" type="search" placeholder="이름으로 찾기 (예: PH, cafe, blend)" autocomplete="off"><button type="button" id="gclose">닫기 (Esc)</button></div>
   <div class="gbody" id="gbody"></div></div></div>
 <div class="err" id="error" hidden></div>
-<div class="err info" id="info" hidden></div>
+<div class="err info" id="info" hidden><div id="info-text"></div><div class="pbar" id="info-bar"><i id="info-fill"></i></div><div class="pstage" id="info-stage"></div></div>
 <dialog id="help" aria-labelledby="help-title">
   <div class="help-head"><h2 id="help-title">조작법</h2><button type="button" class="flash" id="help-close" aria-label="닫기">닫기 (Esc)</button></div>
   <div class="help-body">
@@ -956,17 +961,29 @@ function syncSliders() {
   });
 }
 
-let openingSeen = null;
-function showOpening() {  // a .blend being converted: the server's own status says what Blender is doing; the scene list is rebuilt when it is done
+let openingSeen = null, openingBase = null;
+function paintOpening() {  // the banner: text with the elapsed time (ticking here, between pushes), the bar, the converter's stage
+  const o = S && S.opening;
+  if (!o || o.error) return;
+  const el = openingBase ? openingBase.elapsed + (performance.now() - openingBase.t) / 1000 : o.elapsed_s;
+  $("info-text").textContent = `${o.id.replace(/^blend_/, "")} 변환 중 · ${Math.floor(el / 60)}:${String(Math.floor(el % 60)).padStart(2, "0")}`;
+  const bar = $("info-bar");
+  bar.classList.toggle("indet", o.fraction == null);
+  if (o.fraction != null) $("info-fill").style.width = `${Math.round(100 * o.fraction)}%`;
+  $("info-stage").textContent = (o.stage ? `${o.stage} · ` : "") + (o.fraction != null ? `${Math.round(100 * o.fraction)}%  ` : "") +
+    "Blender가 .blend를 읽어 Mitsuba 씬을 만듭니다(처음 한 번만, 크기에 따라 수십 초~몇 분). 그동안 현재 씬은 그대로 쓸 수 있습니다.";
+}
+setInterval(paintOpening, 500);
+function showOpening() {  // a .blend being converted: the scene list is rebuilt when it is done
   const o = S && S.opening, box = $("info");
   if (o && !o.error) {
-    const act = (S.renderer && S.renderer.activity) || {};
-    const name = o.id.replace(/^blend_/, "");
+    if (!openingBase || openingBase.id !== o.id || o.elapsed_s < openingBase.elapsed) openingBase = { id: o.id, elapsed: o.elapsed_s, t: performance.now() };
+    else openingBase = { id: o.id, elapsed: o.elapsed_s, t: performance.now() };
     box.hidden = false;
-    box.textContent = `${name} 변환 중… ${Math.round(o.elapsed_s)} s (Blender가 .blend를 읽어 Mitsuba 씬을 만듭니다. 처음 한 번만, 크기에 따라 수십 초~몇 분. 그동안 현재 씬은 그대로 쓸 수 있습니다)`;
+    paintOpening();
     openingSeen = o.id;
   } else {
-    box.hidden = true;
+    box.hidden = true; openingBase = null;
     if (o && o.error) showError(`.blend 열기 실패: ${o.error}`);
     if (openingSeen) { openingSeen = null; fillScenes(S.scene); }
   }

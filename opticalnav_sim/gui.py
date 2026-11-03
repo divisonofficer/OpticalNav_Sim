@@ -700,7 +700,10 @@ class Session:
                 timing["screen_ms"] = round(float(np.median(screens)), 1)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
-            out = {"opening": ({**self.opening, "elapsed_s": round(time.time() - self.opening["t0"], 1)} if self.opening else None),
+            conv = ((self.renderer or {}).get("converting") or {}).get(self.opening["id"]) if self.opening else None  # the converter's own progress
+            out = {"opening": ({**self.opening, "elapsed_s": round(time.time() - self.opening["t0"], 1),
+                                "fraction": conv.get("fraction") if conv else None, "stage": conv.get("stage") if conv else None}
+                               if self.opening else None),
                    "scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
