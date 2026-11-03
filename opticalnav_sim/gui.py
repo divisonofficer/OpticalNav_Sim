@@ -24,6 +24,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -140,6 +141,13 @@ def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
     raise KeyError(channel)
 
 
+THUMBS = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "opticalnav_sim" / "thumbs"  # the scene gallery's pictures
+
+
+def thumb_file(scene: str) -> Path:
+    return THUMBS / f"{re.sub(r'[^0-9A-Za-z._-]+', '_', scene)}.jpg"
+
+
 def room_map_r2r(data: dict) -> dict:
     """A robomituba room_map.v1 (dataset x, y) in the R2R frame the map draws: (x, -y)."""
     def pt(p):
@@ -227,6 +235,42 @@ class Session:
         with self.lock:
             fn(*args)
         return self.status()
+
+    def maybe_thumb(self, scene: str, frame_id: int) -> None:
+        """The gallery's picture of a scene: its first finished frame, kept in the thumbnail cache (once per scene, until the file is removed)."""
+        done = getattr(self, "_thumbed", None)
+        if done is None:
+            done = self._thumbed = set()
+        path = thumb_file(scene)
+        if scene in done or path.is_file():
+            done.add(scene)
+            return
+        try:
+            from PIL import Image
+            im = Image.open(io.BytesIO(self.image(frame_id, "rgb", 1.0)))
+            im.thumbnail((320, 240))
+            THUMBS.mkdir(parents=True, exist_ok=True)
+            im.save(path, quality=85)
+            done.add(scene)
+        except Exception:  # noqa: BLE001 - a missing thumbnail is only a missing picture
+            pass
+
+    def thumb(self, scene: str) -> tuple[bytes, str] | None:
+        """(bytes, type) of the scene's gallery picture: its first frame, else (a scene converted from a .blend) its bird's-eye map."""
+        path = thumb_file(scene)
+        if path.is_file():
+            return path.read_bytes(), "image/jpeg"
+        bird = self.birdeye(scene)
+        if bird:
+            small = path.with_suffix(".map.jpg")
+            if not small.is_file():
+                from PIL import Image
+                im = Image.open(bird["path"]).convert("RGB")
+                im.thumbnail((320, 320))
+                THUMBS.mkdir(parents=True, exist_ok=True)
+                im.save(small, quality=85)
+            return small.read_bytes(), "image/jpeg"
+        return None
 
     def refresh_blends(self) -> None:
         """The .blend files the render server offers (--blend-dir / --blend-tsv); none from an older server."""
@@ -1027,7 +1071,15 @@ def make_handler(session: Session, token: str | None = None):
                 if parts == ["api", "state"]:  # ?after=<version>&wait=<s>: long poll until something changes
                     if "after" in q:
                         session.wait(int(q["after"]), float(q.get("wait", 2.0)))
-                    return self._json(200, session.status())
+                    st = session.status()
+                    if st.get("done") and st.get("has_frame") and st.get("frame_id") is not None and st.get("render_mode") != "raster":
+                        session.maybe_thumb(st["scene"], st["frame_id"])
+                    return self._json(200, st)
+                if parts == ["api", "thumb"]:  # the gallery's picture of a scene (404: the page draws initials)
+                    pic = session.thumb(q["scene"])
+                    if pic is None:
+                        return self._json(404, {"error": "no picture yet"})
+                    return self._send(200, pic[0], pic[1], {"Cache-Control": "max-age=60"})
                 if parts == ["api", "scene_stats"]:  # the scene tab: asks the render server each time
                     return self._json(200, session.sim._client.stats(q["scene"]))
                 if parts == ["api", "graph"]:

@@ -42,6 +42,30 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 @keyframes pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .chip.warn .dot { animation: none; } }
 /* cards */
+.scene-open { display: flex; align-items: center; gap: 10px; width: 100%; padding: 6px 10px; background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 8px; font: inherit; cursor: pointer; text-align: left; }
+.scene-open:hover { border-color: var(--accent); }
+.scene-open img { width: 56px; height: 42px; object-fit: cover; border-radius: 5px; flex: none; }
+.scene-open #scene-open-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#gallery { position: fixed; inset: 0; z-index: 20; background: rgba(5, 9, 11, .82); display: flex; align-items: flex-start; justify-content: center; padding: 4vh 16px; }
+#gallery[hidden] { display: none; }
+#gallery .gbox { width: min(1180px, 100%); max-height: 92vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--rule); border-radius: 12px; box-shadow: 0 18px 60px rgba(0,0,0,.6); overflow: hidden; }
+#gallery .ghead { display: flex; gap: 10px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--rule); }
+#gallery .ghead h3 { margin: 0; font-size: 15px; flex: none; }
+#gallery .ghead input { flex: 1; min-width: 0; padding: 7px 10px; background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 8px; font: inherit; }
+#gallery .ghead button { padding: 6px 12px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--rule); border-radius: 8px; cursor: pointer; font: inherit; }
+#gallery .gbody { overflow: auto; padding: 14px; }
+#gallery .gsec { margin: 0 0 8px; font-size: 12px; color: var(--muted); letter-spacing: .04em; }
+#gallery .ggrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+#gallery .gcard { position: relative; display: flex; flex-direction: column; background: var(--panel-2); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; cursor: pointer; padding: 0; color: var(--ink); font: inherit; text-align: left; }
+#gallery .gcard:hover, #gallery .gcard:focus-visible { border-color: var(--accent); outline: none; }
+#gallery .gcard.cur { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+#gallery .gimg { aspect-ratio: 4 / 3; background: linear-gradient(135deg, var(--panel-3), var(--panel)); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 26px; font-weight: 600; overflow: hidden; }
+#gallery .gimg img { width: 100%; height: 100%; object-fit: cover; display: block; }
+#gallery .gname { padding: 7px 9px 3px; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#gallery .gtags { padding: 0 9px 8px; display: flex; gap: 5px; font-size: 10.5px; color: var(--muted); }
+#gallery .gtag { border: 1px solid var(--rule); border-radius: 4px; padding: 0 5px; }
+#gallery .gtag.blend { color: var(--accent); border-color: var(--accent); }
+#gallery .gtag.todo { color: #d9a441; border-color: #d9a441; }
 .card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); min-width: 0; }
 .card > h2, .card-head h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 700; color: var(--ink); }
 .card > h2 svg.i, .card-head svg.i { color: var(--accent); width: 18px; height: 18px; }
@@ -221,7 +245,8 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     <section class="card">
       <h2><svg class="i"><use href="#i-layers"/></svg>Scene</h2>
       <div class="fields one">
-        <label class="f" for="scene"><span>씬</span><select id="scene"></select></label>
+        <div class="f"><span>씬</span><button type="button" id="scene-open" class="scene-open" title="씬 갤러리 열기"><img id="scene-open-img" alt="" hidden><span id="scene-open-name">…</span><span class="chev">▾</span></button></div>
+        <select id="scene" hidden aria-hidden="true"></select>
         <label class="f" for="env" title="창밖 하늘(환경맵). 픽셀만 바꿔 넣으므로 freeze를 다시 기록하지 않습니다."><span>하늘</span><select id="env"></select></label>
         <label class="f" for="envrot" title="하늘(환경맵)을 수직축으로 돌립니다. 광원 편광과는 무관합니다. 원래 하늘이 균일한 씬(대부분의 Infinigen 씬)에서는 바뀌는 것이 없고, sunny_day·blue_hour 같은 맵에서 해와 밝은 쪽의 방향이 바뀝니다"><span>하늘 회전</span><input type="range" id="envrot" min="0" max="345" step="15" value="0"><span class="v" id="envrot-v">0°</span></label>
       </div>
@@ -365,6 +390,9 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
   <div class="status" id="status"><span>서버에 연결하는 중…</span></div>
   <div class="sysinfo" id="sysinfo"></div>
 </footer>
+<div id="gallery" hidden><div class="gbox" role="dialog" aria-label="씬 선택">
+  <div class="ghead"><h3>씬 선택</h3><input id="gsearch" type="search" placeholder="이름으로 찾기 (예: PH, cafe, blend)" autocomplete="off"><button type="button" id="gclose">닫기 (Esc)</button></div>
+  <div class="gbody" id="gbody"></div></div></div>
 <div class="err" id="error" hidden></div>
 <div class="err info" id="info" hidden></div>
 <dialog id="help" aria-labelledby="help-title">
@@ -955,6 +983,7 @@ function apply(st) {
   warpPanes();
   if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: startScene() }, "첫 프레임"); return; }  // GUI server restarted
   showOpening();
+  syncSceneButton();
   showError(S.error ? `렌더 실패: ${S.error}` + (/frozen|not permitted|record/.test(S.error)
     ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "") : "");
   const key = JSON.stringify([S.scene, S.position, S.heading_deg, S.elevation_deg, S.height_m, S.viewpoint, S.candidates.length, S.variant, S.bands]);
@@ -1319,16 +1348,66 @@ $("refit").addEventListener("click", () => configure({ refit_tone: true }, "노�
   for (const band of ["rgb", "nir"]) { $(`ev-${band}`).value = 0; showEv(band); }
   showImages();
 }));
-$("scene").addEventListener("change", async () => {
-  const opt = $("scene").selectedOptions[0], sc = $("scene").value;
-  if (opt && opt.dataset.blend) {  // a .blend not converted yet: the server converts it in the background, then the scene starts
+async function chooseScene(sc, isBlend) {
+  if (isBlend) {  // a .blend not converted yet: the server converts it in the background, then the scene starts
     try { apply(await api("/api/open_blend", { id: sc })); } catch (e) { showError(`.blend 열기 실패: ${e.message}`); }
-    fillScenes(S.scene);  // back to the scene still shown until the new one starts
+    fillScenes(S.scene);
     return;
   }
   graph = null;
   send("/api/start", { scene: sc }, "씬 전환");
-});
+}
+$("scene").addEventListener("change", () => { const o = $("scene").selectedOptions[0]; chooseScene($("scene").value, !!(o && o.dataset.blend)); });
+
+// --- the scene gallery: a card per scene (its first frame, or the bird's-eye map of a .blend, else initials) ---
+const galleryThumbs = new Set();
+function sceneLabel(id) { return id.replace(/^blend_/, "").replace(/^sim_v2a_|^sim_v3_|^sim_/, ""); }
+function openGallery() {
+  $("gallery").hidden = false; $("gsearch").value = ""; renderGallery(); $("gsearch").focus();
+}
+function closeGallery() { $("gallery").hidden = true; }
+function renderGallery() {
+  const q = $("gsearch").value.trim().toLowerCase();
+  const served = Object.keys(S.scans), todo = (S.blends || []).filter((b) => !(b.id in S.scans)).map((b) => b.id);
+  const cards = [...served.map((id) => ({ id, todo: false })), ...todo.map((id) => ({ id, todo: true }))]
+    .filter((c) => !q || c.id.toLowerCase().includes(q) || sceneLabel(c.id).toLowerCase().includes(q) || (q === "blend" && c.id.startsWith("blend_")));
+  const groups = [["지금 씬", cards.filter((c) => c.id === S.scene)],
+    [".blend (서버에 올라온 것)", cards.filter((c) => c.id !== S.scene && !c.todo && c.id.startsWith("blend_"))],
+    [".blend 목록 — 열 때 변환 (수십 초~몇 분)", cards.filter((c) => c.todo)],
+    ["팩 씬", cards.filter((c) => c.id !== S.scene && !c.todo && !c.id.startsWith("blend_"))]];
+  const body = $("gbody"); body.innerHTML = "";
+  for (const [title, list] of groups) {
+    if (!list.length) continue;
+    const h = document.createElement("div"); h.className = "gsec"; h.textContent = `${title} · ${list.length}`; body.appendChild(h);
+    const grid = document.createElement("div"); grid.className = "ggrid"; body.appendChild(grid);
+    for (const c of list.sort((a, b) => a.id.localeCompare(b.id))) {
+      const btn = document.createElement("button"); btn.type = "button"; btn.className = "gcard" + (c.id === S.scene ? " cur" : "");
+      const img = document.createElement("div"); img.className = "gimg"; img.textContent = sceneLabel(c.id).slice(0, 2).toUpperCase();
+      const pic = new Image(); pic.loading = "lazy"; pic.alt = "";
+      pic.onload = () => { img.textContent = ""; img.appendChild(pic); };
+      pic.src = `/api/thumb?scene=${encodeURIComponent(c.id)}`;
+      const name = document.createElement("div"); name.className = "gname"; name.textContent = sceneLabel(c.id); name.title = c.id;
+      const tags = document.createElement("div"); tags.className = "gtags";
+      if (c.id.startsWith("blend_") || c.todo) { const t = document.createElement("span"); t.className = "gtag blend"; t.textContent = ".blend"; tags.appendChild(t); }
+      if (c.todo) { const t = document.createElement("span"); t.className = "gtag todo"; t.textContent = "변환 필요"; tags.appendChild(t); }
+      btn.append(img, name, tags);
+      btn.addEventListener("click", () => { closeGallery(); if (c.id !== S.scene) chooseScene(c.id, c.todo); });
+      grid.appendChild(btn);
+    }
+  }
+  if (!body.children.length) body.textContent = "찾는 씬이 없습니다.";
+}
+function syncSceneButton() {
+  if (!S) return;
+  $("scene-open-name").textContent = sceneLabel(S.scene || "");
+  const im = $("scene-open-img");
+  if (im.dataset.scene !== S.scene) { im.dataset.scene = S.scene; im.hidden = true; im.onload = () => { im.hidden = false; }; im.onerror = () => { im.hidden = true; }; im.src = `/api/thumb?scene=${encodeURIComponent(S.scene)}&t=${Date.now() % 100000}`; }
+}
+$("scene-open").addEventListener("click", openGallery);
+$("gclose").addEventListener("click", closeGallery);
+$("gsearch").addEventListener("input", renderGallery);
+$("gallery").addEventListener("click", (e) => { if (e.target === $("gallery")) closeGallery(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("gallery").hidden) { closeGallery(); e.stopPropagation(); } }, true);
 $("flash").addEventListener("click", toggleFlash);
 $("mirrors").addEventListener("click", toggleMirrors);
 $("lighting").addEventListener("change", () => configure({ lighting: $("lighting").value }, "조명 변경"));
