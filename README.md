@@ -755,6 +755,14 @@ Then restart the render server (it reads the pack's scenes at start) and pick th
 
 **Blender's light power, measured.** Against Cycles (a lone light over a Lambertian plane, world black): an area light's radiance is `W / (pi A)` (disk, square and rectangle all within 1% of it), a point or spot light's intensity `W / (4 pi)` W/sr, a sun's irradiance its strength. The formulas the server used for the importer's scenes are `W / (pi^2 A)` and `W / (4 pi^2)`, pi times too weak; the fill softboxes and the sky hid it there, and those scenes keep them (their fill gain and sky were tuned against them). Scenes with the protocol `blend_direct_v1` get `watt_gain = pi`. A closed 6 x 6 m room with one 45 W disk: Mitsuba / Cycles 0.28 before, 0.81 to 0.92 after; PH19's median radiance over four poses: 1.19 to 1.28 times Cycles' (the importer's pack: 1.4 to 4.5 times).
 
+### Lights hidden from reflections and glass (`hidden_specular`)
+
+A Blender light whose Ray Visibility has Camera, Glossy and Transmission all off (the window light of CS02) is written as
+`light_hidden_spec_<i>_<name>`. The `path_nocaustics` plugin's `hidden_specular` option (source: `docs/patches/path_nocaustics.cpp`,
+build target `path_nocaustics` in the Mitsuba 3.9.1 tree) makes such a shape invisible to the camera and to any ray whose last bounce
+was not diffuse (mirror, metal, glass, rough glossy), front and back; it still lights the room. Lights with only Camera off stay
+`light_hidden_` (still seen in reflections, like Blender). A server on an older plugin loads without the option (the squares show).
+
 ## Scenes straight from `.blend` files
 
 The render server can serve a `.blend` without a hand-made pack: it converts the file with `tools/blend_to_pack.py` into the *blend pack* (`packs/blend-cache`, scenes `blend_<file name>`) and caches the result (until the file, or the converter, changes).

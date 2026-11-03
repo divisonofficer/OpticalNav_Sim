@@ -1001,7 +1001,11 @@ def run_inside(cfg: dict) -> None:
         radiance = [round(c * (1.0 + IMPORTER_WATTS * float(d.energy)), 5) for c in col]
         # a Blender light is not seen by the camera when its Ray Visibility > Camera is off (every light of PH19 and PH33): the
         # server's ``hidden`` prefix lets camera rays through such a box, which lights the room without a white square on the ceiling
-        sid = unique_id(f"light_hidden_{i}_{o.name}" if not o.visible_camera else f"light_{i}_{o.name}")
+        # also off for glossy and transmission rays (the window light of CS02): the server's ``hidden_specular`` hides it from
+        # reflections in metal and from the view through glass as well
+        spec_hidden = not (o.visible_camera or o.visible_glossy or o.visible_transmission)
+        prefix = "light_hidden_spec_" if spec_hidden else "light_hidden_" if not o.visible_camera else "light_"
+        sid = unique_id(f"{prefix}{i}_{o.name}")
         n = {"id": sid, "type": "landmark", "label": f"light:{o.name}", "placement": "point", "material": "infinigen_default",
              "source_ref": None, "is_emitter": True, "emitter_radiance": radiance, "emitter_intensity": 1.0,
              "emitter_shape": "ceiling_panel", "emitter_polarized": False, "emitter_polarizer_angle_deg": 0.0, "emitter_pattern": None,

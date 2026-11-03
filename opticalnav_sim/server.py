@@ -124,6 +124,9 @@ FILL_PREFIX = "light_softbox_"
 # The lights of a scene converted from its .blend (tools/blend_to_pack.py) whose Blender Ray Visibility > Camera is off (all of
 # PH19's and PH33's): the same camera-transparent lights, under their own prefix, so they stay "fixtures", not "fill".
 HIDDEN_LIGHT_PREFIX = "light_hidden_"
+# a Blender light that is off for the camera and also for glossy and transmission rays (path_nocaustics's
+# ``hidden_specular``): only diffuse bounces see it, a window pane or a mirror does not show it
+HIDDEN_SPEC_PREFIX = "light_hidden_spec_"
 ASSIST_SHAPE = re.compile(r'\s*<shape type="rectangle" id="camera_assist_[a-z]+">.*?</shape>', re.S)
 SENSOR_BLOCK = re.compile(r"\s*<sensor\b.*?</sensor>", re.S)
 COMMENT = re.compile(r"\s*<!--.*?-->", re.S)
@@ -1289,6 +1292,8 @@ class Resident:
     scale and rotation change in place). Each is written once as an opaque value before the first
     recording, so later changes replay the same recording."""
 
+    hidden_specular = False  # the plugin knows ``hidden_specular`` (set by the server at start)
+
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
                  pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0,
@@ -1504,6 +1509,8 @@ class Resident:
             inner["sky_nir"] = sky
             if self.hidden:
                 inner["hidden"] = self.hidden
+                if self.hidden == HIDDEN_LIGHT_PREFIX and Resident.hidden_specular:
+                    inner["hidden_specular"] = HIDDEN_SPEC_PREFIX
             if self.rr_depth:
                 inner["rr_depth"] = int(self.rr_depth)
             if pdf is not None:
@@ -2259,6 +2266,9 @@ class Renderer:
                                                                     "assist_mode": "split"})
         # path_nocaustics's "hidden": the room softboxes stay out of the camera's view (an older plugin: they show)
         self.has_hidden = self.has_nocaustics and self._has_plugin({"type": "path_nocaustics", "hidden": FILL_PREFIX})
+        # an older plugin lacks ``hidden_specular``: such lights then show in reflections and through glass
+        Resident.hidden_specular = self.has_hidden and self._has_plugin(
+            {"type": "path_nocaustics", "hidden": HIDDEN_LIGHT_PREFIX, "hidden_specular": HIDDEN_SPEC_PREFIX})
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
         self.preloading: list[list[str]] = []  # [scan, variant, mode] of --preload loads not done yet (main)
         # environment maps a view may ask for by name (file stem): <pack>/envmaps unless --envmaps says otherwise
