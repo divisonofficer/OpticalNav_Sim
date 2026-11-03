@@ -338,6 +338,16 @@ class Session:
         c = self._camera(st)  # dataset convention: (x, height, y_dataset), and y_r2r = -y_dataset
         return [float(c[0, 3]), -float(c[2, 3]), float(c[1, 3])]
 
+    def height_range(self, scene: str) -> tuple[float, float]:
+        """Lowest and highest camera height of free flight. Scenes from a .blend keep Blender's heights (the ground of
+        PH46 is at 6.0 m), so the range hangs on the lowest spawn (eye height above the ground there), not on 0 to 3 m."""
+        zs = []
+        with contextlib.suppress(Exception):
+            zs = [float(s["position"][2]) for s in self.sim._scene_meta(scene).get("spawn") or []]
+        if not zs:
+            return 0.2, 3.0
+        return min(zs) - 1.2, max(3.0, min(zs) + 40.0)
+
     def fly(self, forward: float = 0.0, right: float = 0.0, up: float = 0.0, yaw_deg: float = 0.0,
             pitch_deg: float = 0.0) -> None:
         """Turn by ``yaw_deg`` / ``pitch_deg``, then move ``forward`` / ``right`` / ``up`` metres along the new
@@ -347,7 +357,8 @@ class Session:
         h = st.heading + math.radians(yaw_deg)
         x += forward * math.sin(h) + right * math.cos(h)  # heading 0 looks along +y; positive turns right
         y += forward * math.cos(h) - right * math.sin(h)
-        z = min(max(z + up, 0.2), 3.0)
+        lo, hi = self.height_range(st.scanId)
+        z = min(max(z + up, lo), hi)
         e = min(max(st.elevation + math.radians(pitch_deg), -0.9), 0.9)
         self.sim.teleport([st.scanId], [[x, y, z]], [h], [e])
         self._moved()

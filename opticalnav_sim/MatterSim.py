@@ -534,7 +534,14 @@ class Simulator:
         view."""
         scene = self._split(state.scanId)[0]
         mount = self._mount(scene)
-        if state._free_position is None:
+        meta = self._scene_meta(scene)
+        if state._free_position is None and meta.get("spawn") and not meta.get("graph"):
+            # a scene without a graph starts at its spawn point at the camera's own height (the rig's 1.5 m would put a
+            # camera in the ground of a scene whose ground is not at 0, like a .blend with an origin offset)
+            loc = state.location
+            c2w = frames.camera_at_position((loc.x, loc.y, loc.z + self.camera_offset[1]), state.heading, state.elevation,
+                                            mount)
+        elif state._free_position is None:
             c2w = frames.camera_at_viewpoint(state.location.x, state.location.y, state.heading, state.elevation, mount)
         else:
             x, y, z = state._free_position
