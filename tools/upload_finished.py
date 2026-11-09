@@ -42,6 +42,8 @@ def run(args) -> int:
     state = json.loads(state_path.read_text()) if state_path.is_file() else {}
     for scene in args.done:
         state.setdefault(scene, "uploaded earlier as loose files")
+    for scene in args.skip:
+        state.setdefault(scene, "skipped on purpose: not uploaded")
     state_path.write_text(json.dumps(state, indent=1))
     retried: set[str] = set()
     logf = open(updir / "upload_finished.log", "a", buffering=1)
@@ -110,6 +112,7 @@ def main() -> int:
     ap.add_argument("--remote", default="gcloud:dataset/opticalnav_sim/jn1027_frames/tar")
     ap.add_argument("--interval", type=int, default=10, help="minutes between checks")
     ap.add_argument("--done", action="append", default=["sim_v2a_bookstoreR_underground_47311301"])
+    ap.add_argument("--skip", action="append", default=[], help="a scene that is never uploaded (the apartments)")
     args = ap.parse_args()
     updir = args.out.parent / "jn1027_upload"
     if args.command == "stop":
