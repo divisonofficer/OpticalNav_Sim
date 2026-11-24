@@ -173,7 +173,9 @@ python tools/replay_episode.py --pack packs/opticalnav-v0.2 --server http://127.
 
 Most of these are per-view settings: the API takes them in a view, `MatterSim` has a setter for each, and the viewer has a control. Changing one reloads nothing. Settings marked *records once* make a new dr.freeze recording the first time they are used (a few seconds); every other change only writes values into the resident scene.
 
-**Camera rig editor** (카메라 리그 tab, `setCameraOffset`, `setFlashOffset`). A three.js view of the observer (a disc and arrow on the floor), the camera and its frustum, and the flash rectangle. Wireframes mark the dataset positions. The axes follow Blender: X right, Y forward, Z up.
+**Polarization on or off** (the Render card's **편광** switch; a view's `mode`: `"polar"` or `"rgb"`). Off, the path tracer runs Mitsuba's plain `cuda_rgb` variant: no Stokes vectors, no Mueller matrices. Measured on CS02 at 512 x 384: a 16 spp pass takes 13 ms instead of 74 ms, and the viewer reaches 1024 spp 2 s after a move (128 spp passes of 179 ms against 684 ms). The image is the polarized render's S0: over 512 spp the two agree to 1.6% in the mean (median of 8 x 8 blocks 0.983), with the same median noise per pass (0.41 of the mean) but more outliers (0.16% of a pass's pixels over ten times their mean against 0.02%), so a still image needs the firefly hold-back or the denoiser a little more. DoLP, AoLP, S1 and S2 are zero and their tabs are struck through. A robot's cameras follow the switch unless their sensor measures polarization (those always render polarized). Each mode is a resident scene of its own (loaded once, 10 s on CS02): the server needs both modes, `--modes polar,rgb`, and `--max-resident 2` keeps both loaded so the switch is instant afterwards. Both variants in one server process ran 60 alternating renders here without a fault (an older OptiX 7 build crashed on that: there, one server per mode); a pass right after a switch pays about 25 ms for the variant change.
+
+**Editor camera** (에디터 카메라 tab: the viewer's own camera; a robot's cameras are its configuration's). The flash switch, its size and band, the walking speed, and the mount editor (`setCameraOffset`, `setFlashOffset`). A three.js view of the observer (a disc and arrow on the floor), the camera and its frustum, and the flash rectangle. Wireframes mark the dataset positions. The axes follow Blender: X right, Y forward, Z up.
 
 * Click to select the camera or the flash, then drag a gizmo arrow.
 * `G` grabs the selection: it follows the mouse, `X`/`Y`/`Z` lock an axis, and typed digits move it that many metres. Click or Enter confirms; right click or Esc cancels.
@@ -361,11 +363,11 @@ cd opticalnav_sim
 B=/home/jinnyeong/robomituba-build/mitsuba3
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$B:$LD_LIBRARY_PATH PYTHONPATH=$B/python:.
 CUDA_VISIBLE_DEVICES=0 timeout 6h /usr/bin/python3.10 -u -m opticalnav_sim.server \
-    --pack packs/opticalnav-v0.2 --port 18770 --modes polar --max-resident 1 \
+    --pack packs/opticalnav-v0.2 --port 18770 --modes polar,rgb --max-resident 2 \
     --preload infinigen_apartment_natural_v1_20268504:base:polar
 ```
 
-* The start line should read `modes={'polar': 'cuda_rgbn_polarized'} … freeze=True` (or `cuda_rgb_polarized` on a build without the RGBN variant).
+* The start line should read `modes={'polar': 'cuda_rgbn_polarized', 'rgb': 'cuda_rgb'} … freeze=True` (or `cuda_rgb_polarized` on a build without the RGBN variant).
 * **Expect waits.** Loading a scene takes about 100 s (`--preload`, or the first request for it). The first frame of each spp and resolution records the freeze, about 25 s on the 3.9.1 RGBN build (light on and off together), 90–100 s per pass on the 3.7.1 build. Later frames replay in tens of milliseconds. With `--max-resident 1`, every scene switch pays the load and the recordings again. A variant switch within a scene does not reload (see *One resident scene for all three variants*); `base` and `perturbed` share their recordings. `GET /v1/status` (and the viewer's status bar) says which of these is running.
 * **GPU memory.** Use `--max-resident 1` when the GPU is shared. Freeze recordings failed twice when the card was nearly full, and a server whose recording failed fails every later render until it restarts.
 * **Shared machines.** Start servers under `timeout` so a forgotten one does not hold the GPU. Bind beyond localhost only with a token (`--host 0.0.0.0 --token …`). On WSL2, other machines reach the port only after Windows forwards it (`netsh interface portproxy add v4tov4 listenport=18780 connectaddress=<WSL IP> connectport=18780` and a firewall rule).

@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from opticalnav_sim import MatterSim, frames, server  # noqa: E402
@@ -112,7 +113,7 @@ class FakeClient:
             rgb = np.zeros((v["height"], v["width"], 3), np.uint8)
             rgb[..., 0] = 255  # pure red in RGB
             s = np.zeros((v["height"], v["width"], 3), np.float16)
-            out.append({"rgb": rgb, "s0": s, "s1": s, "s2": s, "s3": s})
+            out.append({"radiance": s + 1} if v.get("mode") == "rgb" else {"rgb": rgb, "s0": s, "s1": s, "s2": s, "s3": s})
         return out
 
     def close(self):
@@ -315,6 +316,18 @@ def test_gui_draws_the_robot_and_rides_with_it():
     assert np.allclose(st["position"], [2.0, 3.0 + back], atol=1e-3) and abs(st["heading_deg"]) < 1e-6
     session.run("fly", session.fly, 0.0, 1.0)                                      # flown a metre to the right: rides from there
     assert np.allclose(session.follow[:3], [back, -1.0, above], atol=1e-6)
+    # polarization off: the view is the server's rgb mode, its radiance shown as unpolarized Stokes images
+    with pytest.raises(ValueError):
+        session.configure({"polarization": False})                                # this server has no rgb mode
+    session.modes = ["polar", "rgb"]
+    session.run("configure", session.configure, {"polarization": False})
+    assert session.view["mode"] == "rgb" and session.status()["polarization"] is False
+    st = session.wait_idle(10)
+    frame = session._frame(st["frame_id"])
+    assert sim._client.views[-1]["mode"] == "rgb" and not frame["s1"].any() and frame["s0"].shape == (48, 64, 3)
+    assert session.image(st["frame_id"], "rgb.dolp", 0.2)[:2] == b"\xff\xd8"
+    session.run("configure", session.configure, {"polarization": True})
+    assert session.view["mode"] == "polar"
     sim.renderer = "raster"                                                        # the preview rasteriser draws no bodies
     session.run("moved", session._moved)
     assert "bodies" not in session.view

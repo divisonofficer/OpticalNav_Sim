@@ -246,15 +246,20 @@ class RobotSession:
                 self.sim_rate, ticks, t_rate = ticks / (now - t_rate), 0, now
             time.sleep(max(0.0, world.dt * 0.5 - (time.monotonic() - now)))
 
-    def _sensor_view(self, request: dict, template: dict | None) -> tuple[dict, str]:
-        """The sensor's view with the editor's look, and that look as a key (a still image is of one look)."""
+    def _sensor_view(self, request: dict, template: dict | None, polarized: bool = False) -> tuple[dict, str]:
+        """The sensor's view with the editor's look, and that look as a key (a still image is of one look).
+        ``polarized``: the sensor measures polarization, so its view is a polarized render whatever the editor's is;
+        any other sensor takes the editor's mode (unpolarized RGB when polarization is off there: the same resident
+        scene as the editor's view, and several times faster)."""
         view = request["view"]
         if template is not None and template.get("scan") == self.scene:
             for k in LOOK:
                 if k in template:
                     view[k] = template[k]
+            if not polarized and template.get("mode") in ("polar", "rgb"):
+                view["mode"] = template["mode"]
         view["bands"], view["renderer"], view["depth"] = "rgb", "path", False
-        return view, json.dumps({k: view.get(k) for k in LOOK}, sort_keys=True, default=str)
+        return view, json.dumps({k: view.get(k) for k in (*LOOK, "mode")}, sort_keys=True, default=str)
 
     def _run(self, run: int, scene: str, eye, heading: float, elevation: float) -> None:
         from .hw import isp
@@ -290,7 +295,10 @@ class RobotSession:
                         return
                     camera = self.cameras[name]
                     request = world.request(camera, spp=256 if settled else 16, denoise=not settled, preview=False)
-                    view, look = self._sensor_view(request, template)
+                    view, look = self._sensor_view(request, template, camera.spec.sensor.cfa.startswith("polar_"))
+                    if settled and view.get("mode") == "rgb":   # unpolarized: a pass costs a fifth, and has more outliers
+                        view["spp"] = 1024
+                    spp = int(view["spp"])
                     seq_at = self.pose_seq
                     have = self.frames.get(name, {})
                 if settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at:
@@ -303,7 +311,7 @@ class RobotSession:
                     if self.run_id != run:
                         return
                     seq = self.frames.get(name, {}).get("seq", 0) + 1
-                    self.frames[name] = {"jpeg": _jpeg(image), "seq": seq, "spp": 256 if settled else 16, "still": settled,
+                    self.frames[name] = {"jpeg": _jpeg(image), "seq": seq, "spp": spp, "still": settled,
                                          "look": look, "pose_seq": seq_at,
                                          "exposure_ms": round(raw.exposure_s * 1e3, 3), "gain_db": round(raw.gain_db, 2),
                                          "size": [int(image.shape[1]), int(image.shape[0])], "seconds": round(time.monotonic() - t0, 3),

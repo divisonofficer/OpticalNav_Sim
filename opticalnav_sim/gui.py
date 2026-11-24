@@ -237,6 +237,8 @@ class Session:
         self.subs: dict[int, dict] = {}  # each page's panes, scale and exposure: the JPEGs a frame makes ahead
         self.trail: list[tuple[float, float]] = []
         self.robot = None                 # robot_view.RobotSession (attach_robot): its links are bodies of this view
+        self.polarization = True          # False: the path tracer's plain RGB variant (no Stokes vectors: several times faster)
+        self.modes: list[str] = ["polar"]  # the render server's modes (main sets them): "rgb" is the unpolarized one
         self.follow: tuple | None = None  # the camera rides with the robot: its place in the robot's frame (set_follow)
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(self.depth, thread_name_prefix="pass")
@@ -535,6 +537,14 @@ class Session:
         if "active_split" in settings:  # MatterSim.setActiveSplit
             self.sim.setActiveSplit(bool(settings["active_split"]))
             restart = True
+        if "polarization" in settings:  # False: render without polarization (the server's rgb mode), for speed
+            want = bool(settings["polarization"])
+            if not want and "rgb" not in self.modes:
+                raise ValueError("the render server has no unpolarized mode: start it with --modes polar,rgb")
+            if want and "polar" not in self.modes:
+                raise ValueError("the render server has no polarized mode: start it with --modes polar,rgb")
+            self.polarization = want
+            restart = True
         if "caustics" in settings:  # MatterSim.setCaustics
             self.sim.setCaustics(bool(settings["caustics"]))
             restart = True
@@ -588,8 +598,10 @@ class Session:
         c2w = self._camera(st)
         st.camera_to_world = c2w
         scene, variant = sim._split(st.scanId)
+        # polarization off: the path tracer's plain RGB variant (the preview rasteriser and Cycles have their own modes)
+        mode = "polar" if self.polarization or sim.renderer != "path" or "rgb" not in self.modes else "rgb"
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
-                "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": "polar",
+                "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": mode,
                 "denoise": False, "preview": False, "s3": False, "depth": True, "lights": sim.lights, "env": dict(sim.env),
                 "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting, "lamps": sim.lamps,
                 "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
@@ -695,6 +707,12 @@ class Session:
             return
         if view.get("bodies") and self.robot is not None:
             self.robot.loaded()
+        if "s0" not in out and "radiance" in out:  # rendered without polarization: unpolarized Stokes images (S1 = S2 = 0)
+            rad = np.asarray(out["radiance"], dtype=np.float32)
+            out = dict(out, s0=rad, s1=np.zeros_like(rad), s2=np.zeros_like(rad))
+        if "nir" in out and "nir_s0" not in out:
+            nir = np.asarray(out["nir"], dtype=np.float32)
+            out = dict(out, nir_s0=nir, nir_s1=np.zeros_like(nir), nir_s2=np.zeros_like(nir))
         wall = time.perf_counter() - started  # the render request's round trip
         with self.cv:
             self.inflight -= 1
@@ -827,7 +845,7 @@ class Session:
                    "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                    "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
-                   "active_split": sim.active_split,
+                   "active_split": sim.active_split, "polarization": self.polarization, "modes": self.modes,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
@@ -1425,6 +1443,8 @@ def main() -> int:
     session.refresh_blends()
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
+    session.modes = list(info.get("modes") or ["polar"])
+    session.polarization = "polar" in session.modes
     from .robot_view import RobotSession
     robot = RobotSession(sim._client.url, args.rig_calibration, config=args.robot)  # the robot a page puts into the scene it shows
     session.attach_robot(robot)

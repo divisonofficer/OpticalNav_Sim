@@ -216,6 +216,9 @@ class SimWorld(World):
             return None if a is None else optics.remap(np.asarray(a, dtype=np.float32), plan.map_x, plan.map_y)
 
         image = np.clip(np.rint(lens(out["rgb"])), 0, 255).astype(np.uint8) if "rgb" in out else None
+        if "s0" not in out and "radiance" in out:   # rendered without polarization (the view's mode "rgb"): S1 = S2 = S3 = 0
+            rad = np.asarray(out["radiance"], dtype=np.float32)
+            out = dict(out, s0=rad, **{n: np.zeros_like(rad) for n in ("s1", "s2", "s3") if n in components})
         s = [lens(out.get(n)) if n in components else None for n in ("s0", "s1", "s2", "s3")]
         return Frame(request["time"], request["intrinsics"], request["pose"], image, s[0], s[1], s[2], s[3],
                      lens(out.get("depth")), dict(self.client.last_timing))

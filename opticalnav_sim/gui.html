@@ -120,6 +120,8 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 .tabs button { font: 12px var(--mono); color: var(--muted); background: none; border: 0; border-radius: 5px; padding: 4px 10px; cursor: pointer; }
 .tabs button:hover { color: var(--ink); }
 .tabs button[aria-pressed=true] { background: var(--accent); color: #062126; font-weight: 600; }
+/* rendered without polarization: the polarization views show nothing (DoLP = 0) */
+body.unpolarized .tabs[data-kind=view] button:not([data-value=img]) { opacity: 0.4; text-decoration: line-through; }
 /* step sliders: a numeric menu shown as a slider over its options (the select stays, hidden, and keeps the logic) */
 select.as-slider { display: none; }
 .frame-wrap { flex: 1; min-height: 0; container-type: size; display: grid; place-items: center; }
@@ -313,6 +315,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <div class="toggles">
         <label class="tg mitsuba-only" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
         <label class="tg mitsuba-only" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
+        <label class="tg mitsuba-only" for="polar" title="편광 렌더 켜기/끄기. 끄면 Mitsuba의 비편광 RGB 변형으로 렌더합니다(Stokes·Mueller 계산 없음): CS02 512×384 16 spp에서 패스 74 → 13 ms. 영상(S0)은 같고, DoLP·AoLP·S1·S2는 0이 됩니다. 편광 센서가 아닌 로봇 카메라도 같은 모드를 따릅니다. 모드마다 씬을 한 번 따로 올립니다(렌더 서버 --modes polar,rgb)."><input type="checkbox" class="sw" id="polar" checked> 편광</label>
         <label class="tg noisy-only" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
         <label class="tg mitsuba-only" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
         <label class="tg" for="warp" title="움직이는 동안 다음 프레임이 끝나기 전까지 마지막 프레임을 새 카메라 쪽으로 옮겨 보여 줍니다. 렌더 서버가 같이 보내는 깊이로 프레임을 입체 격자로 만들어 새 시점에서 그립니다(WebGL): 회전과 이동 모두 맞고, 가려져 있던 곳은 늘이지 않고 다음 프레임까지 검게 비워 둡니다. 프레임을 섞지 않아 흐려지지 않고, 멈추면 렌더한 그대로입니다."><input type="checkbox" class="sw" id="warp" checked> 이동 보간</label>
@@ -1114,13 +1117,16 @@ function apply(st) {
     loadGraph(S.scene).then(drawMap).catch(() => {});
   }
   if (S.has_frame) {
-    $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}`;
+    $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}`;
     $("progress").style.width = S.render_mode === "raster" ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
   syncSliders();
   rigSync();
   if ($("auto").checked !== S.auto) $("auto").checked = S.auto;
+  if ($("polar").checked !== !!S.polarization) $("polar").checked = !!S.polarization;
+  $("polar").disabled = !((S.modes || []).includes("rgb") && (S.modes || []).includes("polar"));
+  document.body.classList.toggle("unpolarized", !S.polarization && S.render_mode === "path");
 }
 
 
@@ -1575,6 +1581,7 @@ $("pass").addEventListener("change", () => configure({ pass_spp: Number($("pass"
 $("target").addEventListener("change", () => configure({ target_spp: Number($("target").value) }, "목표 spp 변경"));
 $("denoise").addEventListener("change", () => configure({ denoise: $("denoise").checked }, "디노이저 전환"));
 $("auto").addEventListener("change", () => configure({ auto: $("auto").checked }, "누적 전환"));
+$("polar").addEventListener("change", () => configure({ polarization: $("polar").checked }, "편광 렌더 전환"));
 $("map").addEventListener("click", (ev) => {
   if (!graph) return;
   const c = $("map"), r = c.getBoundingClientRect(), dpr = c.width / r.width;

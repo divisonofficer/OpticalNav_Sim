@@ -719,6 +719,10 @@ def test_robot_routes_sensors_and_commands():
                                       {"scan": "scene", "variant": "perturbed", "lighting": "all", "bands": "both", "renderer": "raster", "width": 9})
     assert view["variant"] == "perturbed" and view["lighting"] == "all" and view["bands"] == "rgb" and view["renderer"] == "path"
     assert "width" not in view and view["depth"] is False and "perturbed" in look
+    # polarization off in the editor: a plain camera renders unpolarized too (one resident scene), a polarization camera does not
+    plain, _ = session._sensor_view({"view": {"scan": "scene", "mode": "polar"}}, {"scan": "scene", "mode": "rgb"})
+    polar, _ = session._sensor_view({"view": {"scan": "scene", "mode": "polar"}}, {"scan": "scene", "mode": "rgb"}, polarized=True)
+    assert plain["mode"] == "rgb" and polar["mode"] == "polar"
     other, _ = session._sensor_view({"view": {"scan": "scene", "variant": "base"}}, {"scan": "elsewhere", "variant": "perturbed"})
     assert other["variant"] == "base"                                      # the editor shows another scene: not its look
 
@@ -926,3 +930,17 @@ def test_lights_are_shapes_of_their_own_that_move_with_their_link(tmp_path):
     assert [v.shape for v in dark.visuals()["light"]] == ["box"]                                        # off: the housing, no emitter
     with pytest.raises(ValueError):
         bodies.build_model("bare", {"links": {"light": [descriptor["links"]["light"][1]]}}, cache=tmp_path)
+
+
+def test_a_camera_frame_from_an_unpolarized_render():
+    """The server's rgb mode gives radiance alone: a camera's frame takes it as S0, the other Stokes images zero."""
+    world = hw.SimWorld(scene="", client=object())
+    cam = world.spawn(cameras.LucidTRI032S())
+    k = cam.spec.intrinsics()
+    plan = optics.render_plan(k)
+    rad = np.full((plan.height, plan.width, 3), 0.5, np.float32)
+    request = {"plan": plan, "intrinsics": k, "pose": np.eye(4), "time": 0.0}
+    world.client = type("C", (), {"last_timing": {}})()
+    frame = world.frame(request, {"radiance": rad}, ("s0", "s1", "s2"))
+    assert frame.s0.shape == (k.height, k.width, 3) and abs(float(frame.s0[k.height // 2, k.width // 2, 0]) - 0.5) < 1e-6
+    assert not frame.s1.any() and not frame.s2.any() and frame.s3 is None
