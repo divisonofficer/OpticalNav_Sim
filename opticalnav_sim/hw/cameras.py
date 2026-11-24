@@ -21,6 +21,13 @@ from .transform import BODY_TO_OPTICAL, Transform
 
 @dataclass(frozen=True)
 class SensorSpec:
+    """An image sensor: its geometry, its mosaic, and its electrical model in EMVA 1288 terms (hw.sensor turns
+    radiance into its raw values).
+
+    ``full_well_e`` / ``read_noise_e``: saturation capacity and temporal dark noise of a pixel. ``readouts``: an HDR
+    sensor's readouts of one exposure, most sensitive first, each (relative sensitivity, full well, read noise); the
+    camera combines them into one linear value of ``bit_depth`` bits. ``sensitivity``: the pixel's response relative
+    to a plain 3.45 um pixel behind the same lens (a polarizer halves it, at best)."""
     name: str
     width: int
     height: int
@@ -30,6 +37,12 @@ class SensorSpec:
     shutter: str = "global"
     polarizer_deg: tuple = ()    # polar sensors: the angles of a 2x2 polarizer block, row by row
     extinction_ratio: float = 0.0
+    full_well_e: float = 10000.0
+    read_noise_e: float = 2.5
+    dark_current_e_s: float = 0.0
+    black_level: float = 0.0     # the raw value of no light, as a share of the raw range
+    sensitivity: float = 1.0
+    readouts: tuple = ()
     note: str = ""
 
     def size_mm(self) -> tuple[float, float]:
@@ -44,6 +57,7 @@ class LensSpec:
     image_circle_mm: float
     dist: tuple = ()             # k1, k2, p1, p2, k3 in normalized coordinates
     barrel_mm: tuple = (39.0, 50.0)  # diameter, length (drawn; the optical centre is at its front)
+    falloff: float = 4.0         # light towards the corners: cos^falloff of the angle off the axis (4: a thin lens)
     note: str = ""
 
 
@@ -65,11 +79,24 @@ def FujinonHF6XA5M(f_number: float = 4.0) -> LensSpec:
                     note="effective focal length and k1 fitted to the datasheet's angle of view: calibrate")
 
 
-IMX490 = SensorSpec("Sony IMX490", 2880, 1860, 3.0, 24, "RGGB", "rolling",
-                    note="24-bit linear HDR from two photodiodes x two gains; shutter type and CFA phase unverified")
-IMX265 = SensorSpec("Sony IMX265", 2048, 1536, 3.45, 12, "RGGB", "global", note="CFA phase unverified")
+# Sony IMX490 (LUCID's EMVA 1288 brief for the TRI054S: temporal dark noise 0.54 e-, dynamic range 123.6 dB, maximum SNR
+# 50.8 dB, combined saturation capacity 120 000 e-). Each pixel has a large and a small photodiode, each read at a high
+# and a low conversion gain: four 12-bit readouts of one exposure. How sensitivity and capacity split over the four is
+# not published: the split below reproduces the brief's three numbers (noise floor of the first readout, 123.6 dB to
+# the last one's saturation, 50.8 dB at 120 000 e-) and is otherwise an assumption.
+IMX490 = SensorSpec("Sony IMX490", 2880, 1860, 3.0, 24, "RGGB", "rolling", full_well_e=120000.0, read_noise_e=0.54,
+                    black_level=0.0, sensitivity=0.76,
+                    readouts=((1.0, 3000.0, 0.54), (1.0, 20000.0, 4.0), (0.147, 12000.0, 4.0), (0.147, 120000.0, 30.0)),
+                    note="24-bit linear HDR from four readouts; the readouts' split and the shutter type are assumptions")
+# Sony IMX265 (LUCID's EMVA 1288 data for the TRI032S-C: saturation capacity 10 565 e-, temporal dark noise 2.11 e-).
+# The rig's recordings go down to 7 of 4095 in a short exposure: the black level is at most that, taken as 0.
+IMX265 = SensorSpec("Sony IMX265", 2048, 1536, 3.45, 12, "RGGB", "global", full_well_e=10565.0, read_noise_e=2.11)
+# Sony IMX250MYR (FLIR's EMVA page for the BFS-U3-51S5PC: 0.17 e- per 16-bit count, 11.88 bits of dynamic range: about
+# 11 100 e- and 2.9 e-). Polarizer angles row by row and the extinction ratio are Sony's published layout and typical
+# value, not checked against a camera.
 IMX250MYR = SensorSpec("Sony IMX250MYR", 2448, 2048, 3.45, 12, "polar_RGGB", "global", (90.0, 45.0, 135.0, 0.0), 300.0,
-                       note="polarizer layout and extinction ratio from Sony's flyer, unverified here")
+                       full_well_e=11100.0, read_noise_e=2.9, sensitivity=0.45,
+                       note="polarizer layout, extinction ratio and sensitivity are typical values, not measured")
 
 
 @dataclass

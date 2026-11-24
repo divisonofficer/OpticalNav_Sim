@@ -17,7 +17,7 @@ import numpy as np
 
 from ..bodies import safe
 from ..client import RenderClient
-from . import optics
+from . import optics, sensor as sensor_model
 from .actor import Actor, Spec, World
 from .transform import Transform, camera_to_world, optical_pose, pose2d, to_mitsuba, yaw_from_heading
 
@@ -144,3 +144,15 @@ class SimWorld(World):
         return Frame(self.time, k, optical_pose(camera.link_matrix("camera")), image, lens(out.get("s0")),
                      lens(out.get("s1")), lens(out.get("s2")), lens(out.get("s3")), lens(out.get("depth")),
                      dict(self.client.last_timing))
+
+    def capture(self, camera: Actor, exposure_s: float | None = None, gain_db: float = 0.0, noise: bool = True,
+                spp: int | None = None, scale: float | None = None, binning: bool = False, **options) -> tuple:
+        """Render a camera and expose its sensor: ``(raw, frame)``. ``raw`` (hw.sensor.Raw) is what the camera delivers:
+        its mosaic, noise, saturation and bit depth; ``hw.isp.process(raw)`` is the image. ``exposure_s`` None: the
+        camera's auto exposure. ``binning``: the rendered pixel is the mean of the sensor pixels it covers (their
+        noise averaged), instead of one pixel of a smaller sensor. ``frame`` keeps the Stokes images the raw was made
+        from (the ground truth)."""
+        frame = self.render(camera, spp, scale, **options)
+        covered = (camera.spec.sensor.width / frame.intrinsics.width) ** 2 if binning else 1.0
+        return sensor_model.expose(frame, camera.spec, exposure_s, gain_db, noise, seed=self.seed,
+                                   pixels_per_sample=covered), frame

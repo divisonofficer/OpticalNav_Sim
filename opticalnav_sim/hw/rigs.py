@@ -18,33 +18,37 @@ from .calibration import RigCalibration
 from .robots import Visual
 from .transform import BODY_TO_OPTICAL, Transform
 
-ALUMINIUM = ("metal", (0.80, 0.81, 0.83), 0.35)
+ALUMINIUM = ("aluminium", (0.62, 0.63, 0.65), 0.5)   # anodized: satin, not a mirror
 
 
 @dataclass
 class Mast(Spec):
-    """An aluminium profile frame: four posts of ``height`` on a ``footprint`` (along x, along y), tied by rails at the
-    bottom, the middle and the top, with a plate on top. Links: ``mast`` (the centre of its foot) and ``top`` (the
-    centre of the top plate's upper face)."""
+    """A frame of T-slot aluminium extrusions (``profile`` square): four posts of ``height`` on a ``footprint`` (along
+    x, along y), tied by rungs across the front and the back every ``rung_spacing`` (the ladder of the real rig) and by
+    rails along the sides at the bottom, the middle and the top; on top, a bar across the front that the cameras sit on
+    (``camera_bar`` long). Links: ``mast`` (the centre of its foot) and ``top`` (the centre of the posts' tops)."""
     kind = "structure"
     height: float = 0.80
-    footprint: tuple = (0.24, 0.28)
+    footprint: tuple = (0.20, 0.24)
     profile: float = 0.03
-    plate: float = 0.006
+    rung_spacing: float = 0.19
+    camera_bar: float = 0.44
     material: tuple = ALUMINIUM
 
     def link_frames(self, state) -> dict:
         return {"mast": np.eye(4), "top": Transform((0.0, 0.0, self.height)).matrix()}
 
     def visuals(self) -> dict:
-        (lx, ly), h, p = self.footprint, self.height, self.profile
+        (lx, ly), h, p, m = self.footprint, self.height, self.profile, self.material
         x, y = lx / 2.0 - p / 2.0, ly / 2.0 - p / 2.0
-        bars = [Visual("box", (p, p, h - self.plate), Transform((sx * x, sy * y, (h - self.plate) / 2.0)), self.material)
-                for sx in (-1, 1) for sy in (-1, 1)]
-        for z in (p / 2.0, h / 2.0, h - self.plate - p / 2.0):
-            bars += [Visual("box", (lx - 2 * p, p, p), Transform((0.0, sy * y, z)), self.material) for sy in (-1, 1)]
-            bars += [Visual("box", (p, ly - 2 * p, p), Transform((sx * x, 0.0, z)), self.material) for sx in (-1, 1)]
-        bars.append(Visual("box", (lx + 0.04, ly + 0.04, self.plate), Transform((0.0, 0.0, h - self.plate / 2.0)), self.material))
+        along_x, along_y = (0.0, 90.0, 0.0), (90.0, 0.0, 0.0)   # a profile runs along its z: turned to lie along x or y
+        bars = [Visual("profile", (p, h), Transform((sx * x, sy * y, h / 2.0)), m) for sx in (-1, 1) for sy in (-1, 1)]
+        rungs = max(2, round((h - p) / self.rung_spacing) + 1)
+        for z in np.linspace(p / 2.0, h - p / 2.0, rungs):       # the ladder: across the front and the back
+            bars += [Visual("profile", (p, ly - 2 * p), Transform((sx * x, 0.0, float(z)), along_y), m) for sx in (-1, 1)]
+        for z in (p / 2.0, h / 2.0, h - p / 2.0):                # the sides
+            bars += [Visual("profile", (p, lx - 2 * p), Transform((0.0, sy * y, z), along_x), m) for sy in (-1, 1)]
+        bars.append(Visual("profile", (p, self.camera_bar), Transform((x + p, 0.0, h - p / 2.0), along_y), m))
         return {"mast": bars}
 
 

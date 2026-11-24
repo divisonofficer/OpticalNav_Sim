@@ -8,6 +8,7 @@ no recording, the image equal to a scene loaded with the links there).
 
     descriptor = {"links": {"chassis": [{"shape": "box", "size": [x, y, z], "origin": 4x4, "material": [kind, rgb, roughness]},
                                         {"shape": "cylinder", "size": [radius, length], ...},   # axis: the link's y
+                                        {"shape": "profile", "size": [side, length], ...},      # T-slot extrusion along z
                                         {"shape": "mesh", "mesh": "/abs/part.ply", ...}], ...}}
 
 No Mitsuba here: the scene text and the PLY files only.
@@ -25,7 +26,7 @@ import numpy as np
 BODY_PREFIX = "body_"
 GROUP_PREFIX = "bodygrp_"
 CACHE = Path.home() / ".cache" / "opticalnav_sim" / "bodies"
-MATERIALS = ("plastic", "metal", "rubber")
+MATERIALS = ("plastic", "metal", "rubber", "aluminium")
 
 
 def safe(name: str) -> str:
@@ -63,6 +64,33 @@ def cylinder(radius: float, length: float, segments: int = 48) -> tuple[np.ndarr
     return v, np.array(faces, np.int32)
 
 
+def profile(side: float, length: float, slot: float = 0.008, lip: float = 0.002, web: float = 0.003) -> tuple[np.ndarray, np.ndarray]:
+    """A T-slot aluminium extrusion of square section ``side``, ``length`` long along z, centred: a core, a web from it
+    to each corner, and at each corner two lips that leave a ``slot`` wide groove in the middle of every face, wider
+    behind the lips (the T). Built of boxes that overlap inside: from outside, the section's outline and the grooves
+    running along the faces."""
+    h = side / 2.0
+    core = max(side / 3.0, slot + 2.0 * web)
+    span = h - slot / 2.0                         # a lip runs from the groove's edge to the corner
+    parts = [(np.eye(3), (0.0, 0.0), (core, core))]
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            a = math.atan2(sy, sx)                # the web: from the core to the corner
+            rot = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
+            reach = math.hypot(h - lip, h - lip)
+            parts.append((rot, (sx * (h - lip) / 2.0, sy * (h - lip) / 2.0), (reach, web)))
+            parts.append((np.eye(3), (sx * (h - span / 2.0), sy * (h - lip / 2.0)), (span, lip)))   # along the y faces
+            parts.append((np.eye(3), (sx * (h - lip / 2.0), sy * (h - span / 2.0)), (lip, span)))   # along the x faces
+            parts.append((np.eye(3), (sx * (h - 1.5 * lip), sy * (h - 1.5 * lip)), (3.0 * lip, 3.0 * lip)))  # the corner
+    vs, fs, n = [], [], 0
+    for rot, (cx, cy), (dx, dy) in parts:
+        v, f = box((dx, dy, length))
+        vs.append(v @ rot.T.astype(np.float32) + np.array([cx, cy, 0.0], np.float32))
+        fs.append(f + n)
+        n += len(v)
+    return np.concatenate(vs), np.concatenate(fs)
+
+
 def write_ply(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
     head = (f"ply\nformat binary_little_endian 1.0\nelement vertex {len(vertices)}\nproperty float x\nproperty float y\n"
             f"property float z\nelement face {len(faces)}\nproperty list uchar int vertex_indices\nend_header\n")
@@ -78,6 +106,15 @@ def bsdf_xml(material, indent: str = "      ") -> str:
     if kind not in MATERIALS:
         raise ValueError(f"material kind {kind!r}: one of {MATERIALS}")
     alpha = max(rough * rough, 1e-3)
+    if kind == "aluminium":
+        # anodized aluminium (extrusions, machined parts): the metal (Mitsuba's measured "Al") under a clear, slightly
+        # scattering oxide layer: satin and light, not a mirror. As the converter's part-metal materials: a blend.
+        return (f'{indent}<bsdf type="blendbsdf">\n{indent}  <float name="weight" value="0.55" />\n'
+                f'{indent}  <bsdf type="pplastic">\n{indent}    <float name="int_ior" value="1.5000" />\n'
+                f'{indent}    <rgb name="diffuse_reflectance" value="{rgb[0]:.5f} {rgb[1]:.5f} {rgb[2]:.5f}" />\n'
+                f'{indent}    <float name="alpha" value="{alpha:.5f}" />\n{indent}  </bsdf>\n'
+                f'{indent}  <bsdf type="roughconductor">\n{indent}    <string name="material" value="Al" />\n'
+                f'{indent}    <float name="alpha" value="{alpha:.5f}" />\n{indent}  </bsdf>\n{indent}</bsdf>\n')
     if kind == "metal":
         r = [min(c, 0.995) for c in rgb]
         eta, k = [(1 - c) / (1 + c) for c in r], [2 * math.sqrt(c) / math.sqrt(1 - c) for c in r]
@@ -113,8 +150,10 @@ def build_model(name: str, descriptor: dict, cache: Path | None = None) -> dict:
                 v, f = box(vis["size"])
             elif vis["shape"] == "cylinder":
                 v, f = cylinder(*vis["size"])
+            elif vis["shape"] == "profile":  # [side, length]: a T-slot extrusion along the origin's z
+                v, f = profile(*vis["size"])
             else:
-                raise ValueError(f"{name}.{link}: shape {vis['shape']!r} (box, cylinder or mesh)")
+                raise ValueError(f"{name}.{link}: shape {vis['shape']!r} (box, cylinder, profile or mesh)")
             v = (np.c_[v, np.ones(len(v))] @ origin.T)[:, :3]
             file = folder / f"{safe(link)}_{i}.ply"
             if not file.is_file():

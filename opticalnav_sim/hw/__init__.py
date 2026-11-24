@@ -8,11 +8,11 @@
 
 See docs/hardware_platform_plan.md.
 """
-from . import calibration, cameras, optics, rigs, robots
+from . import calibration, cameras, isp, optics, rigs, robots, sensor
 from .actor import Actor, Spec, World
 from .robots import RangerControl, Twist
 from .sim import Frame, SimWorld
 from .transform import Transform, camera_to_world, pose2d, to_mitsuba
 
 __all__ = ["Actor", "Frame", "RangerControl", "SimWorld", "Spec", "Transform", "Twist", "World", "camera_to_world", "calibration", "cameras",
-           "optics", "pose2d", "rigs", "robots", "to_mitsuba"]
+           "isp", "optics", "pose2d", "rigs", "robots", "sensor", "to_mitsuba"]

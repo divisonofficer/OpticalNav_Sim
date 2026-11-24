@@ -7,8 +7,11 @@ speed and steering limits and the drawn shapes are estimates until the vendor's 
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -87,6 +90,15 @@ class RangerMini2(Spec):
     max_steer_deg: float = 90.0         # a steering module's range to either side
     max_steer_rate_deg: float = 180.0   # estimate
     steer_tolerance_deg: float = 15.0   # wheels further than this from their angle are turned before the base drives
+    model_dir: str | None = None        # a converted model (tools/robot_from_usd.py): its meshes are drawn
+
+    @classmethod
+    def from_model(cls, model_dir, **kw) -> "RangerMini2":
+        """The robot as a converted model has it: its meshes, and the wheelbase, track, wheel size and height measured
+        on them."""
+        m = json.loads((Path(model_dir) / "model.json").read_text())
+        return cls(wheelbase=m["wheelbase"], track=m["track"], wheel_radius=m["wheel_radius"], wheel_width=m["wheel_width"],
+                   size=tuple(m["size"]), clearance=m["clearance"], model_dir=str(Path(model_dir).resolve()), **kw)
 
     def wheel_xy(self) -> np.ndarray:
         a, b = self.wheelbase / 2.0, self.track / 2.0
@@ -177,7 +189,15 @@ class RangerMini2(Spec):
         return out
 
     def visuals(self) -> dict:
-        """Link name -> the primitives drawn for it (placeholders with the robot's outer dimensions)."""
+        """Link name -> what is drawn for it: the converted model's meshes, or placeholders with the robot's outer
+        dimensions."""
+        if self.model_dir:
+            links = json.loads((Path(self.model_dir) / "model.json").read_text())["links"]
+            # the model's chassis frame is this spec's base_link (on the floor); its wheel frames are the wheels' centres
+            return {("base_link" if link == "chassis" else link):
+                    [Visual("mesh", (), Transform(), (v["material"][0], tuple(v["material"][1]), v["material"][2]),
+                            str(Path(self.model_dir) / v["mesh"])) for v in visuals]
+                    for link, visuals in links.items()}
         L, W, H = self.size
         body_h = H - self.clearance - 0.03
         dark, grey, tyre = ("plastic", (0.05, 0.05, 0.06), 0.35), ("metal", (0.75, 0.76, 0.78), 0.3), ("rubber", (0.03, 0.03, 0.03), 0.6)
@@ -189,3 +209,13 @@ class RangerMini2(Spec):
             out[f"wheel_{name}"] = [Visual("cylinder", (self.wheel_radius, self.wheel_width), Transform(), tyre),
                                     Visual("box", (0.02, self.wheel_width + 0.004, self.wheel_radius), Transform(), grey)]
         return out
+
+
+MODELS = Path(os.environ.get("OPTICALNAV_HARDWARE", Path(__file__).resolve().parents[2] / "packs" / "hardware"))
+
+
+def ranger_mini(**kw) -> RangerMini2:
+    """The Ranger Mini with its converted meshes when they are there (``$OPTICALNAV_HARDWARE/ranger_mini_v3``, default
+    ``packs/hardware/ranger_mini_v3``: tools/robot_from_usd.py), else with placeholder shapes."""
+    model = MODELS / "ranger_mini_v3"
+    return RangerMini2.from_model(model, **kw) if (model / "model.json").is_file() else RangerMini2(**kw)

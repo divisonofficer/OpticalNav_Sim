@@ -10,7 +10,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from opticalnav_sim import bodies, frames, hw  # noqa: E402
-from opticalnav_sim.hw import Transform, cameras, optics, rigs, robots  # noqa: E402
+from opticalnav_sim.hw import Transform, cameras, isp, optics, rigs, robots, sensor  # noqa: E402
+from opticalnav_sim.hw.sim import Frame  # noqa: E402
+from opticalnav_sim.hw.transform import optical_pose  # noqa: E402
 from opticalnav_sim.hw.calibration import RigCalibration, load_opencv_yaml  # noqa: E402
 from opticalnav_sim.hw.transform import yaw_from_heading  # noqa: E402
 
@@ -290,5 +292,142 @@ def test_rig_calibration_places_the_cameras(tmp_path):
         rigs.spawn_camera_rig(world, robot, path, cameras=("left", "ref"))  # no model known for "ref": say which
     assert len(world.actors) == 4  # and nothing was spawned by the failed call
     mast = rigs.Mast(height=0.8)
-    boxes = mast.visuals()["mast"]
-    assert len(boxes) == 4 + 3 * 4 + 1 and max(v.origin.xyz[2] + v.size[2] / 2.0 for v in boxes) == pytest.approx(0.8)
+    bars = mast.visuals()["mast"]
+    posts = [v for v in bars if v.origin.rpy_deg == (0.0, 0.0, 0.0)]
+    assert all(v.shape == "profile" for v in bars) and len(posts) == 4 and all(v.size == (0.03, 0.8) for v in posts)
+    assert len(bars) == 4 + 2 * 5 + 2 * 3 + 1  # posts, five rungs front and back, three rails a side, the camera bar
+    # a T-slot section: inside the square, a groove in the middle of each face, material at the corners and the core
+    v, f = bodies.profile(0.03, 0.5)
+    assert np.allclose(np.abs(v[:, :2]).max(0), 0.015) and np.isclose(np.abs(v[:, 2]).max(), 0.25)
+    on_face = v[np.isclose(v[:, 0], 0.015)]
+    assert np.abs(on_face[:, 1]).min() >= 0.004 - 1e-9  # nothing on the face inside the 8 mm slot
+    model = bodies.build_model("mast", {"links": {"mast": [{"shape": "profile", "size": [0.03, 0.8], "material": list(rigs.ALUMINIUM)}]}}, tmp_path)
+    assert 'value="Al"' in model["links"]["mast"] and "blendbsdf" in model["links"]["mast"]
+
+
+def _frame(spec, s0, s1=None, s2=None, pose=None):
+    zero = np.zeros_like(s0)
+    return Frame(0.0, spec.intrinsics(), np.eye(4) if pose is None else pose, None, s0.astype(np.float32),
+                 (zero if s1 is None else s1).astype(np.float32), (zero if s2 is None else s2).astype(np.float32), zero)
+
+
+def test_demosaic_returns_a_smooth_image_and_keeps_flat_colours():
+    h, w = 96, 128
+    y, x = np.mgrid[0:h, 0:w]
+    img = np.stack([0.5 + 0.4 * np.sin(x / 23.0) * np.cos(y / 31.0), 0.5 + 0.4 * np.cos(x / 37.0 + 1.0),
+                    0.4 + 0.3 * np.sin((x + y) / 29.0)], -1)
+    for cfa in ("RGGB", "BGGR", "GRBG", "GBRG"):
+        colour, _ = sensor.mosaic(cfa, h, w)
+        for method in ("malvar", "bilinear"):
+            got = isp.demosaic(img[y, x, colour], cfa, method)
+            assert np.abs(got - img)[4:-4, 4:-4].max() < 0.01, (cfa, method)
+            flat = np.ones((h, w, 3)) * (0.2, 0.5, 0.8)
+            assert np.allclose(isp.demosaic(flat[y, x, colour], cfa, method), flat, atol=1e-12), (cfa, method)
+    colour, angle = sensor.mosaic("polar_RGGB", 8, 8, (90.0, 45.0, 135.0, 0.0))
+    assert colour[:4, :4].tolist() == [[0, 0, 1, 1], [0, 0, 1, 1], [1, 1, 2, 2], [1, 1, 2, 2]]  # colours in 2x2 blocks
+    assert angle[:2, :2].tolist() == [[90.0, 45.0], [135.0, 0.0]] and np.array_equal(angle[:2, :2], angle[2:4, 4:6])
+
+
+def test_sensor_follows_the_emva_linear_model():
+    """Mean and variance of a flat field: variance = K^2 (electrons + read noise^2); saturation at the full well."""
+    spec = cameras.LucidTRI032S()
+    s, k = spec.sensor, spec.intrinsics()
+    gain = 4095.0 / s.full_well_e   # counts per electron
+    dark = sensor.expose(_frame(spec, np.zeros((k.height, k.width, 3))), spec, exposure_s=0.01, vignette=False, seed=1)
+    assert dark.data.mean() / gain < 1.0 and dark.data.max() / gain < 6 * s.read_noise_e  # no light: read noise, cut at 0
+    for radiance, electrons in ((0.1, 1000.0), (0.4, 4000.0)):
+        raw = sensor.expose(_frame(spec, np.full((k.height, k.width, 3), radiance)), spec, exposure_s=0.01, vignette=False, seed=1)
+        green = raw.data[0::2, 1::2].astype(np.float64)
+        assert abs(green.mean() / gain - electrons) < 0.01 * electrons + 0.3
+        assert abs(green.var() - gain ** 2 * (electrons + s.read_noise_e ** 2)) < 0.05 * gain ** 2 * (electrons + 10.0)
+    raw = sensor.expose(_frame(spec, np.full((k.height, k.width, 3), 5.0)), spec, exposure_s=0.01, vignette=False)
+    # the well is full: every pixel at the top, less the readout's noise
+    assert raw.data.dtype == np.uint16 and raw.data.max() == 4095 and raw.data.min() > 4095 - 6 * s.read_noise_e * gain
+    # twice the exposure, or twice the gain: twice the counts; four pixels averaged: half the noise
+    f = _frame(spec, np.full((k.height, k.width, 3), 0.1))
+    a = sensor.expose(f, spec, 0.005, vignette=False, noise=False).data.mean()
+    assert np.isclose(sensor.expose(f, spec, 0.010, vignette=False, noise=False).data.mean(), 2.0 * a, rtol=1e-3)
+    assert np.isclose(sensor.expose(f, spec, 0.005, gain_db=6.0206, vignette=False, noise=False).data.mean(), 2.0 * a, rtol=1e-3)
+    one = sensor.expose(f, spec, 0.01, vignette=False, seed=5).data.std()
+    four = sensor.expose(f, spec, 0.01, vignette=False, seed=5, pixels_per_sample=4.0).data.std()
+    assert 1.8 < one / four < 2.2
+    # the lens dims the corners (cos^4), auto exposure puts the bright end near the top without clipping it away
+    v = sensor.vignetting(k)
+    assert v.max() <= 1.0 and 0.3 < v[0, 0] < 0.5 and np.isclose(v[k.height // 2, k.width // 2], 1.0, atol=1e-3)
+    assert np.allclose(sensor.vignetting(k, 2.0), np.sqrt(v))
+    flat = sensor.expose(_frame(spec, np.full((k.height, k.width, 3), 0.3)), spec, 0.01, noise=False)
+    corrected = isp.linear_rgb(flat, isp.Isp(shading=4.0))
+    assert np.ptp(corrected[8:-8, 8:-8]) < 0.01  # the ISP's shading correction undoes it
+    grad = np.repeat(np.linspace(0.01, 1.0, k.width)[None, :, None], k.height, 0).repeat(3, 2)
+    t = sensor.auto_exposure(_frame(spec, grad), spec)
+    raw = sensor.expose(_frame(spec, grad), spec, t, noise=False)
+    assert 0.4 < np.percentile(raw.linear(), 99.0) < 0.7 and np.mean(raw.data >= 4095) == 0.0
+
+
+def test_hdr_sensor_is_linear_across_its_readouts():
+    """IMX490: one linear 24-bit value from four readouts, with the published noise floor, range and best SNR."""
+    spec = cameras.LucidTDR054S()
+    s, k = spec.sensor, spec.intrinsics()
+    top = s.readouts[-1][1] / s.readouts[-1][0]
+    assert abs(20 * math.log10(top / s.readouts[0][2]) - 123.6) < 0.1 and abs(10 * math.log10(s.readouts[-1][1]) - 50.8) < 0.1
+    snr = {}
+    for electrons in (10.0, 2000.0, 25000.0, 800000.0):
+        radiance = electrons / (sensor.responsivity(spec) * 0.01)
+        raw = sensor.expose(_frame(spec, np.full((k.height, k.width, 3), radiance)), spec, exposure_s=0.01, vignette=False, seed=2)
+        assert raw.data.dtype == np.uint32 and raw.white == 2 ** 24 - 1
+        got = raw.linear()[0::2, 1::2] * top
+        assert abs(got.mean() / electrons - 1.0) < 0.01
+        snr[electrons] = 20 * math.log10(got.mean() / got.std())
+    assert abs(snr[2000.0] - 33.0) < 0.5 and abs(snr[800000.0] - 50.7) < 0.5
+    assert snr[25000.0] < snr[2000.0] + 4.0  # the small photodiode has taken over: fewer electrons, the known dip
+
+
+def test_polarization_sensor_recovers_the_stokes_field_in_its_own_frame():
+    spec = cameras.FlirBFS51S5PC(render_scale=0.25)
+    k = spec.intrinsics()
+    h, w = k.height, k.width
+    y, x = np.mgrid[0:h, 0:w]
+    s0 = np.stack([0.6 + 0.2 * np.sin(x / 60.0), 0.5 + 0.2 * np.cos(y / 50.0), 0.4 + 0.1 * np.sin((x + y) / 70.0)], -1)
+    dolp, aolp = 0.3 + 0.2 * np.sin(x / 90.0)[..., None], np.radians(20.0 + 40.0 * np.cos(y / 80.0))[..., None]
+    s1, s2 = s0 * dolp * np.cos(2 * aolp), s0 * dolp * np.sin(2 * aolp)
+    d = (spec.sensor.extinction_ratio - 1.0) / (spec.sensor.extinction_ratio + 1.0)
+    for roll in (0.0, 25.0):
+        pose = optical_pose(Transform((0.0, 0.0, 1.5), (roll, 0.0, 0.0)).matrix())
+        psi = sensor.sensor_frame_rotation(k, pose)
+        assert abs(math.degrees(psi[h // 2, w // 2]) + roll) < 0.2  # on the axis: the camera's roll, nothing else
+        raw = sensor.expose(_frame(spec, s0, s1, s2, pose), spec, exposure_s=0.004, noise=False, vignette=False)
+        out = isp.polarization(raw)
+        g1, g2 = sensor.to_sensor_frame(s1, s2, psi)
+        want_dolp = (np.sqrt(g1 ** 2 + g2 ** 2) / s0)[::2, ::2] * d
+        want_aolp = (np.degrees(0.5 * np.arctan2(g2, g1)) % 180.0)[::2, ::2]
+        assert out["s0"].shape == (h // 2, w // 2, 3) and sorted(out["i"]) == [0.0, 45.0, 90.0, 135.0]
+        assert np.abs(out["dolp"] - want_dolp)[4:-4, 4:-4].mean() < 0.005
+        assert (np.abs((out["aolp_deg"] - want_aolp + 90.0) % 180.0 - 90.0))[4:-4, 4:-4].mean() < 0.6
+    # unpolarized light: every angle sees half of it
+    raw = sensor.expose(_frame(spec, s0), spec, exposure_s=0.004, noise=False, vignette=False)
+    assert isp.polarization(raw)["dolp"][4:-4, 4:-4].max() < 0.02
+    with pytest.raises(ValueError):
+        isp.polarization(sensor.expose(_frame(cameras.LucidTRI032S(), np.ones((384, 512, 3))), cameras.LucidTRI032S(), 0.001))
+
+
+def test_isp_makes_an_image_and_keeps_saturated_areas_neutral():
+    spec = cameras.LucidTRI032S()
+    k = spec.intrinsics()
+    y, x = np.mgrid[0:k.height, 0:k.width]
+    scene = np.stack([0.30 + 0.0 * x, 0.20 + 0.0 * x, 0.10 + 0.0 * x], -1) * (0.2 + 1.8 * (x / k.width))[..., None]
+    scene[:, k.width * 3 // 4:] = 50.0  # a window: far over the well
+    raw = sensor.expose(_frame(spec, scene), spec, exposure_s=0.01, vignette=False, noise=False)
+    img = isp.process(raw, isp.Isp(white_balance=(0.6, 1.0, 0.8), exposure=1.0))
+    assert img.dtype == np.uint8 and img.shape == (k.height, k.width, 3)
+    window = img[8:-8, -40:-8].reshape(-1, 3).astype(int)
+    assert np.ptp(window, axis=1).max() <= 1  # white balance did not tint the clipped window
+    tinted = isp.process(raw, isp.Isp(white_balance=(0.6, 1.0, 0.8), exposure=1.0, clip_highlights=False))[8:-8, -40:-8]
+    assert np.ptp(tinted.reshape(-1, 3).astype(int), axis=1).min() > 20  # without it: a green window
+    grey = isp.process(raw, isp.Isp(white_balance="gray_world"))[8:-8, 8:k.width // 2].reshape(-1, 3).astype(int)
+    assert np.ptp(grey, axis=1).mean() < 6  # gray world: the one-coloured wall comes out neutral
+    hdr = cameras.LucidTDR054S()
+    kh = hdr.intrinsics()
+    big = np.ones((kh.height, kh.width, 3)) * np.logspace(-3, 2, kh.width)[None, :, None]
+    out = isp.process(sensor.expose(_frame(hdr, big), hdr, vignette=False), isp.Isp(tone="reinhard"))
+    cols = out[kh.height // 2, ::kh.width // 12, 1].astype(int)
+    assert np.all(np.diff(cols) >= 0) and cols[-1] - cols[0] > 150  # five decades in one image, in order
