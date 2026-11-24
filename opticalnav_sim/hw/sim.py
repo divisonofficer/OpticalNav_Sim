@@ -79,11 +79,13 @@ class SimWorld(World):
             raise ValueError(f"nothing under ({x:.2f}, {y:.2f}, {from_z:.2f}) in {self.scene}")
         return float(from_z) - hit
 
-    def load_ground(self, floor_z: float | None = None, top: float = 1.4, cell: float = 0.05, rebuild: bool = False):
+    def load_ground(self, floor_z: float | None = None, top: float = 1.4, cell: float = 0.05, rebuild: bool = False,
+                    around: float = 20.0):
         """The scene's ground map as this world's ground (heights, obstacles, each surface's friction from the scene's
         own materials: opticalnav_sim.groundmap). Read from ``<scene>/map/ground.npz`` when it fits, else built from the
         scene's files (seconds; needs them on this machine) and saved there. ``floor_z``: the floor to stand on
-        (default: the one under the first start pose). Robots then follow the floor, stop at obstacles, and, with
+        (default: the one under the first start pose); ``around``: metres mapped around the scene's start poses.
+        Robots then follow the floor, stop at obstacles, and, with
         ``dynamics``, grip as the surface under each wheel allows."""
         from pathlib import Path
 
@@ -101,14 +103,18 @@ class SimWorld(World):
         gm = None
         if saved.is_file() and not rebuild:
             gm = groundmap.GroundMap.load(saved)
-            if abs(gm.floor_z - floor_z) > 0.02 or gm.cell != cell or gm.top < top:
+            if abs(gm.floor_z - floor_z) > 0.02 or gm.cell != cell or gm.top < top or gm.meta.get("around") != around:
                 gm = None
         if gm is None:
-            bounds = (self.meta.get("map") or {}).get("bounds")
-            if bounds is None and self.meta.get("spawn"):
+            bounds = None   # around the start poses (a scene's own map can span a campus), within the scene's map
+            if self.meta.get("spawn"):
                 p = np.array([s["position"][:2] for s in self.meta["spawn"]])
-                bounds = (p[:, 0].min() - 25, p[:, 1].min() - 25, p[:, 0].max() + 25, p[:, 1].max() + 25)
+                bounds = [p[:, 0].min() - around, p[:, 1].min() - around, p[:, 0].max() + around, p[:, 1].max() + around]
+                whole = (self.meta.get("map") or {}).get("bounds")
+                if whole:
+                    bounds = [max(bounds[0], whole[0]), max(bounds[1], whole[1]), min(bounds[2], whole[2]), min(bounds[3], whole[3])]
             gm = groundmap.build(folder, floor_z, top, cell, bounds)
+            gm.meta["around"] = around
             (folder / "map").mkdir(exist_ok=True)
             gm.save(saved)
         self.ground = gm.ground(self.ground.step)

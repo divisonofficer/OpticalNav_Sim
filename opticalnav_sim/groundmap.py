@@ -194,36 +194,91 @@ class GroundMap:
                    tuple(info["origin"]), info["cell"], info["floor_z"], info["top"], info.get("meta", {}))
 
 
+def _vertex_extent(scene_dir: Path, surfaces: list, lo: float, hi: float, cache: dict):
+    """(x0, y0, x1, y1) of the vertices within the height band, in the world: the default bounds."""
+    x0 = y0 = math.inf
+    x1 = y1 = -math.inf
+    for s in surfaces:
+        mesh = _mesh(scene_dir / s["file"], cache)
+        if mesh is None:
+            continue
+        v = mesh[0]
+        v = v[(v[:, 1] >= lo) & (v[:, 1] <= hi)]
+        if len(v):
+            x0, x1 = min(x0, float(v[:, 0].min())), max(x1, float(v[:, 0].max()))
+            y0, y1 = min(y0, float(-v[:, 2].max())), max(y1, float(-v[:, 2].min()))
+    if not math.isfinite(x0):
+        raise ValueError(f"{scene_dir}: nothing between {lo:.2f} and {hi:.2f} m")
+    return x0, y0, x1, y1
+
+
+def _mesh(file: Path, cache: dict):
+    if file not in cache:
+        try:
+            cache[file] = read_ply(file)
+        except (OSError, ValueError):
+            cache[file] = None
+    return cache[file]
+
+
+POINTS_AT_ONCE = 2_000_000   # samples held at a time: a scene of any size is binned in pieces of this many
+
+
 def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bounds=None, xml: str = "base.xml",
           below: float = 0.5, progress=None) -> GroundMap:
     """Sample the scene's meshes into a ground map around the floor at ``floor_z``.
 
     ``top``: the robot's height with what it carries: anything between the floor and it is in the way. ``bounds``:
     (x0, y0, x1, y1) in the world; default: the extent of what stands within the height band. A surface counts as
-    one to stand on when it faces up (within 45 degrees) and lies within ``below`` under and above the floor."""
+    one to stand on when it faces up (within 45 degrees) and lies within ``below`` under and above the floor.
+    Memory is the grids' (25 bytes a cell) plus ``POINTS_AT_ONCE`` samples, whatever the scene's size."""
     scene_dir = Path(scene_dir)
     surfaces = [s for s in scene_surfaces(scene_dir, xml) if not s["emitter"]]
     names = sorted({s["material"] for s in surfaces})
     index = {n: i for i, n in enumerate(names)}
     lo, hi = float(floor_z) - below, float(floor_z) + float(top)
     spacing = cell * 0.5
-    points, cache = [], {}
+    cache: dict = {}
+    if bounds is None:
+        bounds = _vertex_extent(scene_dir, surfaces, lo, hi, cache)
+    x0, y0, x1, y1 = (float(v) for v in bounds)
+    cols, rows = int(math.ceil((x1 - x0) / cell)) + 1, int(math.ceil((y1 - y0) / cell)) + 1
+    if cols * rows > 40_000_000:
+        raise ValueError(f"a {cols} x {rows} map: give bounds or a larger cell")
+    heights = np.full(rows * cols, -np.inf)
+    stand_z = np.full(rows * cols, -np.inf)
+    material = np.full(rows * cols, -1, np.int16)
+    samples = 0
+
+    def bin_points(pts: np.ndarray, stand: np.ndarray, mat: int) -> int:
+        """Samples (Mitsuba axes) into the grids: the highest of all, the highest to stand on and its material."""
+        inside = (pts[:, 1] >= lo) & (pts[:, 1] <= hi)
+        pts, stand = pts[inside], stand[inside]
+        j = np.rint((pts[:, 0] - x0) / cell).astype(np.int64)
+        i = np.rint((-pts[:, 2] - y0) / cell).astype(np.int64)
+        ok = (j >= 0) & (j < cols) & (i >= 0) & (i < rows)
+        flat, z = (i * cols + j)[ok], pts[ok, 1]
+        if not len(flat):
+            return 0
+        np.maximum.at(heights, flat, z)
+        walk = stand[ok] & (z <= floor_z + below)
+        if walk.any():
+            wf, wz = flat[walk], z[walk]
+            np.maximum.at(stand_z, wf, wz)
+            best = wz >= stand_z[wf] - 1e-9   # a later, higher surface takes the cell over
+            material[wf[best]] = mat
+        return int(len(flat))
+
     for n, s in enumerate(surfaces):
         if progress is not None and n % 200 == 0:
             progress(n / max(len(surfaces), 1))
-        file = scene_dir / s["file"]
-        if file not in cache:
-            try:
-                cache[file] = read_ply(file)
-            except (OSError, ValueError):
-                cache[file] = None
-        mesh = cache[file]
+        mesh = _mesh(scene_dir / s["file"], cache)
         if mesh is None or not len(mesh[1]):
             continue
         v, f = mesh
         tri = v[f]                                            # M x 3 x 3, Mitsuba axes
-        ys = tri[..., 1]
-        keep = (ys.max(1) >= lo) & (ys.min(1) <= hi)
+        ys, xs, zs = tri[..., 1], tri[..., 0], -tri[..., 2]
+        keep = (ys.max(1) >= lo) & (ys.min(1) <= hi) & (xs.max(1) >= x0) & (xs.min(1) <= x1) & (zs.max(1) >= y0) & (zs.min(1) <= y1)
         if not keep.any():
             continue
         tri = tri[keep]
@@ -234,43 +289,26 @@ def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bound
         # unseen cell blocks): n steps along each edge, n from the longest edge
         edge = np.maximum.reduce([np.linalg.norm(tri[:, a] - tri[:, b], axis=1) for a, b in ((0, 1), (1, 2), (2, 0))])
         steps = np.clip(np.ceil(edge / spacing).astype(np.int64), 1, 4000)
-        chunks, stands = [], []
+        mat = index[s["material"]]
         for n_steps in np.unique(steps):
-            group = tri[steps == n_steps]
+            group, group_up = tri[steps == n_steps], up[steps == n_steps]
             a, b = np.meshgrid(np.arange(n_steps + 1), np.arange(n_steps + 1), indexing="ij")
             keep_ab = (a + b) <= n_steps
             wa, wb = a[keep_ab] / n_steps, b[keep_ab] / n_steps
             bary = np.stack([1.0 - wa - wb, wa, wb], 1)                           # K x 3
-            chunks.append(np.einsum("kc,mcd->mkd", bary, group).reshape(-1, 3))
-            stands.append(np.repeat(up[steps == n_steps], len(bary)))
-        pts, stand = np.concatenate(chunks), np.concatenate(stands)
-        inside = (pts[:, 1] >= lo) & (pts[:, 1] <= hi)
-        pts, stand = pts[inside], stand[inside]
-        if len(pts):
-            walk = stand & (pts[:, 1] <= floor_z + below)
-            points.append((pts[:, 0], -pts[:, 2], pts[:, 1], walk, np.full(len(pts), index[s["material"]], np.int64)))
-    if not points:
-        raise ValueError(f"{scene_dir}: nothing between {lo:.2f} and {hi:.2f} m")
-    x, y, z, walk, mat = (np.concatenate([p[i] for p in points]) for i in range(5))
-    if bounds is None:
-        bounds = (float(x.min()), float(y.min()), float(x.max()), float(y.max()))
-    x0, y0, x1, y1 = bounds
-    cols, rows = int(math.ceil((x1 - x0) / cell)) + 1, int(math.ceil((y1 - y0) / cell)) + 1
-    if cols * rows > 40_000_000:
-        raise ValueError(f"a {cols} x {rows} map: give bounds or a larger cell")
-    j, i = np.rint((x - x0) / cell).astype(np.int64), np.rint((y - y0) / cell).astype(np.int64)
-    ok = (j >= 0) & (j < cols) & (i >= 0) & (i < rows)
-    flat = (i * cols + j)[ok]
-    z, walk, mat = z[ok], walk[ok], mat[ok]
-    heights = np.full(rows * cols, -np.inf)
-    np.maximum.at(heights, flat, z)
+            # pieces of at most POINTS_AT_ONCE: triangles at a time, and for one huge triangle its lattice at a time
+            per = max(1, POINTS_AT_ONCE // len(bary))
+            for m0 in range(0, len(group), per):
+                part, part_up = group[m0:m0 + per], group_up[m0:m0 + per]
+                for k0 in range(0, len(bary), POINTS_AT_ONCE):
+                    w = bary[k0:k0 + POINTS_AT_ONCE]
+                    pts = np.einsum("kc,mcd->mkd", w, part).reshape(-1, 3)
+                    samples += bin_points(pts, np.repeat(part_up, len(w)), mat)
+        if len(cache) > 64:       # the meshes are read once each (instances aside): do not keep them all
+            cache.clear()
+    if not samples:
+        raise ValueError(f"{scene_dir}: nothing between {lo:.2f} and {hi:.2f} m within the bounds")
     heights[np.isinf(heights)] = np.nan
-    # the surface to stand on in each cell: its highest walkable sample, and that sample's material
-    stand_z = np.full(rows * cols, -np.inf)
-    np.maximum.at(stand_z, flat[walk], z[walk])
-    material = np.full(rows * cols, -1, np.int64)
-    best = walk & (z >= stand_z[flat] - 1e-9)
-    material[flat[best]] = mat[best]
     friction = {}
     for name in names:
         group = [s for s in surfaces if s["material"] == name]
@@ -279,5 +317,5 @@ def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bound
         m = float(np.mean([s["metallic"] for s in group]))
         mu, why = material_friction(name, r, m)
         friction[name] = {"mu": mu, "why": why, "roughness": None if r is None else round(r, 3), "metallic": round(m, 3)}
-    return GroundMap(heights.reshape(rows, cols), material.reshape(rows, cols), names, friction, (x0, y0), float(cell),
-                     float(floor_z), float(top), {"scene": scene_dir.name, "xml": xml, "samples": int(len(z)), "shapes": len(surfaces)})
+    return GroundMap(heights.reshape(rows, cols), material.reshape(rows, cols).astype(np.int64), names, friction, (x0, y0), float(cell),
+                     float(floor_z), float(top), {"scene": scene_dir.name, "xml": xml, "samples": int(samples), "shapes": len(surfaces)})
