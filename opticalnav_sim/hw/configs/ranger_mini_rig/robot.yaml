@@ -1,0 +1,64 @@
+# AgileX Ranger Mini 2.0 with the camera rig of docs/hardware_platform_plan.md: the structure file.
+# Everything the simulator builds for this robot is listed here; nothing of it is in the source code.
+# A copy of this folder under packs/hardware/ (or a folder in $OPTICALNAV_ROBOTS) with another name is another robot.
+name: ranger_mini_rig
+label: Ranger Mini 2.0 · 카메라 리그
+description: AgileX Ranger Mini 2.0 (4륜 조향), 전면 조명 2개, 80 cm 알루미늄 마스트, LUCID HDR + 12-bit 카메라
+
+base:
+  type: four_wheel_steering          # Ackermann / oblique / lateral / spin (hw.robots)
+  model: ranger_mini_v3              # meshes converted from the maker's USD (tools/robot_from_usd.py), in packs/hardware;
+                                     # without them the robot is drawn as boxes and cylinders of the same size
+  params:                            # the maker's manual (V2.0.1, 2023.08) unless marked
+    kerb_mass: 64.5
+    payload: 12.0                    # estimate: the mast with its cameras
+    max_speed: 1.5
+    max_spin: 3.259
+    max_ackermann_deg: 40.0
+    dynamics: true                   # wheel slip by the friction of the surface under each wheel
+
+parts:
+  # The two lamps in the front face (their lenses are in the maker's model: 123 x 45 mm at y = +-0.123, z = 0.280).
+  # Colour and brightness are set over CAN on the real robot; the radiance here is an estimate, in the scene's units.
+  - name: headlight_left
+    type: light
+    label: 전면 조명 (왼쪽)
+    link: base_link
+    mount: {xyz: [0.3605, 0.123, 0.280]}
+    params: {size: [0.12, 0.04], color: [1.0, 1.0, 1.0], radiance: 150.0}
+  - name: headlight_right
+    type: light
+    label: 전면 조명 (오른쪽)
+    link: base_link
+    mount: {xyz: [0.3605, -0.123, 0.280]}
+    params: {size: [0.12, 0.04], color: [1.0, 1.0, 1.0], radiance: 150.0}
+
+  # The frame of T-slot aluminium extrusions on the deck (its dimensions are estimates from a photograph).
+  - name: mast
+    type: mast
+    link: top_plate
+    params: {height: 0.80, footprint: [0.20, 0.24], profile: 0.03}
+
+  # The cameras on the mast's top. "mount" is where each stands without a measured calibration (side by side, datasheet
+  # lens); with one (calibration.file below, or the viewer's --rig-calibration), "calibrated" names its entry there:
+  # the intrinsics and the cameras' poses relative to one another are then the measured ones.
+  - name: hdr
+    type: camera
+    model: lucid_tdr054s             # Sony IMX490, 24-bit HDR; Fujinon HF6XA-5M
+    label: HDR 카메라
+    parent: mast
+    link: top
+    mount: {xyz: [0.10, 0.04, 0.05]}
+    calibrated: {camera: left, size: [1440, 928]}
+  - name: 12bit
+    type: camera
+    model: lucid_tri032s             # Sony IMX265, 12-bit; Fujinon HF6XA-5M
+    label: 12-bit 카메라
+    parent: mast
+    link: top
+    mount: {xyz: [0.10, -0.06, 0.05]}
+    calibrated: {camera: 12_left, size: [1024, 768]}
+
+calibration:
+  file: $OPTICALNAV_RIG_CALIBRATION  # an OpenCV multi-camera YAML; unset or missing: the mounts above
+  reference: {parent: mast, link: top, mount: {xyz: [0.03, 0.0, 0.14]}}   # the calibration's reference camera on the mast: an estimate

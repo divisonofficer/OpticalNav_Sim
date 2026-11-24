@@ -772,3 +772,157 @@ def test_blocked_robot_can_turn_or_slide_free():
     for _ in range(60):
         world.tick()
     assert not r.state.collided and r.pose.xyz[0] < stuck - 0.2
+
+
+# --- robots from configuration files (hw/config.py), URDFs, lights ---------------------------------------------------
+URDF = """<?xml version="1.0"?>
+<robot name="cart">
+  <material name="blue"><color rgba="0.1 0.2 0.8 1"/></material>
+  <link name="base_link"><visual><origin xyz="0 0 0.05"/><geometry><box size="0.6 0.3 0.1"/></geometry><material name="blue"/></visual></link>
+  {wheels}
+</robot>
+"""
+WHEEL = """
+  <link name="{n}_steer_link"><visual><geometry><box size="0.04 0.04 0.08"/></geometry></visual></link>
+  <joint name="{n}_steer" type="revolute"><parent link="base_link"/><child link="{n}_steer_link"/>
+    <origin xyz="{x} {y} 0"/><axis xyz="0 0 1"/><limit lower="-1.6" upper="1.6" effort="5" velocity="6"/></joint>
+  <link name="{n}_wheel_link"><visual><geometry><cylinder radius="0.08" length="0.05"/></geometry>
+    <material name="tyre"><color rgba="0.02 0.02 0.02 1"/></material></visual>
+    <visual><origin xyz="0 0.03 0"/><geometry><mesh filename="hub.stl" scale="0.001 0.001 0.001"/></geometry></visual></link>
+  <joint name="{n}_wheel" type="continuous"><parent link="{n}_steer_link"/><child link="{n}_wheel_link"/>
+    <origin xyz="0 0 -0.06"/><axis xyz="0 1 0"/></joint>
+"""
+
+
+def _cart(tmp_path):
+    """A robot folder as a user would write one: a URDF with an STL mesh, and its structure file."""
+    import struct
+    folder = tmp_path / "cart"
+    folder.mkdir()
+    tri = np.array([[0, 0, 0], [20, 0, 0], [0, 0, 20]], np.float32)            # one triangle, in millimetres
+    (folder / "hub.stl").write_bytes(b"\0" * 80 + struct.pack("<I", 1) + struct.pack("<12fH", 0, 1, 0, *tri.ravel(), 0))
+    places = {"fl": (0.25, 0.2), "fr": (0.25, -0.2), "rl": (-0.25, 0.2), "rr": (-0.25, -0.2)}
+    (folder / "cart.urdf").write_text(URDF.format(wheels="".join(WHEEL.format(n=n, x=x, y=y) for n, (x, y) in places.items())))
+    (folder / "robot.yaml").write_text("""
+name: cart
+label: A cart
+base:
+  type: four_wheel_steering
+  urdf: cart.urdf
+  joints: {steering: [fl_steer, fr_steer, rl_steer, rr_steer], wheels: [fl_wheel, fr_wheel, rl_wheel, rr_wheel]}
+  geometry: {wheel_radius: 0.08}
+  params: {kerb_mass: 20.0, max_speed: 1.0}
+parts:
+  - {name: lamp, type: light, link: base_link, mount: {xyz: [0.31, 0.0, 0.15]}, params: {size: [0.1, 0.03], color: [1.0, 0.5, 0.0], radiance: 10.0}}
+  - {name: mast, type: mast, link: top_plate, params: {height: 0.5}}
+  - {name: front, type: camera, model: lucid_tri032s, parent: mast, link: top, label: Front camera,
+     mount: {xyz: [0.1, 0.0, 0.05], rpy_deg: [0, 10, 0]}, params: {render_scale: 0.5}}
+  - {name: polar, type: camera, model: flir_bfs_51s5pc, parent: mast, link: top, mount: {xyz: [0.1, 0.1, 0.05]}}
+""")
+    return folder
+
+
+def test_urdf_links_joints_and_meshes(tmp_path):
+    from opticalnav_sim.hw import urdf
+    folder = _cart(tmp_path)
+    model = urdf.load(folder / "cart.urdf", cache=tmp_path / "cache")
+    assert model.root == "base_link" and len(model.joints) == 8 and model.joint("fl_steer").limit == (-1.6, 1.6)
+    frames = model.frames()
+    assert np.allclose(frames["fl_wheel_link"][:3, 3], [0.25, 0.2, -0.06])
+    turned = model.frames({"fl_steer": math.pi / 2})["fl_wheel_link"]
+    assert np.allclose(turned[:3, 0], [0.0, 1.0, 0.0]) and np.allclose(turned[:3, 3], [0.25, 0.2, -0.06])   # about z, in place
+    box, = model.visuals["base_link"]
+    assert box.shape == "box" and box.size == (0.6, 0.3, 0.1) and box.material[1] == (0.1, 0.2, 0.8)
+    tyre, hub = model.visuals["fl_wheel_link"]
+    assert tyre.shape == "cylinder" and tyre.material[1] == (0.02, 0.02, 0.02)
+    assert hub.shape == "mesh" and hub.mesh.endswith(".ply") and hub.scale == (0.001, 0.001, 0.001)   # the STL, converted once
+    v, f = groundmap.read_ply(hub.mesh)[:2]
+    assert len(f) == 1 and np.allclose(np.asarray(v)[:, :3].max(0), [20.0, 0.0, 20.0])
+    with pytest.raises(KeyError):
+        model.joint("no_such_joint")
+
+
+def test_robot_from_a_structure_file(tmp_path, monkeypatch):
+    """A folder with a URDF and a robot.yaml is a robot: listed, spawned with its parts on their links, driven."""
+    from opticalnav_sim.hw import config
+    folder = _cart(tmp_path)
+    monkeypatch.setenv("OPTICALNAV_ROBOTS", str(tmp_path))
+    names = [r["name"] for r in config.available()]
+    assert "cart" in names and "ranger_mini_rig" in names              # the one beside it, and the one shipped
+    cfg = config.load("cart")
+    assert cfg.label == "A cart" and [s["name"] for s in cfg.sensors()] == ["front", "polar"]
+    assert cfg.sensors()[0] == {"name": "front", "label": "Front camera", "type": "camera", "model": "LUCID TRI032S"}
+    world = hw.World()
+    robot = config.spawn(world, cfg, at=hw.pose2d(1.0, 2.0, 0.0, 90.0))
+    spec = robot.base.spec
+    assert abs(spec.wheelbase - 0.5) < 1e-9 and abs(spec.track - 0.4) < 1e-9 and spec.wheel_radius == 0.08   # measured on the URDF
+    assert spec.kerb_mass == 20.0 and spec.max_speed == 1.0
+    drawn = spec.visuals()
+    assert set(drawn) == {"base_link"} | {f"{k}_{w}" for k in ("steer", "wheel") for w in ("fl", "fr", "rl", "rr")}
+    # the body's box: 0.05 above the URDF's root, whose origin is 0.06 above the wheels' centres, themselves 0.08 up
+    assert np.allclose(drawn["base_link"][0].origin.xyz, [0.0, 0.0, 0.08 + 0.06 + 0.05])
+    assert np.allclose(drawn["wheel_fl"][0].origin.xyz, [0.0, 0.0, 0.0])                                    # a wheel about its own centre
+    assert set(robot.parts) == {"lamp", "mast", "front", "polar"} and set(robot.sensors) == {"front", "polar"} and set(robot.lights) == {"lamp"}
+    assert robot.sensors["front"].parent is robot.parts["mast"] and robot.sensors["front"].spec.render_scale == 0.5
+    assert robot.sensors["polar"].spec.sensor.cfa.startswith("polar_")
+    # facing +y: the lamp 0.31 m ahead of the base, the camera on top of the 0.5 m mast on the deck
+    assert np.allclose(robot.lights["lamp"].world_matrix()[:3, 3], [1.0, 2.31, 0.15])
+    deck = spec.size[2]
+    assert np.allclose(robot.sensors["front"].world_matrix()[:3, 3], [1.0, 2.1, deck + 0.5 + 0.05])
+    spec.apply(robot.base.state, hw.RangerControl("ackermann", 0.5, 0.0))
+    for _ in range(40):
+        world.tick()
+    assert robot.base.pose.xyz[1] > 2.5 and robot.sensors["front"].world_matrix()[1, 3] > 2.6                # what is on it went with it
+    # a wrong entry names itself and leaves the world as it was
+    for bad, word in ((("parts", 0, "params"), {"brightness": 3}), (("parts", 2, "model"), "no_such_camera")):
+        import copy
+        data = copy.deepcopy(cfg.data)
+        data[bad[0]][bad[1]][bad[2]] = word
+        other = hw.World()
+        with pytest.raises(ValueError):
+            config.spawn(other, config.RobotConfig("cart", data, cfg.path))
+        assert other.actors == []
+    with pytest.raises(ValueError):
+        config.load({"name": "x", "base": {"type": "hovercraft"}})
+    with pytest.raises(ValueError):
+        config.load({"name": "x", "base": {"type": "urdf"}, "parts": [{"name": "a", "type": "mast", "parent": "b"}]})
+    (tmp_path / "yes.yaml").write_text("name: trap\nbase: {type: four_wheel_steering}\nparts:\n  - {name: m, type: mast, on: base}\n")
+    with pytest.raises(ValueError, match="quote"):
+        config.load(tmp_path / "yes.yaml")                               # YAML reads the key "on" as true: said, not guessed
+    with pytest.raises(FileNotFoundError):
+        config.load("no_such_robot")
+
+
+def test_shipped_ranger_configuration_is_the_rig():
+    """The Ranger Mini with its rig comes from its structure file: two lamps in the front face, the mast, two cameras."""
+    from opticalnav_sim.hw import config
+    cfg = config.load("ranger_mini_rig")
+    assert [(p["name"], p["type"]) for p in cfg.parts()] == [("headlight_left", "light"), ("headlight_right", "light"), ("mast", "mast"),
+                                                             ("hdr", "camera"), ("12bit", "camera")]
+    robot = config.spawn(hw.World(), cfg)
+    assert isinstance(robot.base.spec, robots.RangerMini2) and robot.base.spec.dynamics and robot.base.spec.kerb_mass == 64.5
+    assert not robot.calibrated and robot.sensors["hdr"].spec.model == "LUCID TDR054S"
+    left, right = (robot.lights[n].world_matrix()[:3, 3] for n in ("headlight_left", "headlight_right"))
+    assert np.allclose(left, [0.3605, 0.123, 0.28]) and np.allclose(right, [0.3605, -0.123, 0.28])
+
+
+def test_lights_are_shapes_of_their_own_that_move_with_their_link(tmp_path):
+    from opticalnav_sim.hw import lights
+    from opticalnav_sim.hw.sim import _visual_dict
+    lamp = lights.AreaLight(size=(0.1, 0.04), color=(1.0, 0.5, 0.0), radiance=10.0)
+    descriptor = {"links": {link: [_visual_dict(v) for v in vs] for link, vs in lamp.visuals().items()}}
+    model = bodies.build_model("lamp", descriptor, cache=tmp_path)
+    assert 'type="rectangle"' not in model["links"]["light"] and len(model["lights"]["light"]) == 1    # the group holds the housing only
+    text = bodies.scene_xml({"lamp": model}, [("robot_lamp", "lamp")])
+    sid = bodies.light_id("robot_lamp", "light", 1)
+    assert f'<shape type="rectangle" id="{sid}">' in text and '<rgb name="radiance" value="10, 5, 0" />' in text
+    # the link at (1, 2, 3) facing the world's x: the rectangle there, its normal (its z) along x, 0.1 wide (y), 0.04 high (z)
+    at = np.eye(4)
+    at[:3, 3] = (1.0, 2.0, 3.0)
+    (index, m), = bodies.light_poses(model, "light", at)
+    assert index == 1 and np.allclose(m[:3, 3], [1.0, 2.0, 3.0]) and np.allclose(m[:3, 2], [1.0, 0.0, 0.0])
+    assert np.allclose(np.abs(m[:3, 1]), [0.0, 0.05, 0.0]) and np.allclose(np.abs(m[:3, 0]), [0.0, 0.0, 0.02])
+    dark = lights.AreaLight(enabled=False)
+    assert [v.shape for v in dark.visuals()["light"]] == ["box"]                                        # off: the housing, no emitter
+    with pytest.raises(ValueError):
+        bodies.build_model("bare", {"links": {"light": [descriptor["links"]["light"][1]]}}, cache=tmp_path)

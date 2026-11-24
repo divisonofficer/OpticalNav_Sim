@@ -20,3 +20,4 @@ packages = ["opticalnav_sim", "opticalnav_sim.hw"]
 
 [tool.setuptools.package-data]
 opticalnav_sim = ["gui.html"]
+"opticalnav_sim.hw" = ["configs/*/*.yaml"]

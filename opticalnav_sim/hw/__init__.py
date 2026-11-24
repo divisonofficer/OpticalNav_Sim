@@ -8,7 +8,7 @@
 
 See docs/hardware_platform_plan.md.
 """
-from . import calibration, cameras, ground, isp, optics, rigs, robots, sensor
+from . import calibration, cameras, config, ground, isp, lights, optics, rigs, robots, sensor, urdf
 from .actor import Actor, Spec, World
 from .ground import Ground
 from .robots import RangerControl, Twist
@@ -16,4 +16,4 @@ from .sim import Frame, SimWorld
 from .transform import Transform, camera_to_world, pose2d, to_mitsuba
 
 __all__ = ["Actor", "Frame", "Ground", "RangerControl", "SimWorld", "Spec", "Transform", "Twist", "World", "camera_to_world", "calibration", "cameras",
-           "ground", "isp", "optics", "pose2d", "rigs", "robots", "sensor", "to_mitsuba"]
+           "config", "ground", "isp", "lights", "optics", "pose2d", "rigs", "robots", "sensor", "to_mitsuba", "urdf"]

@@ -38,6 +38,17 @@ def instance_id(body: str, link: str) -> str:
     return f"{BODY_PREFIX}{safe(body)}__{safe(link)}"
 
 
+def light_id(body: str, link: str, index: int) -> str:
+    """The scene id of a light on a body's link (a rectangle of its own: an instance cannot emit)."""
+    return f"{instance_id(body, link)}__light{int(index)}"
+
+
+def light_poses(model: dict, link: str, link_to_world: np.ndarray) -> list:
+    """(index, object-to-world 4x4) of the lights on ``link`` when the link stands at ``link_to_world``."""
+    return [(i, np.asarray(link_to_world, dtype=np.float64).reshape(4, 4) @ np.asarray(local, dtype=np.float64))
+            for i, local, _ in (model.get("lights") or {}).get(link, ())]
+
+
 def model_key(descriptor: dict) -> str:
     return hashlib.sha1(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -132,11 +143,16 @@ def build_model(name: str, descriptor: dict, cache: Path | None = None) -> dict:
     key = model_key(descriptor)
     folder = (cache or CACHE) / f"{safe(name)}-{key}"
     folder.mkdir(parents=True, exist_ok=True)
-    links = {}
+    links, lights = {}, {}
     for link, visuals in descriptor["links"].items():
         shapes = ""
         for i, vis in enumerate(visuals):
             origin = np.asarray(vis.get("origin") or np.eye(4), dtype=np.float64).reshape(4, 4)
+            if vis["shape"] == "light":  # [width, height]: a rectangle shining along the origin's z, a shape of its own
+                w, h = (float(s) for s in vis["size"])
+                radiance = [float(c) for c in (vis.get("material") or ("emitter", (1.0, 1.0, 1.0), 0.0))[1]]
+                lights.setdefault(link, []).append((i, (origin @ np.diag([w / 2.0, h / 2.0, 1.0, 1.0])).tolist(), radiance))
+                continue
             mat = bsdf_xml(vis.get("material") or ("plastic", (0.5, 0.5, 0.5), 0.4))
             if vis["shape"] == "mesh":  # the file as it is, placed by its origin
                 src = Path(vis["mesh"])
@@ -163,8 +179,10 @@ def build_model(name: str, descriptor: dict, cache: Path | None = None) -> dict:
             # and turn black where the bent normal faces away. Those take their faces' normals.
             flat = '' if vis["shape"] == "cylinder" else '      <boolean name="face_normals" value="true" />\n'
             shapes += f'    <shape type="ply">\n      <string name="filename" value="{file}" />\n{flat}{mat}    </shape>\n'
+        if not shapes:
+            raise ValueError(f"{name}.{link}: a link needs something drawn besides its lights (a housing)")
         links[link] = f'  <shape type="shapegroup" id="{GROUP_PREFIX}{safe(name)}_{key}__{safe(link)}">\n{shapes}  </shape>\n'
-    return {"name": name, "key": key, "links": links}
+    return {"name": name, "key": key, "links": links, "lights": lights}
 
 
 def scene_xml(models: dict, bodies) -> str:
@@ -180,4 +198,10 @@ def scene_xml(models: dict, bodies) -> str:
                 done.add(gid)
             out += (f'  <shape type="instance" id="{instance_id(body, link)}">\n    <ref id="{gid}" />\n'
                     f'    <transform name="to_world"><translate x="0" y="-1000" z="0" /></transform>\n  </shape>\n')
+            for i, _, radiance in (model.get("lights") or {}).get(link, ()):   # a light: an emitting rectangle, moved with its link
+                rgb = ", ".join(f"{c:.6g}" for c in radiance)
+                out += (f'  <shape type="rectangle" id="{light_id(body, link, i)}">\n'
+                        f'    <transform name="to_world"><scale value="0.001" /><translate x="0" y="-1000" z="0" /></transform>\n'
+                        f'    <bsdf type="diffuse"><rgb name="reflectance" value="0.0" /></bsdf>\n'
+                        f'    <emitter type="area"><rgb name="radiance" value="{rgb}" /></emitter>\n  </shape>\n')
     return out

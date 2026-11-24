@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..bodies import safe
+from ..bodies import model_key, safe
 from ..client import RenderClient
 from . import optics, sensor as sensor_model
 from .actor import Actor, Spec, World
@@ -40,7 +40,10 @@ class Frame:
 
 
 def _visual_dict(v) -> dict:
-    return {"shape": v.shape, "size": list(v.size), "origin": v.origin.matrix().tolist(),
+    origin = v.origin.matrix()
+    if tuple(getattr(v, "scale", (1.0, 1.0, 1.0))) != (1.0, 1.0, 1.0):   # a mesh in other units than metres
+        origin = origin @ np.diag([*v.scale, 1.0])
+    return {"shape": v.shape, "size": list(v.size), "origin": origin.tolist(),
             "material": [v.material[0], list(v.material[1]), float(v.material[2])], **({"mesh": v.mesh} if v.mesh else {})}
 
 
@@ -156,7 +159,9 @@ class SimWorld(World):
             return None
         if id(spec) not in self._models:
             links = {link: [_visual_dict(v) for v in vs] for link, vs in spec.visuals().items()}
-            self._models[id(spec)] = (safe(getattr(spec, "model", None) or type(spec).__name__), links)
+            # named by what is drawn too: two lamps of one model with other colours are two models
+            name = f"{safe(getattr(spec, 'model', None) or type(spec).__name__)}_{model_key({'links': links})[:8]}"
+            self._models[id(spec)] = (name, links)
         return self._models[id(spec)] if self._models[id(spec)][1] else None   # nothing drawn: not a body
 
     def bodies(self) -> list[dict]:

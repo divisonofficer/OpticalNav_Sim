@@ -329,18 +329,14 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     <section class="card">
       <h2><svg class="i"><use href="#i-bulb"/></svg>Lighting</h2>
       <div class="toggles">
-        <button type="button" id="flash" class="toggle" hidden aria-pressed="false"
-          title="카메라 액티브 편광 조명(플래시) 켜기/끄기 (L). 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다."><span class="sw" aria-hidden="true"></span><span class="tl">플래시</span><span class="ts">꺼짐</span><kbd>L</kbd></button>
         <label class="tg" for="lamps" title="Infinigen이 빛을 넣지 않은 램프(책상·스탠드 램프)의 갓도 빛나게 합니다. 세기는 이 씬의 다른 램프와 같고, 대역별 세기는 백열등을 따릅니다. 데이터셋은 이 램프들을 꺼진 채로 렌더했습니다."><input type="checkbox" class="sw" id="lamps"> 꺼진 램프</label>
       </div>
       <div class="fields">
         <label class="f" for="lighting" title="조명(I로 순환). 실내 조명은 Infinigen 원래 램프·천장등, 전역 조명은 로드 때 방마다 더한 소프트박스. 빠지는 조명은 어두워지거나(램프) 씬에서 빠집니다(freeze 재기록 없음)."><span>조명 방식</span><select id="lighting"><option value="none">없음</option><option value="fixtures">실내 조명</option><option value="all">실내+전역</option></select></label>
-        <label class="f" for="flashscale" title="카메라 조명(플래시)의 크기. 전체 세기(파워)는 그대로 두고 면적만 키웁니다(방사휘도 ÷ 배율²). 작은 조명은 거울·광택면을 거친 빛이 드물게 매우 밝게 잡혀 흰 점(firefly)이 생기는데, 큰 조명은 이를 크게 줄입니다. 1×가 데이터셋의 플래시(0.12×0.08 m)입니다."><span>플래시 크기</span><select id="flashscale" class="as-slider"><option value="1">1× 기본</option><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option></select></label>
-        <label class="f" for="flashband" title="액티브 조명이 내는 대역"><span>플래시 대역</span><select id="flashband"><option value="rgb">RGB</option><option value="nir">NIR</option><option value="both">둘 다</option></select></label>
       </div>
     </section>
     <section class="card">
-      <h2><svg class="i"><use href="#i-cube"/></svg>Mirrors · Motion</h2>
+      <h2><svg class="i"><use href="#i-cube"/></svg>Mirrors</h2>
       <div class="toggles">
         <button type="button" id="mirrors" class="toggle" hidden aria-pressed="false"
           title="거울과 유리 켜기/끄기 (M): perturbed와 base 전환. 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다."><span class="sw" aria-hidden="true"></span><span class="tl">거울</span><span class="ts">꺼짐</span><kbd>M</kbd></button>
@@ -349,8 +345,6 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <label class="f" for="mirrorsrc" title="거울·유리벽: 변형(perturbed)의 데이터셋 배치, 또는 robomituba 배치 로직으로 미리 만든 후보 풀에서 밀도만큼(로드·freeze 재기록 없음)"><span>거울 배치</span><select id="mirrorsrc"><option value="dataset">데이터셋</option><option value="pool">랜덤 풀</option></select></label>
         <label class="f" for="mdensity" title="robomituba 단위 밀도(1 = 기본)"><span>밀도</span><input type="range" id="mdensity" min="0" max="4" step="0.25" value="1"><span class="v" id="mdensity-v">1</span></label>
         <label class="f" for="mglass" title="유리벽 수(우회로가 남는 것만)"><span>유리벽</span><select id="mglass" class="as-slider"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></label>
-        <label class="f" for="speed" title="W/A/S/D를 누르고 있을 때 움직이는 속도"><span>이동 속도</span><select id="speed" class="as-slider"><option value="0.5">0.5 m/s</option><option value="1" selected>1 m/s</option><option value="2">2 m/s</option><option value="4">4 m/s</option></select></label>
-        <label class="f" for="step" title="터치 패드 버튼 한 번에 움직이는 거리"><span>패드 보폭</span><select id="step" class="as-slider"><option value="0.1">0.1 m</option><option value="0.25" selected>0.25 m</option><option value="0.5">0.5 m</option></select></label>
       </div>
     </section>
     <section class="card">
@@ -394,13 +388,24 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     </section>
     <section class="card info">
       <div class="ptabs" role="tablist" aria-label="정보 패널">
-        <button type="button" role="tab" id="t-rig" aria-controls="p-rig" data-tab="rig">카메라 리그</button>
+        <button type="button" role="tab" id="t-rig" aria-controls="p-rig" data-tab="rig">에디터 카메라</button>
         <button type="button" role="tab" id="t-state" aria-controls="p-state" data-tab="state">현재 상태</button>
         <button type="button" role="tab" id="t-probe" aria-controls="p-probe" data-tab="probe">픽셀 값</button>
         <button type="button" role="tab" id="t-scene" aria-controls="p-scene" data-tab="scene">씬 정보</button>
         <button type="button" role="tab" id="t-robot" aria-controls="p-robot" data-tab="robot">로봇</button>
       </div>
       <section class="ppanel" role="tabpanel" id="p-rig" aria-labelledby="t-rig" hidden>
+        <p class="hint">에디터 카메라: 이 뷰어가 장면을 보는 카메라입니다(로봇의 카메라는 로봇 탭에서, 로봇 설정 파일대로). 여기서 플래시와 마운트 위치, 이동을 정합니다.</p>
+        <div class="toggles">
+        <button type="button" id="flash" class="toggle" hidden aria-pressed="false"
+          title="카메라 액티브 편광 조명(플래시) 켜기/끄기 (L). 같은 씬을 그대로 쓰므로 씬을 다시 올리지 않습니다."><span class="sw" aria-hidden="true"></span><span class="tl">플래시</span><span class="ts">꺼짐</span><kbd>L</kbd></button>
+        </div>
+        <div class="fields one">
+        <label class="f" for="flashscale" title="카메라 조명(플래시)의 크기. 전체 세기(파워)는 그대로 두고 면적만 키웁니다(방사휘도 ÷ 배율²). 작은 조명은 거울·광택면을 거친 빛이 드물게 매우 밝게 잡혀 흰 점(firefly)이 생기는데, 큰 조명은 이를 크게 줄입니다. 1×가 데이터셋의 플래시(0.12×0.08 m)입니다."><span>플래시 크기</span><select id="flashscale" class="as-slider"><option value="1">1× 기본</option><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option></select></label>
+        <label class="f" for="flashband" title="액티브 조명이 내는 대역"><span>플래시 대역</span><select id="flashband"><option value="rgb">RGB</option><option value="nir">NIR</option><option value="both">둘 다</option></select></label>
+        <label class="f" for="speed" title="W/A/S/D를 누르고 있을 때 움직이는 속도"><span>이동 속도</span><select id="speed" class="as-slider"><option value="0.5">0.5 m/s</option><option value="1" selected>1 m/s</option><option value="2">2 m/s</option><option value="4">4 m/s</option></select></label>
+        <label class="f" for="step" title="터치 패드 버튼 한 번에 움직이는 거리"><span>패드 보폭</span><select id="step" class="as-slider"><option value="0.1">0.1 m</option><option value="0.25" selected>0.25 m</option><option value="0.5">0.5 m</option></select></label>
+        </div>
         <div class="rig-view" id="rig-view">
           <canvas id="rig3d" tabindex="0" aria-label="카메라와 플래시 위치를 관측자 기준으로 편집하는 3D 보기"></canvas>
           <div class="rig-mode" id="rig-mode"></div>
@@ -422,8 +427,10 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <p class="hint">렌더 서버에 올라간 씬 기준, 5초마다 갱신. GPU는 장치 전체 사용량(다른 프로세스 포함).</p>
       </section>
       <section class="ppanel" role="tabpanel" id="p-robot" aria-labelledby="t-robot" hidden>
+        <label class="f" for="robot-config" title="스폰할 로봇: 구조 파일(robot.yaml)이 있는 폴더를 packs/hardware 나 $OPTICALNAV_ROBOTS 에 넣으면 여기에 뜹니다. 베이스·조명·마스트·카메라가 모두 그 파일에서 옵니다."><span>로봇</span><select id="robot-config"></select></label>
+        <dl id="robot-parts"></dl>
         <div class="rig-tools">
-          <button type="button" class="flash primary" id="robot-spawn" title="지금 카메라가 보는 바닥에 Ranger Mini와 카메라 리그를 놓습니다. 이 화면에 로봇이 나타나고, 센서 뷰어를 켜면 로봇 카메라의 영상이 서브 뷰어로 열립니다.">로봇 스폰</button>
+          <button type="button" class="flash primary" id="robot-spawn" title="지금 에디터 카메라가 보는 바닥에 위에서 고른 로봇을 놓습니다(베이스·조명·마스트·카메라 모두 그 로봇의 설정 파일대로). 이 화면에 로봇이 나타나고, 센서 뷰어를 켜면 로봇 카메라의 영상이 서브 뷰어로 열립니다.">로봇 스폰</button>
           <button type="button" class="flash" id="robot-despawn" hidden>로봇 제거</button>
         </div>
         <p id="robot-note" role="status" aria-live="polite"></p>
@@ -447,7 +454,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
             <span><kbd>Space</kbd></span><span>정지 (키를 놓아도 0.5초 뒤 멈춤)</span>
           </div>
         </div>
-        <p class="hint" id="robot-hint">Ranger Mini 2.0과 카메라 리그(HDR, 12-bit)를 지금 보는 씬에 놓습니다. 로봇은 에디터 뷰에 그대로 보이고, 로봇 카메라는 서브 뷰어로 켜고 끕니다(여기 스위치, 또는 위의 ＋ 서브 뷰어에서 소스를 고르기). 바닥 높이·장애물·마찰은 씬 파일의 재질에서 읽습니다.</p>
+        <p class="hint" id="robot-hint">고른 로봇을 지금 보는 씬에 놓습니다. 로봇이 무엇으로 이루어지는지(베이스, 조명, 마스트, 카메라)는 그 로봇의 구조 파일(robot.yaml)에서 읽습니다. 로봇은 에디터 뷰에 그대로 보이고, 로봇 카메라는 서브 뷰어로 켜고 끕니다(여기 스위치, 또는 위의 ＋ 서브 뷰어에서 소스를 고르기). 바닥 높이·장애물·마찰은 씬 파일의 재질에서 읽습니다.</p>
       </section>
     </section>
   </aside>
@@ -492,7 +499,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
       <h3>로봇</h3>
       <div class="keys">
-        <span>로봇 탭</span><span>로봇 스폰: 카메라가 보는 바닥에 Ranger Mini와 카메라 리그가 놓이고 이 화면에 보입니다. 센서 뷰어를 켜면 로봇 카메라 영상이 서브 뷰어로 열립니다</span>
+        <span>로봇 탭</span><span>로봇 스폰: 에디터 카메라가 보는 바닥에 고른 로봇(구조 파일 robot.yaml의 베이스·조명·카메라)이 놓이고 이 화면에 보입니다. 센서 뷰어를 켜면 로봇 카메라 영상이 서브 뷰어로 열립니다</span>
         <span>＋ 서브 뷰어</span><span>에디터 뷰 옆(또는 아래)에 창을 원하는 만큼 엽니다. 창마다 소스를 고릅니다: 에디터 뷰의 다른 채널, 또는 로봇 센서. 경계선을 끌어 크기를 바꿉니다</span>
         <span><kbd>T</kbd></span><span>키보드로 운전 켜고 끄기: 켜면 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> <kbd>Q</kbd><kbd>E</kbd> <kbd>Space</kbd>가 로봇을 움직입니다 (전후진 · 조향 · 횡이동 · 정지)</span>
       </div>
@@ -504,7 +511,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <p class="hint">버튼으로 움직이고, 화면을 좌우로 밀면 회전합니다. 화면을 두 번 탭하면 그곳으로 고개를 돌리고, 한 번 탭하면 그 픽셀의 편광 값이 나옵니다. 번호 원을 누르면 그래프 지점으로 갑니다.</p>
     </section>
     <section>
-      <h3>카메라 리그 (3D 편집)</h3>
+      <h3>에디터 카메라 (마운트·플래시 3D 편집)</h3>
       <p class="hint">관측자(바닥의 원과 화살표) 기준으로 카메라 마운트와 플래시를 옮깁니다. 플래시는 카메라를 따라 움직이고 계속 카메라 시야 방향을 봅니다. 카메라를 올리면 데이터셋 리그처럼 시선이 조금 더 아래로 향합니다. 옮기는 동안 렌더가 따라오며, freeze를 다시 기록하지 않습니다. 키는 3D 보기를 누른 뒤에 듣습니다.</p>
       <div class="keys desk-only">
         <span>클릭</span><span>카메라·플래시 선택, 화살표를 끌어 축 방향으로 이동</span>
@@ -2001,6 +2008,16 @@ function renderRobot() {
   const raster = on && S && S.render_mode && S.render_mode !== "path" ? "지금 렌더러는 로봇을 그리지 않습니다 (Mitsuba 경로 추적에서만 보입니다). " : "";
   robotNote(R.error ? `로봇: ${R.error}` : raster + (R.message || ""), !!R.error);
   if ($("robot-follow").checked !== !!R.follow) $("robot-follow").checked = !!R.follow;
+  $("robot-config").disabled = on || busy;
+  if (R.config && $("robot-config").value !== R.config.name && [...$("robot-config").options].some((o) => o.value === R.config.name)) $("robot-config").value = R.config.name;
+  const partsKey = JSON.stringify(R.config || null);
+  if (partsKey !== renderRobot.parts) {  // what this robot is made of, as its structure file lists it
+    renderRobot.parts = partsKey;
+    const kinds = { light: "조명", mast: "마스트", camera: "카메라", urdf: "URDF" };
+    const c = R.config || { parts: [] };
+    $("robot-parts").innerHTML = [["베이스", c.base || "—"], ...c.parts.map((p) => [kinds[p.type] || p.type, `${p.label} → ${p.parent}${p.link ? "." + p.link : ""}`])]
+      .map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
+  }
   syncSensorList();
   for (const sn of R.sensors || []) {
     const mine = SUBS.filter((x) => x.kind === "sensor" && x.sensor === sn.name), box = $(`sensor-on-${sn.name}`);
@@ -2070,7 +2087,7 @@ async function pollRobot() {
   robotTimer = setTimeout(pollRobot, R && R.running ? 200 : 1500);
 }
 $("robot-spawn").addEventListener("click", async () => {
-  try { robotNote("로봇을 준비하는 중…"); await robotApi("spawn", {}); pollRobot(); } catch (e) { robotNote(e.message, true); }
+  try { robotNote("로봇을 준비하는 중…"); await robotApi("spawn", { config: $("robot-config").value || undefined }); pollRobot(); } catch (e) { robotNote(e.message, true); }
 });
 $("robot-despawn").addEventListener("click", () => robotApi("despawn", {}).catch((e) => robotNote(e.message, true)));
 $("robot-follow").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked }).catch((e) => robotNote(e.message, true)));
@@ -2267,6 +2284,12 @@ window.addEventListener("resize", layout);
   for (const spec of (saved.subs || []).slice(0, 8)) addSub(spec, true);
   layout();
 })();
+// the registered robots (hw/config.py): choosing one sets what the next spawn builds
+api("/api/robot/configs").then(({ configs, current }) => {
+  $("robot-config").innerHTML = configs.map((c) => `<option value="${c.name}" title="${c.description}">${c.label}</option>`).join("");
+  $("robot-config").value = current;
+}).catch(() => {});
+$("robot-config").addEventListener("change", (ev) => robotApi("config", { config: ev.target.value }).catch((e) => robotNote(e.message, true)));
 pollRobot();
 try { showTab(localStorage.getItem("opticalnav-panel-tab") || "state"); } catch (e) { showTab("state"); }
 

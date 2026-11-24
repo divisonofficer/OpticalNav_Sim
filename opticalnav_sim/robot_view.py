@@ -1,14 +1,17 @@
 """The viewer's robot: a robot with its camera rig put into the scene the viewer shows, driven from the page.
 
 The viewer (gui.py) stays the editor: its camera renders the scene with the robot in it (``bodies`` gives its view the
-robot's links as they stand), and each of the robot's cameras is a sensor pane the page switches on and off. One
-``RobotSession`` holds a hw.SimWorld (the Ranger Mini with wheel dynamics, the mast, the rig's cameras), steps it in
-real time, and renders the sensors that are switched on through the render server, with the editor's lighting:
+robot's links as they stand), and each of the robot's cameras is a sensor a sub viewer of the page shows. What the
+robot is comes from its configuration (hw/config.py: a structure file naming the base, its lights, masts and cameras);
+one ``RobotSession`` spawns it into a hw.SimWorld, steps it in real time, and renders the sensors that are switched
+on through the render server, with the editor's lighting:
 
     GET  /api/robot/state                  pose, velocity, odometry, slip and friction per wheel, sensors, messages
     GET  /api/robot/frame/<sensor>.jpg     that sensor's latest image (through its sensor model and ISP)
     GET  /api/robot/map.png                the ground map around the robot: friction (red slippery .. green grippy), obstacles
-    POST /api/robot/spawn                  put the robot on the floor in front of the editor camera
+    GET  /api/robot/configs                the registered robots (hw.config.available) and the one in use
+    POST /api/robot/spawn    {"config"}    put the robot (that configuration, or the one in use) on the floor in front
+                                           of the editor camera
     POST /api/robot/despawn
     POST /api/robot/sensors  {"hdr": true, "12bit": false}       which sensor panes render
     POST /api/robot/follow   {"on": true}                        the editor camera rides behind the robot
@@ -27,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 CONTROL_TIMEOUT_S = 0.5      # the Ranger's CAN command timeout: no command for this long stops it
-SENSOR_LABELS = {"hdr": "HDR 카메라", "12bit": "12-bit 카메라"}
+DEFAULT_CONFIG = "ranger_mini_rig"
 # what a sensor's view takes from the editor's: the scene as it is lit and dressed there (and so the same resident
 # scene on the render server: another variant or lighting would not load a second one, but these keep one picture)
 LOOK = ("variant", "lights", "env", "flash_band", "nir", "lighting", "lamps", "flash_scale", "flash_offset", "max_depth",
@@ -42,9 +45,12 @@ def _jpeg(image: np.ndarray, quality: int = 82) -> bytes:
 
 
 class RobotSession:
-    def __init__(self, server_url: str | None = None, calibration: str | None = None, client=None):
+    def __init__(self, server_url: str | None = None, calibration: str | None = None, client=None, config: str | None = None):
+        from .hw import config as robot_config
         self.server_url, self.client = server_url, client
         self.calibration = calibration or os.environ.get("OPTICALNAV_RIG_CALIBRATION")
+        self.config = robot_config.load(config or os.environ.get("OPTICALNAV_ROBOT") or DEFAULT_CONFIG)   # what the robot is
+        self.calibrated = False
         self.lock = threading.RLock()
         self.view_source = None          # () -> the editor's current view (dict) or None: the viewer sets it
         self.world = None
@@ -67,10 +73,23 @@ class RobotSession:
         self._bodies: list = []          # the robot's links as the render server's view field, as of pose_seq
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
-    def spawn(self, scene: str, eye, heading: float = 0.0, elevation: float = 0.0) -> dict:
+    def use(self, config) -> None:
+        """Another robot (a registered name, or the path of a structure file) for the next spawn."""
+        from .hw import config as robot_config
+        cfg = robot_config.load(config)
+        with self.lock:
+            self.config = cfg
+            self.enabled &= {s["name"] for s in cfg.sensors()}
+
+    def labels(self) -> dict:
+        return {s["name"]: s["label"] for s in self.config.sensors()}
+
+    def spawn(self, scene: str, eye, heading: float = 0.0, elevation: float = 0.0, config=None) -> dict:
         """Put the robot into ``scene`` on the floor in front of a camera: ``eye`` its (x, y, height), ``heading`` and
         ``elevation`` in radians as MatterSim counts them (heading 0 looks along +y, positive turns right)."""
         self.despawn()
+        if config:
+            self.use(config)
         with self.lock:
             self.run_id += 1
             self.scene, self.message, self.error = scene, "로봇을 준비하는 중", ""
@@ -101,7 +120,7 @@ class RobotSession:
 
     def _build(self, run: int, scene: str, eye, heading: float, elevation: float) -> None:
         from . import groundmap, hw
-        from .hw import Transform, cameras, rigs, robots
+        from .hw import config as robot_config
 
         self._say("렌더 서버에 연결하는 중")
         world = hw.SimWorld(self.server_url, scene=scene, spp=16) if self.client is None else \
@@ -128,23 +147,20 @@ class RobotSession:
         self._say("지면 지도 만드는 중: 높이·장애물·마찰 (씬 파일의 재질에서, 처음 한 번)")
         gm = world.load_ground(floor_z=floor_z, center=(x, y))
         self._map(gm)
-        x, y = self._free_spot(world, robots.ranger_mini(), x, y, yaw_deg)
+        cfg = self.config
+        x, y = self._free_spot(world, robot_config.base_spec(cfg), x, y, yaw_deg)
         start = world.on_floor(x, y, yaw_deg)
-        robot = world.spawn(robots.ranger_mini(dynamics=True), at=start, name="robot")
-        cams = {}
-        if self.calibration and Path(self.calibration).is_file():
-            rig = rigs.spawn_camera_rig(world, robot, self.calibration, cameras=("left", "12_left"))
-            cams["hdr"], cams["12bit"] = rig["left"], rig["12_left"]
-        else:  # no calibration at hand: the same two cameras by their datasheet models, side by side on the mast
-            mast = world.spawn(rigs.Mast(), attach_to=robot, link="top_plate", name="robot_mast")
-            cams["hdr"] = world.spawn(cameras.LucidTDR054S(), attach_to=mast, link="top", mount=Transform((0.10, 0.04, 0.05)), name="robot_hdr")
-            cams["12bit"] = world.spawn(cameras.LucidTRI032S(), attach_to=mast, link="top", mount=Transform((0.10, -0.06, 0.05)), name="robot_12bit")
+        # the robot as its configuration lists it: the base, then its lights, masts and cameras on their links
+        built = robot_config.spawn(world, cfg, at=start, name="robot",
+                                   calibration=self.calibration if self.calibration and Path(self.calibration).is_file() else None)
+        robot, cams = built.base, dict(built.sensors)
         self._say("로봇 모델을 렌더 서버에 올리는 중")
         bodies = world.bodies()   # registers the models
         with self.lock:
             if self.run_id != run:
                 return
             self.world, self.robot, self.cameras, self.start_pose = world, robot, cams, start
+            self.calibrated = built.calibrated
             self._bodies = bodies
             self.pose_seq += 1
             self.message = "로봇이 든 씬을 올리는 중 (처음 한 번, 씬에 따라 30초쯤)"
@@ -154,7 +170,7 @@ class RobotSession:
         """(x, y) or the nearest place around it where the robot's footprint is clear (in front of a camera may be a
         table)."""
         ground = world.ground
-        if ground.heights is None:
+        if ground.heights is None or not hasattr(spec, "footprint"):
             return x, y
         c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
         foot = spec.footprint()
@@ -203,23 +219,25 @@ class RobotSession:
                     if self.run_id != run:
                         return
                     control = self.control
-                    robot.spec.apply(robot.state, hw.Twist() if control is None or now - control[1] > CONTROL_TIMEOUT_S else control[0])
+                    if hasattr(robot.spec, "apply"):   # a base that drives
+                        robot.spec.apply(robot.state, hw.Twist() if control is None or now - control[1] > CONTROL_TIMEOUT_S else control[0])
                     for _ in range(steps):
                         world.tick()
                     last += steps * world.dt if steps < 20 else (now - last)
                     ticks += steps
-                    p, t = robot.pose, robot.state.twist
+                    p, t = robot.pose, getattr(robot.state, "twist", None) or hw.Twist()
                     if abs(t.vx) + abs(t.vy) + abs(t.wz) > 1e-3:
                         self.moved_at = now
                     # the links as they stand now, for the viewer's own camera: a new sequence number when one moved
-                    stand = np.r_[p.xyz, p.rpy_deg, np.degrees(robot.state.steer)]
+                    stand = np.r_[p.xyz, p.rpy_deg, np.degrees(getattr(robot.state, "steer", np.zeros(0)))]
                     if drawn is None or np.abs(stand[:3] - drawn[:3]).max() > 5e-4 or np.abs(stand[3:] - drawn[3:]).max() > 0.05:
                         drawn = stand
                         self._bodies = world.bodies()
                         self.pose_seq += 1
                     if not self.trail or math.hypot(p.xyz[0] - self.trail[-1][0], p.xyz[1] - self.trail[-1][1]) > 0.02:
                         self.trail.append([round(p.xyz[0], 3), round(p.xyz[1], 3)])
-                        o = robot.state.odometry
+                        o = getattr(robot.state, "odometry", None)
+                        o = np.zeros(3) if o is None else o
                         c, s = math.cos(math.radians(self.start_pose.rpy_deg[2])), math.sin(math.radians(self.start_pose.rpy_deg[2]))
                         self.odo_trail.append([round(self.start_pose.xyz[0] + c * o[0] - s * o[1], 3),
                                                round(self.start_pose.xyz[1] + s * o[0] + c * o[1], 3)])
@@ -336,8 +354,8 @@ class RobotSession:
     def set_sensors(self, wanted: dict) -> None:
         with self.lock:
             for name, on in wanted.items():
-                if name not in SENSOR_LABELS:
-                    raise ValueError(f"no sensor {name!r} (have: {', '.join(SENSOR_LABELS)})")
+                if name not in self.labels():
+                    raise ValueError(f"{self.config.name} has no sensor {name!r} (has: {', '.join(self.labels())})")
                 (self.enabled.add if on else self.enabled.discard)(name)
                 if not on:
                     self.frames.pop(name, None)
@@ -358,17 +376,26 @@ class RobotSession:
         with self.lock:
             out = {"scene": self.scene, "running": self.running, "spawned": self.robot is not None, "message": self.message,
                    "error": self.error, "map": self.map_info, "sim_rate": round(self.sim_rate, 1),
-                   "calibrated": bool(self.calibration and Path(self.calibration).is_file()),
+                   "calibrated": self.calibrated, "config": self.config.summary(),
                    "sensors": [{"name": n, "label": label, "enabled": n in self.enabled,
                                 "model": self.cameras[n].spec.model if n in self.cameras else "",
                                 **{k: v for k, v in self.frames.get(n, {}).items() if k not in ("jpeg", "look")}}
-                               for n, label in SENSOR_LABELS.items()]}
+                               for n, label in self.labels().items()]}
+            for s, listed in zip(out["sensors"], self.config.sensors()):
+                s["model"] = s["model"] or listed["model"]
             robot = self.robot
             if robot is None:
                 return out
             st, p = robot.state, robot.pose
             spec = robot.spec
             c, s = math.cos(math.radians(p.rpy_deg[2])), math.sin(math.radians(p.rpy_deg[2]))
+            if not hasattr(spec, "footprint"):   # a base that does not drive: where it stands
+                out["robot"] = {"x": round(p.xyz[0], 3), "y": round(p.xyz[1], 3), "z": round(p.xyz[2], 3), "yaw_deg": round(p.rpy_deg[2], 2),
+                                "roll_deg": 0.0, "pitch_deg": 0.0, "vx": 0.0, "vy": 0.0, "wz": 0.0, "command": [0.0, 0.0, 0.0],
+                                "steer_deg": [], "wheel_speed": [], "slip": [], "mu": [], "collided": False, "material": None,
+                                "footprint": [[round(p.xyz[0] + dx, 3), round(p.xyz[1] + dy, 3)] for dx, dy in ((-.2, -.2), (.2, -.2), (.2, .2), (-.2, .2))]}
+                out["trail"], out["odometry_trail"] = self.trail[-1500:], self.odo_trail[-1500:]
+                return out
             foot = spec.footprint()
             out["robot"] = {
                 "x": round(p.xyz[0], 3), "y": round(p.xyz[1], 3), "z": round(p.xyz[2], 3), "yaw_deg": round(p.rpy_deg[2], 2),
@@ -396,6 +423,9 @@ def get(handler, robot: RobotSession, parts: list, query: dict) -> None:
     tail = parts[2:]
     if tail == ["state"]:
         return handler._json(200, robot_state(handler, robot))
+    if tail == ["configs"]:
+        from .hw import config as robot_config
+        return handler._json(200, {"configs": robot_config.available(), "current": robot.config.name})
     if tail == ["map.png"]:
         with robot.lock:
             png = robot.map_png
@@ -423,7 +453,11 @@ def post(handler, robot: RobotSession, parts: list, body: dict) -> None:
     if tail == ["sensors"]:
         robot.set_sensors({str(k): bool(v) for k, v in body.items()})
     elif tail == ["spawn"] and session is not None:
+        if body.get("config"):
+            robot.use(str(body["config"]))   # an unknown robot fails here, as a 400
         session.run("robot", session.spawn_robot)
+    elif tail == ["config"]:
+        robot.use(str(body["config"]))
     elif tail == ["despawn"] and session is not None:
         session.run("robot", session.despawn_robot)
     elif tail == ["follow"] and session is not None:

@@ -2785,9 +2785,12 @@ class Renderer:
                 raise ValueError(f"unknown body model {b.get('model')!r} (register it: POST /v1/bodies)")
             if set(b.get("links") or {}) != set(model["links"]):
                 raise ValueError(f"body {b.get('id')!r} needs a pose for each link of {model['name']}: {sorted(model['links'])}")
-            poses = tuple(sorted((body_models.instance_id(b["id"], link),
-                                  np.ascontiguousarray(m, dtype=np.float64).reshape(4, 4).tobytes())
-                                 for link, m in b["links"].items()))
+            poses = [(body_models.instance_id(b["id"], link), np.ascontiguousarray(m, dtype=np.float64).reshape(4, 4).tobytes())
+                     for link, m in b["links"].items()]
+            for link, m in b["links"].items():   # the lights on a link move with it (rectangles of their own)
+                poses += [(body_models.light_id(b["id"], link, i), np.ascontiguousarray(at).tobytes())
+                          for i, at in body_models.light_poses(model, link, m)]
+            poses = tuple(sorted(poses))
             placed.append((str(b["id"]), f"{model['name']}", model["key"], poses))
         placed = tuple(sorted(placed))
         if len({p[0] for p in placed}) != len(placed):

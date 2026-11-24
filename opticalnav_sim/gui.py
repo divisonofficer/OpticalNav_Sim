@@ -1384,8 +1384,11 @@ def main() -> int:
                     help="accumulate passes as a plain mean (default: fireflies held back, see robust_mean)")
     ap.add_argument("--depth", type=int, default=2, help="passes in flight on the render server (2 overlaps CPU and GPU)")
     ap.add_argument("--rig-calibration", default=os.environ.get("OPTICALNAV_RIG_CALIBRATION"),
-                    help="a multi-camera calibration (OpenCV YAML) for the robot mode's camera rig; without it, two "
-                         "cameras by their datasheet models")
+                    help="a multi-camera calibration (OpenCV YAML) for the cameras of a robot whose configuration names "
+                         "entries of it; without it they stand at the configuration's mounts with their datasheet lens")
+    ap.add_argument("--robot", default=os.environ.get("OPTICALNAV_ROBOT"),
+                    help="the robot a page spawns: a registered configuration's name or the path of its robot.yaml "
+                         "(hw/config.py; default ranger_mini_rig). The page lists the registered ones")
     ap.add_argument("--token", default=os.environ.get("OPTICALNAV_GUI_TOKEN"),
                     help="required to listen beyond localhost (default $OPTICALNAV_GUI_TOKEN); open /?token=<token>")
     args = ap.parse_args()
@@ -1423,7 +1426,7 @@ def main() -> int:
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
     from .robot_view import RobotSession
-    robot = RobotSession(sim._client.url, args.rig_calibration)  # the robot a page puts into the scene it shows
+    robot = RobotSession(sim._client.url, args.rig_calibration, config=args.robot)  # the robot a page puts into the scene it shows
     session.attach_robot(robot)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token, robot))
     resident = [r[0] for r in info.get("resident", [])]

@@ -25,14 +25,16 @@ from .transform import Transform, rpy_matrix
 
 @dataclass(frozen=True)
 class Visual:
-    """One drawn primitive of a link, in the link's frame: a ``box`` (size x, y, z) or a ``cylinder`` (radius, length;
-    its axis is the link's y, a wheel's axle), or a ``mesh`` file. ``material``: (kind, rgb, roughness) with kind
-    "plastic" | "metal" | "rubber"."""
+    """One drawn primitive of a link, in the link's frame: a ``box`` (size x, y, z), a ``cylinder`` (radius, length;
+    its axis is the link's y, a wheel's axle), a ``profile`` (side, length), a ``mesh`` file (``scale``: of the file's
+    own units), or a ``light`` (width, height: a rectangle that shines along the origin's z). ``material``: (kind,
+    rgb, roughness) with kind "plastic" | "metal" | "rubber" | "aluminium"; a light's is ("emitter", radiance rgb, 0)."""
     shape: str
     size: tuple
     origin: Transform = Transform()
     material: tuple = ("plastic", (0.5, 0.5, 0.5), 0.4)
     mesh: str | None = None
+    scale: tuple = (1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -119,6 +121,7 @@ class RangerMini2(Spec):
     max_steer_rate_deg: float = 180.0   # estimate
     steer_tolerance_deg: float = 15.0   # wheels further than this from their angle are turned before the base drives
     model_dir: str | None = None        # a converted model (tools/robot_from_usd.py): its meshes are drawn
+    link_visuals: dict | None = None    # link -> [Visual], given instead (a URDF's, placed by hw.config)
     # --- dynamics (off: the wheels never slip) ---
     dynamics: bool = False
     motor_torque: float = 23.0          # N m at a wheel: 350 W at the top speed's 15 rad/s (derived, not from the manual)
@@ -298,6 +301,8 @@ class RangerMini2(Spec):
     def visuals(self) -> dict:
         """Link name -> what is drawn for it: the converted model's meshes, or placeholders with the robot's outer
         dimensions."""
+        if self.link_visuals is not None:
+            return {link: list(vs) for link, vs in self.link_visuals.items() if vs}
         if self.model_dir:
             links = json.loads((Path(self.model_dir) / "model.json").read_text())["links"]
             # the model's chassis frame is this spec's base_link (on the floor); its wheel frames are the wheels' centres
