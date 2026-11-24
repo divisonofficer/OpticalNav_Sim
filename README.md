@@ -19,17 +19,13 @@ A Matterport3DSimulator-compatible Python API for OpticalNav indoor scenes. Ever
 
 A drive of the Ranger Mini 2.0 with its camera rig through the `REF_CS02` lab, recorded in the viewer (November 2026): an S-curve in Ackermann mode, a spin in place, a sideways run with all four wheels at 90 degrees, another spin. Left: the editor camera, standing in a corner and turning to follow the robot, with the ground map (friction and obstacles from the scene's materials) and the robot's trail. Right: what the robot's two cameras deliver through their sensor models and ISP, each with its own auto exposure (the HDR camera's time and gain are in its caption). Bottom: per wheel, steering angle, speed, the friction of the floor under it and slip. The drive was logged live (noisy, 16 samples a frame) and then rendered again frame by frame by the viewer's recorder: 378 frames of 1920 x 1080 in 24 min on an RTX 5090 (3.9 s a frame: the editor's view at 800 x 600 and 1024 samples, each sensor at 512, unpolarized, all denoised). Click the preview for the 19 s recording. See [Hardware in the scene](#hardware-in-the-scene-robots-and-cameras-opticalnav_simhw).
 
-[![Browser viewer (October 2026): walking, switching bands and views, the camera light and the mirrors](docs/media/viewer_2026.gif)](docs/media/viewer_2026.mp4)
+[![Browser viewer (November 2026) in REF_CS02: walking and turning, a sub viewer switched through S1/S0 and depth, the camera light, then the robot with its two cameras as sub viewers](docs/media/viewer_ref.gif)](docs/media/viewer_ref.mp4)
 
-The browser viewer (October 2026 layout) on an RTX 5090, in a base-only scene (`sim_apt_22572521_vanilla_r2`) with its synthetic mirror and flash variants, RGB and NIR in one render. It walks a few steps and turns, then lets the passes accumulate. Next the second pane switches to NIR DoLP, NIR AoLP and RGB S1/S0. Finally the camera light (L) and the mirrors (M) go off and on again. Click the preview for the 28 s recording. *Viewer tools and render options* describes the controls.
-
-[![Browser viewer: walking an R2R path, accumulating to 1024 spp, switching polarization channels](docs/media/viewer.gif)](docs/media/viewer.mp4)
-
-The earlier viewer layout on an RTX 5090. Each move renders one 16 spp pass. While the camera stays put, passes accumulate up to 1024 spp. The second pane switches between DoLP, AoLP, S1/S0 and S2/S0, and the side panel shows the graph map and per-pixel Stokes values. Click the preview for the 40 s recording. It was made before W/A/S/D free movement was added.
+The browser viewer (November 2026 layout) in the `REF_CS02` lab on an RTX 5090, as a sequence of screenshots (14 s; not a continuous screen recording). The editor camera walks in and turns, each move a 16 spp pass, then the passes accumulate to 1024 spp. A sub viewer switches from AoLP to S1/S0 and to depth; the camera light (L) comes on. Then the Ranger Mini is spawned from the robot tab and its HDR and 12-bit cameras are opened as sub viewers beside the editor's DoLP; the editor camera turns to follow the robot as it drives. Click the preview for the MP4.
 
 [![An R2R episode rendered live: RGB, DoLP, AoLP and the path on the graph](docs/media/episode_polar.gif)](docs/media/episode_polar.mp4)
 
-An R2R episode driven through the MatterSim API, every frame rendered live at 64 spp. The panels are the RGB preview, DoLP (black to red over 0–0.2), AoLP (hue around the colour circle for 0–180°, brightness DoLP / 0.2), and the planned and travelled path. [Two agents rendered in one call](docs/media/two_agents.mp4) (7 s).
+An R2R episode on an Infinigen apartment (the REF scenes come from `.blend` files and have start poses but no connectivity graph, so this demo stays on the earlier data), driven through the MatterSim API, every frame rendered live at 64 spp. The panels are the RGB preview, DoLP (black to red over 0–0.2), AoLP (hue around the colour circle for 0–180°, brightness DoLP / 0.2), and the planned and travelled path. [Two agents rendered in one call](docs/media/two_agents.mp4) (7 s).
 
 ## Quick start
 
@@ -124,12 +120,12 @@ python -m opticalnav_sim.gui --pack packs/opticalnav-v0.2 --server http://127.0.
 # open http://127.0.0.1:18780 (from another machine or a phone: ssh -L 18780:127.0.0.1:18780 <host>)
 ```
 
-![The viewer: control cards, two panes, map with the room plan, info tabs, status bar](docs/media/viewer_2026_overview.jpg)
+![The viewer in REF_CS02: control cards, the editor's pane, two sub viewers (DoLP and AoLP), the map, info tabs, status bar](docs/media/viewer_overview.jpg)
 
 The page fits the window.
 
-* **Control cards** (Scene, Render, Lighting, Mirrors · Motion, View · Exposure). Switches toggle settings, and step sliders set the numeric ones (pass and target spp, path depth, RR start depth, render size, flash size, glass walls, speed).
-* **Two camera panes.** Each has band tabs (RGB, R, G, B, NIR), view tabs (영상, DoLP, AoLP, S1/S0, S2/S0) and a 깊이 (depth) button that is the same in every band, plus buttons to save the JPEG, overlay a thirds grid or go full screen. A phone shows one pane.
+* **Control cards** (Scene, Render, Lighting, Mirrors, View · Exposure). Switches toggle settings (among them polarization on or off and the editor view's own render), and step sliders set the numeric ones (pass and target spp, path depth, RR start depth, render size, glass walls). The editor camera's flash, its size and band and the walking speed are in the 에디터 카메라 tab.
+* **The editor's pane and sub viewers.** The editor's pane is always there; beside it (or under it: 배치) are sub viewers, opened with ＋ 서브 뷰어 and closed with their ✕, each showing another channel of the editor's view or a sensor of the robot. A pane of the editor's view has band tabs (RGB, R, G, B, NIR), view tabs (영상, DoLP, AoLP, S1/S0, S2/S0) and a 깊이 (depth) button that is the same in every band, plus buttons to save the JPEG, overlay a thirds grid or go full screen. A phone shows the editor's pane alone.
 * **Map.** The graph, drawn over the scene's room plan when the pack has one.
 * **Info tabs.** Camera rig, current state, pixel Stokes values, and scene info.
 * **Status bar.** Pass timing split into GPU, server CPU, queue, transfer, viewer, JPEG and screen, plus the Mitsuba version, the variant and the scene's pack.
@@ -189,7 +185,9 @@ Offsets are `[right, up, forward]` in the observer's level frame, so a pitched c
 
 [![Rig editor: grabbing the flash along X, then up along Z; the DoLP pane changes with it](docs/media/rig_editor.gif)](docs/media/rig_editor.mp4)
 
-<img src="docs/media/tab_rig.png" alt="Camera rig tab" width="300"> <img src="docs/media/tab_scene.png" alt="Scene info tab" width="300">
+(Recorded in October 2026 on an Infinigen apartment, when the tab was still called 카메라 리그; the editor works the same in the REF scenes. The two pictures below are the current tabs in `REF_CS02`.)
+
+<img src="docs/media/tab_editor_camera.png" alt="Editor camera tab (REF_CS02)" width="300"> <img src="docs/media/tab_scene.png" alt="Scene info tab (REF_CS02)" width="300">
 
 **Accumulation, display curve and sky.** Three things that make a still frame look more like a photograph:
 
@@ -225,7 +223,9 @@ The lit parts stay in the scene's lights (group `fixture`, same light class), so
 
 **Near-infrared reflectance range** (NIR 반사율, `setNirRange`, view `nir_range`). robomituba's pseudo-NIR albedo `dot(max(c, 1 − c), luma)` lies between 0.5 (mid grey) and 1 (black or white), so every surface reflects at least half the near-infrared. That keeps paths alive and makes NIR noisier than RGB. `rgb2nir` now maps the value linearly onto `[low, high]`, set through two shared uniforms at render time with no recording. 0.5–1.0, the default, is the dataset's formula. At 0.1–0.5 NIR grain fell 43% and outliers 26% (64 spp).
 
-![NIR reflectance range 0.5–1.0 (dataset) and 0.1–0.5, same view and exposure](docs/media/nir_range.jpg)
+![NIR reflectance range 0.5–1.0 (dataset) and 0.1–0.5 in REF_CS02, same view and exposure](docs/media/nir_range.jpg)
+
+`blend_REF_CS02`, 16 passes of 256 spp each with fireflies held back, denoised, both at the exposure fitted to the left one. The ceiling panels emit no near-infrared here, so the room is lit through the window alone; the mean falls to 0.44 of the dataset range's.
 
 **Split active pass** (split switch, `setActiveSplit`, view `active_split`; *records once*). With the camera light on, the passive and flash passes render on one path. This is `path_nocaustics` `assist_mode=split`: the scene's lights as the passive pass sees them, plus the flash's own emitter sample at each bounce (never caustics). The image is the same as two paths: at 1024 spp the means agreed within 0.1% in RGB and NIR on `20263004` and `sim_apt_22572521_vanilla_r2`. GPU time per 16 spp frame fell from 143 to 101 ms and from 127 to 84 ms. It is on by default.
 
@@ -511,9 +511,9 @@ The residual falls with spp, so it is Monte Carlo noise rather than a scene diff
 
 ### Frames by samples per pixel
 
-![One dataset view at 1024 spp and the simulator at 16, 64 and 256 spp, as RGB, DoLP and AoLP](docs/media/spp_samples.jpg)
+![One view of REF_CS02 at 4096 spp and single renders at 16, 64 and 256 spp, as RGB, DoLP and AoLP](docs/media/spp_samples.jpg)
 
-`base`, `support_pose_00159` at `h_180`. DoLP is drawn black to red over 0–0.2. AoLP maps 0–180° once around the colour circle (0° and 180° red, 90° cyan), with brightness DoLP / 0.2 so weakly polarized light goes dark, and nothing of the RGB image underneath. Polarization is noisier than intensity, so DoLP and AoLP need more samples than S0 to approach the dataset frame. The errors are for this one view, so they differ slightly from the three-view averages in *Performance and hosting*.
+`blend_REF_CS02`, `base`, one view of the lab: single renders at 16, 64 and 256 spp (no accumulation, no firefly hold-back, no denoiser) against the mean of four 1024 spp renders. On this view S0 is off by 24.9%, 14.1% and 8.0% of the mean (mean absolute error) and DoLP by 0.043, 0.028 and 0.019: a lab lit through a window and by ceiling panels, with glossy metal everywhere, is a noisier scene than the Infinigen apartment this figure showed before (16.2%, 8.4%, 4.6% and 0.023, 0.012, 0.007 there, against the dataset's own frame). DoLP is drawn black to red over 0–0.2. AoLP maps 0–180° once around the colour circle (0° and 180° red, 90° cyan), with brightness DoLP / 0.2 so weakly polarized light goes dark, and nothing of the RGB image underneath. Polarization is noisier than intensity, so DoLP and AoLP need more samples than S0 to approach the reference. The errors are for this one view of another scene than the three-view averages in *Performance and hosting* (measured on the Infinigen apartments).
 
 ## Performance and hosting
 
