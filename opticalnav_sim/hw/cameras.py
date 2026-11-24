@@ -113,6 +113,7 @@ class CameraSpec(Spec):
     render_scale: float = 0.25
     body_mm: tuple = (29.0, 29.0, 45.0)      # width, height, length of the housing (drawn behind the lens)
     calibration: Intrinsics | None = None    # measured intrinsics, at the size they were measured: replaces the lens model
+    drawn: bool = True                       # False: no housing in the scene (an observer's eye, not a piece of hardware)
 
     def __post_init__(self):
         w, h = self.sensor.size_mm()
@@ -154,6 +155,8 @@ class CameraSpec(Spec):
 
     def visuals(self) -> dict:
         """The lens barrel and the housing, behind the optical centre (the camera does not see itself)."""
+        if not self.drawn:
+            return {}
         d, length = (v / 1000.0 for v in self.lens.barrel_mm)
         w, h, body = (v / 1000.0 for v in self.body_mm)
         black, grey = ("plastic", (0.02, 0.02, 0.02), 0.3), ("metal", (0.55, 0.55, 0.58), 0.35)

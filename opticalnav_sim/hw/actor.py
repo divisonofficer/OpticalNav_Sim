@@ -120,7 +120,7 @@ class World:
         if actor.parent is not None:
             actor.parent.children.remove(actor)
 
-    def _on_ground(self, actor: Actor, pose: Transform) -> Transform:
+    def _on_ground(self, actor: Actor, pose: Transform, _partial: bool = False) -> Transform:
         """A wheeled base's pose after a step, as the ground allows it: stopped where its footprint would cover
         something higher than a step (it keeps its place, its speed is dropped), else set on the floor under its
         wheels: their heights give the base's height and its roll and pitch."""
@@ -144,6 +144,33 @@ class World:
         a, b, z0 = (float(v) for v in np.linalg.lstsq(np.c_[wheels, np.ones(4)], z, rcond=None)[0])
         corners = (np.c_[spec.footprint(), np.zeros(4), np.ones(4)] @ pose.matrix().T)[:, :2]
         if ground.blocked(corners, z0, (a * c - b * s, a * s + b * c), pose.xyz[:2]):
+            # Blocked as a whole: the part of the step that is free is still taken (the turn without the travel, or
+            # the travel without the turn), so a robot against a wall can turn away or slide along it; if neither
+            # is free it stays, and its speed is dropped.
+            if not _partial:
+                old = actor.pose
+                moved = math.hypot(pose.xyz[0] - old.xyz[0], pose.xyz[1] - old.xyz[1]) > 1e-9
+                turned = abs(pose.rpy_deg[2] - old.rpy_deg[2]) > 1e-9
+                parts = []
+                if moved and turned:
+                    parts = [("turn", Transform((old.xyz[0], old.xyz[1], pose.xyz[2]), pose.rpy_deg)),
+                             ("travel", Transform(pose.xyz, (pose.rpy_deg[0], pose.rpy_deg[1], old.rpy_deg[2])))]
+                if moved:  # along a wall: the step's part along world x, or along world y
+                    parts += [("slide", Transform((pose.xyz[0], old.xyz[1], pose.xyz[2]), pose.rpy_deg)),
+                              ("slide", Transform((old.xyz[0], pose.xyz[1], pose.xyz[2]), pose.rpy_deg))]
+                for kind, part in parts:
+                    if math.hypot(part.xyz[0] - old.xyz[0], part.xyz[1] - old.xyz[1]) < 1e-9 and \
+                            abs(part.rpy_deg[2] - old.rpy_deg[2]) < 1e-9:
+                        continue
+                    done = self._on_ground(actor, part, _partial=True)
+                    if done is not None:
+                        state.collided = True   # it touched, and gave way
+                        t = state.twist
+                        if kind != "slide":
+                            state.twist = type(t)(0.0, 0.0, t.wz) if kind == "turn" else type(t)(t.vx, t.vy, 0.0)
+                        return done
+            if _partial:
+                return None
             state.collided = True
             state.speed, state.setpoint = np.zeros(4), np.zeros(4)
             state.twist = type(state.twist)()

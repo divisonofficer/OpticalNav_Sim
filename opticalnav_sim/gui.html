@@ -242,6 +242,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
 <header class="top">
   <h1>OpticalNav Sim Viewer</h1>
   <button type="button" class="icon-btn" id="help-btn" aria-haspopup="dialog" title="조작법과 3D 리그 편집 키 (?)">도움말 ?</button>
+  <a class="icon-btn" id="robot-link" href="/robot" title="로봇과 카메라 리그를 씬에 놓고 몰기">로봇 모드</a>
   <div class="monitor" id="monitor" role="status" aria-live="polite"></div>
 </header>
 <details class="settings" id="settings">
@@ -1868,6 +1869,13 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "?" && !ev.target.closest("select, input, #rig3d")) { ev.preventDefault(); openHelp(); }
 });
 boot().catch((e) => showError(`시작 실패: ${e.message}`));
+</script>
+<script>
+// the robot mode opens on the scene the viewer is showing
+document.getElementById("robot-link").addEventListener("click", (e) => {
+  const sel = document.getElementById("scene");
+  if (sel && sel.value) e.currentTarget.href = "/robot?scene=" + encodeURIComponent(sel.value);
+});
 </script>
 </body>
 </html>

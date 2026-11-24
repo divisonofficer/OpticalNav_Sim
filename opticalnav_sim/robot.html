@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpticalNav Sim 로봇 모드</title>
+<style>
+:root {
+  --bg: #0b1114; --panel: #121a1e; --panel-2: #182227; --panel-3: #1e2a30; --ink: #e2e9ec; --muted: #8b9ca4; --rule: #24323a;
+  --accent: #3fc9d4; --accent-2: #f08250; --warn: #e3a05a; --bad: #ef6b6b; --ok: #45c48a;
+  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  --sans: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --radius: 10px;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.5 var(--sans); }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+header a { color: var(--accent); text-decoration: none; }
+select, button, input[type=number] { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px; font: inherit; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); color: #06282c; border-color: var(--accent); font-weight: 600; }
+button.on { border-color: var(--accent); color: var(--accent); }
+#banner { padding: 8px 16px; display: none; border-bottom: 1px solid var(--rule); }
+#banner.info { display: block; background: #10262a; color: var(--accent); }
+#banner.bad { display: block; background: #2b1717; color: var(--bad); }
+main { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, 1fr); gap: 12px; padding: 12px 16px; }
+@media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+.cams { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-content: start; }
+.pane { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); overflow: hidden; }
+.pane h2 { margin: 0; padding: 7px 10px; font-size: 12px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--rule); }
+.pane h2 span { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; text-align: right; }
+.pane img { display: block; width: 100%; background: #000; min-height: 120px; }
+.side { display: grid; gap: 12px; align-content: start; }
+canvas { display: block; width: 100%; background: #0e1417; }
+table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; }
+td, th { padding: 3px 10px; text-align: right; border-top: 1px solid var(--rule); }
+td:first-child, th:first-child { text-align: left; color: var(--muted); font-family: var(--sans); font-weight: 400; }
+th { color: var(--muted); font-weight: 400; }
+.hot { color: var(--accent-2); }
+.bad { color: var(--bad); }
+.keys { padding: 8px 10px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
+kbd { background: var(--panel-3); border: 1px solid var(--rule); border-radius: 4px; padding: 0 5px; font: 11px var(--mono); color: var(--ink); }
+.row { display: flex; gap: 8px; align-items: center; padding: 8px 10px; flex-wrap: wrap; }
+.row label { color: var(--muted); }
+.legend { display: flex; align-items: center; gap: 6px; padding: 8px 10px; color: var(--muted); font-size: 11px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 90px; height: 8px; border-radius: 4px; background: linear-gradient(90deg, rgb(217,64,51), rgb(64,204,51)); }
+</style>
+</head>
+<body>
+<header>
+  <h1>로봇 모드</h1>
+  <label>씬 <select id="scene"></select></label>
+  <button id="start" class="primary">시작</button>
+  <button id="stop">정지</button>
+  <span id="where" style="color:var(--muted)"></span>
+  <span style="flex:1"></span>
+  <a href="/">← 뷰어로</a>
+</header>
+<div id="banner"></div>
+<main>
+  <section class="cams">
+    <div class="pane"><h2>HDR 카메라 <span id="m-hdr"></span></h2><img id="f-hdr" alt="HDR 카메라 영상"></div>
+    <div class="pane"><h2>12-bit 카메라 <span id="m-12bit"></span></h2><img id="f-12bit" alt="12-bit 카메라 영상"></div>
+    <div class="pane"><h2>추적 시점 <span id="m-chase"></span></h2><img id="f-chase" alt="로봇 뒤에서 본 영상"></div>
+    <div class="pane">
+      <h2>바퀴 <span>조향 · 속도 · 바닥 마찰 · 미끄럼</span></h2>
+      <table id="wheels"></table>
+      <h2 style="border-top:1px solid var(--rule)">로봇 상태 <span id="m-sim"></span></h2>
+      <table id="status"></table>
+    </div>
+  </section>
+  <section class="side">
+    <div class="pane">
+      <h2>지도 <span id="m-map"></span></h2>
+      <canvas id="map" width="560" height="420"></canvas>
+      <div class="legend"><span>마찰 0.1</span><i></i><span>0.9</span><span style="margin-left:8px">검정: 막힘</span><span style="margin-left:8px;color:var(--accent)">— 실제 궤적</span><span style="color:var(--accent-2)">- - 오도메트리</span></div>
+    </div>
+    <div class="pane">
+      <h2>조종</h2>
+      <div class="row">
+        <label>속도 <input id="speed" type="number" min="0.1" max="1.5" step="0.1" value="0.6" style="width:64px"> m/s</label>
+        <label>조향 <input id="steer" type="number" min="5" max="40" step="5" value="20" style="width:56px"> °</label>
+        <label>지도 폭 <input id="span" type="number" min="4" max="60" step="2" value="12" style="width:56px"> m</label>
+      </div>
+      <div class="keys">
+        <span><kbd>W</kbd> <kbd>S</kbd></span><span>전진 / 후진</span>
+        <span><kbd>A</kbd> <kbd>D</kbd></span><span>좌 / 우 조향 (전후진 없이 누르면 제자리 회전)</span>
+        <span><kbd>Q</kbd> <kbd>E</kbd></span><span>좌 / 우 횡이동</span>
+        <span><kbd>Space</kbd></span><span>정지 (키를 놓아도 0.5초 뒤 멈춤)</span>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const CAMS = ["hdr", "12bit", "chase"];
+const seen = {};
+let S = null, mapImg = null, mapKey = "";
+const held = new Set();
+
+async function api(path, body) {
+  const r = await fetch("/api/robot/" + path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+function banner(text, kind) { const b = $("banner"); b.textContent = text || ""; b.className = text ? kind : ""; }
+
+async function scenes() {
+  try {
+    const want = new URLSearchParams(location.search).get("scene");
+    const { scenes } = await api("scenes");
+    $("scene").innerHTML = scenes.map((s) => `<option${s === want ? " selected" : ""}>${s}</option>`).join("");
+  } catch (e) { banner("렌더 서버에서 씬 목록을 받지 못했습니다: " + e.message, "bad"); }
+}
+
+$("start").onclick = async () => {
+  try { banner("시작하는 중…", "info"); await api("start", { scene: $("scene").value }); }
+  catch (e) { banner(e.message, "bad"); }
+};
+$("stop").onclick = () => api("stop", {}).catch((e) => banner(e.message, "bad"));
+
+function row(label, value, cls) { return `<tr><td>${label}</td><td class="${cls || ""}">${value}</td></tr>`; }
+
+function paint() {
+  if (!S) return;
+  banner(S.error || S.message, S.error ? "bad" : "info");
+  $("where").textContent = S.scene ? `${S.scene}${S.running ? "" : " (멈춤)"}` : "";
+  for (const n of CAMS) {
+    const c = (S.cameras || {})[n];
+    if (!c) { $("m-" + n).textContent = S.running ? "첫 프레임 대기" : ""; continue; }
+    $("m-" + n).textContent = n === "chase" ? `${c.size[0]}×${c.size[1]} · ${c.spp} spp`
+      : `${c.model} · ${c.format} · ${c.size[0]}×${c.size[1]} · 노출 ${c.exposure_ms} ms${c.gain_db ? " +" + c.gain_db + " dB" : ""} · ${c.spp} spp`;
+    if (seen[n] !== c.seq) { seen[n] = c.seq; $("f-" + n).src = `/api/robot/frame/${n}.jpg?seq=${c.seq}`; }
+  }
+  const r = S.robot;
+  $("m-sim").textContent = S.running ? `시뮬레이션 ${S.sim_rate} Hz` : "";
+  if (!r) { $("status").innerHTML = ""; $("wheels").innerHTML = ""; return; }
+  const speed = Math.hypot(r.vx, r.vy);
+  $("status").innerHTML = [
+    row("위치 (x, y, z)", `${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(3)} m`),
+    row("방위 · 롤 · 피치", `${r.yaw_deg.toFixed(1)}° · ${r.roll_deg.toFixed(1)}° · ${r.pitch_deg.toFixed(1)}°`),
+    row("속도 (실제)", `${speed.toFixed(2)} m/s · 회전 ${r.wz.toFixed(2)} rad/s`),
+    row("명령 (vx, vy, ω)", r.command.map((v) => v.toFixed(2)).join(", ")),
+    row("바닥 재질", r.material || "—"),
+    row("충돌", r.collided ? "막힘: 앞에 장애물" : "없음", r.collided ? "bad" : ""),
+  ].join("");
+  const names = ["앞 왼쪽", "앞 오른쪽", "뒤 왼쪽", "뒤 오른쪽"];
+  $("wheels").innerHTML = "<tr><th></th><th>조향</th><th>바퀴 속도</th><th>마찰 μ</th><th>미끄럼</th></tr>" + names.map((n, i) =>
+    `<tr><td>${n}</td><td>${r.steer_deg[i].toFixed(1)}°</td><td>${r.wheel_speed[i].toFixed(2)} m/s</td><td>${r.mu[i].toFixed(2)}</td>` +
+    `<td class="${r.slip[i] > 0.05 ? "hot" : ""}">${r.slip[i].toFixed(3)} m/s</td></tr>`).join("");
+  drawMap();
+}
+
+function drawMap() {
+  const cv = $("map"), ctx = cv.getContext("2d"), W = cv.width, H = cv.height;
+  ctx.fillStyle = "#0e1417"; ctx.fillRect(0, 0, W, H);
+  const m = S.map, r = S.robot;
+  if (!m || !r) return;
+  const key = S.scene + m.x0 + m.y0;
+  if (mapKey !== key) { mapKey = key; mapImg = new Image(); mapImg.onload = drawMap; mapImg.src = "/api/robot/map.png?k=" + encodeURIComponent(key); }
+  const span = Math.max(4, +$("span").value || 12), scale = W / span;        // pixels per metre
+  const X = (x) => W / 2 + (x - r.x) * scale, Y = (y) => H / 2 - (y - r.y) * scale;
+  if (mapImg && mapImg.complete && mapImg.naturalWidth) {
+    ctx.imageSmoothingEnabled = false;                                      // the picture's top row is the map's far (y1) edge
+    ctx.drawImage(mapImg, X(m.x0), Y(m.y1), (m.x1 - m.x0) * scale, (m.y1 - m.y0) * scale);
+  }
+  const path = (pts, color, dash) => {
+    if (!pts || pts.length < 2) return;
+    ctx.beginPath(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    pts.forEach((p, i) => (i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1]))));
+    ctx.stroke(); ctx.setLineDash([]);
+  };
+  path(S.odometry_trail, "#f08250", [4, 3]);
+  path(S.trail, "#3fc9d4");
+  ctx.beginPath(); r.footprint.forEach((p, i) => (i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])))); ctx.closePath();
+  ctx.fillStyle = r.collided ? "rgba(239,107,107,0.45)" : "rgba(226,233,236,0.25)"; ctx.fill();
+  ctx.strokeStyle = r.collided ? "#ef6b6b" : "#e2e9ec"; ctx.lineWidth = 1.5; ctx.stroke();
+  const a = r.yaw_deg * Math.PI / 180;                                      // the heading: an arrow from the centre
+  ctx.beginPath(); ctx.moveTo(W / 2, H / 2); ctx.lineTo(W / 2 + Math.cos(a) * 0.6 * scale, H / 2 - Math.sin(a) * 0.6 * scale);
+  ctx.strokeStyle = "#3fc9d4"; ctx.lineWidth = 2; ctx.stroke();
+  $("m-map").textContent = `${span} m 폭 · 격자 ${m.cell} m`;
+}
+
+function command() {
+  const v = Math.min(1.5, Math.max(0.1, +$("speed").value || 0.6)), st = Math.min(40, Math.max(5, +$("steer").value || 20));
+  const fwd = (held.has("w") ? 1 : 0) - (held.has("s") ? 1 : 0), turn = (held.has("a") ? 1 : 0) - (held.has("d") ? 1 : 0);
+  const side = (held.has("q") ? 1 : 0) - (held.has("e") ? 1 : 0);
+  if (held.has(" ")) return { mode: "twist" };
+  if (side) return { mode: "lateral", linear: side * Math.min(v, 0.75) };
+  if (fwd) return { mode: "ackermann", linear: fwd * v, steering_deg: turn * st };
+  if (turn) return { mode: "spin", angular: turn * 1.0 };
+  return null;
+}
+// a held key sends its command ten times a second; a tap sends it once at once (the chassis keeps it for 0.5 s)
+const send = () => { const c = command(); if (c && S && S.running) api("control", c).catch(() => {}); };
+addEventListener("keydown", (e) => {
+  if (["INPUT", "SELECT"].includes(e.target.tagName)) return;
+  const k = e.key.toLowerCase();
+  if (!"wasdqe ".includes(k)) return;
+  e.preventDefault();
+  if (!held.has(k)) { held.add(k); send(); }
+});
+addEventListener("keyup", (e) => held.delete(e.key.toLowerCase()));
+addEventListener("blur", () => held.clear());
+setInterval(send, 100);
+setInterval(async () => { try { S = await api("state"); paint(); } catch (e) { banner("뷰어와 연결이 끊겼습니다: " + e.message, "bad"); } }, 200);
+$("span").oninput = () => S && drawMap();
+scenes();
+</script>
+</body>
+</html>

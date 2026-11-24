@@ -129,15 +129,27 @@ def render_plan(k: Intrinsics, oversample: float = 1.0, margin_px: float = 2.0) 
     return RenderPlan(width, height, math.degrees(2.0 * math.atan(width / (2.0 * f))), map_x, map_y)
 
 
+_CV2 = []
+
+
+def _cv2():
+    """OpenCV when this interpreter has a working one (an install built against another numpy fails at import with a
+    TypeError, not an ImportError), else None."""
+    if not _CV2:
+        try:
+            import cv2
+            _CV2.append(cv2)
+        except Exception:  # noqa: BLE001
+            _CV2.append(None)
+    return _CV2[0]
+
+
 def remap(image: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
     """Bilinear resampling of ``image`` (H x W or H x W x C) at (map_x, map_y); the edge is repeated outside."""
     img = np.asarray(image)
-    if img.dtype == np.float32 and (img.ndim == 2 or img.shape[2] <= 4):
-        try:  # the same resampling, several times faster (it interpolates in 1/32 pixel steps: 5e-4 of a step's contrast)
-            import cv2
-            return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        except ImportError:
-            pass
+    if img.dtype == np.float32 and (img.ndim == 2 or img.shape[2] <= 4) and _cv2() is not None:
+        # the same resampling, several times faster (it interpolates in 1/32 pixel steps: 5e-4 of a step's contrast)
+        return _cv2().remap(img, map_x, map_y, _cv2().INTER_LINEAR, borderMode=_cv2().BORDER_REPLICATE)
     h, w = img.shape[:2]
     x, y = np.clip(map_x, 0.0, w - 1.0), np.clip(map_y, 0.0, h - 1.0)
     x0, y0 = np.minimum(np.floor(x).astype(np.int64), w - 2), np.minimum(np.floor(y).astype(np.int64), h - 2)

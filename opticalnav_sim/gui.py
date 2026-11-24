@@ -1034,7 +1034,9 @@ def dispatch(session: Session, path: str, body: dict) -> dict:
     raise KeyError(f"no route /api/{path}")
 
 
-def make_handler(session: Session, token: str | None = None):
+def make_handler(session: Session, token: str | None = None, robot=None):
+    from . import robot_view
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -1076,6 +1078,11 @@ def make_handler(session: Session, token: str | None = None):
                 return
             if parts == ["ws"] and self.headers.get("Upgrade", "").lower() == "websocket":
                 return self._websocket()
+            if robot is not None and robot_view.handles(parts):  # the robot mode's page and data (robot_view.py)
+                try:
+                    return robot_view.get(self, robot, parts, q)
+                except Exception as exc:  # noqa: BLE001 - to the page
+                    return self._json(502, {"error": f"{type(exc).__name__}: {exc}"})
             try:
                 if not parts:
                     if token and q.get("token"):  # remember the token, then drop it from the address bar
@@ -1125,6 +1132,9 @@ def make_handler(session: Session, token: str | None = None):
                 return
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                parts = [p for p in url.path.split("/") if p]
+                if robot is not None and robot_view.handles(parts):
+                    return robot_view.post(self, robot, parts, body)
                 if not url.path.startswith("/api/"):
                     return self._json(404, {"error": f"no route {url.path}"})
                 try:
@@ -1266,6 +1276,9 @@ def main() -> int:
     ap.add_argument("--plain-mean", action="store_true",
                     help="accumulate passes as a plain mean (default: fireflies held back, see robust_mean)")
     ap.add_argument("--depth", type=int, default=2, help="passes in flight on the render server (2 overlaps CPU and GPU)")
+    ap.add_argument("--rig-calibration", default=os.environ.get("OPTICALNAV_RIG_CALIBRATION"),
+                    help="a multi-camera calibration (OpenCV YAML) for the robot mode's camera rig; without it, two "
+                         "cameras by their datasheet models")
     ap.add_argument("--token", default=os.environ.get("OPTICALNAV_GUI_TOKEN"),
                     help="required to listen beyond localhost (default $OPTICALNAV_GUI_TOKEN); open /?token=<token>")
     args = ap.parse_args()
@@ -1302,7 +1315,9 @@ def main() -> int:
     session.refresh_blends()
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token))
+    from .robot_view import RobotSession
+    robot = RobotSession(sim._client.url, args.rig_calibration)  # the robot mode (/robot): started from its page
+    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token, robot))
     resident = [r[0] for r in info.get("resident", [])]
     print(f"[gui] http://{args.host}:{args.port}{'/?token=<token>' if args.token else ''}  render server {sim._client.url}  freeze={info.get('drjit_freeze')}  "
           f"resident={resident}", flush=True)

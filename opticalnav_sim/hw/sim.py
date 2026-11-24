@@ -135,7 +135,7 @@ class SimWorld(World):
         if id(spec) not in self._models:
             links = {link: [_visual_dict(v) for v in vs] for link, vs in spec.visuals().items()}
             self._models[id(spec)] = (safe(getattr(spec, "model", None) or type(spec).__name__), links)
-        return self._models[id(spec)]
+        return self._models[id(spec)] if self._models[id(spec)][1] else None   # nothing drawn: not a body
 
     def bodies(self) -> list[dict]:
         """Every drawn actor as the render server's view field: registers a model the first time it is used."""
@@ -169,23 +169,36 @@ class SimWorld(World):
             view["bodies"] = bodies
         return view, plan, k
 
-    def render(self, camera: Actor, spp: int | None = None, scale: float | None = None, oversample: float = 1.0,
-               stokes_dtype: str = "float32", **options) -> Frame:
-        """Render a camera now. ``scale``: share of the sensor's resolution (default: the spec's render_scale).
-        ``options``: other view fields of the render server (bands, lights, env, depth, denoise...)."""
+    def request(self, camera: Actor, spp: int | None = None, scale: float | None = None, oversample: float = 1.0,
+                **options) -> dict:
+        """What ``render`` asks the server for, with the world as it is now: ``{"view", "plan", "intrinsics", "pose",
+        "time"}``. Split from the rendering so a caller that steps the world on another thread reads the poses in one
+        short moment (under its own lock) and waits for the image outside it."""
         if camera.spec.kind != "camera":
             raise ValueError(f"{camera.name} is a {camera.spec.kind}, not a camera")
         view, plan, k = self.view(camera, spp, scale, oversample, **options)
-        out = self.client.render([view], stokes_dtype)[0]
         self.seed += 1
+        return {"view": view, "plan": plan, "intrinsics": k, "pose": optical_pose(camera.link_matrix("camera")), "time": self.time}
+
+    def frame(self, request: dict, out: dict, components=("s0", "s1", "s2", "s3")) -> Frame:
+        """The server's answer to a ``request`` as the camera's Frame (the lens's distortion applied). ``components``:
+        the Stokes images to keep (a plain sensor needs S0 only: the others are not resampled)."""
+        plan = request["plan"]
 
         def lens(a):
             return None if a is None else optics.remap(np.asarray(a, dtype=np.float32), plan.map_x, plan.map_y)
 
         image = np.clip(np.rint(lens(out["rgb"])), 0, 255).astype(np.uint8) if "rgb" in out else None
-        return Frame(self.time, k, optical_pose(camera.link_matrix("camera")), image, lens(out.get("s0")),
-                     lens(out.get("s1")), lens(out.get("s2")), lens(out.get("s3")), lens(out.get("depth")),
-                     dict(self.client.last_timing))
+        s = [lens(out.get(n)) if n in components else None for n in ("s0", "s1", "s2", "s3")]
+        return Frame(request["time"], request["intrinsics"], request["pose"], image, s[0], s[1], s[2], s[3],
+                     lens(out.get("depth")), dict(self.client.last_timing))
+
+    def render(self, camera: Actor, spp: int | None = None, scale: float | None = None, oversample: float = 1.0,
+               stokes_dtype: str = "float32", **options) -> Frame:
+        """Render a camera now. ``scale``: share of the sensor's resolution (default: the spec's render_scale).
+        ``options``: other view fields of the render server (bands, lights, env, depth, denoise...)."""
+        request = self.request(camera, spp, scale, oversample, **options)
+        return self.frame(request, self.client.render([request["view"]], stokes_dtype)[0])
 
     def capture(self, camera: Actor, exposure_s: float | None = None, gain_db: float | None = None, noise: bool = True,
                 spp: int | None = None, scale: float | None = None, binning: bool = False, **options) -> tuple:
@@ -197,10 +210,18 @@ class SimWorld(World):
         instead and leave the camera's setting alone. ``binning``: the rendered pixel is the mean of the sensor pixels
         it covers (their noise averaged), instead of one pixel of a smaller sensor. ``frame`` keeps the Stokes images
         the raw was made from (the ground truth)."""
-        frame = self.render(camera, spp, scale, **options)
+        request = self.request(camera, spp, scale, **options)
+        return self.expose(camera, request, self.client.render([request["view"]], "float32")[0], exposure_s, gain_db, noise, binning)
+
+    def expose(self, camera: Actor, request: dict, out: dict, exposure_s: float | None = None, gain_db: float | None = None,
+               noise: bool = True, binning: bool = False) -> tuple:
+        """``capture``'s second half: the server's answer to ``request`` through the camera's sensor."""
+        polar = camera.spec.sensor.cfa.startswith("polar_")
+        frame = self.frame(request, out, ("s0", "s1", "s2") if polar else ("s0",))
+        light = sensor_model.irradiance(frame, camera.spec)   # once: the meter and the sensor both read it
         if exposure_s is None:
-            exposure_s, auto_gain = camera.state.exposure.next(frame, camera.spec)
+            exposure_s, auto_gain = camera.state.exposure.next(frame, camera.spec, light)
             gain_db = auto_gain if gain_db is None else gain_db
         covered = (camera.spec.sensor.width / frame.intrinsics.width) ** 2 if binning else 1.0
         return sensor_model.expose(frame, camera.spec, exposure_s, gain_db or 0.0, noise, seed=self.seed,
-                                   pixels_per_sample=covered), frame
+                                   pixels_per_sample=covered, light=light), frame

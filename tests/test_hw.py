@@ -690,3 +690,63 @@ def test_ground_map_from_scene_files_gives_heights_obstacles_and_friction(tmp_pa
     assert r.state.collided and 2.3 < r.pose.xyz[0] + spec.size[0] / 2.0 <= 2.8 + 0.05   # its nose at the crate (x = 2.8)
     ground.set_material("hall_wet_stain", 0.05)    # an override: the stain is ice now
     assert ground.friction(1.0, 0.0) == 0.05
+
+
+def test_robot_mode_routes_and_commands():
+    """The viewer's robot mode without a render server: its routes, its command parsing, its page."""
+    from opticalnav_sim import robot_view
+    assert robot_view.handles(["robot"]) and robot_view.handles(["api", "robot", "state"]) and not robot_view.handles(["api", "state"])
+    session = robot_view.RobotSession("http://127.0.0.1:1")
+    assert session.state() == {"scene": "", "running": False, "message": "", "error": "", "cameras": {}, "map": None, "sim_rate": 0.0}
+    assert session.command({"mode": "ackermann", "linear": 0.5, "steering_deg": 20.0}) == {"ok": True}
+    control, at = session.control
+    assert isinstance(control, hw.RangerControl) and control.steering_deg == 20.0
+    session.command({"mode": "twist", "vx": 0.2, "wz": 0.1})
+    assert isinstance(session.control[0], hw.Twist) and session.control[0].wz == 0.1
+    with pytest.raises(ValueError):
+        session.command({"mode": "fly"})
+    assert session.frame("hdr") is None
+    page = robot_view.PAGE.read_text()
+    assert "/api/robot/" in page and 'id="map"' in page and all(f'id="f-{n}"' in page for n in ("hdr", "12bit", "chase"))
+
+    class Fake:
+        sent = None
+
+        def _send(self, code, body, ctype):
+            self.sent = (code, ctype, len(body))
+
+        def _json(self, code, payload):
+            self.sent = (code, payload)
+    h = Fake()
+    robot_view.get(h, session, ["robot"], {})
+    assert h.sent[0] == 200 and h.sent[1].startswith("text/html")
+    robot_view.get(h, session, ["api", "robot", "frame", "hdr.jpg"], {})
+    assert h.sent[0] == 404
+    robot_view.post(h, session, ["api", "robot", "control"], {"mode": "spin", "angular": 1.0})
+    assert h.sent == (200, {"ok": True})
+
+
+def test_blocked_robot_can_turn_or_slide_free():
+    """Against a wall the part of a step that is free is still taken: the robot is not glued to what it touched."""
+    cell = 0.05
+    x = np.arange(-3.0, 3.0 + 1e-9, cell)
+    heights = np.zeros((len(x), len(x)))
+    heights[:, x >= 1.0] = 2.0                         # a wall along x = 1
+    ground = hw.Ground()
+    ground.set_height_map(heights, (x[0], x[0]), cell)
+    world = hw.World(dt=0.02, ground=ground)
+    spec = robots.RangerMini2()
+    r = world.spawn(spec, at=hw.pose2d(0.0, 0.0, 0.0, 0.0))
+    spec.apply(r.state, hw.Twist(0.6, 0.0, 0.0))
+    for _ in range(200):
+        world.tick()
+    stuck = r.pose.xyz[0]
+    assert r.state.collided and stuck + spec.size[0] / 2.0 <= 1.0 + cell
+    spec.apply(r.state, hw.Twist(0.6, 0.4, 0.0))       # still pushing into the wall, and sideways: it slides along it
+    for _ in range(100):
+        world.tick()
+    assert r.pose.xyz[1] > 0.3 and abs(r.pose.xyz[0] - stuck) < 0.06
+    spec.apply(r.state, hw.Twist(-0.5, 0.0, 0.0))
+    for _ in range(60):
+        world.tick()
+    assert not r.state.collided and r.pose.xyz[0] < stuck - 0.2

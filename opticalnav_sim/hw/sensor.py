@@ -11,6 +11,7 @@ sets the exposure time as a camera would; exposures of two cameras of one rig ar
 """
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 
@@ -94,9 +95,12 @@ def to_sensor_frame(s1: np.ndarray, s2: np.ndarray, angle: np.ndarray) -> tuple[
     return s1 * c + s2 * s, -s1 * s + s2 * c
 
 
+@functools.lru_cache(maxsize=64)
 def vignetting(k: Intrinsics, power: float = 4.0) -> np.ndarray:
     """A lens's fall-off towards the corners: cos^power of the ray's angle off the axis (H x W, 1 on the axis).
-    4 is the natural vignetting of a thin lens; a real wide-angle lens falls off less (LensSpec.falloff)."""
+    4 is the natural vignetting of a thin lens; a real wide-angle lens falls off less (LensSpec.falloff). Kept per
+    camera (every pixel's ray is an inverse of the distortion: a third of a second for a 0.3 MP image); do not write
+    into the result."""
     u, v = np.meshgrid(np.arange(k.width, dtype=np.float64), np.arange(k.height, dtype=np.float64))
     rays = k.rays(np.stack([u.ravel(), v.ravel()], 1))
     return ((1.0 + (rays ** 2).sum(1)) ** (-float(power) / 2.0)).reshape(k.height, k.width)
@@ -152,36 +156,40 @@ class ExposureControl:
     exposure_limits: tuple = (2.0e-5, 0.03)
     gain_limits: tuple = (0.0, 24.0)
 
-    def level(self, frame, spec, exposure_s: float, gain_db: float) -> float:
-        """What the meter reads: the mean of the image at this setting (clipped pixels count as full)."""
+    def level(self, frame, spec, exposure_s: float, gain_db: float, light: np.ndarray | None = None) -> float:
+        """What the meter reads: the mean of the image at this setting (clipped pixels count as full). ``light``: the
+        frame's ``irradiance``, when the caller has it."""
         well = spec.sensor.readouts[0][1] * 8.0 if spec.sensor.readouts else spec.sensor.full_well_e
-        signal = irradiance(frame, spec) * responsivity(spec) * exposure_s * 10.0 ** (gain_db / 20.0) / well
+        light = irradiance(frame, spec) if light is None else light
+        signal = light * (responsivity(spec) * exposure_s * 10.0 ** (gain_db / 20.0) / well)
         return float(np.minimum(signal, 1.0).mean())
 
-    def _towards(self, frame, spec, exposure_s: float, gain_db: float, share: float) -> tuple[float, float]:
-        level = max(self.level(frame, spec, exposure_s, gain_db), 1e-9)
+    def _towards(self, frame, spec, exposure_s: float, gain_db: float, share: float, light) -> tuple[float, float]:
+        level = max(self.level(frame, spec, exposure_s, gain_db, light), 1e-9)
         total = exposure_s * 10.0 ** (gain_db / 20.0) * (self.target / level) ** share   # time x gain: the sensitivity
         low_gain = 10.0 ** (self.gain_limits[0] / 20.0)
         t = float(np.clip(total / low_gain, *self.exposure_limits))
         return t, float(np.clip(20.0 * math.log10(max(total / t, 1e-12)), *self.gain_limits))
 
-    def settle(self, frame, spec) -> tuple[float, float]:
+    def settle(self, frame, spec, light: np.ndarray | None = None) -> tuple[float, float]:
         """The setting the auto exposure ends at on this frame (as after many frames of the same view)."""
+        light = irradiance(frame, spec) if light is None else light
         t, g = self.exposure_s or 0.005, self.gain_db
         for _ in range(30):  # clipped highlights make it more than one step
-            t, g = self._towards(frame, spec, t, g, 1.0)
+            t, g = self._towards(frame, spec, t, g, 1.0, light)
         return t, g
 
-    def next(self, frame, spec) -> tuple[float, float]:
+    def next(self, frame, spec, light: np.ndarray | None = None) -> tuple[float, float]:
         """(exposure, gain) to take ``frame`` with; the setting then moves on for the frame after it."""
         if not self.auto:
             if self.exposure_s is None:
                 self.exposure_s = 0.005
             return self.exposure_s, self.gain_db
+        light = irradiance(frame, spec) if light is None else light
         if self.exposure_s is None:
-            self.exposure_s, self.gain_db = self.settle(frame, spec)
+            self.exposure_s, self.gain_db = self.settle(frame, spec, light)
         used = (self.exposure_s, self.gain_db)
-        self.exposure_s, self.gain_db = self._towards(frame, spec, *used, 1.0 - self.damping)
+        self.exposure_s, self.gain_db = self._towards(frame, spec, *used, 1.0 - self.damping, light)
         return used
 
 
@@ -191,7 +199,7 @@ def auto_exposure(frame, spec, **settings) -> float:
 
 
 def expose(frame, spec, exposure_s: float | None = None, gain_db: float = 0.0, noise: bool = True, vignette: bool = True,
-           seed: int | None = 0, pixels_per_sample: float = 1.0) -> Raw:
+           seed: int | None = 0, pixels_per_sample: float = 1.0, light: np.ndarray | None = None) -> Raw:
     """The raw frame a camera delivers of ``frame`` (a SimWorld render at the camera's image size).
 
     ``exposure_s``: None is a settled auto exposure (ExposureControl). ``gain_db``: analogue gain. ``noise`` off gives the mean
@@ -199,11 +207,13 @@ def expose(frame, spec, exposure_s: float | None = None, gain_db: float = 0.0, n
     (binning: 4 for 2x2); the noise of the mean shrinks accordingly. The mosaic is laid over the rendered image: at a
     reduced render size it is a sensor of that size, not a crop of the real one."""
     sensor = spec.sensor
+    if light is None:  # ``light``: the frame's irradiance, when the caller has computed it (auto exposure needs it too)
+        light = irradiance(frame, spec, vignette)
     if exposure_s is None:  # a settled auto exposure, gain included
-        exposure_s, auto_gain = ExposureControl().settle(frame, spec)
+        exposure_s, auto_gain = ExposureControl().settle(frame, spec, light if vignette else None)
         gain_db = gain_db + auto_gain
     rng = np.random.default_rng(seed)
-    electrons = irradiance(frame, spec, vignette) * responsivity(spec) * float(exposure_s)
+    electrons = light * (responsivity(spec) * float(exposure_s))
     n = float(pixels_per_sample)
 
     def read(mean_e: np.ndarray, full_well: float, read_noise: float) -> np.ndarray:
