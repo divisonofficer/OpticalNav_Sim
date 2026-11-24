@@ -3,6 +3,8 @@ the sources and for what is still an estimate); a calibration replaces the lens 
 
 A camera renders at ``render_scale`` of its sensor's resolution by default (0.25: a 5 MP sensor as 0.3 MP). Its
 intrinsics, and the mosaic the sensor model lays over the image, are those of the reduced image.
+
+Another camera is a ``SensorSpec`` and a ``LensSpec`` (or a calibration) in a ``CameraSpec``: nothing else knows the models.
 """
 from __future__ import annotations
 
@@ -78,7 +80,7 @@ class CameraSpec(Spec):
     model: str = "camera"
     render_scale: float = 0.25
     body_mm: tuple = (29.0, 29.0, 45.0)      # width, height, length of the housing (drawn behind the lens)
-    calibration: Intrinsics | None = None    # measured intrinsics at full resolution: replaces the lens model
+    calibration: Intrinsics | None = None    # measured intrinsics, at the size they were measured: replaces the lens model
 
     def __post_init__(self):
         w, h = self.sensor.size_mm()
@@ -89,18 +91,21 @@ class CameraSpec(Spec):
             raise ValueError("render_scale is a share of the sensor's resolution: 0 < render_scale <= 1")
 
     def full_intrinsics(self) -> Intrinsics:
+        """The camera's own intrinsics: its calibration at the size it was measured (a real camera is often read out
+        binned: the rig's TDR054S at 1440 x 928, its TRI032S at 1024 x 768), else the lens model at full resolution."""
         if self.calibration is not None:
-            if (self.calibration.width, self.calibration.height) != (self.sensor.width, self.sensor.height):
-                raise ValueError("a calibration is given at the sensor's full resolution")
             return self.calibration
         f = self.lens.focal_mm * 1000.0 / self.sensor.pixel_um
         return Intrinsics(self.sensor.width, self.sensor.height, f, f, (self.sensor.width - 1) / 2.0,
                           (self.sensor.height - 1) / 2.0, tuple(self.lens.dist))
 
     def image_size(self, scale: float | None = None) -> tuple[int, int]:
-        """Rendered image size: the sensor's at ``scale``, even in both directions (a mosaic's 2x2 blocks stay whole)."""
+        """Rendered image size: ``scale`` of the sensor's width, with the shape of the camera's own image, even in both
+        directions (a mosaic's 2x2 blocks stay whole)."""
         s = self.render_scale if scale is None else float(scale)
-        return max(2, 2 * round(self.sensor.width * s / 2)), max(2, 2 * round(self.sensor.height * s / 2))
+        full = self.full_intrinsics()
+        width = max(2, 2 * round(self.sensor.width * s / 2))
+        return width, max(2, 2 * round(width * full.height / full.width / 2))
 
     def intrinsics(self, scale: float | None = None) -> Intrinsics:
         return self.full_intrinsics().scaled(*self.image_size(scale))

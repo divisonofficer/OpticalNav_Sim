@@ -17,7 +17,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Intrinsics:
-    """A camera matrix and distortion at one image size. ``dist``: k1, k2, p1, p2, k3 (and k4, k5, k6 when given)."""
+    """A camera matrix and distortion at one image size. ``dist``: OpenCV's coefficients (see ``distort``)."""
     width: int
     height: int
     fx: float
@@ -53,26 +53,55 @@ class Intrinsics:
 
 
 def distort(xy: np.ndarray, dist) -> np.ndarray:
-    """Brown-Conrady, as cv2.projectPoints applies it to normalized coordinates."""
+    """OpenCV's distortion of normalized coordinates, as cv2.projectPoints applies it: radial (k1, k2, k3 over
+    k4, k5, k6: the rational model), tangential (p1, p2) and thin prism (s1..s4), from 4, 5, 8 or 12 coefficients in
+    OpenCV's order (k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4). The tilted sensor terms are not modelled."""
     xy = np.asarray(xy, dtype=np.float64)
     if not len(dist):
         return xy.copy()
-    k1, k2, p1, p2, k3, k4, k5, k6 = (list(dist) + [0.0] * 8)[:8]
+    if len(dist) > 12 and any(float(v) != 0.0 for v in dist[12:]):
+        raise ValueError("the tilted sensor model (distortion coefficients 13 and 14) is not supported")
+    k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4 = (list(dist) + [0.0] * 12)[:12]
     x, y = xy[:, 0], xy[:, 1]
     r2 = x * x + y * y
     radial = (1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))) / (1.0 + r2 * (k4 + r2 * (k5 + r2 * k6)))
-    return np.stack([x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
-                     y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y], 1)
+    return np.stack([x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) + r2 * (s1 + s2 * r2),
+                     y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y + r2 * (s3 + s4 * r2)], 1)
 
 
-def undistort(xy_d: np.ndarray, dist, iterations: int = 30) -> np.ndarray:
-    """Inverse of ``distort`` by fixed-point iteration (converges for the distortion of real lenses over their image)."""
+def undistort(xy_d: np.ndarray, dist, iterations: int = 40) -> np.ndarray:
+    """Inverse of ``distort``: Newton's method from the distorted point, a step halved while it does not come closer.
+    (OpenCV's fixed-point iteration diverges at the image edge of some rational-model calibrations.) A point the
+    model does not reach (it folds back outside the calibrated field) comes back as the nearest the iteration found."""
     xy_d = np.asarray(xy_d, dtype=np.float64)
     if not len(dist):
         return xy_d.copy()
     xy = xy_d.copy()
+    err = distort(xy, dist) - xy_d
+    h = 1e-6
     for _ in range(iterations):
-        xy = xy + (xy_d - distort(xy, dist))
+        size = np.hypot(err[:, 0], err[:, 1])
+        todo = size > 1e-13
+        if not todo.any():
+            break
+        p, e = xy[todo], err[todo]
+        jx = (distort(p + (h, 0.0), dist) - distort(p - (h, 0.0), dist)) / (2.0 * h)   # d(distorted) / dx
+        jy = (distort(p + (0.0, h), dist) - distort(p - (0.0, h), dist)) / (2.0 * h)
+        det = jx[:, 0] * jy[:, 1] - jy[:, 0] * jx[:, 1]
+        det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+        step = np.stack([(jy[:, 1] * e[:, 0] - jy[:, 0] * e[:, 1]) / det, (jx[:, 0] * e[:, 1] - jx[:, 1] * e[:, 0]) / det], 1)
+        best, best_err, best_size, scale = p, e, size[todo], np.ones(len(p))
+        for _ in range(8):
+            trial = p - step * scale[:, None]
+            trial_err = distort(trial, dist) - xy_d[todo]
+            trial_size = np.hypot(trial_err[:, 0], trial_err[:, 1])
+            better = trial_size < best_size
+            best, best_err, best_size = (np.where(better[:, None], trial, best), np.where(better[:, None], trial_err, best_err),
+                                         np.where(better, trial_size, best_size))
+            if better.all():
+                break
+            scale = np.where(better, scale, scale * 0.5)
+        xy[todo], err[todo] = best, best_err
     return xy
 
 

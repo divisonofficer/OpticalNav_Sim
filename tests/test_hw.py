@@ -10,7 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from opticalnav_sim import bodies, frames, hw  # noqa: E402
-from opticalnav_sim.hw import Transform, cameras, optics, robots  # noqa: E402
+from opticalnav_sim.hw import Transform, cameras, optics, rigs, robots  # noqa: E402
+from opticalnav_sim.hw.calibration import RigCalibration, load_opencv_yaml  # noqa: E402
 from opticalnav_sim.hw.transform import yaw_from_heading  # noqa: E402
 
 
@@ -204,3 +205,90 @@ def test_body_models_become_shapegroups_and_instances(tmp_path):
     with pytest.raises(ValueError):
         bodies.bsdf_xml(("wood", (0.5, 0.5, 0.5), 0.4))
     assert "roughconductor" in bodies.bsdf_xml(("metal", (0.8, 0.8, 0.8), 0.3)) and "pplastic" in bodies.bsdf_xml(("rubber", (0, 0, 0), 0.6))
+
+
+RIG_YAML = """%YAML:1.0
+---
+t_ref_transform_in_ref: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0.,
+       1. ]
+k_ref: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 910.5, 0., 501.9, 0., 910.3, 408.5, 0., 0., 1. ]
+d_ref: !!opencv-matrix
+   rows: 1
+   cols: 12
+   dt: d
+   data: [ -0.115, -0.0118, 0.0088, -0.0036, 3.203, 0.0814, -0.2285,
+       3.604, 0.0034, 0.0053, -0.0118, -0.0007 ]
+t_left_transform_in_ref: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 1., 0., 0., -0.10, 0., 1., 0., 0.09, 0., 0., 1., 0.07, 0., 0., 0., 1. ]
+k_left: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1032.6, 0., 696.9, 0., 1032.1, 463.5, 0., 0., 1. ]
+d_left: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ -0.09, 0.10, -0.002, -0.009, -0.45 ]
+"""
+
+
+def test_rational_and_thin_prism_distortion_matches_opencv_and_inverts():
+    """A 12-coefficient calibration (the rig's): projection as OpenCV's, and every pixel's ray found back."""
+    cv2 = pytest.importorskip("cv2")
+    d = (-0.115, -0.0118, 0.0088, -0.0036, 3.203, 0.0814, -0.2285, 3.604, 0.0034, 0.0053, -0.0118, -0.0007)
+    k = optics.Intrinsics(1024, 768, 910.5, 910.3, 501.9, 408.5, d)
+    pts = np.random.default_rng(1).uniform([-0.6, -0.45, 1.0], [0.6, 0.45, 2.0], (400, 3))
+    ref, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), k.matrix(), np.array(d))
+    assert np.abs(k.project(pts) - ref.reshape(-1, 2)).max() < 1e-9
+    u, v = np.meshgrid(np.arange(0.0, 1024.0, 7.0), np.arange(0.0, 768.0, 7.0))
+    px = np.stack([u.ravel(), v.ravel()], 1)
+    rays = k.rays(px)
+    assert np.abs(k.project(np.c_[rays, np.ones(len(rays))]) - px).max() < 1e-7
+    with pytest.raises(ValueError):  # a tilted sensor is another model
+        optics.distort(np.zeros((1, 2)), d + (0.01, 0.0))
+
+
+def test_rig_calibration_places_the_cameras(tmp_path):
+    path = tmp_path / "rig.yaml"
+    path.write_text(RIG_YAML)
+    assert load_opencv_yaml(path)["d_ref"].shape == (1, 12)
+    cal = RigCalibration.load(path)
+    assert cal.reference == "ref" and sorted(cal.cameras) == ["left", "ref"]
+    assert np.allclose(cal.relative("ref", "left")[:3, 3], (0.10, -0.09, -0.07))
+    k = cal.cameras["left"].intrinsics(1440, 928)
+    assert (k.width, k.fx, k.cx, len(k.dist)) == (1440, 1032.6, 696.9, 5)
+    # optical frame: x right, y down, z forward. 10 cm to the left, 9 cm lower, 7 cm ahead of the reference camera
+    mounts = rigs.camera_mounts(cal, ["ref", "left"], Transform((0.03, 0.0, 0.14)))
+    assert np.allclose(mounts["ref"].xyz, (0.03, 0.0, 0.14)) and np.allclose(mounts["left"].xyz, (0.10, 0.10, 0.05))
+    assert np.allclose(mounts["left"].rpy_deg, 0.0, atol=1e-9)
+
+    world = hw.World()
+    robot = world.spawn(robots.RangerMini2(), at=hw.pose2d(2.0, 1.0, 0.0, 90.0))
+    spec = {"ref": lambda c, s: cameras.LucidTRI032S(calibration=c.intrinsics(1024, 768), render_scale=s),
+            "left": lambda c, s: cameras.LucidTDR054S(calibration=c.intrinsics(1440, 928), render_scale=s)}
+    rig = rigs.spawn_camera_rig(world, robot, path, cameras=("left", "ref"), models=spec)
+    assert set(rig) == {"mast", "left", "ref"} and rig["left"].parent is rig["mast"] and rig["mast"].parent is robot
+    # deck 0.338 m + mast 0.80 m + mount; the robot faces +y, so its left is -x
+    assert np.allclose(rig["ref"].world_matrix()[:3, 3], (2.0, 1.03, 0.338 + 0.80 + 0.14), atol=1e-9)
+    assert np.allclose(rig["left"].world_matrix()[:3, 3], (1.9, 1.10, 0.338 + 0.80 + 0.05), atol=1e-9)
+    small = rig["left"].spec.intrinsics()   # a quarter of the sensor's width, the recorded image's shape
+    assert (small.width, small.height) == (720, 464) and math.isclose(small.fx, 1032.6 / 2.0)
+    assert rig["ref"].spec.image_size() == (512, 384) and rig["left"].spec.image_size(0.5) == (1440, 928)
+    with pytest.raises(KeyError):
+        rigs.spawn_camera_rig(world, robot, path, cameras=("left", "ref"))  # no model known for "ref": say which
+    assert len(world.actors) == 4  # and nothing was spawned by the failed call
+    mast = rigs.Mast(height=0.8)
+    boxes = mast.visuals()["mast"]
+    assert len(boxes) == 4 + 3 * 4 + 1 and max(v.origin.xyz[2] + v.size[2] / 2.0 for v in boxes) == pytest.approx(0.8)
