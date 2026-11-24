@@ -704,6 +704,15 @@ def test_robot_routes_sensors_and_commands():
     assert [s["enabled"] for s in session.state()["sensors"]] == [True, False]
     with pytest.raises(ValueError):
         session.set_sensors({"lidar": True})
+    # a sensor renders while a page shows it (the viewer says which) or a call switched it on; no other does
+    session.viewers = lambda: {"12bit"}
+    assert session.rendering() == {"hdr", "12bit"} and [s["enabled"] for s in session.state()["sensors"]] == [True, True]
+    session.set_sensors({"hdr": False})
+    assert session.rendering() == {"12bit"}
+    session.viewers = lambda: set()
+    assert session.rendering() == set() and [s["enabled"] for s in session.state()["sensors"]] == [False, False]
+    session.viewers = None
+    session.set_sensors({"hdr": True})
     assert session.bodies("scene") == [] and session.pose2d() is None      # nothing spawned: nothing to draw
     assert session.command({"mode": "ackermann", "linear": 0.5, "steering_deg": 20.0}) == {"ok": True}
     control, at = session.control

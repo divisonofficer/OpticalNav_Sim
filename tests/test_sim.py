@@ -270,7 +270,7 @@ def test_gui_draws_the_robot_and_rides_with_it():
     from opticalnav_sim import gui
 
     class Robot:
-        scene, running, pose_seq, view_source, gone, seen = "scene", True, 0, None, 0, 0
+        scene, running, pose_seq, view_source, viewers, gone, seen = "scene", True, 0, None, None, 0, 0
         at = (1.0, 2.0, 0.0, 0.0)          # x, y, z, yaw: facing +x
         links = [{"id": "robot", "model": "ranger", "links": {"base_link": np.eye(4)}}]
 
@@ -328,6 +328,34 @@ def test_gui_draws_the_robot_and_rides_with_it():
     assert session.image(st["frame_id"], "rgb.dolp", 0.2)[:2] == b"\xff\xd8"
     session.run("configure", session.configure, {"polarization": True})
     assert session.view["mode"] == "polar"
+    # the editor's own view switched off: a move changes the camera, nothing is rendered; switched on, the view as it is now
+    session.wait_idle(10)
+    n = len(sim._client.views)
+    session.run("configure", session.configure, {"editor_render": False})
+    st = session.run("fly", session.fly, 0.5)
+    time.sleep(0.3)
+    assert len(sim._client.views) == n and st["editor_render"] is False and not st["stale"] and not st["server"]["busy"]
+    session.run("configure", session.configure, {"editor_render": True})
+    st = session.wait_idle(10)
+    assert len(sim._client.views) > n and st["editor_render"] and np.allclose(sim._client.views[-1]["camera_to_world"], session.view["camera_to_world"])
+    # the robot's sensors a connected page shows are the ones rendered; when every page has gone, a move of the robot
+    # no longer renders the editor's view (the next page finds it moved)
+    assert session.viewed_sensors() == set() and robot.viewers() == set()
+    page = {"panes": {"a": "rgb.img"}, "scale": 0.2, "ev": {}, "dirty": False, "sensors": {"hdr"}}
+    session.subs[1], session.pages_seen = page, True
+    assert robot.viewers() == {"hdr"}
+    del session.subs[1]
+    assert robot.viewers() == set()
+    n = len(sim._client.views)
+    robot.at, robot.pose_seq = (2.0, 3.5, 0.0, math.pi / 2), robot.pose_seq + 1
+    time.sleep(0.4)
+    assert len(sim._client.views) == n                                             # nobody watches: not rendered
+    session.subs[1] = page                                                         # a page again: the view follows the robot
+    deadline = time.time() + 5
+    while len(sim._client.views) == n and time.time() < deadline:
+        time.sleep(0.02)
+    assert len(sim._client.views) > n
+    session.wait_idle(10)
     sim.renderer = "raster"                                                        # the preview rasteriser draws no bodies
     session.run("moved", session._moved)
     assert "bodies" not in session.view

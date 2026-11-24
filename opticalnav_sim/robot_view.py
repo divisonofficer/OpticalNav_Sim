@@ -13,12 +13,16 @@ on through the render server, with the editor's lighting:
     POST /api/robot/spawn    {"config"}    put the robot (that configuration, or the one in use) on the floor in front
                                            of the editor camera
     POST /api/robot/despawn
-    POST /api/robot/sensors  {"hdr": true, "12bit": false}       which sensor panes render
+    POST /api/robot/sensors  {"hdr": true, "12bit": false}       sensors rendered whoever watches (a script's; a page's
+                                                                 sub viewers name theirs in its socket subscription:
+                                                                 a sensor no page shows and no call switched on is
+                                                                 not rendered)
     POST /api/robot/follow   {"on": true}                        the editor camera rides behind the robot
     POST /api/robot/control  {"mode", "linear", "steering_deg", "angular"}    held for 0.5 s (the chassis's own timeout)
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import math
@@ -53,10 +57,11 @@ class RobotSession:
         self.calibrated = False
         self.lock = threading.RLock()
         self.view_source = None          # () -> the editor's current view (dict) or None: the viewer sets it
+        self.viewers = None              # () -> the sensors some page shows now (the viewer sets it): rendered while shown
         self.world = None
         self.robot = None
         self.cameras: dict = {}          # sensor name -> actor
-        self.enabled: set = set()        # the sensors that render
+        self.enabled: set = set()        # the sensors switched on by a call (POST /api/robot/sensors): rendered whoever watches
         self.frames: dict = {}           # name -> {"jpeg", "seq", "spp", "exposure_ms", "gain_db", "size", "seconds"}
         self.message, self.error = "", ""
         self.scene = ""
@@ -277,8 +282,9 @@ class RobotSession:
         threading.Thread(target=self._simulate, args=(run,), name="robot-sim", daemon=True).start()
         turn = 0
         while self._alive(run):
+            wanted = self.rendering()   # a sensor nobody shows is not rendered
             with self.lock:
-                order = [n for n in self.cameras if n in self.enabled]
+                order = [n for n in self.cameras if n in wanted]
             if not order:
                 time.sleep(0.05)
                 continue
@@ -327,6 +333,15 @@ class RobotSession:
                 time.sleep(2.0)
 
     # --- the viewer's calls ---------------------------------------------------------------------------------------
+    def rendering(self) -> set:
+        """The sensors that render: those a connected page shows in a sub viewer, and those switched on by a call."""
+        shown = set()
+        if self.viewers is not None:
+            with contextlib.suppress(Exception):
+                shown = set(self.viewers())
+        with self.lock:
+            return shown | self.enabled
+
     def bodies(self, scene: str) -> list:
         """The robot's links for a view of ``scene`` (the render server's ``bodies`` field): none elsewhere."""
         with self.lock:
@@ -381,11 +396,12 @@ class RobotSession:
         return {"ok": True}
 
     def state(self) -> dict:
+        rendering = self.rendering()
         with self.lock:
             out = {"scene": self.scene, "running": self.running, "spawned": self.robot is not None, "message": self.message,
                    "error": self.error, "map": self.map_info, "sim_rate": round(self.sim_rate, 1),
                    "calibrated": self.calibrated, "config": self.config.summary(),
-                   "sensors": [{"name": n, "label": label, "enabled": n in self.enabled,
+                   "sensors": [{"name": n, "label": label, "enabled": n in rendering,
                                 "model": self.cameras[n].spec.model if n in self.cameras else "",
                                 **{k: v for k, v in self.frames.get(n, {}).items() if k not in ("jpeg", "look")}}
                                for n, label in self.labels().items()]}

@@ -175,6 +175,7 @@ main .pane.drop { outline: 2px dashed var(--accent); outline-offset: -3px; }
   overflow: hidden; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
 .frame canvas.warp { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
+.frame.paused { outline: 2px dashed var(--warn); outline-offset: -2px; }
 .frame.grid::after { content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(90deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)),
               linear-gradient(0deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)); }
@@ -316,6 +317,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <label class="tg mitsuba-only" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
         <label class="tg mitsuba-only" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
         <label class="tg mitsuba-only" for="polar" title="편광 렌더 켜기/끄기. 끄면 Mitsuba의 비편광 RGB 변형으로 렌더합니다(Stokes·Mueller 계산 없음): CS02 512×384 16 spp에서 패스 74 → 13 ms. 영상(S0)은 같고, DoLP·AoLP·S1·S2는 0이 됩니다. 편광 센서가 아닌 로봇 카메라도 같은 모드를 따릅니다. 모드마다 씬을 한 번 따로 올립니다(렌더 서버 --modes polar,rgb)."><input type="checkbox" class="sw" id="polar" checked> 편광</label>
+        <label class="tg" for="editor-render" title="에디터 뷰의 렌더 켜기/끄기. 끄면 에디터 카메라는 더 렌더하지 않고 마지막 화면이 남습니다(카메라를 움직이면 그 화면을 새 시점 쪽으로 옮겨 보여 주기만 합니다). GPU를 로봇 센서 뷰어에만 쓰고 싶을 때 끕니다. 에디터 창 머리의 눈 버튼과 같습니다."><input type="checkbox" class="sw" id="editor-render" checked> 에디터 뷰 렌더</label>
         <label class="tg noisy-only" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
         <label class="tg mitsuba-only" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
         <label class="tg" for="warp" title="움직이는 동안 다음 프레임이 끝나기 전까지 마지막 프레임을 새 카메라 쪽으로 옮겨 보여 줍니다. 렌더 서버가 같이 보내는 깊이로 프레임을 입체 격자로 만들어 새 시점에서 그립니다(WebGL): 회전과 이동 모두 맞고, 가려져 있던 곳은 늘이지 않고 다음 프레임까지 검게 비워 둡니다. 프레임을 섞지 않아 흐려지지 않고, 멈추면 렌더한 그대로입니다."><input type="checkbox" class="sw" id="warp" checked> 이동 보간</label>
@@ -368,6 +370,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
   <section class="card pane" id="pane-a">
     <div class="pane-head card-head">
       <span class="pdot" id="dot-a"></span><h2 id="title-a">RGB 영상</h2>
+      <button type="button" class="icon-btn" id="editor-render-btn" data-act="render" data-pane="a" aria-pressed="true" title="에디터 뷰 렌더 켜기/끄기: 끄면 이 창은 렌더하지 않고 마지막 화면이 남습니다 (GPU는 센서 뷰어에)"><svg class="i"><use href="#i-eye"/></svg></button>
       <button type="button" class="icon-btn" data-act="shot" data-pane="a" title="이 화면 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
       <button type="button" class="icon-btn" data-act="grid" data-pane="a" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
       <button type="button" class="icon-btn" data-act="full" data-pane="a" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
@@ -655,6 +658,7 @@ document.getElementById("main").addEventListener("click", (ev) => {
   } else if (b.dataset.act === "full") {
     if (document.fullscreenElement) document.exitFullscreen(); else frame.requestFullscreen().catch(() => {});
   } else if (b.dataset.act === "close") removeSub(pane);
+  else if (b.dataset.act === "render") configure({ editor_render: !(S && S.editor_render) }, "에디터 뷰 렌더 전환");
 });
 
 async function boot() {
@@ -950,7 +954,9 @@ function subscribe() {
   const panes = {};
   const subsShown = getComputedStyle($("subs")).display !== "none";
   for (const pane of editorPanes()) if (pane === "a" || subsShown) panes[pane] = view[pane];
-  wsSend({ type: "subscribe", panes, scale: Number($("scale").value),
+  // the robot's sensors this page shows: the server renders those, and stops when their viewer (or this page) closes
+  const sensors = subsShown ? [...new Set(SUBS.filter((x) => x.kind === "sensor" && x.sensor).map((x) => x.sensor))] : [];
+  wsSend({ type: "subscribe", panes, sensors, scale: Number($("scale").value),
            ev: { rgb: Number($("ev-rgb").value), nir: Number($("ev-nir").value) } });
 }
 const WHAT = { start: "첫 프레임", forward: "이동", move: "이동", turn: "회전", about: "뒤로 돌기", pitch: "고개 돌리기",
@@ -1117,7 +1123,7 @@ function apply(st) {
     loadGraph(S.scene).then(drawMap).catch(() => {});
   }
   if (S.has_frame) {
-    $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}`;
+    $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
     $("progress").style.width = S.render_mode === "raster" ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
@@ -1125,6 +1131,10 @@ function apply(st) {
   rigSync();
   if ($("auto").checked !== S.auto) $("auto").checked = S.auto;
   if ($("polar").checked !== !!S.polarization) $("polar").checked = !!S.polarization;
+  const rendering = S.editor_render !== false;
+  if ($("editor-render").checked !== rendering) $("editor-render").checked = rendering;
+  $("editor-render-btn").setAttribute("aria-pressed", String(rendering));
+  $("frame-a").classList.toggle("paused", !rendering);
   $("polar").disabled = !((S.modes || []).includes("rgb") && (S.modes || []).includes("polar"));
   document.body.classList.toggle("unpolarized", !S.polarization && S.render_mode === "path");
 }
@@ -1364,6 +1374,7 @@ function renderStatus() {
       (tail.length ? `<span class="logline" title="${tail.join("\n").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])}">${tail[tail.length - 1].replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])}</span>` : "");
     return;
   }
+  if (S.editor_render === false && !S.has_frame) { $("status").innerHTML = `<span class="busy">에디터 뷰 렌더 꺼짐</span>`; return; }
   if (!S.has_frame) { $("status").innerHTML = "<span>첫 프레임을 렌더하는 중…</span>"; return; }
   const ms = (v) => (v || 0).toFixed(0);
   const t = S.timing || {};
@@ -1372,7 +1383,8 @@ function renderStatus() {
     `<span>표시 <b>${(S.fps || 0).toFixed(1)}</b> fps</span><span title="렌더 요청을 보내고 화면에 올리기까지 (최근 5초 중앙값)">패스 <b>${ms(t.wall_ms)}</b> ms</span>` +
     `<span class="split" title="패스 시간 내역 (최근 5초 중앙값). GPU: 서버가 커널을 넣은 뒤 GPU를 기다린 시간(CPU 작업에 가려지지 않은 GPU 시간). 서버 CPU: 렌더 호출의 나머지와 분리·인코딩. 대기열: 서버의 렌더 스레드에서 다른 패스 뒤에 기다린 시간. 전송: 왕복에서 서버 시간을 뺀 나머지. 뷰어: 누적·디노이즈·편광 계산. JPEG: 패스를 받은 스레드에서 열린 페이지들의 화면 JPEG(편광 색·톤매핑)과 깊이 격자를 미리 만드는 시간(렌더와 겹쳐 돎). 화면: 페이지로 보내는 시간(미리 만든 것이 없으면 만드는 시간 포함)">` +
     `GPU <b>${ms(t.gpu_ms)}</b> · 서버 CPU <b>${ms(t.server_cpu_ms)}</b> · 대기열 <b>${ms(t.queue_ms)}</b> · 전송 <b>${ms(t.transfer_ms)}</b> · 뷰어 <b>${ms(t.viewer_ms)}</b> · JPEG <b>${ms(t.jpeg_ms)}</b> · 화면 <b>${ms(t.screen_ms)}</b> ms</span>` +
-    `<span>동시 요청 <b>${S.in_flight}</b></span>` + (S.auto ? "" : `<span class="busy">누적 멈춤 (Space)</span>`);
+    `<span>동시 요청 <b>${S.in_flight}</b></span>` + (S.auto ? "" : `<span class="busy">누적 멈춤 (Space)</span>`) +
+    (S.editor_render === false ? `<span class="busy">에디터 뷰 렌더 꺼짐</span>` : "");
 }
 
 const GRAD = {
@@ -1582,6 +1594,7 @@ $("target").addEventListener("change", () => configure({ target_spp: Number($("t
 $("denoise").addEventListener("change", () => configure({ denoise: $("denoise").checked }, "디노이저 전환"));
 $("auto").addEventListener("change", () => configure({ auto: $("auto").checked }, "누적 전환"));
 $("polar").addEventListener("change", () => configure({ polarization: $("polar").checked }, "편광 렌더 전환"));
+$("editor-render").addEventListener("change", () => configure({ editor_render: $("editor-render").checked }, "에디터 뷰 렌더 전환"));
 $("map").addEventListener("click", (ev) => {
   if (!graph) return;
   const c = $("map"), r = c.getBoundingClientRect(), dpr = c.width / r.width;
@@ -2029,7 +2042,7 @@ function renderRobot() {
   for (const sn of R.sensors || []) {
     const mine = SUBS.filter((x) => x.kind === "sensor" && x.sensor === sn.name), box = $(`sensor-on-${sn.name}`);
     if (box && box.checked !== mine.length > 0) box.checked = mine.length > 0;
-    if (mine.length && on && !sn.enabled) wantSensor(sn.name, true);   // shown here, not rendered yet (a new robot, a reloaded page)
+    if (mine.length && on && !sn.enabled) wantSensor();   // shown here, not rendered yet (a new robot, a restarted viewer): say it again
     for (const sub of mine) {
       const img = $(`simg-${sub.id}`), wait = $(`swait-${sub.id}`);
       if (!on) {
@@ -2166,12 +2179,13 @@ $("main").addEventListener("drop", (ev) => {
   if (t.classList.contains("sub")) setSubSource(t.id.slice(5), `sensor:${name}`);
   else if (!addSub({ kind: "sensor", sensor: name })) showError("서브 뷰어는 8개까지 열 수 있습니다");
 });
-const sensorAsked = {};
-function wantSensor(name, on) {  // the server renders a sensor while a viewer of it is open (asked at most once a second)
-  const now = performance.now();
-  if (on && now - (sensorAsked[name] || 0) < 1000) return;
-  sensorAsked[name] = now;
-  api("/api/robot/sensors", { [name]: on }).then((r) => { R = r; }).catch(() => {});
+// A sensor is rendered only while a viewer of it is open: the page's subscription names the sensors its sub viewers
+// show (subscribe), and the server renders those and no others; closing the viewer, or the page, stops its render.
+let sensorsSaid = 0;
+function wantSensor() {  // from the poll: at most once a second
+  if (performance.now() - sensorsSaid < 1000) return;
+  sensorsSaid = performance.now();
+  subscribe();
 }
 function saveLayout() {
   try {
@@ -2229,11 +2243,10 @@ function addSub(spec, quiet) {
   $(`src-${id}`).addEventListener("change", (ev) => setSubSource(id, ev.target.value));
   buildTabs(el);
   wireFrame($(`frame-${id}`));
-  if (sub.kind === "sensor") { $(`title-${id}`).textContent = ""; wantSensor(sub.sensor, true); }
+  if (sub.kind === "sensor") $(`title-${id}`).textContent = "";
   if (!quiet) { layout(); saveLayout(); subscribe(); renderLegends(); renderRobot(); }
   return sub;
 }
-function dropSensorIfUnused(name) { if (!SUBS.some((x) => x.kind === "sensor" && x.sensor === name)) wantSensor(name, false); }
 function removeSub(id) {
   const i = SUBS.findIndex((x) => x.id === id);
   if (i < 0) return;
@@ -2241,16 +2254,14 @@ function removeSub(id) {
   $(`pane-${id}`).remove();
   if (paneUrl[id]) URL.revokeObjectURL(paneUrl[id]);
   delete pick[id]; delete paneUrl[id]; delete paneFrame[id]; delete warpGL[id];
-  if (sub.kind === "sensor") dropSensorIfUnused(sub.sensor);
   layout(); saveLayout(); subscribe(); renderRobot();
 }
 function setSubSource(id, value) {
   const sub = subOf(id), was = sub.kind === "sensor" ? sub.sensor : null;
   sub.kind = value.startsWith("sensor:") ? "sensor" : "editor";
-  if (sub.kind === "sensor") { sub.sensor = value.slice(7); sub.seq = 0; $(`simg-${id}`).hidden = true; $(`swait-${id}`).hidden = false; $(`title-${id}`).textContent = ""; wantSensor(sub.sensor, true); }
+  if (sub.kind === "sensor") { sub.sensor = value.slice(7); sub.seq = 0; $(`simg-${id}`).hidden = true; $(`swait-${id}`).hidden = false; $(`title-${id}`).textContent = ""; }
   else paneTitle(id);
   $(`pane-${id}`).dataset.kind = sub.kind;
-  if (was && was !== (sub.kind === "sensor" ? sub.sensor : null)) dropSensorIfUnused(was);
   syncSources(); saveLayout(); subscribe(); renderLegends(); renderRobot();
 }
 $("sub-add").addEventListener("click", () => {

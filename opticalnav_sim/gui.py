@@ -258,6 +258,8 @@ class Session:
         self.trail: list[tuple[float, float]] = []
         self.robot = None                 # robot_view.RobotSession (attach_robot): its links are bodies of this view
         self.polarization = True          # False: the path tracer's plain RGB variant (no Stokes vectors: several times faster)
+        self.render_on = True             # False: the editor's own view is not rendered (configure "editor_render"): its last picture stays
+        self.pages_seen = False           # a page has connected: from then on, a view nobody watches is not rendered again
         self.modes: list[str] = ["polar"]  # the render server's modes (main sets them): "rgb" is the unpolarized one
         self.follow: tuple | None = None  # the camera rides with the robot: its place in the robot's frame (set_follow)
         self._local = threading.local()
@@ -414,7 +416,14 @@ class Session:
         rendered again whenever the robot has moved."""
         self.robot = robot
         robot.view_source = self._view_now
+        robot.viewers = self.viewed_sensors
         threading.Thread(target=self._watch_robot, name="robot-watch", daemon=True).start()
+
+    def viewed_sensors(self) -> set:
+        """The robot's sensors some connected page shows in a sub viewer (its subscription names them): the only
+        ones rendered. A page that closes takes its sensors with it."""
+        with self.cv:
+            return {name for sub in self.subs.values() for name in sub.get("sensors", ())}
 
     def _view_now(self) -> dict | None:
         with self.cv:
@@ -477,6 +486,8 @@ class Session:
             robot = self.robot
             if robot.pose_seq == seen or not self.started:
                 continue
+            if self.pages_seen and not self.subs:   # every page has gone: nobody watches the editor's view, leave it
+                continue                            # (the next page finds the robot moved, and the view follows then)
             with self.lock:
                 seen = robot.pose_seq
                 if self.follow is not None:
@@ -561,6 +572,11 @@ class Session:
         if "active_split" in settings:  # MatterSim.setActiveSplit
             self.sim.setActiveSplit(bool(settings["active_split"]))
             restart = True
+        if "editor_render" in settings:  # False: stop rendering the editor's view (its last picture stays; the GPU is the sensors')
+            with self.cv:
+                self.render_on = bool(settings["editor_render"])
+                self.version += 1
+                self.cv.notify_all()   # switched on: the render loop takes the view as it is now
         if "polarization" in settings:  # False: render without polarization (the server's rgb mode), for speed
             want = bool(settings["polarization"])
             if not want and "rgb" not in self.modes:
@@ -683,7 +699,7 @@ class Session:
         return int(max(base, min(want, left - left % base))) if left >= base else int(base)
 
     def _wants_pass(self) -> bool:
-        if self.view is None or self.error or self.inflight >= self.depth:
+        if self.view is None or self.error or self.inflight >= self.depth or not self.render_on:
             return False
         if self.issued == 0:
             return True
@@ -905,7 +921,7 @@ class Session:
             screens = [ms for t, ms in self.screens if now - t <= 5.0]
             if screens:  # per page: JPEGs (polarization, tone), the depth grid, the socket writes
                 timing["screen_ms"] = round(float(np.median(screens)), 1)
-            waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error
+            waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error and self.render_on
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             conv = ((self.renderer or {}).get("converting") or {}).get(self.opening["id"]) if self.opening else None  # the converter's own progress
             out = {"opening": ({**self.opening, "elapsed_s": round(time.time() - self.opening["t0"], 1),
@@ -919,6 +935,7 @@ class Session:
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                    "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
                    "active_split": sim.active_split, "polarization": self.polarization, "modes": self.modes,
+                   "editor_render": self.render_on,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
@@ -1354,8 +1371,9 @@ def make_handler(session: Session, token: str | None = None, robot=None):
             changes and, for each new frame, the JPEGs of the panes the page subscribed to as binary messages
             (4-byte frame id, 1-byte pane, JPEG; pane_byte: 0 the editor's pane "a", 1 "b", 3 + n the sub viewer
             "s<n>"; 2 is the depth grid). The page sends {"type": "input", "id", "path", "body"} (answered by
-            {"type": "ack"}), {"type": "subscribe", "panes": {"a": "rgb.img", "s0": "rgb.dolp", ...}, "scale"}
-            (any number of panes: each a channel of the editor's view) and {"type": "probe", "frame", "x", "y"}."""
+            {"type": "ack"}), {"type": "subscribe", "panes": {"a": "rgb.img", "s0": "rgb.dolp", ...}, "scale",
+            "sensors": ["hdr", ...]} (any number of panes, each a channel of the editor's view; the robot's sensors
+            the page shows, which are rendered while it shows them) and {"type": "probe", "frame", "x", "y"}."""
             import base64
             import hashlib
 
@@ -1368,9 +1386,10 @@ def make_handler(session: Session, token: str | None = None, robot=None):
             self.end_headers()
             self.close_connection = True
             ws = WebSocket(self.rfile, self.wfile)
-            sub = {"panes": {"a": "rgb.img", "b": "rgb.dolp"}, "scale": 0.2, "ev": {}, "dirty": True}
+            sub = {"panes": {"a": "rgb.img", "b": "rgb.dolp"}, "scale": 0.2, "ev": {}, "dirty": True, "sensors": set()}
             with session.cv:
                 session.subs[id(sub)] = sub
+                session.pages_seen = True
             alive = threading.Event()
             alive.set()
 
@@ -1433,6 +1452,8 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                             sub["panes"] = {str(k): v for k, v in list(dict(msg.get("panes") or sub["panes"]).items())[:MAX_PANES]}
                             sub["scale"] = float(msg.get("scale", sub["scale"]))
                             sub["ev"] = {k: float(v) for k, v in dict(msg.get("ev") or {}).items() if k in ("rgb", "nir")}
+                            if "sensors" in msg:  # the robot's sensors this page shows: rendered while it does
+                                sub["sensors"] = {str(n) for n in list(msg.get("sensors") or [])[:32]}
                             sub["dirty"] = True
                             session.version += 1
                             session.cv.notify_all()
