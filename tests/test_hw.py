@@ -692,12 +692,19 @@ def test_ground_map_from_scene_files_gives_heights_obstacles_and_friction(tmp_pa
     assert ground.friction(1.0, 0.0) == 0.05
 
 
-def test_robot_mode_routes_and_commands():
-    """The viewer's robot mode without a render server: its routes, its command parsing, its page."""
+def test_robot_routes_sensors_and_commands():
+    """The viewer's robot without a render server: its routes, its sensors' switches, its command parsing."""
     from opticalnav_sim import robot_view
-    assert robot_view.handles(["robot"]) and robot_view.handles(["api", "robot", "state"]) and not robot_view.handles(["api", "state"])
-    session = robot_view.RobotSession("http://127.0.0.1:1")
-    assert session.state() == {"scene": "", "running": False, "message": "", "error": "", "cameras": {}, "map": None, "sim_rate": 0.0}
+    assert robot_view.handles(["api", "robot", "state"]) and not robot_view.handles(["api", "state"]) and not robot_view.handles(["robot"])
+    session = robot_view.RobotSession("http://127.0.0.1:1", calibration="")
+    st = session.state()
+    assert not st["running"] and not st["spawned"] and "robot" not in st
+    assert [(s["name"], s["enabled"]) for s in st["sensors"]] == [("hdr", False), ("12bit", False)]
+    session.set_sensors({"hdr": True})
+    assert [s["enabled"] for s in session.state()["sensors"]] == [True, False]
+    with pytest.raises(ValueError):
+        session.set_sensors({"lidar": True})
+    assert session.bodies("scene") == [] and session.pose2d() is None      # nothing spawned: nothing to draw
     assert session.command({"mode": "ackermann", "linear": 0.5, "steering_deg": 20.0}) == {"ok": True}
     control, at = session.control
     assert isinstance(control, hw.RangerControl) and control.steering_deg == 20.0
@@ -706,8 +713,14 @@ def test_robot_mode_routes_and_commands():
     with pytest.raises(ValueError):
         session.command({"mode": "fly"})
     assert session.frame("hdr") is None
-    page = robot_view.PAGE.read_text()
-    assert "/api/robot/" in page and 'id="map"' in page and all(f'id="f-{n}"' in page for n in ("hdr", "12bit", "chase"))
+    # a sensor's view takes the editor's look (its lighting, its variant), but is always the path tracer's RGB
+    session.scene = "scene"
+    view, look = session._sensor_view({"view": {"scan": "scene", "variant": "base", "spp": 16}},
+                                      {"scan": "scene", "variant": "perturbed", "lighting": "all", "bands": "both", "renderer": "raster", "width": 9})
+    assert view["variant"] == "perturbed" and view["lighting"] == "all" and view["bands"] == "rgb" and view["renderer"] == "path"
+    assert "width" not in view and view["depth"] is False and "perturbed" in look
+    other, _ = session._sensor_view({"view": {"scan": "scene", "variant": "base"}}, {"scan": "elsewhere", "variant": "perturbed"})
+    assert other["variant"] == "base"                                      # the editor shows another scene: not its look
 
     class Fake:
         sent = None
@@ -718,12 +731,20 @@ def test_robot_mode_routes_and_commands():
         def _json(self, code, payload):
             self.sent = (code, payload)
     h = Fake()
-    robot_view.get(h, session, ["robot"], {})
-    assert h.sent[0] == 200 and h.sent[1].startswith("text/html")
     robot_view.get(h, session, ["api", "robot", "frame", "hdr.jpg"], {})
     assert h.sent[0] == 404
+    robot_view.get(h, session, ["api", "robot", "state"], {})
+    assert h.sent[0] == 200 and h.sent[1]["sensors"][0]["enabled"]
     robot_view.post(h, session, ["api", "robot", "control"], {"mode": "spin", "angular": 1.0})
     assert h.sent == (200, {"ok": True})
+    robot_view.post(h, session, ["api", "robot", "sensors"], {"hdr": False, "12bit": True})
+    assert [s["enabled"] for s in h.sent[1]["sensors"]] == [False, True]
+    robot_view.post(h, session, ["api", "robot", "spawn"], {})             # no viewer behind this handler
+    assert h.sent[0] == 404
+    here = Path(robot_view.__file__).parent
+    page = (here / "gui.html").read_text()                                 # one viewer: the robot is a tab and panes of it
+    assert all(f'id="sensor-{n}"' in page for n in ("hdr", "12bit")) and 'id="robot-spawn"' in page and "/api/robot/" in page
+    assert not (here / "robot.html").exists()
 
 
 def test_blocked_robot_can_turn_or_slide_free():

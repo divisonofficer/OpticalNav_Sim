@@ -223,6 +223,8 @@ class Session:
         self.screens: deque = deque(maxlen=64)  # (sent, ms) a page's panes and depth grid took to make and send
         self.subs: dict[int, dict] = {}  # each page's panes, scale and exposure: the JPEGs a frame makes ahead
         self.trail: list[tuple[float, float]] = []
+        self.robot = None                 # robot_view.RobotSession (attach_robot): its links are bodies of this view
+        self.follow: tuple | None = None  # the camera rides with the robot: its place in the robot's frame (set_follow)
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(self.depth, thread_name_prefix="pass")
         self._loop_thread = threading.Thread(target=self._loop, name="render-loop", daemon=True)
@@ -361,7 +363,86 @@ class Session:
         z = min(max(z + up, lo), hi)
         e = min(max(st.elevation + math.radians(pitch_deg), -0.9), 0.9)
         self.sim.teleport([st.scanId], [[x, y, z]], [h], [e])
+        if self.follow is not None:  # flown while riding with the robot: ride from here
+            self._keep_follow()
         self._moved()
+
+    # --- the robot (robot_view.RobotSession): a body in the scene this camera renders ---
+    FOLLOW = (-2.4, 0.0, 1.5, 0.0, -0.33)  # behind, to the left, above the robot's base (m); heading off its own, elevation (rad)
+
+    def attach_robot(self, robot) -> None:
+        """``robot``'s links are drawn in this session's view, its sensors take this view's lighting, and the view is
+        rendered again whenever the robot has moved."""
+        self.robot = robot
+        robot.view_source = self._view_now
+        threading.Thread(target=self._watch_robot, name="robot-watch", daemon=True).start()
+
+    def _view_now(self) -> dict | None:
+        with self.cv:
+            return dict(self.view) if self.view is not None else None
+
+    def spawn_robot(self) -> None:
+        """The robot on the floor in front of the camera, in the scene shown."""
+        if self.robot is None:
+            raise ValueError("this viewer has no robot")
+        st = self.sim.getState()[0]
+        self.follow = None
+        self.robot.spawn(self.sim._split(st.scanId)[0], self.free_pose(), st.heading, st.elevation)
+
+    def despawn_robot(self) -> None:
+        self.follow = None
+        if self.robot is not None:
+            self.robot.despawn()
+            self._moved()
+
+    def set_follow(self, on: bool) -> None:
+        """The camera rides with the robot (behind and above it at first; flying moves it to another place on the
+        robot, kept from then on), or stays where it is."""
+        self.follow = self.FOLLOW if on and self.robot is not None and self.robot.pose2d() is not None else None
+        if self.follow is not None:
+            self._ride()
+            self._moved()
+
+    def _keep_follow(self) -> None:
+        at = self.robot.pose2d() if self.robot is not None else None
+        if at is None:
+            self.follow = None
+            return
+        st = self.sim.getState()[0]
+        x, y, z = self.free_pose()
+        rx, ry, rz, yaw = at
+        dx, dy = x - rx, y - ry
+        self.follow = (dx * math.cos(yaw) + dy * math.sin(yaw), -dx * math.sin(yaw) + dy * math.cos(yaw), z - rz,
+                       st.heading - (math.pi / 2 - yaw), st.elevation)
+
+    def _ride(self) -> None:
+        """Move the camera to its place on the robot."""
+        at = self.robot.pose2d() if self.robot is not None else None
+        if at is None or self.follow is None:
+            self.follow = None
+            return
+        rx, ry, rz, yaw = at
+        back, left, above, dh, e = self.follow
+        st = self.sim.getState()[0]
+        x = rx + back * math.cos(yaw) - left * math.sin(yaw)
+        y = ry + back * math.sin(yaw) + left * math.cos(yaw)
+        lo, hi = self.height_range(st.scanId)
+        self.sim.teleport([st.scanId], [[x, y, min(max(rz + above, lo), hi)]], [math.pi / 2 - yaw + dh], [e])
+
+    def _watch_robot(self) -> None:
+        """The robot moved (or came, or went): this view holds it, so render it again (as a flown camera does: the
+        render loop takes the newest view when a pass can start, and shows each first pass that finishes)."""
+        seen = -1
+        while True:
+            time.sleep(0.04)
+            robot = self.robot
+            if robot.pose_seq == seen or not self.started:
+                continue
+            with self.lock:
+                seen = robot.pose_seq
+                if self.follow is not None:
+                    self._ride()
+                self._moved()
 
     def act(self, op: str, value=0.0) -> None:
         st = self.sim.getState()[0]
@@ -501,6 +582,13 @@ class Session:
                 "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                 "renderer": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
                 "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
+        if self.robot is not None:
+            if self.robot.scene and self.robot.running and self.robot.scene != scene:  # another scene: the robot stays behind
+                self.robot.despawn()
+                self.follow = None
+            bodies = self.robot.bodies(scene) if sim.renderer == "path" else []   # the preview rasteriser draws none
+            if bodies:
+                view["bodies"] = bodies
         pos = st._free_position or (st.location.x, st.location.y)
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
             self.trail.append((pos[0], pos[1]))
@@ -589,7 +677,11 @@ class Session:
                     self.error = f"{type(exc).__name__}: {exc}"
                     self.version += 1
                 self.cv.notify_all()
+            if view.get("bodies") and "body model" in str(exc) and self.robot is not None:
+                self.robot.reregister()  # a restarted render server lost the robot's models: sent again, the view follows
             return
+        if view.get("bodies") and self.robot is not None:
+            self.robot.loaded()
         wall = time.perf_counter() - started  # the render request's round trip
         with self.cv:
             self.inflight -= 1
@@ -1039,6 +1131,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        viewer_session = session
 
         def log_message(self, fmt, *args):
             pass
@@ -1078,7 +1171,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                 return
             if parts == ["ws"] and self.headers.get("Upgrade", "").lower() == "websocket":
                 return self._websocket()
-            if robot is not None and robot_view.handles(parts):  # the robot mode's page and data (robot_view.py)
+            if robot is not None and robot_view.handles(parts):  # the robot in the scene: its state and sensors (robot_view.py)
                 try:
                     return robot_view.get(self, robot, parts, q)
                 except Exception as exc:  # noqa: BLE001 - to the page
@@ -1316,7 +1409,8 @@ def main() -> int:
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
     from .robot_view import RobotSession
-    robot = RobotSession(sim._client.url, args.rig_calibration)  # the robot mode (/robot): started from its page
+    robot = RobotSession(sim._client.url, args.rig_calibration)  # the robot a page puts into the scene it shows
+    session.attach_robot(robot)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(session, args.token, robot))
     resident = [r[0] for r in info.get("resident", [])]
     print(f"[gui] http://{args.host}:{args.port}{'/?token=<token>' if args.token else ''}  render server {sim._client.url}  freeze={info.get('drjit_freeze')}  "

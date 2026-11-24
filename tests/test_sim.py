@@ -11,6 +11,7 @@ import re
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -260,6 +261,66 @@ def test_http_roundtrip():
         assert RenderClient(url, token="s3cret").info()["mitsuba_variant"] == "fake"
     finally:
         secured.shutdown()
+
+
+def test_gui_draws_the_robot_and_rides_with_it():
+    """A robot attached to the viewer's session: its links are bodies of the editor's view, a move of it renders the
+    view again, the camera can ride with it, and it stays behind when another scene opens."""
+    from opticalnav_sim import gui
+
+    class Robot:
+        scene, running, pose_seq, view_source, gone, seen = "scene", True, 0, None, 0, 0
+        at = (1.0, 2.0, 0.0, 0.0)          # x, y, z, yaw: facing +x
+        links = [{"id": "robot", "model": "ranger", "links": {"base_link": np.eye(4)}}]
+
+        def bodies(self, scene):
+            return list(self.links) if scene == self.scene and self.running else []
+
+        def pose2d(self):
+            return self.at if self.running else None
+
+        def despawn(self):
+            self.running, self.gone = False, self.gone + 1
+
+        def loaded(self):
+            self.seen += 1
+
+    sim = MatterSim.Simulator()
+    sim.setCameraResolution(64, 48)
+    sim.initialize()
+    sim._client = FakeClient(_rows([(0, 0), (0, 2), (2, 0)], [(0, 1), (0, 2)]))
+    session = gui.Session(sim, {"scene": ["base"], "other": ["base"]}, pass_spp=16, target_spp=16)
+    robot = Robot()
+    session.attach_robot(robot)
+    assert robot.view_source() is None
+    session.run("start", session.start, "scene", "v0", 0.0)
+    session.wait_idle(10)
+    assert sim._client.views[-1]["bodies"] == robot.links and robot.view_source()["scan"] == "scene" and robot.seen
+    n = len(sim._client.views)
+    robot.at, robot.pose_seq = (2.0, 2.0, 0.0, 0.0), robot.pose_seq + 1            # it drove a metre: the view is rendered again
+    deadline = time.time() + 5
+    while len(sim._client.views) == n and time.time() < deadline:
+        time.sleep(0.02)
+    assert len(sim._client.views) > n
+    # riding: behind (-x of a robot facing +x) and above it, looking where it looks (heading 90 degrees: along +x)
+    st = session.run("robot", session.set_follow, True)
+    back, _, above, _, elevation = gui.Session.FOLLOW
+    assert np.allclose(st["position"], [2.0 + back, 2.0], atol=1e-3) and abs(st["heading_deg"] - 90.0) < 1e-6
+    assert abs(session.free_pose()[2] - above) < 1e-6 and abs(st["elevation_deg"] - math.degrees(elevation)) < 0.01
+    robot.at, robot.pose_seq = (2.0, 3.0, 0.0, math.pi / 2), robot.pose_seq + 1    # it turned to +y and moved: the camera too
+    deadline = time.time() + 5
+    while abs(session.status()["heading_deg"]) > 1e-6 and time.time() < deadline:
+        time.sleep(0.02)
+    st = session.status()
+    assert np.allclose(st["position"], [2.0, 3.0 + back], atol=1e-3) and abs(st["heading_deg"]) < 1e-6
+    session.run("fly", session.fly, 0.0, 1.0)                                      # flown a metre to the right: rides from there
+    assert np.allclose(session.follow[:3], [back, -1.0, above], atol=1e-6)
+    sim.renderer = "raster"                                                        # the preview rasteriser draws no bodies
+    session.run("moved", session._moved)
+    assert "bodies" not in session.view
+    sim.renderer = "path"
+    session.run("start", session.start, "other", "v0", 0.0)                        # another scene: the robot stays behind
+    assert robot.gone == 1 and session.follow is None and "bodies" not in session.view
 
 
 def test_gui_session_and_routes():

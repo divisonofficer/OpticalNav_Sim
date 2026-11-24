@@ -123,6 +123,31 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 /* step sliders: a numeric menu shown as a slider over its options (the select stays, hidden, and keeps the logic) */
 select.as-slider { display: none; }
 .frame-wrap { flex: 1; min-height: 0; container-type: size; display: grid; place-items: center; }
+/* the robot's sensors: panes under the editor's two, switched on and off from the robot tab */
+main.has-sensors { grid-template-rows: minmax(0, 1.45fr) minmax(0, 1fr); }
+main.has-sensors > aside { grid-column: 3; grid-row: 1 / span 2; }
+#sensors { grid-column: 1 / span 2; grid-row: 2; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 10px; min-height: 0; }
+#sensors[hidden], #sensors > [hidden] { display: none; }
+.sensor h2 small { font: 11.5px var(--mono); color: var(--muted); font-weight: 400; margin-left: 4px; }
+.sdot { background: var(--accent-2); }
+.sensor-wrap { flex: 1; min-height: 120px; position: relative; background: #000; border-radius: 6px; overflow: hidden; }
+.sensor-wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.sensor-wrap .wait { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 12.5px; padding: 12px; text-align: center; }
+.sensor-wrap:fullscreen { border-radius: 0; }
+#p-robot { display: flex; flex-direction: column; gap: 10px; }
+#p-robot[hidden] { display: none; }
+#p-robot .toggles { flex-direction: column; gap: 7px; }
+#robot-note { font-size: 12.5px; margin: 0; padding: 6px 9px; border-radius: 7px; background: var(--panel-2); color: var(--ink); }
+#robot-note:empty { display: none; }
+#robot-note.bad { color: var(--bad, #ef6b6b); }
+#robot-wheels { width: 100%; border-collapse: collapse; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+#robot-wheels th { color: var(--muted); font-weight: 400; text-align: right; padding: 1px 0 1px 6px; }
+#robot-wheels td { text-align: right; padding: 1px 0 1px 6px; }
+#robot-wheels td:first-child, #robot-wheels th:first-child { text-align: left; padding-left: 0; color: var(--muted); }
+#robot-wheels td.hot { color: var(--warn); }
+.map-legend { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; font-size: 11.5px; color: var(--muted); }
+.map-legend[hidden] { display: none; }
+.map-legend i { width: 56px; height: 8px; border-radius: 4px; background: linear-gradient(90deg, rgb(217, 64, 51), rgb(64, 204, 51)); }
 .frame { position: relative; width: min(100cqw, calc(100cqh * 4 / 3)); aspect-ratio: 4 / 3; background: #000; border: 1px solid var(--rule); border-radius: 8px;
   overflow: hidden; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
@@ -160,7 +185,7 @@ kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); b
 .hint { font-size: 12px; color: var(--muted); margin: 0; }
 .hint:empty { display: none; }
 .ptabs { display: flex; gap: 2px; background: var(--panel-2); border-radius: 8px; padding: 3px; }
-.ptabs button { flex: 1; font: 12.5px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 6px; padding: 6px 4px; cursor: pointer; white-space: nowrap; }
+.ptabs button { flex: 1 1 auto; font: 12.5px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 6px; padding: 6px 4px; cursor: pointer; white-space: nowrap; }
 .ptabs button[aria-selected=true] { background: var(--panel-3); color: var(--ink); font-weight: 600; }
 /* status bar */
 .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; padding: 8px 14px; }
@@ -210,6 +235,10 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
 }
 @media (max-width: 1000px) {
   main { grid-template-columns: minmax(0, 1fr); }
+  main.has-sensors { grid-template-rows: none; }
+  main.has-sensors > aside, #sensors { grid-column: auto; grid-row: auto; }
+  #sensors { grid-auto-flow: row; }
+  .sensor-wrap { aspect-ratio: 3 / 2; }
   .frame-wrap { container-type: normal; display: block; }
   .frame { width: 100%; }
   .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -242,7 +271,6 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
 <header class="top">
   <h1>OpticalNav Sim Viewer</h1>
   <button type="button" class="icon-btn" id="help-btn" aria-haspopup="dialog" title="조작법과 3D 리그 편집 키 (?)">도움말 ?</button>
-  <a class="icon-btn" id="robot-link" href="/robot" title="로봇과 카메라 리그를 씬에 놓고 몰기">로봇 모드</a>
   <div class="monitor" id="monitor" role="status" aria-live="polite"></div>
 </header>
 <details class="settings" id="settings">
@@ -316,7 +344,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     </section>
   </div>
 </details>
-<main>
+<main id="main">
   <section class="card pane" id="pane-a">
     <div class="pane-head card-head">
       <span class="pdot" id="dot-a"></span><h2 id="title-a">RGB 영상</h2>
@@ -348,6 +376,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     <section class="card">
       <h2><svg class="i"><use href="#i-map"/></svg>지도</h2>
       <canvas id="map" width="600" height="600" aria-label="연결 그래프 지도. 누르면 가장 가까운 지점으로 이동"></canvas>
+      <div class="map-legend" id="map-legend" hidden><span>마찰 0.1</span><i></i><span>0.9</span><span>검정: 막힘</span><span style="color:var(--accent)">— 궤적</span><span style="color:#d17be8">- - 오도메트리</span><span style="color:var(--accent-2)">— 카메라</span></div>
       <p class="hint" id="map-src"></p>
     </section>
     <section class="card info">
@@ -356,6 +385,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <button type="button" role="tab" id="t-state" aria-controls="p-state" data-tab="state">현재 상태</button>
         <button type="button" role="tab" id="t-probe" aria-controls="p-probe" data-tab="probe">픽셀 값</button>
         <button type="button" role="tab" id="t-scene" aria-controls="p-scene" data-tab="scene">씬 정보</button>
+        <button type="button" role="tab" id="t-robot" aria-controls="p-robot" data-tab="robot">로봇</button>
       </div>
       <section class="ppanel" role="tabpanel" id="p-rig" aria-labelledby="t-rig" hidden>
         <div class="rig-view" id="rig-view">
@@ -378,8 +408,57 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <dl id="scene-stats"><div><dt>씬</dt><dd>불러오는 중…</dd></div></dl>
         <p class="hint">렌더 서버에 올라간 씬 기준, 5초마다 갱신. GPU는 장치 전체 사용량(다른 프로세스 포함).</p>
       </section>
+      <section class="ppanel" role="tabpanel" id="p-robot" aria-labelledby="t-robot" hidden>
+        <div class="rig-tools">
+          <button type="button" class="flash primary" id="robot-spawn" title="지금 카메라가 보는 바닥에 Ranger Mini와 카메라 리그를 놓습니다. 이 화면에 로봇이 나타나고, 센서 창을 켜면 로봇 카메라의 영상이 아래에 열립니다.">로봇 스폰</button>
+          <button type="button" class="flash" id="robot-despawn" hidden>로봇 제거</button>
+        </div>
+        <p id="robot-note" role="status" aria-live="polite"></p>
+        <div id="robot-on" hidden>
+          <div class="toggles">
+            <label class="tg" for="robot-drive" title="켜면 W/A/S/D/Q/E와 Space가 카메라가 아니라 로봇을 움직입니다 (T). 화살표·R/F·우클릭 드래그는 그대로 카메라를 돌립니다."><input type="checkbox" class="sw" id="robot-drive"> 키보드로 운전 <kbd>T</kbd></label>
+            <label class="tg" for="robot-follow" title="카메라가 로봇을 따라갑니다 (처음에는 뒤쪽 위). 따라가는 중에 카메라를 움직이면 그 자리에서 계속 따라갑니다."><input type="checkbox" class="sw" id="robot-follow"> 카메라가 따라가기</label>
+            <label class="tg" for="sensor-on-hdr" title="LUCID TDR054S (IMX490, 24-bit HDR): 센서 모델과 ISP를 거친 영상"><input type="checkbox" class="sw" id="sensor-on-hdr" data-sensor="hdr"> HDR 카메라 창</label>
+            <label class="tg" for="sensor-on-12bit" title="LUCID TRI032S (IMX265, 12-bit): 센서 모델과 ISP를 거친 영상"><input type="checkbox" class="sw" id="sensor-on-12bit" data-sensor="12bit"> 12-bit 카메라 창</label>
+            <label class="tg" for="robot-zoom" title="지도를 로봇 주변으로 확대하고, 지면 지도(마찰·장애물)를 깝니다"><input type="checkbox" class="sw" id="robot-zoom" checked> 지도를 로봇 주변으로</label>
+          </div>
+          <div class="fields one" style="margin-top:8px">
+            <label class="f" for="robot-speed" title="W/S를 누르고 있을 때의 속도 (Ranger Mini 2.0: 최대 1.5 m/s)"><span>로봇 속도</span><select id="robot-speed" class="as-slider"><option value="0.3">0.3 m/s</option><option value="0.6" selected>0.6 m/s</option><option value="1">1.0 m/s</option><option value="1.5">1.5 m/s</option></select></label>
+            <label class="f" for="robot-steer" title="A/D를 누르고 있을 때의 조향각 (안쪽 바퀴, 최대 40°)"><span>조향각</span><select id="robot-steer" class="as-slider"><option value="10">10°</option><option value="20" selected>20°</option><option value="30">30°</option><option value="40">40°</option></select></label>
+          </div>
+          <table id="robot-wheels" style="margin-top:8px"></table>
+          <dl id="robot-readout" style="margin-top:8px"></dl>
+          <div class="keys desk-only" style="margin-top:8px">
+            <span><kbd>W</kbd> <kbd>S</kbd></span><span>전진 / 후진</span>
+            <span><kbd>A</kbd> <kbd>D</kbd></span><span>좌 / 우 조향 (전후진 없이 누르면 제자리 회전)</span>
+            <span><kbd>Q</kbd> <kbd>E</kbd></span><span>좌 / 우 횡이동</span>
+            <span><kbd>Space</kbd></span><span>정지 (키를 놓아도 0.5초 뒤 멈춤)</span>
+          </div>
+        </div>
+        <p class="hint" id="robot-hint">Ranger Mini 2.0과 카메라 리그(HDR, 12-bit)를 지금 보는 씬에 놓습니다. 로봇은 이 화면에 그대로 보이고, 로봇 카메라는 센서 창으로 켜고 끕니다. 바닥 높이·장애물·마찰은 씬 파일의 재질에서 읽습니다.</p>
+      </section>
     </section>
   </aside>
+  <section id="sensors" hidden aria-label="로봇 센서 창">
+    <section class="card pane sensor" id="sensor-hdr" hidden>
+      <div class="pane-head card-head">
+        <span class="pdot sdot"></span><h2>HDR 카메라<small id="smeta-hdr"></small></h2>
+        <button type="button" class="icon-btn" data-sensor-shot="hdr" title="이 센서 영상 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
+        <button type="button" class="icon-btn" data-act="full" data-pane="s-hdr" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
+        <button type="button" class="icon-btn" data-sensor-off="hdr" title="이 센서 창 끄기">✕</button>
+      </div>
+      <div class="sensor-wrap" id="frame-s-hdr"><div class="wait" id="swait-hdr">첫 프레임을 기다리는 중…</div><img id="simg-hdr" alt="HDR 카메라 영상" hidden></div>
+    </section>
+    <section class="card pane sensor" id="sensor-12bit" hidden>
+      <div class="pane-head card-head">
+        <span class="pdot sdot"></span><h2>12-bit 카메라<small id="smeta-12bit"></small></h2>
+        <button type="button" class="icon-btn" data-sensor-shot="12bit" title="이 센서 영상 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
+        <button type="button" class="icon-btn" data-act="full" data-pane="s-12bit" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
+        <button type="button" class="icon-btn" data-sensor-off="12bit" title="이 센서 창 끄기">✕</button>
+      </div>
+      <div class="sensor-wrap" id="frame-s-12bit"><div class="wait" id="swait-12bit">첫 프레임을 기다리는 중…</div><img id="simg-12bit" alt="12-bit 카메라 영상" hidden></div>
+    </section>
+  </section>
 </main>
 <div class="pad" role="group" aria-label="조작">
   <button type="button" data-op="turn" data-v="-1">↶ 회전<span id="pad-turn-l"></span></button>
@@ -419,6 +498,11 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <span><kbd>Space</kbd></span><span>누적 일시정지 / 재개</span>
         <span><kbd>?</kbd></span><span>이 도움말</span>
       </div>
+      <h3>로봇</h3>
+      <div class="keys">
+        <span>로봇 탭</span><span>로봇 스폰: 카메라가 보는 바닥에 Ranger Mini와 카메라 리그가 놓이고 이 화면에 보입니다. 센서 창을 켜면 로봇 카메라 영상이 아래에 열립니다</span>
+        <span><kbd>T</kbd></span><span>키보드로 운전 켜고 끄기: 켜면 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> <kbd>Q</kbd><kbd>E</kbd> <kbd>Space</kbd>가 로봇을 움직입니다 (전후진 · 조향 · 횡이동 · 정지)</span>
+      </div>
       <h3>지도</h3>
       <p class="hint">누르면 가장 가까운 그래프 지점으로 이동합니다(에피소드 단계가 0으로 돌아갑니다). 방 평면도가 있는 씬은 방 종류별 색과 이름, 문(■)과 트인 통로(○)가 함께 그려집니다.</p>
     </section>
@@ -456,6 +540,7 @@ const paneView = (p) => pick[p].aov ? `rgb.${pick[p].aov}` : `${pick[p].band}.${
 const view = { get a() { return paneView("a"); }, get b() { return paneView("b"); } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let S = null, graph = null, poseKey = "";
+let R = null;  // the robot's state (/api/robot/state), see renderRobot
 // The server renders on its own (newest camera, accumulating while it stays put). One WebSocket carries
 // everything: the server pushes state on every change and the panes' JPEGs for every new frame; the page
 // sends inputs (answered at once, before any render) and probes.
@@ -1133,11 +1218,16 @@ function drawCandidates() {
 
 function mapTransform(canvas) {
   const pad = 24, w = canvas.width, h = canvas.height;
+  if (R && R.robot && $("robot-zoom").checked) {  // around the robot: 14 m across the shorter side
+    const s = Math.min(w, h) / 14, ox = w / 2 - s * R.robot.x, oy = h / 2 + s * R.robot.y;
+    return { to: (x, y) => [ox + s * x, oy - s * y], from: (px, py) => [(px - ox) / s, (oy - py) / s], scale: s };
+  }
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   const grow = (x, y) => { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); };
   for (let i = 0; i < graph.x.length; i++) grow(graph.x[i], graph.y[i]);
   for (const room of (graph.rooms || {}).rooms || []) for (const poly of room.polygons) for (const [x, y] of poly) grow(x, y);
   if (graph.image) { const [bx0, by0, bx1, by1] = graph.image.bounds; grow(bx0, by0); grow(bx1, by1); }
+  if (R && R.robot) { grow(R.robot.x - 2, R.robot.y - 2); grow(R.robot.x + 2, R.robot.y + 2); for (const [x, y] of R.trail || []) grow(x, y); }
   const s = Math.min((w - 2 * pad) / Math.max(x1 - x0, 1e-3), (h - 2 * pad) / Math.max(y1 - y0, 1e-3));
   const ox = (w - s * (x1 - x0)) / 2 - s * x0, oy = (h + s * (y1 - y0)) / 2 + s * y0;
   return { to: (x, y) => [ox + s * x, oy - s * y], from: (px, py) => [(px - ox) / s, (oy - py) / s], scale: s };
@@ -1167,6 +1257,7 @@ function drawMap() {
   if (!graph || !S) return;
   const T = mapTransform(c);
   drawBackdrop(g, T);
+  drawGround(g, T);
   drawRooms(g, T, dpr);
   g.fillStyle = css("--muted"); g.globalAlpha = 0.55;
   const dot = Math.max(1.5, 1.8 * dpr);
@@ -1185,6 +1276,7 @@ function drawMap() {
   g.fillStyle = css("--accent");
   for (const cand of S.candidates.slice(0, 9)) { const [px, py] = T.to(cand.x, cand.y); g.beginPath(); g.arc(px, py, 2.5 * dpr, 0, 7); g.fill(); }
   g.beginPath(); g.arc(cx, cy, 5 * dpr, 0, 7); g.fill();
+  drawRobot(g, T, dpr);
 }
 
 // floor plan under the graph (robomituba room_map): one hue per room type, its name at the centroid, a
@@ -1483,7 +1575,9 @@ document.addEventListener("keydown", (ev) => {
   if (ev.target.closest("select, input, #rig3d, dialog") || $("help").open || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
   const key = keyOf(ev), k = key;
   let handled = true;
-  if (key in MOVE_KEYS) held.add(key);  // continuous while held; key repeats change nothing
+  if (key === "t" && R && R.spawned) { $("robot-drive").checked = !$("robot-drive").checked; syncDrive(); }
+  else if (driving() && ROBOT_KEYS.includes(key)) { if (!rheld.has(key)) { rheld.add(key); sendDrive(); } }  // a tap is a command at once
+  else if (key in MOVE_KEYS) held.add(key);  // continuous while held; key repeats change nothing
   else if (key === "g") act("free_off");
   else if (key === "l") toggleFlash();
   else if (key === "m") toggleMirrors();
@@ -1496,13 +1590,13 @@ document.addEventListener("keydown", (ev) => {
   if (handled) ev.preventDefault();
 });
 
-document.addEventListener("keyup", (ev) => { held.delete(keyOf(ev)); });
+document.addEventListener("keyup", (ev) => { held.delete(keyOf(ev)); rheld.delete(keyOf(ev)); });
 // A menu, slider or checkbox keeps keyboard focus after it is used, and keys typed into it never reach the
 // walk controls: hand focus back to the page once the change is made.
 document.addEventListener("change", (ev) => {
   if (ev.target.matches("select, input[type=range], input[type=checkbox]")) ev.target.blur();
 });
-window.addEventListener("blur", () => held.clear());  // a key released in another window must not stick
+window.addEventListener("blur", () => { held.clear(); rheld.clear(); });  // a key released in another window must not stick
 
 // --- camera rig editor: three.js, loaded when the panel first opens ---
 // Blender's frame: X right, Y forward, Z up (metres), the observer on the floor at the origin facing +Y. The
@@ -1832,7 +1926,7 @@ let panelTab = "state", statsTimer = null;
 function showTab(name) {
   panelTab = name;
   document.querySelectorAll(".ptabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
-  for (const t of ["rig", "state", "probe", "scene"]) $(`p-${t}`).hidden = t !== name;
+  for (const t of ["rig", "state", "probe", "scene", "robot"]) $(`p-${t}`).hidden = t !== name;
   try { localStorage.setItem("opticalnav-panel-tab", name); } catch (e) { /* not remembered */ }
   if (name === "rig") rigLoad().then(rigSync).catch((e) => { $("rig-mode").textContent = `three.js를 불러오지 못했습니다 (${e.message})`; });
   clearInterval(statsTimer);
@@ -1859,6 +1953,129 @@ async function loadSceneStats() {
     ["변형", (st.variants || []).join(", ")], ["씬 텍스트 · Mitsuba", `${st.text_mb} MB · ${st.mitsuba_variant}`], ...gpu];
   $("scene-stats").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
 }
+
+// --- the robot: spawned into the scene this page shows (the editor's camera renders it), its cameras as sensor panes ---
+// R is /api/robot/state, polled (5 times a second while there is a robot): pose, wheels, sensors, messages.
+let robotTimer = null, groundImg = null, groundKey = "";
+const SENSORS = ["hdr", "12bit"], ROBOT_KEYS = ["w", "a", "s", "d", "q", "e", " "];
+const rheld = new Set(), sensorSeq = {};
+const driving = () => !!(R && R.spawned && $("robot-drive").checked);
+async function robotApi(path, body) { R = await api(`/api/robot/${path}`, body); renderRobot(); return R; }
+function robotNote(text, bad) { const n = $("robot-note"); n.textContent = text || ""; n.classList.toggle("bad", !!bad); }
+function syncDrive() {
+  rheld.clear();
+  if (driving()) for (const k of ROBOT_KEYS) held.delete(k);
+  renderRobot();
+}
+function driveCommand() {
+  const v = Number($("robot-speed").value), st = Number($("robot-steer").value);
+  const fwd = (rheld.has("w") ? 1 : 0) - (rheld.has("s") ? 1 : 0), turn = (rheld.has("a") ? 1 : 0) - (rheld.has("d") ? 1 : 0);
+  const side = (rheld.has("q") ? 1 : 0) - (rheld.has("e") ? 1 : 0);
+  if (rheld.has(" ")) return { mode: "twist" };
+  if (side) return { mode: "lateral", linear: side * Math.min(v, 0.75) };
+  if (fwd) return { mode: "ackermann", linear: fwd * v, steering_deg: turn * st };
+  if (turn) return { mode: "spin", angular: turn * 1.0 };
+  return null;
+}
+// a held key sends its command ten times a second (the chassis keeps one for 0.5 s)
+function sendDrive() { const c = driving() && driveCommand(); if (c) api("/api/robot/control", c).catch(() => {}); }
+setInterval(sendDrive, 100);
+
+function renderRobot() {
+  if (!R) return;
+  const on = !!R.spawned, busy = R.running && !on;
+  $("robot-spawn").hidden = on; $("robot-spawn").disabled = busy;
+  $("robot-despawn").hidden = !on && !busy;
+  $("robot-on").hidden = !on; $("robot-hint").hidden = on;
+  const raster = on && S && S.render_mode && S.render_mode !== "path" ? "지금 렌더러는 로봇을 그리지 않습니다 (Mitsuba 경로 추적에서만 보입니다). " : "";
+  robotNote(R.error ? `로봇: ${R.error}` : raster + (R.message || ""), !!R.error);
+  if ($("robot-follow").checked !== !!R.follow) $("robot-follow").checked = !!R.follow;
+  let shown = 0;
+  for (const sn of R.sensors || []) {
+    const pane = $(`sensor-${sn.name}`), box = $(`sensor-on-${sn.name}`), want = on && sn.enabled;
+    if (box.checked !== !!sn.enabled) box.checked = !!sn.enabled;
+    pane.hidden = !want;
+    if (!want) { sensorSeq[sn.name] = 0; $(`simg-${sn.name}`).hidden = true; $(`swait-${sn.name}`).hidden = false; $(`smeta-${sn.name}`).textContent = ""; continue; }
+    shown++;
+    if (sn.seq && sensorSeq[sn.name] !== sn.seq) {
+      sensorSeq[sn.name] = sn.seq;
+      const img = $(`simg-${sn.name}`);
+      img.src = `/api/robot/frame/${sn.name}.jpg?seq=${sn.seq}`; img.hidden = false; $(`swait-${sn.name}`).hidden = true;
+      $(`smeta-${sn.name}`).textContent = `${sn.model} · ${sn.format} · ${sn.size[0]}×${sn.size[1]} · 노출 ${sn.exposure_ms} ms${sn.gain_db ? ` +${sn.gain_db} dB` : ""} · ${sn.spp} spp`;
+    }
+  }
+  const had = $("main").classList.contains("has-sensors");
+  $("sensors").hidden = !shown; $("main").classList.toggle("has-sensors", shown > 0);
+  if (had !== shown > 0) { drawMap(); subscribe(); }
+  $("map-legend").hidden = !(on && R.map && $("robot-zoom").checked);
+  const r = R.robot;
+  if (!r) { $("robot-wheels").innerHTML = ""; $("robot-readout").innerHTML = ""; drawMap(); return; }
+  const names = ["앞 왼쪽", "앞 오른쪽", "뒤 왼쪽", "뒤 오른쪽"];
+  $("robot-wheels").innerHTML = "<tr><th>바퀴</th><th>조향</th><th>속도</th><th>마찰 μ</th><th>미끄럼</th></tr>" + names.map((n, i) =>
+    `<tr><td>${n}</td><td>${r.steer_deg[i].toFixed(1)}°</td><td>${r.wheel_speed[i].toFixed(2)}</td><td>${r.mu[i].toFixed(2)}</td>` +
+    `<td class="${r.slip[i] > 0.05 ? "hot" : ""}">${r.slip[i].toFixed(3)}</td></tr>`).join("");
+  const rows = [["위치 (x, y, z)", `${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(2)} m`],
+    ["방위 · 롤 · 피치", `${r.yaw_deg.toFixed(1)}° · ${r.roll_deg.toFixed(1)}° · ${r.pitch_deg.toFixed(1)}°`],
+    ["속도 (실제)", `${Math.hypot(r.vx, r.vy).toFixed(2)} m/s · ${r.wz.toFixed(2)} rad/s`],
+    ["명령 (vx, vy, ω)", r.command.map((v) => v.toFixed(2)).join(", ")],
+    ["바닥 재질", r.material || "—"], ["충돌", r.collided ? "막힘: 장애물" : "없음"],
+    ["리그", R.calibrated ? "캘리브레이션 파일" : "데이터시트 모델"], ["시뮬레이션", `${R.sim_rate} Hz`]];
+  $("robot-readout").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
+  drawMap();
+}
+// the ground map under the graph: friction (red slippery .. green grippy), black where the robot does not pass
+function drawGround(g, T) {
+  const m = R && R.spawned && $("robot-zoom").checked ? R.map : null;
+  if (!m) return;
+  const key = `${R.scene}|${m.x0}|${m.y0}|${m.x1}|${m.floor_z}`;
+  if (groundKey !== key) { groundKey = key; groundImg = new Image(); groundImg.onload = drawMap; groundImg.src = `/api/robot/map.png?k=${encodeURIComponent(key)}`; }
+  if (!groundImg || !groundImg.complete || !groundImg.naturalWidth) return;
+  const [px, py] = T.to(m.x0, m.y1);  // the picture's top row is the map's far (y1) edge
+  g.imageSmoothingEnabled = false; g.globalAlpha = 0.85;
+  g.drawImage(groundImg, px, py, (m.x1 - m.x0) * T.scale, (m.y1 - m.y0) * T.scale);
+  g.globalAlpha = 1; g.imageSmoothingEnabled = true;
+}
+function drawRobot(g, T, dpr) {
+  const r = R && R.robot;
+  if (!r) return;
+  const path = (pts, color, dash) => {
+    if (!pts || pts.length < 2) return;
+    g.beginPath(); g.setLineDash(dash || []); g.strokeStyle = color; g.lineWidth = 1.5 * dpr;
+    pts.forEach(([x, y], i) => { const [px, py] = T.to(x, y); i ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.stroke(); g.setLineDash([]);
+  };
+  path(R.odometry_trail, "#d17be8", [4 * dpr, 3 * dpr]);
+  path(R.trail, css("--accent"));
+  g.beginPath(); r.footprint.forEach(([x, y], i) => { const [px, py] = T.to(x, y); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.closePath();
+  g.fillStyle = r.collided ? "rgba(239,107,107,0.5)" : "rgba(226,233,236,0.3)"; g.fill();
+  g.strokeStyle = r.collided ? "#ef6b6b" : "#e2e9ec"; g.lineWidth = 1.5 * dpr; g.stroke();
+  const a = r.yaw_deg * Math.PI / 180, [cx, cy] = T.to(r.x, r.y), len = Math.max(0.6 * T.scale, 9 * dpr);  // the heading
+  g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(a) * len, cy - Math.sin(a) * len);
+  g.strokeStyle = css("--accent"); g.lineWidth = 2 * dpr; g.stroke();
+}
+async function pollRobot() {
+  clearTimeout(robotTimer);
+  try { R = await api("/api/robot/state"); renderRobot(); } catch (e) { /* the viewer is away: the socket says so */ }
+  robotTimer = setTimeout(pollRobot, R && R.running ? 200 : 1500);
+}
+$("robot-spawn").addEventListener("click", async () => {
+  try { robotNote("로봇을 준비하는 중…"); await robotApi("spawn", {}); pollRobot(); } catch (e) { robotNote(e.message, true); }
+});
+$("robot-despawn").addEventListener("click", () => robotApi("despawn", {}).catch((e) => robotNote(e.message, true)));
+$("robot-follow").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked }).catch((e) => robotNote(e.message, true)));
+$("robot-drive").addEventListener("change", syncDrive);
+$("robot-zoom").addEventListener("change", () => { renderRobot(); drawMap(); });
+document.querySelectorAll("[data-sensor]").forEach((box) => box.addEventListener("change", () =>
+  robotApi("sensors", { [box.dataset.sensor]: box.checked }).catch((e) => robotNote(e.message, true))));
+document.querySelectorAll("[data-sensor-off]").forEach((b) => b.addEventListener("click", () =>
+  robotApi("sensors", { [b.dataset.sensorOff]: false }).catch((e) => robotNote(e.message, true))));
+document.querySelectorAll("[data-sensor-shot]").forEach((b) => b.addEventListener("click", () => {
+  const n = b.dataset.sensorShot, seq = sensorSeq[n];
+  if (!seq) return;
+  const a = document.createElement("a");
+  a.href = `/api/robot/frame/${n}.jpg?seq=${seq}`; a.download = `opticalnav_${R.scene}_robot_${n}.jpg`; a.click();
+}));
+pollRobot();
 try { showTab(localStorage.getItem("opticalnav-panel-tab") || "state"); } catch (e) { showTab("state"); }
 
 function openHelp() { if (!$("help").open) $("help").showModal(); }
@@ -1869,13 +2086,6 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "?" && !ev.target.closest("select, input, #rig3d")) { ev.preventDefault(); openHelp(); }
 });
 boot().catch((e) => showError(`시작 실패: ${e.message}`));
-</script>
-<script>
-// the robot mode opens on the scene the viewer is showing
-document.getElementById("robot-link").addEventListener("click", (e) => {
-  const sel = document.getElementById("scene");
-  if (sel && sel.value) e.currentTarget.href = "/robot?scene=" + encodeURIComponent(sel.value);
-});
 </script>
 </body>
 </html>

@@ -19,4 +19,4 @@ gui = ["pillow"]
 packages = ["opticalnav_sim", "opticalnav_sim.hw"]
 
 [tool.setuptools.package-data]
-opticalnav_sim = ["gui.html", "robot.html"]
+opticalnav_sim = ["gui.html"]
