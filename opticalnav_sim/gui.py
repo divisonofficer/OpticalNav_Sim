@@ -58,22 +58,42 @@ def robust_mean(acc: dict[str, np.ndarray], counts) -> dict[str, np.ndarray]:
     there is no median to trust, and the plain mean is returned."""
     n = np.asarray(counts, dtype=np.float32)
     used = n > 0
-    w = n[used] / n[used].sum()
-    means = {k: v[used] / n[used].reshape((-1,) + (1,) * (v.ndim - 1)) for k, v in acc.items()}
+    m, total = int(used.sum()), float(n[used].sum())
+    # buckets fill from the first on: the filled ones are a slice (a view), not a copy of every sum
+    pick = slice(0, m) if bool(used[:m].all()) else used
     out = {}
-    for band, keys in (("s0", [k for k in means if not k.startswith("nir_")]),
-                       ("nir_s0", [k for k in means if k.startswith("nir_")])):
+    for band, keys in (("s0", [k for k in acc if not k.startswith("nir_")]),
+                       ("nir_s0", [k for k in acc if k.startswith("nir_")])):
         if not keys:
             continue
-        scale = None
-        if band in means and int(used.sum()) >= 3:
-            lum = means[band] @ stokes.LUMA if means[band].ndim == 4 else means[band]
-            cap = FIREFLY_K * np.median(lum, axis=0) + FIREFLY_FLOOR
-            scale = np.minimum(1.0, cap / np.maximum(lum, 1e-12))
+        # The plain mean first (the sums' sum over the samples), which is the answer wherever no bucket stands out:
+        # nearly everywhere. Then only the pixels that can hold a bucket over the limit (its brightest bucket above
+        # FIREFLY_K times its darkest: the median is no lower than the darkest) get their median, and those with a
+        # bucket over K medians are summed again with that bucket scaled down. The same numbers as scaling every
+        # bucket of every pixel, without the median and the products of the pixels that need neither.
         for k in keys:
-            v = means[k] if scale is None else means[k] * (scale[..., None] if means[k].ndim == scale.ndim + 1 else scale)
-            out[k] = np.tensordot(w, v, axes=1).astype(np.float32)
+            out[k] = (acc[k][pick].sum(axis=0) / total).astype(np.float32)
+        if band not in acc or m < 3:
+            continue
+        sums = acc[band][pick]
+        lum = (sums @ stokes.LUMA if sums.ndim == 4 else sums) / n[used].reshape(-1, 1, 1)
+        maybe = np.nonzero(lum.max(axis=0) > FIREFLY_K * lum.min(axis=0) + FIREFLY_FLOOR)
+        if not len(maybe[0]):
+            continue
+        some = lum[(slice(None),) + maybe]                                   # buckets x candidate pixels
+        cap = FIREFLY_K * np.median(some, axis=0) + FIREFLY_FLOOR
+        over = some > cap
+        hit = over.any(axis=0)
+        if not hit.any():
+            continue
+        at = tuple(a[hit] for a in maybe)
+        scale = np.where(over[:, hit], cap[hit] / np.maximum(some[:, hit], 1e-12), 1.0)
+        for k in keys:
+            v = acc[k][pick][(slice(None),) + at]                            # buckets x pixels (x channels)
+            out[k][at] = ((v * (scale[..., None] if v.ndim == 3 else scale)).sum(axis=0) / total).astype(np.float32)
     return out
+
+
 CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  # the older pane names
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
 PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
@@ -242,6 +262,10 @@ class Session:
         self.follow: tuple | None = None  # the camera rides with the robot: its place in the robot's frame (set_follow)
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(self.depth, thread_name_prefix="pass")
+        self._acc_lock = threading.Lock()  # the running sums: pass threads add to them, the publisher reads them
+        self._jpeg_pool = ThreadPoolExecutor(4, thread_name_prefix="jpeg")  # a frame's panes, encoded side by side
+        self._job: dict | None = None      # the newest state the publisher has not shown yet (_pass, _publisher)
+        threading.Thread(target=self._publisher, name="publisher", daemon=True).start()
         self._loop_thread = threading.Thread(target=self._loop, name="render-loop", daemon=True)
         self._loop_thread.start()
         self.renderer: dict = {}          # the render server's /v1/status, refreshed every second
@@ -636,9 +660,11 @@ class Session:
         with self.cv:
             self.gen += 1
             self.view, self.gen_started = view, time.time()
-            self.issued = self.passes = self.published = 0
-            self.spp_issued = self.spp_done = 0
-            self.acc, self.acc_n = {}, [0] * FIREFLY_BUCKETS
+            self.issued = self.published = 0
+            self.spp_issued = 0
+            with self._acc_lock:
+                self.passes = self.spp_done = 0
+                self.acc, self.acc_n = {}, [0] * FIREFLY_BUCKETS
             self.error = ""
             self.started = True
             self.pose = pose
@@ -687,6 +713,9 @@ class Session:
         return client
 
     def _pass(self, gen: int, view: dict, seed: int) -> None:
+        """A pass thread: ask the render server for one pass and add it to the running sums. Nothing else: the mean,
+        the denoiser, the polarization images and the JPEGs are the publisher's (_publisher), so a pass that comes
+        back never waits for a picture to be made, and the next one is already on its way."""
         started = time.perf_counter()
         try:
             client = self._client()
@@ -707,40 +736,82 @@ class Session:
             return
         if view.get("bodies") and self.robot is not None:
             self.robot.loaded()
-        if "s0" not in out and "radiance" in out:  # rendered without polarization: unpolarized Stokes images (S1 = S2 = 0)
-            rad = np.asarray(out["radiance"], dtype=np.float32)
-            out = dict(out, s0=rad, s1=np.zeros_like(rad), s2=np.zeros_like(rad))
+        if "s0" not in out and "radiance" in out:  # rendered without polarization: S0 alone (S1 = S2 = 0, made when shown)
+            out = dict(out, s0=np.asarray(out["radiance"], dtype=np.float32))
         if "nir" in out and "nir_s0" not in out:
-            nir = np.asarray(out["nir"], dtype=np.float32)
-            out = dict(out, nir_s0=nir, nir_s1=np.zeros_like(nir), nir_s2=np.zeros_like(nir))
+            out = dict(out, nir_s0=np.asarray(out["nir"], dtype=np.float32))
         wall = time.perf_counter() - started  # the render request's round trip
+        job = {"gen": gen, "view": view, "depth": out.get("depth"), "started": started, "wall": wall, "timing": timing,
+               "server_s": server_s, "one": None}
         with self.cv:
             self.inflight -= 1
+            self.cv.notify_all()   # the render loop sends the next pass now
+            current = gen == self.gen
+            # the camera moved on while this pass rendered: while moving, still show it if it is newer than what the
+            # page has (a game shows the last finished frame), but never accumulate it
+            if not current and (seed != 0 or gen <= self.frame_meta.get("frame_gen", -1)):
+                return
+        added = False
+        if current:
+            spp = int(view["spp"])
+            with self._acc_lock:   # the sums: the publisher reads them under it, a move empties them under it
+                if gen == self.gen:
+                    b = int(np.argmin(self.acc_n))  # the lightest bucket: passes differ in size, so not round-robin
+                    for k in ACCUMULATED:
+                        if k in out:
+                            a = np.asarray(out[k], dtype=np.float32)
+                            if k not in self.acc:
+                                self.acc[k] = np.zeros((FIREFLY_BUCKETS,) + a.shape, np.float32)
+                            self.acc[k][b] += a * spp  # a pass is the mean of its samples: weight it by them
+                    self.acc_n[b] += spp
+                    self.passes += 1
+                    self.spp_done += spp
+                    added = True
+        if not added:
+            if seed != 0:
+                return
+            job["one"] = {k: np.asarray(out[k], dtype=np.float32) for k in ACCUMULATED if k in out}
+        with self.cv:
+            if self._job is None or self._job["gen"] <= gen:
+                self._job = job   # the newest state to show: one not yet taken is replaced (several passes, one picture)
             self.cv.notify_all()
-            if gen != self.gen:
-                # the camera moved on while this pass rendered: while moving, still show it if it is newer than
-                # what the page has (a game shows the last finished frame), but never accumulate it
-                if seed != 0 or gen <= self.frame_meta.get("frame_gen", -1):
+
+    def _publisher(self) -> None:
+        """Make the picture of the newest state and publish it: the mean of the passes so far (fireflies held back),
+        denoised when asked, its polarization images, each page's JPEGs. One thread, always on the newest job: when
+        passes arrive faster than pictures are made, a picture shows several passes at once and none is waited for."""
+        while True:
+            with self.cv:
+                while self._job is None:
+                    self.cv.wait()
+                job, self._job = self._job, None
+            try:
+                self._publish(job)
+            except Exception as exc:  # noqa: BLE001 - shown on the page; the next pass tries again
+                with self.cv:
+                    if job["gen"] == self.gen:
+                        self.error = f"{type(exc).__name__}: {exc}"
+                        self.version += 1
+                    self.cv.notify_all()
+
+    def _publish(self, job: dict) -> None:
+        made = time.perf_counter()
+        gen, view = job["gen"], job["view"]
+        if job["one"] is not None:   # a pass of a camera already left: shown as it is
+            mean, passes, spp_shown = job["one"], 1, int(view["spp"])
+        else:
+            with self._acc_lock:     # the sums as they stand now (a later pass than the job's may be in: all the better)
+                if gen != self.gen or not self.acc:
                     return
-                passes = 1
-                mean = {k: np.asarray(out[k], dtype=np.float32) for k in ACCUMULATED if k in out}
-            else:
-                spp = int(view["spp"])
-                b = int(np.argmin(self.acc_n))  # the lightest bucket: passes differ in size, so not round-robin
-                for k in ACCUMULATED:
-                    if k in out:
-                        a = np.asarray(out[k], dtype=np.float32)
-                        if k not in self.acc:
-                            self.acc[k] = np.zeros((FIREFLY_BUCKETS,) + a.shape, np.float32)
-                        self.acc[k][b] += a * spp  # a pass is the mean of its samples: weight it by them
-                self.acc_n[b] += spp
-                self.passes += 1
-                self.spp_done += spp
-                passes = self.passes
+                passes, spp_shown = self.passes, self.spp_done
                 if self.robust:
                     mean = robust_mean(self.acc, self.acc_n)
                 else:
                     mean = {k: self.acc[k].sum(axis=0) / self.spp_done for k in ACCUMULATED if k in self.acc}
+        if "s0" in mean and "s1" not in mean:   # an unpolarized render
+            mean["s1"] = mean["s2"] = np.zeros_like(mean["s0"])
+        if "nir_s0" in mean and "nir_s1" not in mean:
+            mean["nir_s1"] = mean["nir_s2"] = np.zeros_like(mean["nir_s0"])
         nir = [mean.get(f"nir_s{k}") for k in range(3)]
         if self.sim.denoise:
             # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
@@ -764,26 +835,28 @@ class Session:
             extra = {"nir_grey": nir[0], "nir_derived": stokes.derived_mono(nir[0], nir[1], nir[2])}
         # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
         frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
-                 "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": self.spp_done if gen == self.gen else view["spp"], "passes": passes,
-                 "variant": view["variant"], "depth": out.get("depth"),
+                 "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": spp_shown, "passes": passes,
+                 "variant": view["variant"], "depth": job["depth"],
                  "c2w": [round(float(v), 5) for v in np.asarray(view["camera_to_world"]).ravel()]}
-        # Where a pass's time went (ms). gpu: the server waiting for the GPU after queuing the pass's kernels, the
-        # GPU time no CPU work hid (exact kernel times would need a sync per kernel); server_cpu: the rest of its
-        # render call plus splitting and encoding; queue: waiting behind other passes on the server's one render
-        # thread; transfer: the round trip minus the server's time (network, decoding); viewer: accumulating,
-        # denoising, deriving here.
-        g = lambda k: 1000.0 * float(timing.get(k, 0.0))
+        # Where a pass's time went (ms), for the pass this picture was made after. gpu: the server waiting for the GPU
+        # after queuing the pass's kernels, the GPU time no CPU work hid (exact kernel times would need a sync per
+        # kernel); server_cpu: the rest of its render call plus splitting and encoding; queue: waiting behind other
+        # passes on the server's one render thread; transfer: the round trip minus the server's time (network,
+        # decoding); viewer: the publisher's mean, denoising and deriving (beside the next pass, not before it);
+        # wall: from the pass's request to its picture.
+        timing = job["timing"]
+        g = lambda k: 1000.0 * float(timing.get(k, 0.0))  # noqa: E731
         frame["timing"] = {
-            "wall_ms": 1000.0 * (time.perf_counter() - started), "round_trip_ms": 1000.0 * wall,
-            "queue_ms": g("queue_s"), "gpu_ms": g("wait_s"),
+            "round_trip_ms": 1000.0 * job["wall"], "queue_ms": g("queue_s"), "gpu_ms": g("wait_s"),
             "server_cpu_ms": g("render_s") - g("wait_s") + g("split_s") + g("post_s") + g("encode_s"),
-            "transfer_ms": max(0.0, 1000.0 * (wall - server_s)), "viewer_ms": 1000.0 * (time.perf_counter() - started - wall)}
-        made = time.perf_counter()
+            "transfer_ms": max(0.0, 1000.0 * (job["wall"] - job["server_s"])), "viewer_ms": 1000.0 * (time.perf_counter() - made)}
+        jpeg_from = time.perf_counter()
         self._prepare(frame)
-        frame["timing"]["jpeg_ms"] = 1000.0 * (time.perf_counter() - made)
+        frame["timing"]["jpeg_ms"] = 1000.0 * (time.perf_counter() - jpeg_from)
+        frame["timing"]["wall_ms"] = 1000.0 * (time.perf_counter() - job["started"])
         with self.cv:
             if gen == self.gen:
-                if passes <= self.published:  # a later pass of this camera got here first
+                if passes <= self.published:  # nothing new since the last picture of this camera
                     return
                 self.published = passes
             elif gen <= self.frame_meta.get("frame_gen", -1):  # an older camera, and something newer is shown
@@ -956,16 +1029,19 @@ class Session:
         return str(channel), round(float(scale), 4), tuple(sorted((ev or {}).items()))
 
     def _prepare(self, frame: dict) -> None:
-        """Make a new frame's pane JPEGs (every page's subscribed channels) and depth grid on the pass thread that
-        rendered it, before it is published: three pass threads make them side by side with the renders, and a
-        page's sender only writes them out (Session.image falls back to making one, for a page that changed)."""
+        """Make a new frame's pane JPEGs (every page's subscribed channels) and depth grid before it is published,
+        on the publisher's thread, several panes side by side (the encoder releases the interpreter): a page's
+        sender only writes them out (Session.image falls back to making one, for a page that changed)."""
         with self.cv:
             wanted = {self._image_key(ch, sub["scale"], sub["ev"]) for sub in self.subs.values()
                       for ch in sub["panes"].values() if ch}
-        frame["jpegs"] = {}
-        for key in wanted:
+
+        def make(key):
             with contextlib.suppress(KeyError, ValueError):
-                frame["jpegs"][key] = self._image_of(frame, key[0], key[1], dict(key[2]))
+                return key, self._image_of(frame, key[0], key[1], dict(key[2]))
+            return key, None
+        made = self._jpeg_pool.map(make, wanted) if len(wanted) > 1 else map(make, wanted)
+        frame["jpegs"] = {key: img for key, img in made if img is not None}
         frame["grid"] = None if frame.get("depth") is None else depth_grid(frame["depth"])
 
     def image(self, frame_id: int, channel: str, scale: float, ev: dict | None = None) -> bytes:
