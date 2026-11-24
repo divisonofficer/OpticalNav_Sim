@@ -2246,9 +2246,13 @@ class Renderer:
                  envmap_dir: Path | None = None, sun_deg: float = 8.0, freeze_spp: int = 16,
                  default_sky: str | None = None, default_sky_rotate: float = 0.0, fill_gain: float = 1.0,
                  default_depth: int = 0, lamp_power: str = "importer", alpha_power: float = 1.0,
-                 cycles_gpu: str = "share", cycles_device: str = "OPTIX"):
+                 cycles_gpu: str = "share", cycles_device: str = "OPTIX", ser: bool = True):
         import drjit as dr
         import mitsuba as mi
+
+        # Shader execution reordering (see ser_lock). Before anything is recorded: it is compiled into the kernels.
+        self.ser = bool(ser)
+        dr.set_flag(dr.JitFlag.ShaderExecutionReordering, self.ser)
 
         available = mi.variants()
         wanted = {"polar": variant, "rgb": rgb_variant}
@@ -3361,6 +3365,28 @@ def compact_on_start(renderer: Renderer, skip=()) -> None:
             print(f"[compact] {scan} failed (exit {done.returncode}): served as it is", flush=True)
 
 
+def ser_lock(gpu: str, folder: str | None = None):
+    """The right to run polarized kernels with shader execution reordering (SER) on a GPU: an open, locked file, or
+    None when another server has it.
+
+    With SER on (Dr.Jit's default on RTX 40 / 50), polarized OptiX kernels die of CUDA_ERROR_ILLEGAL_ADDRESS (700) when
+    another process keeps the GPU busy, whatever that process runs, and not when they have it to themselves. Measured on
+    driver 580.97 under WSL2 (2026-11-25), 1024 spp frames: next to another busy process 21 crashes in 159 frames; the
+    same with SER off, none in 95; one server alone with SER on, none in 1005. Stock Mitsuba does it too (tools/ser_crash_repro.py), so it is not this server's doing.
+    Another job on the GPU that is not one of ours cannot be seen here: --ser off is for that."""
+    import fcntl
+    import tempfile
+
+    path = Path(folder or tempfile.gettempdir()) / f"opticalnav_ser_gpu{re.sub(r'[^0-9A-Za-z]+', '_', str(gpu))}.lock"
+    f = open(path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pack", action="append", default=[],
@@ -3391,6 +3417,10 @@ def main() -> int:
                          "process crashed on the OptiX 7 build, so run one server per mode there")
     ap.add_argument("--max-resident", type=int, default=2, help="scene/variant/mode triples kept loaded")
     ap.add_argument("--preload", action="append", default=[], help="SCAN[:VARIANT[:MODE]] to load at start (repeatable)")
+    ap.add_argument("--ser", choices=["on", "off"], default="on",
+                    help="shader execution reordering. On: the fast way, for a GPU no other CUDA job is busy on. Off: for a "
+                         "GPU shared with other work (a second server, training): with it on, polarized kernels die of "
+                         "CUDA error 700 about once a minute there; off they do not, and take 2.8 times as long")
     ap.add_argument("--freeze", choices=["auto", "on", "off"], default="auto",
                     help="replay renders with dr.freeze (auto: when this Dr.Jit has it)")
     ap.add_argument("--freeze-spp", type=int, default=16,
@@ -3442,6 +3472,12 @@ def main() -> int:
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
     if not modes or any(m not in MODE_VARIANTS for m in modes):
         raise SystemExit(f"--modes must name polar and/or rgb, got {args.modes!r}")
+    held = None   # kept open (and so locked) as long as the process lives
+    if "polar" in modes and args.ser == "on":
+        held = ser_lock(os.environ.get("CUDA_VISIBLE_DEVICES") or "0")
+        if held is None:
+            raise SystemExit("another render server with shader execution reordering on runs on this GPU: two of them kill each other "
+                             "(CUDA error 700, about once a minute). Use that one, or start both with --ser off (2.8 times slower).")
     from . import blend_scenes
     packs = [Path(p).resolve() for p in args.pack]
     args.blend_dir = list(args.blend_dir) + [d for d in os.environ.get("OPTICALNAV_BLEND_DIRS", "").split(":") if d]
@@ -3459,7 +3495,7 @@ def main() -> int:
     renderer = Renderer(packs, args.variant, args.max_resident, args.freeze, args.rgb_variant, modes,
                         kernel_history=args.kernel_history, envmap_dir=args.envmaps, sun_deg=args.sun_deg, default_sky=args.default_sky, default_sky_rotate=args.default_sky_rotate,
                         fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power, alpha_power=args.alpha_power,
-                        freeze_spp=args.freeze_spp, cycles_gpu=args.cycles_gpu, cycles_device=args.cycles_device)
+                        freeze_spp=args.freeze_spp, cycles_gpu=args.cycles_gpu, cycles_device=args.cycles_device, ser=args.ser == "on")
     renderer.blend_pack = blend_pack
     renderer.blend_files = blend_scenes.listed(args.blend_dir, args.blend_tsv)
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
@@ -3467,7 +3503,7 @@ def main() -> int:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[serve] http://{args.host}:{args.port}  modes={renderer.variant_of}  scans={len(renderer.meta)}  "
           f"path_nocaustics={renderer.has_nocaustics}  freeze={renderer.freeze}  "
-          f"kernel_history={renderer.kernel_history}", flush=True)
+          f"kernel_history={renderer.kernel_history}  ser={renderer.ser}", flush=True)
     if not args.no_compact:
         compact_on_start(renderer, set(args.compact_skip))
     for item in args.preload:

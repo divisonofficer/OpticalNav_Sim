@@ -95,7 +95,8 @@ def start_server(args, log) -> bool:
     stop_server(args.port, log)
     logs = args.out / "logs"
     cmd = [PYTHON, "-u", "-m", "opticalnav_sim.server", "--pack", str(args.pack), "--no-compact", "--port", str(args.port),
-           "--modes", "polar", "--max-resident", "1", "--envmaps", str(args.envmaps)]
+           "--modes", "polar", "--max-resident", "1", "--envmaps", str(args.envmaps),
+           "--ser", "off" if args.share_gpu else "on"]
     with open(logs / f"server{'' if args.worker == 0 else '.' + str(args.worker)}.log", "ab") as f:
         subprocess.Popen(cmd, cwd=REPO, env=env(args.gpu), stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(120):
@@ -261,6 +262,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18770)
     ap.add_argument("--scene", action="append", default=[])
     ap.add_argument("--limit", type=int, default=None, help="a test: only the first N missing frames of each scene")
+    ap.add_argument("--share-gpu", action="store_true",
+                    help="other work runs on this GPU: servers with --ser off (no CUDA 700 crashes there, 2.8 times slower a "
+                         "frame). More than one worker implies it; one worker alone on the GPU is the fastest")
     ap.add_argument("--workers", type=int, default=1, help="renderers at once, each with its own server on port "
                     "--port + i; they share the frame list through claim files, so one reloading its scene does not "
                     "stop the others")
@@ -290,6 +294,9 @@ def main() -> int:
             elif not a.startswith("--workers="):
                 rest.append(a)
         (args.out / "STOP").unlink(missing_ok=True)
+        if args.workers > 1 and not args.share_gpu:
+            print(f"{args.workers} servers on one GPU: started with --ser off (they kill each other otherwise). One worker is faster.")
+            rest.append("--share-gpu")
         for i in range(args.workers):
             cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--worker", str(i), "--keep-stop", *rest]
             with open(args.out / "logs" / f"supervisor{'' if i == 0 else '.' + str(i)}.out", "ab") as f:

@@ -1384,3 +1384,12 @@ def test_blend_scenes_ids_lists_and_cache_stamp(tmp_path):
     assert blend_scenes.up_to_date(pack, "s1", f.resolve())
     f.write_bytes(b"BLENDER2")  # the file changed: converted again
     assert not blend_scenes.up_to_date(pack, "s1", f.resolve())
+
+
+def test_one_server_with_shader_reordering_per_gpu(tmp_path):
+    """Two servers with SER on kill each other (CUDA 700): the second one is told, another GPU or a freed lock is not."""
+    first = server.ser_lock("0", tmp_path)
+    assert first is not None and server.ser_lock("0", tmp_path) is None
+    assert server.ser_lock("1", tmp_path) is not None
+    first.close()                                          # the first server ended
+    assert server.ser_lock("0", tmp_path) is not None
