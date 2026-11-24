@@ -43,7 +43,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import frames, progress, stokes
+from . import bodies as body_models, frames, progress, stokes
 
 MAX_PIXELS = 2048 * 2048
 
@@ -1297,12 +1297,15 @@ class Resident:
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
                  pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0,
-                 blender_power: bool = False, alpha_power: float = 1.0, watt_gain: float = 1.0):
+                 blender_power: bool = False, alpha_power: float = 1.0, watt_gain: float = 1.0, bodies: str = ""):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
         started = time.time()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
+        if bodies:  # robots and their equipment (bodies.scene_xml): instances a view places (set_bodies)
+            end = text.rindex("</scene>")
+            text = text[:end] + bodies + text[end:]
         self.hidden = hidden  # shape id prefix camera rays pass through (path_nocaustics "hidden"; FILL_PREFIX)
         self.upgraded_flash = False  # an old one-pass flash rendered as the current protocol (upgrade_flash_text)
         if flash is not None and flash.get("synthetic") and flash_xml is None:
@@ -1391,6 +1394,8 @@ class Resident:
         # Look takes the whole-scene path; with the flash off the assist shapes are parked once.
         self.sensor = self.scene.sensors()[0]
         self.assist_shapes = {s.id(): s for s in self.scene.shapes() if s.id().startswith(ASSIST_PREFIX)}
+        self.body_shapes = {s.id(): s for s in self.scene.shapes() if s.id().startswith(body_models.BODY_PREFIX)}
+        self.body_pose: dict[str, bytes] = {}  # instance id -> the matrix last written
         sensor_keys = set(mi.traverse(self.sensor).keys())
         self.ks_size = "film.size" if "film.size" in sensor_keys else None
         self.size = self.fov = None
@@ -1741,6 +1746,28 @@ class Resident:
             dr.make_opaque(ps["to_world"])  # evaluated, as _evaluate_transforms would
         self.scene.parameters_changed([])
 
+    def set_bodies(self, poses: dict) -> float:
+        """Place the bodies' links: instance id -> object-to-world 4x4. A changed instance is written through its own
+        parameters and evaluated (as the flash is, see _write_assist), then the scene rebuilds its top-level
+        structure alone: the links' meshes are in shapegroups, built once. Returns the seconds it took."""
+        import drjit as dr
+
+        t0, mi, moved = time.perf_counter(), self.mi, False
+        for sid, m in poses.items():
+            if sid not in self.body_shapes:
+                raise ValueError(f"no body link {sid!r} in this scene")
+            m = np.ascontiguousarray(m, dtype=np.float64).reshape(4, 4)
+            if self.body_pose.get(sid) == m.tobytes():
+                continue
+            ps = mi.traverse(self.body_shapes[sid])
+            ps["to_world"] = mi.ScalarTransform4f(m.tolist())
+            ps.update()
+            dr.make_opaque(ps["to_world"])
+            self.body_pose[sid], moved = m.tobytes(), True
+        if moved:
+            self.scene.parameters_changed([])
+        return time.perf_counter() - t0
+
     def _camera_only(self, ps) -> None:
         """A sensor's new to_world, evaluated in place, without the sensor's parameters_changed (see _set_camera)."""
         import drjit as dr
@@ -1966,6 +1993,14 @@ class Resident:
                 p.update()
                 self._evaluate_transforms(p)
                 for key in keys:
+                    # A replay that records again bakes the film's size of the moment into the recording: a recording
+                    # of another size, replayed here with the film at the size just recorded, came back at that size
+                    # from then on (16 x 16 images for 792 x 514 views, after a 16 x 16 view was recorded on the same
+                    # scene). Those are left alone: used next at their own size, they settle there. (Setting the film
+                    # to each recording's size first changed the inputs again: recorded over and over, then CUDA 700.)
+                    if key[0] != "batch" and "dual" not in key and self.size is not None \
+                            and (int(key[1]), int(key[2])) != self.size:
+                        continue
                     progress.FREEZE.begin(f"{self.name}|{self.mode}|{key[3]}|{key[0]}|{key[1]}x{key[2]}", calls=1,
                                           remember=False, score=self.score)
                     try:
@@ -2253,6 +2288,7 @@ class Renderer:
                 self.meta[scan], self.pack_of[scan] = json.loads(scene_json.read_text()), p
         # resident scenes by (scan, xml, flash_xml, mode); a variant renders on one of them (see plan)
         self.cache: OrderedDict[tuple, Resident] = OrderedDict()
+        self.body_models: dict[str, dict] = {}  # name -> bodies.build_model (POST /v1/bodies)
         self.plans: dict[tuple[str, str, str], tuple] = {}
         self.denoisers: dict[tuple[str, int, int], object] = {}
         # path_nocaustics with camera-assist modes (an older build of the plugin has none: active variants
@@ -2296,6 +2332,17 @@ class Renderer:
 
     blend_pack: Path | None = None
     blend_files: dict = {}  # id -> .blend offered in the viewer's scene list (--blend-dir / --blend-tsv), converted when chosen
+
+    def register_body(self, name: str, descriptor: dict) -> dict:
+        """A body model views may place (bodies.py): its links' meshes are written once, by the descriptor's hash."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(name)):
+            raise ValueError("a body model's name is 1..64 letters, digits, '_', '.', '-'")
+        links = dict(descriptor.get("links") or {})
+        if not links or len(links) > 256 or sum(len(v) for v in links.values()) > 2048:
+            raise ValueError("a body model has 1..256 links and at most 2048 primitives")
+        model = body_models.build_model(str(name), {"links": links})
+        self.body_models[str(name)] = model
+        return {"model": model["name"], "key": model["key"], "links": sorted(model["links"])}
 
     def register_scene(self, pack: Path, scan: str) -> None:
         """Serve a scene that appeared after the start (one just converted from its .blend)."""
@@ -2534,7 +2581,7 @@ class Renderer:
         if rkey in self.cache:
             self.cache.move_to_end(rkey)
             return self.cache[rkey]
-        scan, xml, flash_xml, mode = rkey
+        scan, xml, flash_xml, mode, *with_bodies = rkey
         if self.cycles is not None and self.cycles_gpu == "exclusive":
             self.free_cycles()
         while len(self.cache) >= self.max_resident:
@@ -2566,7 +2613,9 @@ class Renderer:
                 fill_gain=self.fill_gain if own else 1.0,
                 blender_power=self.lamp_power == "blender" and own,
                 alpha_power=self.alpha_power if own and not self.direct_scene(scan) else 1.0,
-                watt_gain=math.pi if self.direct_scene(scan) else 1.0)
+                watt_gain=math.pi if self.direct_scene(scan) else 1.0,
+                bodies=body_models.scene_xml(self.body_models, [(b, name) for b, name, _ in with_bodies[0]])
+                if with_bodies else "")
         self.cache[rkey] = loaded
         return loaded
 
@@ -2727,9 +2776,27 @@ class Renderer:
         raster_aa = str(view.get("raster_aa", "off"))  # the preview's antialiasing (raster.AA_MODES)
         if raster_aa not in ("off", "edge", "ssaa2"):
             raise ValueError("raster_aa must be 'off', 'edge' or 'ssaa2'")
+        # bodies: [{"id", "model" (POST /v1/bodies), "links": {link: object-to-world 4x4}}]. Which bodies a view
+        # holds picks its resident scene (they are loaded with it); their poses are scene data, written per frame.
+        placed = []
+        for b in view.get("bodies") or ():
+            model = self.body_models.get(str(b.get("model")))
+            if model is None:
+                raise ValueError(f"unknown body model {b.get('model')!r} (register it: POST /v1/bodies)")
+            if set(b.get("links") or {}) != set(model["links"]):
+                raise ValueError(f"body {b.get('id')!r} needs a pose for each link of {model['name']}: {sorted(model['links'])}")
+            poses = tuple(sorted((body_models.instance_id(b["id"], link),
+                                  np.ascontiguousarray(m, dtype=np.float64).reshape(4, 4).tobytes())
+                                 for link, m in b["links"].items()))
+            placed.append((str(b["id"]), f"{model['name']}", model["key"], poses))
+        placed = tuple(sorted(placed))
+        if len({p[0] for p in placed}) != len(placed):
+            raise ValueError("body ids repeat in one view")
+        if placed and renderer != "path":
+            raise ValueError("bodies are drawn by the path tracer only (renderer 'path')")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
                 mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth,
-                renderer, raster_aa)
+                renderer, raster_aa, placed)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False):
@@ -2739,14 +2806,19 @@ class Renderer:
                                                                         flash_band, nir, lighting, mirrors, lamps,
                                                                         flash_scale, flash_pdf, flash_offset, max_depth,
                                                                         caustics, split, nir_range, rr_depth,
-                                                                        renderer, raster_aa) = key
+                                                                        renderer, raster_aa, placed) = key
         if renderer == "cycles":  # a Blender process, not a Mitsuba scene: nothing of the path tracer is loaded for it
             return self._cycles_start(key, cams, started - submitted)
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
         with ACTIVITY.doing("rendering"):
             rkey, passes, follow, hidden = self.plan(scan, variant, mode)
+            if placed:  # a scene with these bodies in it is another resident scene (their meshes load with it)
+                rkey = rkey + (tuple((b, name, mkey) for b, name, mkey, _ in placed),)
             resident = self._resident(rkey, variant)
+            if placed:
+                resident.set_bodies({sid: np.frombuffer(m, dtype=np.float64).reshape(4, 4)
+                                     for _, _, _, poses in placed for sid, m in poses})
             # lighting mode (and the lamps added to dark lamps, when asked for): the light groups it leaves out
             # are removed from the scene (hidden), not just dimmed
             groups = LIGHTING[lighting] + (("lamp",) if lamps else ())
@@ -3192,6 +3264,12 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     return self._json(500, {"error": str(exc)})
                 except Exception as exc:  # noqa: BLE001
                     return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            if route == "/v1/bodies":  # {"name", "links": {...}} (bodies.py): a model views may then place
+                try:
+                    body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                    return self._json(200, renderer.register_body(body["name"], body))
+                except (KeyError, ValueError, TypeError) as exc:
+                    return self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
             if route == "/v1/gpu/free":  # {"backend": "cycles" | "mitsuba" | "all"}: hand that renderer's GPU memory back
                 try:
                     body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")

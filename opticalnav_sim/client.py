@@ -89,6 +89,14 @@ class RenderClient:
         key = "id" if not str(id_or_path).startswith("/") and "=" not in str(id_or_path) else "path"
         return json.loads(self._request("POST", "/v1/blend", json.dumps({key: id_or_path}).encode())[0])
 
+    def register_body(self, name: str, links: dict) -> dict:
+        """Register a body model (robots, equipment: opticalnav_sim/bodies.py). A view then places it with
+        ``"bodies": [{"id", "model": name, "links": {link: object-to-world 4x4}}]``."""
+        def plain(v):
+            return {k: (np.asarray(x).tolist() if k == "origin" else list(x) if isinstance(x, tuple) else x) for k, x in v.items()}
+        payload = {"name": name, "links": {link: [plain(v) for v in visuals] for link, visuals in links.items()}}
+        return json.loads(self._request("POST", "/v1/bodies", json.dumps(payload).encode())[0])
+
     def meta(self, scan: str) -> dict:
         return self._json(f"/v1/scans/{scan}/meta")
 
@@ -103,7 +111,13 @@ class RenderClient:
         """Render dataset-convention cameras. Each view: scan, variant, camera_to_world (4x4),
         width, height, hfov_deg, spp, seed, mode ("polar" | "rgb"), denoise. Returns per view
         {rgb, s0, s1, s2, s3} in polar mode or {rgb, radiance} in rgb mode."""
-        payload = {"views": [dict(v, camera_to_world=np.asarray(v["camera_to_world"]).tolist()) for v in views],
+        def plain(v: dict) -> dict:
+            out = dict(v, camera_to_world=np.asarray(v["camera_to_world"]).tolist())
+            if v.get("bodies"):
+                out["bodies"] = [dict(b, links={k: np.asarray(m).tolist() for k, m in b["links"].items()}) for b in v["bodies"]]
+            return out
+
+        payload = {"views": [plain(v) for v in views],
                    "stokes_dtype": stokes_dtype, "format": "raw"}
         data, headers = self._request("POST", "/v1/render", json.dumps(payload).encode())
         self.last_render_seconds = float(headers.get("X-Render-Seconds", 0.0))

@@ -792,6 +792,37 @@ A third renderer next to Mitsuba's path tracer and the raster preview: a view wi
 
 **One GPU, two renderers.** `--cycles-gpu share` (default): Blender and the resident Mitsuba scenes stay loaded together; whichever runs out of GPU memory takes it from the other (Blender is stopped, or the Mitsuba scenes and Dr.Jit's cache are dropped) and retries once. `--cycles-gpu exclusive`: using one frees the other at once. By hand: `curl -X POST :18770/v1/gpu/free -d '{"backend": "cycles"}'` (`"mitsuba"`, or `"all"`) answers with what was freed and the GPU's memory. `--cycles-device CUDA` for a card without OptiX.
 
+## Hardware in the scene: robots and cameras (`opticalnav_sim.hw`)
+
+![A Ranger Mini 2.0 driving in CS02: an observer camera (left), and the two cameras on its deck (LUCID TDR054S, FLIR polarization camera)](docs/media/hardware_cs02.jpg)
+
+*CS02, three ticks of a drive (Ackermann, then oblique): a fixed observer camera, and the robot's own two cameras, each through its lens model.*
+
+Robots, cameras and the equipment on them are defined in Python and attached to one another, as in CARLA: move the base and everything on it follows. The robot is in the scene (its shadow, its reflection in a mirror, its polarization), and moving it rebuilds no mesh. The plan, with what is done and what is next: [docs/hardware_platform_plan.md](docs/hardware_platform_plan.md).
+
+```python
+from opticalnav_sim import hw
+from opticalnav_sim.hw import Transform, cameras, robots
+
+world = hw.SimWorld(scene="blend_REF_CS02", spp=64)                       # a render server at OPTICALNAV_SIM_URL
+robot = world.spawn(robots.RangerMini2(), at=world.on_floor(20.9, -12.4, yaw_deg=110.0))
+cam = world.spawn(cameras.LucidTDR054S(), attach_to=robot, link="top_plate",
+                  mount=Transform((0.22, 0.0, 0.12), (0.0, 5.0, 0.0)))    # x forward, y left, z up; pitch > 0 looks down
+pol = world.spawn(cameras.FlirBFS51S5PC(), attach_to=robot, link="top_plate", mount=Transform((0.22, 0.12, 0.12)))
+
+robot.spec.apply(robot.state, hw.RangerControl("ackermann", linear=0.5, steering_deg=18.0))   # or hw.Twist(vx, vy, wz)
+for _ in range(30):
+    world.tick()                                                            # kinematics, 0.05 s a tick
+frame = world.render(cam)   # frame.s0..s3 (Stokes, H x W x 3), frame.image (uint8), frame.intrinsics, frame.pose
+```
+
+* **Frames.** The world is the R2R frame (x, y, height); every actor and link is ROS REP-103 (x forward, y left, z up, yaw counter-clockwise from +x), so a mount is what a URDF or a tape measure gives. A camera's `optical` link is OpenCV's frame (z forward). `hw.camera_to_world` and `hw.to_mitsuba` are the only places that know the renderer's axes.
+* **Robot.** `robots.RangerMini2`: AgileX Ranger Mini 2.0, four steered and driven wheels. `RangerControl` has the robot's modes (`ackermann`, `oblique`, `spin`, `lateral`); `Twist` is the driver's `cmd_vel`. Wheels turn at a rate, drive along their heading, and the body moves as they roll without slipping (least squares over the four); a change of mode turns the wheels with the base at rest. Links to attach to: `base_link` (on the floor), `chassis`, `top_plate`, `steer_*`, `wheel_*`. The drawn shapes and the wheel radius, speed and steering limits are placeholders until the vendor's URDF is in.
+* **Cameras.** A sensor and a lens: `LucidTDR054S` (Sony IMX490, 2880 x 1860), `LucidTRI032S` (IMX265, 2048 x 1536), `FlirBFS51S5PC` (IMX250MYR, 2448 x 2048, colour polarization), each with the Fujinon HF6XA-5M 6 mm by default. `render_scale` (default 0.25) is the share of the sensor's resolution that is rendered; `spec.intrinsics()` is the camera matrix and distortion of that image. `CameraSpec(calibration=Intrinsics(...))` replaces the lens model with a measured one.
+* **Lens.** OpenCV's model (`hw.optics`: `project`, `rays`, checked against `cv2.projectPoints` to 1e-9 px). The server renders a pinhole wide enough for every ray of the sensor and `world.render` resamples it into the lens's image (`render_plan`, `remap`). The default lens model is fitted to the datasheet: effective focal length 6.14 mm and k1 = -0.104 reproduce its angle of view on 2/3" (74.7 x 58.1 degrees) and agree with its TV distortion (-2.85 %: k1 = -0.106).
+* **Bodies on the server.** A spec with `visuals()` is a body: `POST /v1/bodies` registers its links (boxes, cylinders, mesh files, each with a material: plastic, metal, rubber, mapped to `pplastic` / `roughconductor` like the `.blend` converter's), and a view places it with `"bodies": [{"id", "model", "links": {link: 4x4}}]`. In the scene a link is a `shapegroup` and each body draws it through an `instance`; a move writes the instances' transforms, so only the scene's top-level acceleration structure is rebuilt and a frozen render replays. Measured (RTX 5090, 512 x 384, 16 spp): 15 links moved in 3.4 ms a frame on a 437k-triangle scene (16.6 ms for 60), frames as fast as with nothing moving, no recording after the first, and the moved scene's image equal to a scene loaded with the links there (difference 0.997 of the noise between two seeds, at 1024 spp). A scene with bodies is its own resident scene: the first view that brings a new set of body models loads it. A camera's image of 720 x 464 (a 792 x 514 pinhole, 16 spp) takes 0.26 s while driving, 0.17 s of it the server's render; each new image size records once (20 to 30 s).
+* **Not there yet** (the plan's later milestones): the sensor model (noise, bit depth, mosaics, the polarization sensor's four angles) and the ISP; ground following and collisions; bodies in the raster preview and in Cycles; a ROS 2 bridge. A camera sees through its own housing only because the housing is drawn behind its optical centre: a part of the robot in front of the lens is in the image, as on the real robot.
+
 ## Sharing a server
 
 The server listens on `127.0.0.1` by default. To serve other machines, give it a token. It then refuses any request without `Authorization: Bearer <token>`, and it will not bind beyond localhost without one. Clients read the token from `OPTICALNAV_SIM_TOKEN`.
@@ -811,6 +842,7 @@ The protocol is plain HTTP and the token travels unencrypted. Across untrusted n
 | `GET /v1/scans` | scan ids |
 | `GET /v1/scans/<scan>/meta` | camera rig, Stokes basis, variants, graph and episode counts |
 | `GET /v1/scans/<scan>/connectivity` | connectivity JSON |
+| `POST /v1/bodies` | Takes `{"name", "links": {link: [{shape, size, origin 4x4, material}]}}`; registers a body model that views place with `"bodies"` (see Hardware in the scene) |
 | `POST /v1/gpu/free` | Takes `{"backend": "cycles" \| "mitsuba" \| "all"}`; frees that renderer's GPU memory, returns what was freed and the GPU's memory |
 | `POST /v1/render` | Takes `{"views": [{scan, variant, camera_to_world 4x4, width, height, hfov_deg, spp, seed}], "stokes_dtype"}` and returns NPZ with `rgb_i`, `s0_i`..`s3_i` |
 
