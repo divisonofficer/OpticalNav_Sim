@@ -373,6 +373,7 @@ def test_gui_session_and_routes():
     probe = session.probe(st["frame_id"], 3, 3, "g")
     assert probe["dolp"] == float(session._polarization(frame, "g")["dolp"][3, 3]) and probe["s0"] == float(frame["s0"][3, 3, 1])
     assert gui.pane_channel("nir_aolp") == ("nir", "aolp") and gui.pane_channel("rgb.img") == ("rgb", "img")
+    assert [gui.pane_byte(p) for p in ("a", "b", "s0", "s7", "s250", "x")] == [0, 1, 3, 10, None, None]  # 2: the depth grid
     session.configure({"refit_tone": True})
     assert session.tones[(frame["scan"], frame["variant"])] == gui.tonemap.global_params([frame["s0"]])
 

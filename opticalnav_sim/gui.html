@@ -123,13 +123,23 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 /* step sliders: a numeric menu shown as a slider over its options (the select stays, hidden, and keeps the logic) */
 select.as-slider { display: none; }
 .frame-wrap { flex: 1; min-height: 0; container-type: size; display: grid; place-items: center; }
-/* the robot's sensors: panes under the editor's two, switched on and off from the robot tab */
-main.has-sensors { grid-template-rows: minmax(0, 1.45fr) minmax(0, 1fr); }
-main.has-sensors > aside { grid-column: 3; grid-row: 1 / span 2; }
-#sensors { grid-column: 1 / span 2; grid-row: 2; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 10px; min-height: 0; }
-#sensors[hidden], #sensors > [hidden] { display: none; }
-.sensor h2 small { font: 11.5px var(--mono); color: var(--muted); font-weight: 400; margin-left: 4px; }
-.sdot { background: var(--accent-2); }
+/* the editor's pane, then the sub viewers (another channel of the editor's view, or a sensor of the robot): added,
+   closed and resized freely; beside the editor or under it (layout(): the grid tracks) */
+main.dock-bottom > #pane-a { grid-column: 1; grid-row: 1; }
+main.dock-bottom > #subs { grid-column: 1; grid-row: 2; }
+main.dock-bottom > aside { grid-column: 2; grid-row: 1 / span 2; }
+#subs { position: relative; display: grid; gap: 10px; min-width: 0; min-height: 0; grid-auto-rows: minmax(0, 1fr); }
+#subs[hidden] { display: none; }
+#splitter { position: absolute; z-index: 3; border-radius: 4px; touch-action: none; }
+main.dock-right #splitter { left: -10px; top: 0; bottom: 0; width: 10px; cursor: col-resize; }
+main.dock-bottom #splitter { top: -10px; left: 0; right: 0; height: 10px; cursor: row-resize; }
+#splitter:hover, #splitter.drag { background: var(--accent); opacity: 0.55; }
+.sub .pane-head select.src { flex: none; max-width: 46%; background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 7px; padding: 4px 6px; font: inherit; font-size: 12.5px; }
+.sub .pane-head h2 { font-size: 13px; font-weight: 600; }
+.sub h2 small { font: 11.5px var(--mono); color: var(--muted); font-weight: 400; }
+.sub[data-kind=sensor] .tabsets, .sub[data-kind=sensor] .frame-wrap, .sub[data-kind=sensor] .legend, .sub[data-kind=sensor] [data-act=grid] { display: none; }
+.sub[data-kind=editor] .sensor-wrap { display: none; }
+.sub[data-kind=sensor] .pdot { background: var(--accent-2); }
 .sensor-wrap { flex: 1; min-height: 120px; position: relative; background: #000; border-radius: 6px; overflow: hidden; }
 .sensor-wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .sensor-wrap .wait { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 12.5px; padding: 12px; text-align: center; }
@@ -139,6 +149,17 @@ main.has-sensors > aside { grid-column: 3; grid-row: 1 / span 2; }
 #p-robot .toggles { flex-direction: column; gap: 7px; }
 #robot-note { font-size: 12.5px; margin: 0; padding: 6px 9px; border-radius: 7px; background: var(--panel-2); color: var(--ink); }
 #robot-note:empty { display: none; }
+#robot-sensors { display: flex; flex-direction: column; gap: 5px; }
+#robot-sensors:empty { display: none; }
+#robot-sensors h3 { margin: 0 0 1px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.sensor-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid var(--rule); border-radius: 7px; background: var(--panel-2); cursor: grab; font-size: 12.5px; }
+.sensor-row:hover { border-color: var(--muted); }
+.sensor-row.dragging { opacity: 0.5; }
+.sensor-row .grip { color: var(--muted); letter-spacing: -2px; flex: none; }
+.sensor-row .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sensor-row .nm small { font: 11px var(--mono); color: var(--muted); margin-left: 6px; }
+main .pane.drop { outline: 2px dashed var(--accent); outline-offset: -3px; }
+#subs.drop { outline: 2px dashed var(--accent); outline-offset: 2px; border-radius: 10px; }
 #robot-note.bad { color: var(--bad, #ef6b6b); }
 #robot-wheels { width: 100%; border-collapse: collapse; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
 #robot-wheels th { color: var(--muted); font-weight: 400; text-align: right; padding: 1px 0 1px 6px; }
@@ -235,9 +256,9 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
 }
 @media (max-width: 1000px) {
   main { grid-template-columns: minmax(0, 1fr); }
-  main.has-sensors { grid-template-rows: none; }
-  main.has-sensors > aside, #sensors { grid-column: auto; grid-row: auto; }
-  #sensors { grid-auto-flow: row; }
+  main.dock-bottom > #pane-a, main.dock-bottom > #subs, main.dock-bottom > aside { grid-column: auto; grid-row: auto; }
+  #subs { grid-template-columns: minmax(0, 1fr) !important; grid-auto-rows: auto; }
+  #splitter { display: none; }
   .sensor-wrap { aspect-ratio: 3 / 2; }
   .frame-wrap { container-type: normal; display: block; }
   .frame { width: 100%; }
@@ -251,7 +272,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
   details.settings > summary::before { content: "▸"; }
   details.settings[open] > summary::before { content: "▾"; }
   .cards { grid-template-columns: minmax(0, 1fr); }
-  #pane-b { display: none; }
+  #subs { display: none; }
 }
 </style>
 </head>
@@ -271,6 +292,8 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
 <header class="top">
   <h1>OpticalNav Sim Viewer</h1>
   <button type="button" class="icon-btn" id="help-btn" aria-haspopup="dialog" title="조작법과 3D 리그 편집 키 (?)">도움말 ?</button>
+  <button type="button" class="icon-btn desk-only" id="sub-add" title="서브 뷰어를 하나 더 엽니다: 에디터 뷰의 다른 채널(DoLP, AoLP, 깊이 …)이나 로봇에 단 센서를 고릅니다. 각 창의 ✕로 닫습니다.">＋ 서브 뷰어</button>
+  <button type="button" class="icon-btn desk-only" id="dock-toggle" title="서브 뷰어를 에디터 뷰 옆에 둘지 아래에 둘지. 경계선을 끌면 크기가 바뀝니다.">배치: 옆</button>
   <div class="monitor" id="monitor" role="status" aria-live="polite"></div>
 </header>
 <details class="settings" id="settings">
@@ -361,17 +384,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     </div></div>
     <div class="legend" id="legend-a"></div>
   </section>
-  <section class="card pane" id="pane-b">
-    <div class="pane-head card-head">
-      <span class="pdot" id="dot-b"></span><h2 id="title-b">RGB DoLP</h2>
-      <button type="button" class="icon-btn" data-act="shot" data-pane="b" title="이 화면 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
-      <button type="button" class="icon-btn" data-act="grid" data-pane="b" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
-      <button type="button" class="icon-btn" data-act="full" data-pane="b" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
-    </div>
-    <div class="tabsets"><div class="tabs" role="group" aria-label="오른쪽 화면 대역" data-pane="b" data-kind="band"></div><div class="tabs" role="group" aria-label="오른쪽 화면 보기" data-pane="b" data-kind="view"></div><div class="tabs" role="group" aria-label="오른쪽 화면 채널 무관 (AOV)" data-pane="b" data-kind="aov"></div></div>
-    <div class="frame-wrap"><div class="frame" id="frame-b"><img id="img-b" alt="현재 시점의 두 번째 채널"></div></div>
-    <div class="legend" id="legend-b"></div>
-  </section>
+  <section id="subs" hidden aria-label="서브 뷰어"><div id="splitter" role="separator" aria-label="에디터 뷰와 서브 뷰어의 경계: 끌어서 크기 조절"></div></section>
   <aside>
     <section class="card">
       <h2><svg class="i"><use href="#i-map"/></svg>지도</h2>
@@ -410,16 +423,15 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </section>
       <section class="ppanel" role="tabpanel" id="p-robot" aria-labelledby="t-robot" hidden>
         <div class="rig-tools">
-          <button type="button" class="flash primary" id="robot-spawn" title="지금 카메라가 보는 바닥에 Ranger Mini와 카메라 리그를 놓습니다. 이 화면에 로봇이 나타나고, 센서 창을 켜면 로봇 카메라의 영상이 아래에 열립니다.">로봇 스폰</button>
+          <button type="button" class="flash primary" id="robot-spawn" title="지금 카메라가 보는 바닥에 Ranger Mini와 카메라 리그를 놓습니다. 이 화면에 로봇이 나타나고, 센서 뷰어를 켜면 로봇 카메라의 영상이 서브 뷰어로 열립니다.">로봇 스폰</button>
           <button type="button" class="flash" id="robot-despawn" hidden>로봇 제거</button>
         </div>
         <p id="robot-note" role="status" aria-live="polite"></p>
+        <div id="robot-sensors" aria-label="로봇에 단 센서"></div>
         <div id="robot-on" hidden>
           <div class="toggles">
             <label class="tg" for="robot-drive" title="켜면 W/A/S/D/Q/E와 Space가 카메라가 아니라 로봇을 움직입니다 (T). 화살표·R/F·우클릭 드래그는 그대로 카메라를 돌립니다."><input type="checkbox" class="sw" id="robot-drive"> 키보드로 운전 <kbd>T</kbd></label>
             <label class="tg" for="robot-follow" title="카메라가 로봇을 따라갑니다 (처음에는 뒤쪽 위). 따라가는 중에 카메라를 움직이면 그 자리에서 계속 따라갑니다."><input type="checkbox" class="sw" id="robot-follow"> 카메라가 따라가기</label>
-            <label class="tg" for="sensor-on-hdr" title="LUCID TDR054S (IMX490, 24-bit HDR): 센서 모델과 ISP를 거친 영상"><input type="checkbox" class="sw" id="sensor-on-hdr" data-sensor="hdr"> HDR 카메라 창</label>
-            <label class="tg" for="sensor-on-12bit" title="LUCID TRI032S (IMX265, 12-bit): 센서 모델과 ISP를 거친 영상"><input type="checkbox" class="sw" id="sensor-on-12bit" data-sensor="12bit"> 12-bit 카메라 창</label>
             <label class="tg" for="robot-zoom" title="지도를 로봇 주변으로 확대하고, 지면 지도(마찰·장애물)를 깝니다"><input type="checkbox" class="sw" id="robot-zoom" checked> 지도를 로봇 주변으로</label>
           </div>
           <div class="fields one" style="margin-top:8px">
@@ -435,30 +447,10 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
             <span><kbd>Space</kbd></span><span>정지 (키를 놓아도 0.5초 뒤 멈춤)</span>
           </div>
         </div>
-        <p class="hint" id="robot-hint">Ranger Mini 2.0과 카메라 리그(HDR, 12-bit)를 지금 보는 씬에 놓습니다. 로봇은 이 화면에 그대로 보이고, 로봇 카메라는 센서 창으로 켜고 끕니다. 바닥 높이·장애물·마찰은 씬 파일의 재질에서 읽습니다.</p>
+        <p class="hint" id="robot-hint">Ranger Mini 2.0과 카메라 리그(HDR, 12-bit)를 지금 보는 씬에 놓습니다. 로봇은 에디터 뷰에 그대로 보이고, 로봇 카메라는 서브 뷰어로 켜고 끕니다(여기 스위치, 또는 위의 ＋ 서브 뷰어에서 소스를 고르기). 바닥 높이·장애물·마찰은 씬 파일의 재질에서 읽습니다.</p>
       </section>
     </section>
   </aside>
-  <section id="sensors" hidden aria-label="로봇 센서 창">
-    <section class="card pane sensor" id="sensor-hdr" hidden>
-      <div class="pane-head card-head">
-        <span class="pdot sdot"></span><h2>HDR 카메라<small id="smeta-hdr"></small></h2>
-        <button type="button" class="icon-btn" data-sensor-shot="hdr" title="이 센서 영상 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
-        <button type="button" class="icon-btn" data-act="full" data-pane="s-hdr" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
-        <button type="button" class="icon-btn" data-sensor-off="hdr" title="이 센서 창 끄기">✕</button>
-      </div>
-      <div class="sensor-wrap" id="frame-s-hdr"><div class="wait" id="swait-hdr">첫 프레임을 기다리는 중…</div><img id="simg-hdr" alt="HDR 카메라 영상" hidden></div>
-    </section>
-    <section class="card pane sensor" id="sensor-12bit" hidden>
-      <div class="pane-head card-head">
-        <span class="pdot sdot"></span><h2>12-bit 카메라<small id="smeta-12bit"></small></h2>
-        <button type="button" class="icon-btn" data-sensor-shot="12bit" title="이 센서 영상 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
-        <button type="button" class="icon-btn" data-act="full" data-pane="s-12bit" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
-        <button type="button" class="icon-btn" data-sensor-off="12bit" title="이 센서 창 끄기">✕</button>
-      </div>
-      <div class="sensor-wrap" id="frame-s-12bit"><div class="wait" id="swait-12bit">첫 프레임을 기다리는 중…</div><img id="simg-12bit" alt="12-bit 카메라 영상" hidden></div>
-    </section>
-  </section>
 </main>
 <div class="pad" role="group" aria-label="조작">
   <button type="button" data-op="turn" data-v="-1">↶ 회전<span id="pad-turn-l"></span></button>
@@ -500,7 +492,8 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
       <h3>로봇</h3>
       <div class="keys">
-        <span>로봇 탭</span><span>로봇 스폰: 카메라가 보는 바닥에 Ranger Mini와 카메라 리그가 놓이고 이 화면에 보입니다. 센서 창을 켜면 로봇 카메라 영상이 아래에 열립니다</span>
+        <span>로봇 탭</span><span>로봇 스폰: 카메라가 보는 바닥에 Ranger Mini와 카메라 리그가 놓이고 이 화면에 보입니다. 센서 뷰어를 켜면 로봇 카메라 영상이 서브 뷰어로 열립니다</span>
+        <span>＋ 서브 뷰어</span><span>에디터 뷰 옆(또는 아래)에 창을 원하는 만큼 엽니다. 창마다 소스를 고릅니다: 에디터 뷰의 다른 채널, 또는 로봇 센서. 경계선을 끌어 크기를 바꿉니다</span>
         <span><kbd>T</kbd></span><span>키보드로 운전 켜고 끄기: 켜면 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> <kbd>Q</kbd><kbd>E</kbd> <kbd>Space</kbd>가 로봇을 움직입니다 (전후진 · 조향 · 횡이동 · 정지)</span>
       </div>
       <h3>지도</h3>
@@ -535,12 +528,17 @@ const BANDS = [["rgb", "RGB"], ["r", "R"], ["g", "G"], ["b", "B"], ["nir", "NIR"
 const VIEWS = [["img", "영상"], ["dolp", "DoLP"], ["aolp", "AoLP"], ["s1", "S1/S0"], ["s2", "S2/S0"]];
 // what is the same in every band (the render server's AOVs), in a group of its own; picked, it replaces band and view
 const AOVS = [["depth", "깊이"]];
-const pick = { a: { band: "rgb", view: "img", aov: null }, b: { band: "rgb", view: "dolp", aov: null } };
+const pick = { a: { band: "rgb", view: "img", aov: null } };  // the editor's pane, then each sub viewer of the editor's view (addSub)
 const paneView = (p) => pick[p].aov ? `rgb.${pick[p].aov}` : `${pick[p].band}.${pick[p].view}`;
-const view = { get a() { return paneView("a"); }, get b() { return paneView("b"); } };
+const view = new Proxy({}, { get: (_, pane) => paneView(pane) });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let S = null, graph = null, poseKey = "";
 let R = null;  // the robot's state (/api/robot/state), see renderRobot
+// the sub viewers beside (or under) the editor's pane: {id: "s<n>", kind: "editor" | "sensor", sensor, seq}
+const SUBS = [];
+const LAYOUT = { dock: "right", f: 0.5 };  // where the sub viewers sit, and the editor's share of the width (height)
+const subOf = (pane) => SUBS.find((x) => x.id === pane);
+const editorPanes = () => ["a", ...SUBS.filter((x) => x.kind === "editor").map((x) => x.id)];
 // The server renders on its own (newest camera, accumulating while it stays put). One WebSocket carries
 // everything: the server pushes state on every change and the panes' JPEGs for every new frame; the page
 // sends inputs (answered at once, before any render) and probes.
@@ -595,17 +593,18 @@ function syncTabs(pane) {
       String(kind === "aov" ? pick[pane].aov === b.dataset.value : !pick[pane].aov && pick[pane][kind] === b.dataset.value)));
   });
 }
-function buildTabs() {
-  try {  // each pane's band and view, remembered in this browser
-    const saved = JSON.parse(localStorage.getItem("opticalnav-panes") || "null");
-    for (const pane of ["a", "b"]) {
-      const s = saved && saved[pane];
+function buildTabs(root = document) {
+  if (root === document) {
+    try {  // the editor pane's band and view, remembered in this browser
+      const s = (JSON.parse(localStorage.getItem("opticalnav-panes") || "null") || {}).a;
       if (s && BANDS.some(([v]) => v === s.band) && VIEWS.some(([v]) => v === s.view))
-        pick[pane] = { band: s.band, view: s.view, aov: AOVS.some(([v]) => v === s.aov) ? s.aov : null };
-    }
-  } catch (e) { /* storage blocked or unreadable: the defaults */ }
-  document.querySelectorAll(".tabs[data-pane]").forEach((box) => {  // the panes' tabs (not the renderer switch)
+        pick.a = { band: s.band, view: s.view, aov: AOVS.some(([v]) => v === s.aov) ? s.aov : null };
+    } catch (e) { /* storage blocked or unreadable: the defaults */ }
+  }
+  const panes = new Set();
+  root.querySelectorAll(".tabs[data-pane]").forEach((box) => {  // the panes' tabs (not the renderer switch)
     const pane = box.dataset.pane, kind = box.dataset.kind;
+    panes.add(pane);
     box.innerHTML = "";
     for (const [value, label] of { band: BANDS, view: VIEWS, aov: AOVS }[kind]) {
       const b = document.createElement("button");
@@ -613,7 +612,8 @@ function buildTabs() {
       b.addEventListener("click", () => {
         if (kind === "aov") pick[pane].aov = value;
         else { pick[pane][kind] = value; pick[pane].aov = null; }
-        try { localStorage.setItem("opticalnav-panes", JSON.stringify(pick)); } catch (e) { /* not remembered */ }
+        try { localStorage.setItem("opticalnav-panes", JSON.stringify({ a: pick.a })); } catch (e) { /* not remembered */ }
+        saveLayout();
         // a near-infrared pane needs the near-infrared band: turn it on alongside the visible one
         if (pick[pane].band === "nir" && S && S.nir_available && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
         syncTabs(pane); paneTitle(pane); showImages(); renderLegends();
@@ -621,23 +621,31 @@ function buildTabs() {
       box.appendChild(b);
     }
   });
-  for (const pane of ["a", "b"]) { syncTabs(pane); paneTitle(pane); }
+  for (const pane of panes) { syncTabs(pane); paneTitle(pane); }
 }
 // pane header buttons: save the shown JPEG, a rule-of-thirds grid, full screen
-document.querySelectorAll(".pane-head .icon-btn").forEach((b) => b.addEventListener("click", () => {
-  const pane = b.dataset.pane, frame = $(`frame-${pane}`);
+document.getElementById("main").addEventListener("click", (ev) => {
+  const b = ev.target.closest(".pane-head .icon-btn");
+  if (!b || !b.dataset.act) return;
+  const pane = b.dataset.pane, sub = subOf(pane), sensor = sub && sub.kind === "sensor";
+  const frame = $(sensor ? `sframe-${pane}` : `frame-${pane}`);
   if (b.dataset.act === "shot") {
-    if (!paneUrl[pane]) return;
     const a = document.createElement("a");
-    a.href = paneUrl[pane];
-    a.download = `opticalnav_${S ? S.scene : "view"}_${view[pane].replace(".", "_")}_${S ? S.frame_spp : 0}spp.jpg`;
+    if (sensor) {
+      if (!sub.seq) return;
+      a.href = `/api/robot/frame/${sub.sensor}.jpg?seq=${sub.seq}`; a.download = `opticalnav_${R ? R.scene : "scene"}_robot_${sub.sensor}.jpg`;
+    } else {
+      if (!paneUrl[pane]) return;
+      a.href = paneUrl[pane];
+      a.download = `opticalnav_${S ? S.scene : "view"}_${view[pane].replace(".", "_")}_${S ? S.frame_spp : 0}spp.jpg`;
+    }
     a.click();
   } else if (b.dataset.act === "grid") {
     b.setAttribute("aria-pressed", String(frame.classList.toggle("grid")));
   } else if (b.dataset.act === "full") {
     if (document.fullscreenElement) document.exitFullscreen(); else frame.requestFullscreen().catch(() => {});
-  }
-}));
+  } else if (b.dataset.act === "close") removeSub(pane);
+});
 
 async function boot() {
   const wide = window.matchMedia("(min-width: 761px)");
@@ -746,14 +754,15 @@ function send(path, body, what) {
   });
 }
 
-// pane images: 4-byte frame id, 1-byte pane (0 = a, 1 = b), then the JPEG
-const paneUrl = { a: null, b: null };
+// pane images: 4-byte frame id, 1-byte pane (0: the editor's pane "a", 3 + n: sub viewer "s<n>"; 2: the depth grid), then the JPEG
+const paneUrl = {};
 function showPane(buf) {
   const dv = new DataView(buf), id = dv.getUint32(0), kind = dv.getUint8(4);
   if (kind === 2) return keepDepthGrid(id, dv);
-  const pane = kind === 0 ? "a" : "b";
-  const url = URL.createObjectURL(new Blob([buf.slice(5)], { type: "image/jpeg" }));
+  const pane = kind === 0 ? "a" : `s${kind - 3}`;
   const img = $(`img-${pane}`), old = paneUrl[pane];
+  if (!img) return;  // a sub viewer closed while its image was on the way
+  const url = URL.createObjectURL(new Blob([buf.slice(5)], { type: "image/jpeg" }));
   paneUrl[pane] = url;
   img.onload = () => { paneFrame[pane] = id; if (warpGL[pane]) warpGL[pane].texDirty = true; warpPanes(); };
   img.src = url;
@@ -768,7 +777,7 @@ function showPane(buf) {
 // WARP_DEPTH m ahead (exact for turns only). Frames are never blended, so nothing blurs; a frame
 // of the current camera shows as rendered.
 const WARP_DEPTH = 2.5, WARP_FAR = 60;  // no hit (a window's sky): this far
-const frameC2w = new Map(), depthGrids = new Map(), paneFrame = { a: null, b: null };
+const frameC2w = new Map(), depthGrids = new Map(), paneFrame = {};
 function keepDepthGrid(id, dv) {
   const gw = dv.getUint16(5), gh = dv.getUint16(7), z = new Float32Array((gw + 1) * (gh + 1));
   for (let k = 0; k < z.length; k++) { const mm = dv.getUint16(9 + 2 * k); z[k] = mm ? mm / 1000 : WARP_FAR; }
@@ -821,9 +830,9 @@ void main() {
 }`;
 const WARP_FS = `precision mediump float; uniform sampler2D uTex; varying vec2 vUV;
 void main() { gl_FragColor = texture2D(uTex, vUV); }`;
-const warpGL = { a: null, b: null };
+const warpGL = {};
 function warpContext(pane) {
-  if (warpGL[pane] !== null) return warpGL[pane];
+  if (pane in warpGL) return warpGL[pane];
   const img = $(`img-${pane}`), cv = document.createElement("canvas");
   cv.className = "warp";
   img.after(cv);
@@ -907,7 +916,7 @@ function warpDraw(pane, img, grid, src, dst) {
 }
 function warpPanes() {
   const dst = S && S.camera_to_world, on = $("warp").checked;
-  for (const pane of ["a", "b"]) {
+  for (const pane of editorPanes()) {
     const img = $(`img-${pane}`), src = frameC2w.get(paneFrame[pane]), grid = depthGrids.get(paneFrame[pane]);
     let tf = "", drawn = false;
     if (on && dst && src && img.naturalWidth && src.some((v, k) => Math.abs(v - dst[k]) > 1e-4) &&
@@ -928,8 +937,10 @@ function warpPanes() {
 addEventListener("resize", () => S && warpPanes());
 
 function subscribe() {
-  const showB = getComputedStyle($("pane-b")).display !== "none";
-  wsSend({ type: "subscribe", panes: { a: view.a, b: showB ? view.b : null }, scale: Number($("scale").value),
+  const panes = {};
+  const subsShown = getComputedStyle($("subs")).display !== "none";
+  for (const pane of editorPanes()) if (pane === "a" || subsShown) panes[pane] = view[pane];
+  wsSend({ type: "subscribe", panes, scale: Number($("scale").value),
            ev: { rgb: Number($("ev-rgb").value), nir: Number($("ev-nir").value) } });
 }
 const WHAT = { start: "첫 프레임", forward: "이동", move: "이동", turn: "회전", about: "뒤로 돌기", pitch: "고개 돌리기",
@@ -1368,8 +1379,7 @@ function legendHtml(pane, sc) {
 function renderLegends() {
   const sc = Number($("scale").value).toFixed(2);
   $("scale-v").textContent = sc;
-  $("legend-a").innerHTML = legendHtml(view.a, sc);
-  $("legend-b").innerHTML = legendHtml(view.b, sc);
+  for (const pane of editorPanes()) $(`legend-${pane}`).innerHTML = legendHtml(view[pane], sc);
 }
 
 // --- probe: hover on desktop, tap on touch ---
@@ -1392,8 +1402,8 @@ function showProbe(p) {
     ["깊이", p.depth_m == null ? "—" : `${p.depth_m.toFixed(3)} m`]]
     .map(([k2, v]) => `<div><dt>${k2}</dt><dd>${v}</dd></div>`).join("");
 }
-for (const id of ["frame-a", "frame-b"]) {
-  const frame = $(id), img = frame.querySelector("img");
+function wireFrame(frame) {
+  const img = frame.querySelector("img");
   frame.addEventListener("mousemove", (ev) => { if (!mouselook) probeAt(img, ev.clientX, ev.clientY); });
   // touch: a horizontal swipe turns (drag the world: swipe left looks right), a tap probes
   let start = null;
@@ -1433,6 +1443,7 @@ for (const id of ["frame-a", "frame-b"]) {
   frame.addEventListener("contextmenu", (ev) => ev.preventDefault());
   frame.addEventListener("dblclick", (ev) => { if (S && S.started && !ev.target.closest(".cand")) lookAt(img, ev.clientX, ev.clientY); });
 }
+wireFrame($("frame-a"));
 
 // --- controls ---
 document.querySelectorAll(".pad button").forEach((b) => b.addEventListener("click", () => {
@@ -1957,8 +1968,8 @@ async function loadSceneStats() {
 // --- the robot: spawned into the scene this page shows (the editor's camera renders it), its cameras as sensor panes ---
 // R is /api/robot/state, polled (5 times a second while there is a robot): pose, wheels, sensors, messages.
 let robotTimer = null, groundImg = null, groundKey = "";
-const SENSORS = ["hdr", "12bit"], ROBOT_KEYS = ["w", "a", "s", "d", "q", "e", " "];
-const rheld = new Set(), sensorSeq = {};
+const ROBOT_KEYS = ["w", "a", "s", "d", "q", "e", " "];
+const rheld = new Set();
 const driving = () => !!(R && R.spawned && $("robot-drive").checked);
 async function robotApi(path, body) { R = await api(`/api/robot/${path}`, body); renderRobot(); return R; }
 function robotNote(text, bad) { const n = $("robot-note"); n.textContent = text || ""; n.classList.toggle("bad", !!bad); }
@@ -1990,23 +2001,23 @@ function renderRobot() {
   const raster = on && S && S.render_mode && S.render_mode !== "path" ? "지금 렌더러는 로봇을 그리지 않습니다 (Mitsuba 경로 추적에서만 보입니다). " : "";
   robotNote(R.error ? `로봇: ${R.error}` : raster + (R.message || ""), !!R.error);
   if ($("robot-follow").checked !== !!R.follow) $("robot-follow").checked = !!R.follow;
-  let shown = 0;
+  syncSensorList();
   for (const sn of R.sensors || []) {
-    const pane = $(`sensor-${sn.name}`), box = $(`sensor-on-${sn.name}`), want = on && sn.enabled;
-    if (box.checked !== !!sn.enabled) box.checked = !!sn.enabled;
-    pane.hidden = !want;
-    if (!want) { sensorSeq[sn.name] = 0; $(`simg-${sn.name}`).hidden = true; $(`swait-${sn.name}`).hidden = false; $(`smeta-${sn.name}`).textContent = ""; continue; }
-    shown++;
-    if (sn.seq && sensorSeq[sn.name] !== sn.seq) {
-      sensorSeq[sn.name] = sn.seq;
-      const img = $(`simg-${sn.name}`);
-      img.src = `/api/robot/frame/${sn.name}.jpg?seq=${sn.seq}`; img.hidden = false; $(`swait-${sn.name}`).hidden = true;
-      $(`smeta-${sn.name}`).textContent = `${sn.model} · ${sn.format} · ${sn.size[0]}×${sn.size[1]} · 노출 ${sn.exposure_ms} ms${sn.gain_db ? ` +${sn.gain_db} dB` : ""} · ${sn.spp} spp`;
+    const mine = SUBS.filter((x) => x.kind === "sensor" && x.sensor === sn.name), box = $(`sensor-on-${sn.name}`);
+    if (box && box.checked !== mine.length > 0) box.checked = mine.length > 0;
+    if (mine.length && on && !sn.enabled) wantSensor(sn.name, true);   // shown here, not rendered yet (a new robot, a reloaded page)
+    for (const sub of mine) {
+      const img = $(`simg-${sub.id}`), wait = $(`swait-${sub.id}`);
+      if (!on) {
+        sub.seq = 0; img.hidden = true; wait.hidden = false; $(`title-${sub.id}`).innerHTML = "";
+        wait.textContent = busy ? "로봇을 준비하는 중…" : "로봇이 없습니다. 오른쪽 로봇 탭에서 스폰하세요.";
+      } else if (sn.seq && sub.seq !== sn.seq) {
+        sub.seq = sn.seq;
+        img.src = `/api/robot/frame/${sn.name}.jpg?seq=${sn.seq}`; img.hidden = false; wait.hidden = true;
+        $(`title-${sub.id}`).innerHTML = `<small>${sn.model} · ${sn.format} · ${sn.size[0]}×${sn.size[1]} · 노출 ${sn.exposure_ms} ms${sn.gain_db ? ` +${sn.gain_db} dB` : ""} · ${sn.spp} spp</small>`;
+      } else if (!sn.seq) { img.hidden = true; wait.hidden = false; wait.textContent = "첫 프레임을 기다리는 중… (센서마다 처음 한 번 freeze 기록, 20–30초)"; }
     }
   }
-  const had = $("main").classList.contains("has-sensors");
-  $("sensors").hidden = !shown; $("main").classList.toggle("has-sensors", shown > 0);
-  if (had !== shown > 0) { drawMap(); subscribe(); }
   $("map-legend").hidden = !(on && R.map && $("robot-zoom").checked);
   const r = R.robot;
   if (!r) { $("robot-wheels").innerHTML = ""; $("robot-readout").innerHTML = ""; drawMap(); return; }
@@ -2065,16 +2076,197 @@ $("robot-despawn").addEventListener("click", () => robotApi("despawn", {}).catch
 $("robot-follow").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked }).catch((e) => robotNote(e.message, true)));
 $("robot-drive").addEventListener("change", syncDrive);
 $("robot-zoom").addEventListener("change", () => { renderRobot(); drawMap(); });
-document.querySelectorAll("[data-sensor]").forEach((box) => box.addEventListener("change", () =>
-  robotApi("sensors", { [box.dataset.sensor]: box.checked }).catch((e) => robotNote(e.message, true))));
-document.querySelectorAll("[data-sensor-off]").forEach((b) => b.addEventListener("click", () =>
-  robotApi("sensors", { [b.dataset.sensorOff]: false }).catch((e) => robotNote(e.message, true))));
-document.querySelectorAll("[data-sensor-shot]").forEach((b) => b.addEventListener("click", () => {
-  const n = b.dataset.sensorShot, seq = sensorSeq[n];
-  if (!seq) return;
-  const a = document.createElement("a");
-  a.href = `/api/robot/frame/${n}.jpg?seq=${seq}`; a.download = `opticalnav_${R.scene}_robot_${n}.jpg`; a.click();
-}));
+// --- sub viewers: any number of them, each another channel of the editor's view or one of the robot's sensors ---
+// The robot's sensors are what its configuration lists (R.sensors): a row each in the robot tab, with a switch
+// (a sub viewer of it opens or closes) and a grip (drag the row onto a viewer: that viewer shows the sensor; onto
+// the editor's pane or the empty space: a new sub viewer opens with it).
+let SENSOR_LIST = [];   // [{name, label, model}], as the server last gave them
+const SENSOR_MIME = "application/x-opticalnav-sensor";
+const sensorLabel = (name) => (SENSOR_LIST.find((x) => x.name === name) || {}).label || name;
+function sourceOptions(sub) {
+  const have = SENSOR_LIST.map((x) => x.name);
+  const names = sub.kind === "sensor" && !have.includes(sub.sensor) ? [...have, sub.sensor] : have;
+  return [["editor", "에디터 뷰"], ...names.map((n) => [`sensor:${n}`, `로봇 · ${sensorLabel(n)}`])];
+}
+function syncSources() {
+  for (const sub of SUBS) {
+    const sel = $(`src-${sub.id}`);
+    sel.innerHTML = sourceOptions(sub).map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+    sel.value = subSource(sub);
+  }
+}
+function syncSensorList() {
+  const list = (R && R.sensors || []).map((x) => ({ name: x.name, label: x.label || x.name, model: x.model || "" }));
+  if (JSON.stringify(list) === JSON.stringify(SENSOR_LIST)) return;
+  SENSOR_LIST = list;
+  const box = $("robot-sensors");
+  box.innerHTML = list.length ? `<h3>센서 (끌어서 뷰어에 놓거나 스위치로 열기)</h3>` + list.map((x) =>
+    `<div class="sensor-row" draggable="true" data-name="${x.name}" title="끌어서 뷰어에 놓으세요: 서브 뷰어 위에 놓으면 그 창이, 에디터 뷰나 빈 곳에 놓으면 새 서브 뷰어가 이 센서를 보여 줍니다">` +
+    `<span class="grip" aria-hidden="true">⋮⋮</span><span class="nm">${x.label}<small>${x.model}</small></span>` +
+    `<input type="checkbox" class="sw" id="sensor-on-${x.name}" data-sensor="${x.name}" aria-label="${x.label} 뷰어 열기"></div>`).join("") : "";
+  box.querySelectorAll(".sensor-row").forEach((row) => {
+    row.addEventListener("dragstart", (ev) => {
+      ev.dataTransfer.setData(SENSOR_MIME, row.dataset.name); ev.dataTransfer.setData("text/plain", row.dataset.name);
+      ev.dataTransfer.effectAllowed = "copy"; row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => { row.classList.remove("dragging"); clearDrop(); });
+  });
+  box.querySelectorAll("[data-sensor]").forEach((sw) => sw.addEventListener("change", () => {
+    const name = sw.dataset.sensor;
+    if (sw.checked) addSub({ kind: "sensor", sensor: name });
+    else for (const sub of SUBS.filter((x) => x.kind === "sensor" && x.sensor === name)) removeSub(sub.id);
+  }));
+  syncSources();
+}
+// a dragged sensor over the viewers: the pane under it lights up; dropped on a sub viewer it becomes that viewer's
+// source, anywhere else among the viewers a new sub viewer opens with it
+function clearDrop() { document.querySelectorAll("main .drop").forEach((e) => e.classList.remove("drop")); }
+function dropTarget(ev) {
+  if (ev.target.closest("aside")) return null;
+  return ev.target.closest(".pane.sub") || ev.target.closest("#pane-a") || ev.target.closest("#subs");
+}
+$("main").addEventListener("dragover", (ev) => {
+  if (!ev.dataTransfer.types.includes(SENSOR_MIME)) return;
+  const t = dropTarget(ev);
+  clearDrop();
+  if (!t) return;
+  ev.preventDefault(); ev.dataTransfer.dropEffect = "copy";
+  t.classList.add("drop");
+});
+$("main").addEventListener("dragleave", (ev) => { if (!ev.relatedTarget || !$("main").contains(ev.relatedTarget)) clearDrop(); });
+$("main").addEventListener("drop", (ev) => {
+  const name = ev.dataTransfer.getData(SENSOR_MIME), t = dropTarget(ev);
+  clearDrop();
+  if (!name || !t) return;
+  ev.preventDefault();
+  if (t.classList.contains("sub")) setSubSource(t.id.slice(5), `sensor:${name}`);
+  else if (!addSub({ kind: "sensor", sensor: name })) showError("서브 뷰어는 8개까지 열 수 있습니다");
+});
+const sensorAsked = {};
+function wantSensor(name, on) {  // the server renders a sensor while a viewer of it is open (asked at most once a second)
+  const now = performance.now();
+  if (on && now - (sensorAsked[name] || 0) < 1000) return;
+  sensorAsked[name] = now;
+  api("/api/robot/sensors", { [name]: on }).then((r) => { R = r; }).catch(() => {});
+}
+function saveLayout() {
+  try {
+    localStorage.setItem("opticalnav-layout", JSON.stringify({ dock: LAYOUT.dock, f: LAYOUT.f,
+      subs: SUBS.map((x) => x.kind === "sensor" ? { kind: "sensor", sensor: x.sensor } : { kind: "editor", ...pick[x.id] }) }));
+  } catch (e) { /* not remembered */ }
+}
+// the grid: the editor's pane, the sub viewers beside or under it (tiled), the side column
+function layout() {
+  const main = $("main"), box = $("subs"), n = SUBS.length;
+  const narrow = window.matchMedia("(max-width: 1000px)").matches, f = LAYOUT.f;
+  box.hidden = !n;
+  main.classList.toggle("dock-right", LAYOUT.dock === "right");
+  main.classList.toggle("dock-bottom", LAYOUT.dock !== "right");
+  $("dock-toggle").textContent = LAYOUT.dock === "right" ? "배치: 옆" : "배치: 아래";
+  if (narrow) { main.style.gridTemplateColumns = main.style.gridTemplateRows = ""; return; }
+  if (LAYOUT.dock === "right") {
+    main.style.gridTemplateColumns = n ? `minmax(0, ${f}fr) minmax(0, ${1 - f}fr) 340px` : "minmax(0, 1fr) 340px";
+    main.style.gridTemplateRows = "minmax(0, 1fr)";
+    box.style.gridTemplateColumns = `repeat(${n <= 2 ? 1 : 2}, minmax(0, 1fr))`;
+  } else {
+    main.style.gridTemplateColumns = "minmax(0, 1fr) 340px";
+    main.style.gridTemplateRows = n ? `minmax(0, ${f}fr) minmax(0, ${1 - f}fr)` : "minmax(0, 1fr)";
+    box.style.gridTemplateColumns = `repeat(${Math.min(Math.max(n, 1), 4)}, minmax(0, 1fr))`;
+  }
+  if (S && S.started) { drawMap(); warpPanes(); }
+}
+function subSource(sub) { return sub.kind === "sensor" ? `sensor:${sub.sensor}` : "editor"; }
+function addSub(spec, quiet) {
+  if (SUBS.length >= 8) return null;
+  let n = 0;
+  while (SUBS.some((x) => x.id === `s${n}`)) n++;
+  const id = `s${n}`, sub = { id, kind: spec.kind === "sensor" && spec.sensor ? "sensor" : "editor", sensor: String(spec.sensor || ""), seq: 0 };
+  pick[id] = { band: BANDS.some(([v]) => v === spec.band) ? spec.band : "rgb", view: VIEWS.some(([v]) => v === spec.view) ? spec.view : "dolp",
+               aov: AOVS.some(([v]) => v === spec.aov) ? spec.aov : null };
+  const el = document.createElement("section");
+  el.className = "card pane sub"; el.id = `pane-${id}`; el.dataset.kind = sub.kind;
+  const opts = sourceOptions(sub);
+  el.innerHTML = `<div class="pane-head card-head">
+      <span class="pdot" id="dot-${id}"></span>
+      <select class="src" id="src-${id}" aria-label="이 서브 뷰어가 보여 줄 것" title="이 창이 보여 줄 것: 에디터 뷰의 다른 채널, 또는 로봇에 단 센서">${opts.map(([v, t]) => `<option value="${v}">${t}</option>`).join("")}</select>
+      <h2 id="title-${id}"></h2>
+      <button type="button" class="icon-btn" data-act="shot" data-pane="${id}" title="이 화면 저장 (JPEG)"><svg class="i"><use href="#i-shot"/></svg></button>
+      <button type="button" class="icon-btn" data-act="grid" data-pane="${id}" aria-pressed="false" title="3분할 격자"><svg class="i"><use href="#i-grid"/></svg></button>
+      <button type="button" class="icon-btn" data-act="full" data-pane="${id}" title="전체 화면"><svg class="i"><use href="#i-full"/></svg></button>
+      <button type="button" class="icon-btn" data-act="close" data-pane="${id}" title="이 서브 뷰어 닫기">✕</button>
+    </div>
+    <div class="tabsets"><div class="tabs" role="group" aria-label="대역" data-pane="${id}" data-kind="band"></div><div class="tabs" role="group" aria-label="보기" data-pane="${id}" data-kind="view"></div><div class="tabs" role="group" aria-label="채널 무관 (AOV)" data-pane="${id}" data-kind="aov"></div></div>
+    <div class="frame-wrap"><div class="frame" id="frame-${id}"><img id="img-${id}" alt="에디터 뷰의 다른 채널"></div></div>
+    <div class="sensor-wrap" id="sframe-${id}"><div class="wait" id="swait-${id}">로봇이 없습니다. 오른쪽 로봇 탭에서 스폰하세요.</div><img id="simg-${id}" alt="로봇 센서 영상" hidden></div>
+    <div class="legend" id="legend-${id}"></div>`;
+  $("subs").appendChild(el);
+  SUBS.push(sub);
+  $(`src-${id}`).value = subSource(sub);
+  $(`src-${id}`).addEventListener("change", (ev) => setSubSource(id, ev.target.value));
+  buildTabs(el);
+  wireFrame($(`frame-${id}`));
+  if (sub.kind === "sensor") { $(`title-${id}`).textContent = ""; wantSensor(sub.sensor, true); }
+  if (!quiet) { layout(); saveLayout(); subscribe(); renderLegends(); renderRobot(); }
+  return sub;
+}
+function dropSensorIfUnused(name) { if (!SUBS.some((x) => x.kind === "sensor" && x.sensor === name)) wantSensor(name, false); }
+function removeSub(id) {
+  const i = SUBS.findIndex((x) => x.id === id);
+  if (i < 0) return;
+  const [sub] = SUBS.splice(i, 1);
+  $(`pane-${id}`).remove();
+  if (paneUrl[id]) URL.revokeObjectURL(paneUrl[id]);
+  delete pick[id]; delete paneUrl[id]; delete paneFrame[id]; delete warpGL[id];
+  if (sub.kind === "sensor") dropSensorIfUnused(sub.sensor);
+  layout(); saveLayout(); subscribe(); renderRobot();
+}
+function setSubSource(id, value) {
+  const sub = subOf(id), was = sub.kind === "sensor" ? sub.sensor : null;
+  sub.kind = value.startsWith("sensor:") ? "sensor" : "editor";
+  if (sub.kind === "sensor") { sub.sensor = value.slice(7); sub.seq = 0; $(`simg-${id}`).hidden = true; $(`swait-${id}`).hidden = false; $(`title-${id}`).textContent = ""; wantSensor(sub.sensor, true); }
+  else paneTitle(id);
+  $(`pane-${id}`).dataset.kind = sub.kind;
+  if (was && was !== (sub.kind === "sensor" ? sub.sensor : null)) dropSensorIfUnused(was);
+  syncSources(); saveLayout(); subscribe(); renderLegends(); renderRobot();
+}
+$("sub-add").addEventListener("click", () => {
+  // the next thing not on screen yet: a polarization view of the editor's, then the robot's sensors, then more views
+  const have = new Set(SUBS.map((x) => x.kind === "sensor" ? `sensor:${x.sensor}` : `editor:${paneView(x.id)}`));
+  const order = [{ kind: "editor", view: "dolp" }, ...(R && R.spawned ? SENSOR_LIST.map((x) => ({ kind: "sensor", sensor: x.name })) : []),
+    { kind: "editor", view: "aolp" }, { kind: "editor", aov: "depth" }, { kind: "editor", view: "s1" }, { kind: "editor", view: "s2" }];
+  const next = order.find((o) => !have.has(o.kind === "sensor" ? `sensor:${o.sensor}` : `editor:${o.aov ? `rgb.${o.aov}` : `rgb.${o.view}`}`)) || { kind: "editor", view: "dolp" };
+  if (!addSub(next)) showError("서브 뷰어는 8개까지 열 수 있습니다");
+});
+$("dock-toggle").addEventListener("click", () => { LAYOUT.dock = LAYOUT.dock === "right" ? "bottom" : "right"; layout(); saveLayout(); subscribe(); });
+// the boundary between the editor's pane and the sub viewers: drag to resize
+(() => {
+  const bar = $("splitter");
+  const move = (ev) => {
+    const a = $("pane-a").getBoundingClientRect(), b = $("subs").getBoundingClientRect();
+    const f = LAYOUT.dock === "right" ? (ev.clientX - a.left) / (b.right - a.left) : (ev.clientY - a.top) / (b.bottom - a.top);
+    LAYOUT.f = Math.min(0.8, Math.max(0.2, f));
+    layout();
+  };
+  bar.addEventListener("pointerdown", (ev) => { bar.setPointerCapture(ev.pointerId); bar.classList.add("drag"); ev.preventDefault(); });
+  bar.addEventListener("pointermove", (ev) => { if (bar.classList.contains("drag")) move(ev); });
+  const end = () => { if (bar.classList.contains("drag")) { bar.classList.remove("drag"); saveLayout(); } };
+  bar.addEventListener("pointerup", end); bar.addEventListener("pointercancel", end);
+  bar.addEventListener("dblclick", () => { LAYOUT.f = 0.5; layout(); saveLayout(); });
+})();
+window.addEventListener("resize", layout);
+(() => {  // the windows as they were left in this browser; at first one sub viewer: the editor's DoLP (the old right pane)
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem("opticalnav-layout") || "null"); } catch (e) { /* the default */ }
+  if (!saved) {
+    let b = null;
+    try { b = (JSON.parse(localStorage.getItem("opticalnav-panes") || "null") || {}).b; } catch (e) { /* the default */ }
+    saved = { dock: "right", f: 0.5, subs: [{ kind: "editor", ...(b || { band: "rgb", view: "dolp" }) }] };
+  }
+  LAYOUT.dock = saved.dock === "bottom" ? "bottom" : "right";
+  LAYOUT.f = Math.min(0.8, Math.max(0.2, Number(saved.f) || 0.5));
+  for (const spec of (saved.subs || []).slice(0, 8)) addSub(spec, true);
+  layout();
+})();
 pollRobot();
 try { showTab(localStorage.getItem("opticalnav-panel-tab") || "state"); } catch (e) { showTab("state"); }
 

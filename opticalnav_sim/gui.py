@@ -96,6 +96,19 @@ DEPTH_RANGE = (0.3, 12.0)  # metres shown from red (near) to blue (far), on a lo
 DEPTH_GRID = 64  # cells across the depth grid the page warps frames with (and as many down as the aspect gives)
 
 
+MAX_PANES = 12  # the editor's pane and its sub viewers, per page
+
+
+def pane_byte(pane: str) -> int | None:
+    """The byte that names a pane in a pushed image: 0 "a" (the editor's), 1 "b", 3 + n the sub viewer "s<n>" (2 is
+    the depth grid)."""
+    if pane in ("a", "b"):
+        return "ab".index(pane)
+    if pane[:1] == "s" and pane[1:].isdigit() and int(pane[1:]) < 250:
+        return 3 + int(pane[1:])
+    return None
+
+
 def depth_rgb(z: np.ndarray) -> np.ndarray:
     """uint8 RGB of a depth map (m): turbo (Google's polynomial fit) from red at DEPTH_RANGE[0] to blue at
     DEPTH_RANGE[1], log scale; black where nothing was hit."""
@@ -1245,9 +1258,10 @@ def make_handler(session: Session, token: str | None = None, robot=None):
         def _websocket(self) -> None:
             """GET /ws: the page's one connection. The server pushes {"type": "state"} whenever anything
             changes and, for each new frame, the JPEGs of the panes the page subscribed to as binary messages
-            (4-byte frame id, 1-byte pane, JPEG). The page sends {"type": "input", "id", "path", "body"}
-            (answered by {"type": "ack"}), {"type": "subscribe", "panes": {"a": "rgb", "b": "dolp"|null},
-            "scale"} and {"type": "probe", "frame", "x", "y"}."""
+            (4-byte frame id, 1-byte pane, JPEG; pane_byte: 0 the editor's pane "a", 1 "b", 3 + n the sub viewer
+            "s<n>"; 2 is the depth grid). The page sends {"type": "input", "id", "path", "body"} (answered by
+            {"type": "ack"}), {"type": "subscribe", "panes": {"a": "rgb.img", "s0": "rgb.dolp", ...}, "scale"}
+            (any number of panes: each a channel of the editor's view) and {"type": "probe", "frame", "x", "y"}."""
             import base64
             import hashlib
 
@@ -1280,18 +1294,18 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                             sub["dirty"] = False
                             sent_frame = frame_id
                             shown = time.perf_counter()
-                            for i, pane in enumerate(("a", "b")):
-                                ch = sub["panes"].get(pane)
+                            for pane, ch in list(sub["panes"].items()):
+                                code = pane_byte(pane)
                                 try:
                                     pane_channel(ch)
                                 except KeyError:  # no pane (a phone shows one), or an unknown name
                                     ch = None
-                                if ch is not None:
+                                if ch is not None and code is not None:
                                     try:
                                         img = session.image(frame_id, ch, float(sub["scale"]), sub["ev"])
                                     except KeyError:  # already replaced by a newer frame
                                         break
-                                    ws.send(frame_id.to_bytes(4, "big") + bytes([i]) + img, opcode=0x2)
+                                    ws.send(frame_id.to_bytes(4, "big") + bytes([code]) + img, opcode=0x2)
                             grid = session.depth_grid(frame_id)
                             if grid is not None:  # the page's motion warp (pane byte 2)
                                 ws.send(frame_id.to_bytes(4, "big") + bytes([2]) + grid, opcode=0x2)
@@ -1322,7 +1336,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                             ws.send_json({"type": "ack", "id": msg.get("id"), "error": f"{type(exc).__name__}: {exc}"})
                     elif kind == "subscribe":
                         with session.cv:  # wake the sender to resend this frame's panes
-                            sub["panes"] = {k: v for k, v in dict(msg.get("panes") or sub["panes"]).items()}
+                            sub["panes"] = {str(k): v for k, v in list(dict(msg.get("panes") or sub["panes"]).items())[:MAX_PANES]}
                             sub["scale"] = float(msg.get("scale", sub["scale"]))
                             sub["ev"] = {k: float(v) for k, v in dict(msg.get("ev") or {}).items() if k in ("rgb", "nir")}
                             sub["dirty"] = True

@@ -743,7 +743,8 @@ def test_robot_routes_sensors_and_commands():
     assert h.sent[0] == 404
     here = Path(robot_view.__file__).parent
     page = (here / "gui.html").read_text()                                 # one viewer: the robot is a tab and panes of it
-    assert all(f'id="sensor-{n}"' in page for n in ("hdr", "12bit")) and 'id="robot-spawn"' in page and "/api/robot/" in page
+    assert 'id="robot-sensors"' in page and 'draggable="true"' in page and 'id="robot-spawn"' in page and "/api/robot/" in page
+    assert 'id="subs"' in page and 'id="sub-add"' in page and 'id="pane-b"' not in page   # sub viewers: any number, opened and closed
     assert not (here / "robot.html").exists()
 
 

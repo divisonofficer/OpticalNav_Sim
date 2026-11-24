@@ -360,6 +360,7 @@ class RobotSession:
                    "error": self.error, "map": self.map_info, "sim_rate": round(self.sim_rate, 1),
                    "calibrated": bool(self.calibration and Path(self.calibration).is_file()),
                    "sensors": [{"name": n, "label": label, "enabled": n in self.enabled,
+                                "model": self.cameras[n].spec.model if n in self.cameras else "",
                                 **{k: v for k, v in self.frames.get(n, {}).items() if k not in ("jpeg", "look")}}
                                for n, label in SENSOR_LABELS.items()]}
             robot = self.robot
