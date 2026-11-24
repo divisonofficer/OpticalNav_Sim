@@ -445,12 +445,19 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
           <div class="toggles">
             <label class="tg" for="robot-drive" title="켜면 W/A/S/D/Q/E와 Space가 카메라가 아니라 로봇을 움직입니다 (T). 화살표·R/F·우클릭 드래그는 그대로 카메라를 돌립니다."><input type="checkbox" class="sw" id="robot-drive"> 키보드로 운전 <kbd>T</kbd></label>
             <label class="tg" for="robot-follow" title="카메라가 로봇을 따라갑니다 (처음에는 뒤쪽 위). 따라가는 중에 카메라를 움직이면 그 자리에서 계속 따라갑니다."><input type="checkbox" class="sw" id="robot-follow"> 카메라가 따라가기</label>
+            <label class="tg" for="robot-track" title="에디터 카메라는 제자리에 있고 로봇을 화면 가운데에 두도록 고개만 돌립니다(삼각대 위의 카메라). 좁은 곳에서 뒤따라가는 카메라가 벽에 들어갈 때 씁니다."><input type="checkbox" class="sw" id="robot-track"> 카메라가 로봇 바라보기</label>
             <label class="tg" for="robot-zoom" title="지도를 로봇 주변으로 확대하고, 지면 지도(마찰·장애물)를 깝니다"><input type="checkbox" class="sw" id="robot-zoom" checked> 지도를 로봇 주변으로</label>
           </div>
           <div class="fields one" style="margin-top:8px">
             <label class="f" for="robot-speed" title="W/S를 누르고 있을 때의 속도 (Ranger Mini 2.0: 최대 1.5 m/s)"><span>로봇 속도</span><select id="robot-speed" class="as-slider"><option value="0.3">0.3 m/s</option><option value="0.6" selected>0.6 m/s</option><option value="1">1.0 m/s</option><option value="1.5">1.5 m/s</option></select></label>
             <label class="f" for="robot-steer" title="A/D를 누르고 있을 때의 조향각 (안쪽 바퀴, 최대 40°)"><span>조향각</span><select id="robot-steer" class="as-slider"><option value="10">10°</option><option value="20" selected>20°</option><option value="30">30°</option><option value="40">40°</option></select></label>
           </div>
+          <div class="rig-tools">
+            <button type="button" class="flash" id="robot-rec" title="녹화: 누른 뒤 로봇을 몰고, 다시 누르면 그 주행을 프레임마다 고품질로 다시 렌더해 MP4로 만듭니다(에디터 뷰 + 열려 있는 센서 뷰어 + 지도). 몰 때의 화면은 거칠어도 영상은 깨끗합니다. 렌더하는 동안 로봇은 멈춰 있습니다.">● 녹화 시작</button>
+            <button type="button" class="flash" id="robot-rec-cancel" hidden>취소</button>
+            <a class="flash" id="robot-rec-file" hidden download>영상 받기</a>
+          </div>
+          <p class="hint" id="robot-rec-note"></p>
           <table id="robot-wheels" style="margin-top:8px"></table>
           <dl id="robot-readout" style="margin-top:8px"></dl>
           <div class="keys desk-only" style="margin-top:8px">
@@ -2027,7 +2034,19 @@ function renderRobot() {
   $("robot-on").hidden = !on; $("robot-hint").hidden = on;
   const raster = on && S && S.render_mode && S.render_mode !== "path" ? "지금 렌더러는 로봇을 그리지 않습니다 (Mitsuba 경로 추적에서만 보입니다). " : "";
   robotNote(R.error ? `로봇: ${R.error}` : raster + (R.message || ""), !!R.error);
-  if ($("robot-follow").checked !== !!R.follow) $("robot-follow").checked = !!R.follow;
+  if ($("robot-follow").checked !== (R.follow_mode === "ride")) $("robot-follow").checked = R.follow_mode === "ride";
+  if ($("robot-track").checked !== (R.follow_mode === "track")) $("robot-track").checked = R.follow_mode === "track";
+  const rec = R.recording || { phase: "idle" };
+  $("robot-rec").textContent = rec.phase === "logging" ? "■ 녹화 끝 · 렌더" : "● 녹화 시작";
+  $("robot-rec").setAttribute("aria-pressed", String(rec.phase === "logging"));
+  $("robot-rec").disabled = rec.phase === "rendering" || rec.phase === "encoding";
+  $("robot-rec-cancel").hidden = !["logging", "rendering"].includes(rec.phase);
+  $("robot-rec-file").hidden = rec.phase !== "done";
+  if (rec.phase === "done") $("robot-rec-file").href = `/api/robot/recording/${rec.file}`;
+  $("robot-rec-note").textContent = rec.phase === "logging" ? `기록 중: ${rec.seconds.toFixed(1)} s${rec.full ? " (5분 한도)" : ""} · 로봇을 몰고 다시 누르세요`
+    : rec.phase === "rendering" ? `렌더 중: ${rec.done} / ${rec.frames} 프레임 · ${Math.round(rec.seconds || 0)} s 지남${rec.eta_s != null ? ` · 약 ${Math.round(rec.eta_s)} s 남음` : ""}`
+    : rec.phase === "encoding" ? "MP4로 묶는 중…" : rec.phase === "done" ? `완료: ${rec.file} (${rec.size_mb} MB, ${rec.frames} 프레임, 렌더 ${Math.round(rec.seconds || 0)} s)`
+    : rec.phase === "error" ? `녹화 실패: ${rec.error}` : "";
   $("robot-config").disabled = on || busy;
   if (R.config && $("robot-config").value !== R.config.name && [...$("robot-config").options].some((o) => o.value === R.config.name)) $("robot-config").value = R.config.name;
   const partsKey = JSON.stringify(R.config || null);
@@ -2110,7 +2129,15 @@ $("robot-spawn").addEventListener("click", async () => {
   try { robotNote("로봇을 준비하는 중…"); await robotApi("spawn", { config: $("robot-config").value || undefined }); pollRobot(); } catch (e) { robotNote(e.message, true); }
 });
 $("robot-despawn").addEventListener("click", () => robotApi("despawn", {}).catch((e) => robotNote(e.message, true)));
-$("robot-follow").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked }).catch((e) => robotNote(e.message, true)));
+$("robot-follow").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked, mode: "ride" }).catch((e) => robotNote(e.message, true)));
+$("robot-track").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked, mode: "track" }).catch((e) => robotNote(e.message, true)));
+// a recording: log the drive, then have it rendered again at full quality (the open sensor viewers are the video's)
+$("robot-rec").addEventListener("click", () => {
+  const logging = R && R.recording && R.recording.phase === "logging";
+  const sensors = [...new Set(SUBS.filter((x) => x.kind === "sensor").map((x) => x.sensor))];
+  robotApi("record", logging ? { action: "stop", sensors: sensors.length ? sensors : undefined } : { action: "start" }).catch((e) => robotNote(e.message, true));
+});
+$("robot-rec-cancel").addEventListener("click", () => robotApi("record", { action: "cancel" }).catch((e) => robotNote(e.message, true)));
 $("robot-drive").addEventListener("change", syncDrive);
 $("robot-zoom").addEventListener("change", () => { renderRobot(); drawMap(); });
 // --- sub viewers: any number of them, each another channel of the editor's view or one of the robot's sensors ---

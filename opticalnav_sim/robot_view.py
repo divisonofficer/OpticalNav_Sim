@@ -17,7 +17,12 @@ on through the render server, with the editor's lighting:
                                                                  sub viewers name theirs in its socket subscription:
                                                                  a sensor no page shows and no call switched on is
                                                                  not rendered)
-    POST /api/robot/follow   {"on": true}                        the editor camera rides behind the robot
+    POST /api/robot/follow   {"on": true, "mode": "ride"|"track"}   the editor camera rides behind the robot, or stays
+                                                                 where it is and turns to keep it in view
+    POST /api/robot/record   {"action": "start"}                 log the drive from now on
+                             {"action": "stop", "fps", "spp", "sensor_spp", "sensors", "name"}   render what was logged
+                             (robot_record.py: every frame at full quality) and write an MP4; "cancel" drops it
+    GET  /api/robot/recording/<name>.mp4   a finished recording (state["recording"]["file"] names it)
     POST /api/robot/control  {"mode", "linear", "steering_deg", "angular"}    held for 0.5 s (the chassis's own timeout)
 """
 from __future__ import annotations
@@ -39,6 +44,28 @@ DEFAULT_CONFIG = "ranger_mini_rig"
 # scene on the render server: another variant or lighting would not load a second one, but these keep one picture)
 LOOK = ("variant", "lights", "env", "flash_band", "nir", "lighting", "lamps", "flash_scale", "flash_offset", "max_depth",
         "rr_depth", "caustics", "nir_range", "active_split", "mirrors")
+
+
+def clean_render(client, view: dict, passes: int = 8) -> dict:
+    """A view rendered as ``passes`` passes of ``view["spp"]`` samples, their mean with fireflies held back
+    (gui.robust_mean: a pass's pixel far above the others' median is scaled down), then denoised: the server's
+    answer as one render would give it (``s0``.. or ``radiance``). The denoiser alone leaves a firefly as a white
+    speck; the mean alone leaves the grain. For a camera standing still, and for recordings."""
+    from .gui import robust_mean
+    outs = [client.render([dict(view, seed=int(view.get("seed", 0)) * 1000 + i, denoise=False)], "float32")[0] for i in range(passes)]
+    keys = [k for k in ("s0", "s1", "s2", "radiance") if k in outs[0]]
+    spp = float(view["spp"])
+    acc = {("s0" if k == "radiance" else k): np.stack([np.asarray(o[k], dtype=np.float32) for o in outs]) * spp for k in keys}
+    mean = robust_mean(acc, [spp] * passes)
+    try:
+        den = client.denoise({k: mean[k] for k in ("s0", "s1", "s2") if k in mean})
+        mean.update({k: den[k] for k in den if k in mean})
+    except (ConnectionError, OSError, RuntimeError):
+        pass   # the mean as it is rather than nothing
+    out = dict(outs[-1])
+    for k in keys:
+        out[k] = mean["s0" if k == "radiance" else k]
+    return out
 
 
 def _jpeg(image: np.ndarray, quality: int = 82) -> bytes:
@@ -75,6 +102,10 @@ class RobotSession:
         self.sim_rate = 0.0
         self.moved_at = 0.0              # when the robot last moved (a camera standing still gets more samples)
         self.pose_seq = 0                # grows whenever a link has moved: the viewer redraws its own view
+        self.editor_pose = None          # () -> the editor camera's (pose, follow) now (the viewer sets it): logged with a drive
+        self.log: list | None = None     # a drive being logged for a recording: one entry a tick (log_start)
+        self.replaying = False           # a recording renders: the robot's real time and its live sensors hold
+        self.recording: dict = {"phase": "idle"}   # logging / rendering / encoding / done / error, with its numbers
         self._bodies: list = []          # the robot's links as the render server's view field, as of pose_seq
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
@@ -115,6 +146,46 @@ class RobotSession:
             self.message = ""
             if had:
                 self.pose_seq += 1
+
+    # --- recordings: a drive logged tick by tick, rendered again by robot_record.render ----------------------------
+    LOG_LIMIT = 6000   # ticks: five minutes
+
+    def log_start(self) -> None:
+        with self.lock:
+            if self.robot is None:
+                raise ValueError("no robot to record: spawn one first")
+            if self.replaying:
+                raise ValueError("a recording is being rendered")
+            self.log = []
+            self.recording = {"phase": "logging", "ticks": 0, "seconds": 0.0}
+
+    def log_stop(self) -> list:
+        with self.lock:
+            log, self.log = self.log or [], None
+            return log
+
+    def _entry(self) -> dict:
+        """The robot as it stands now, to put it back there: its pose, its base's state, where its odometry says it
+        is, and the editor camera."""
+        robot = self.robot
+        st = robot.state
+        snap = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in vars(st).items() if k != "ground"} if st is not None else {}
+        for k in ("command", "twist"):
+            if k in snap:
+                snap[k] = type(snap[k])(**vars(snap[k]))
+        o = snap.get("odometry")
+        o = np.zeros(3) if o is None else o
+        c, s = math.cos(math.radians(self.start_pose.rpy_deg[2])), math.sin(math.radians(self.start_pose.rpy_deg[2]))
+        cam, follow = self.editor_pose() if self.editor_pose is not None else ((0.0, 0.0, 1.5, 0.0, 0.0), None)
+        return {"t": self.world.time, "pose": robot.pose, "state": snap, "cam": cam, "follow": follow,
+                "odometry_xy": (self.start_pose.xyz[0] + c * o[0] - s * o[1], self.start_pose.xyz[1] + s * o[0] + c * o[1])}
+
+    def restore(self, entry: dict) -> None:
+        """Put the robot back as an entry of a log has it (its pose and its base's state: the wheels' angles too)."""
+        robot = self.robot
+        robot.pose = entry["pose"]
+        for k, v in entry["state"].items():
+            setattr(robot.state, k, v.copy() if isinstance(v, np.ndarray) else v)
 
     def _alive(self, run: int) -> bool:
         return self.running and self.run_id == run
@@ -218,6 +289,10 @@ class RobotSession:
         drawn = None
         while self._alive(run):
             now = time.monotonic()
+            if self.replaying:   # a recording renders: the robot stands where the recording puts it
+                last = now
+                time.sleep(0.05)
+                continue
             steps = min(int((now - last) / world.dt), 20)   # real time, at most a second behind
             if steps:
                 with self.lock:
@@ -228,6 +303,12 @@ class RobotSession:
                         robot.spec.apply(robot.state, hw.Twist() if control is None or now - control[1] > CONTROL_TIMEOUT_S else control[0])
                     for _ in range(steps):
                         world.tick()
+                        if self.log is not None:   # a recording logs: every tick, to be rendered again
+                            self.log.append(self._entry())
+                            self.recording.update(ticks=len(self.log), seconds=round(len(self.log) * world.dt, 2))
+                            if len(self.log) >= self.LOG_LIMIT:
+                                self.recording["full"] = True
+                                break
                     last += steps * world.dt if steps < 20 else (now - last)
                     ticks += steps
                     p, t = robot.pose, getattr(robot.state, "twist", None) or hw.Twist()
@@ -282,6 +363,9 @@ class RobotSession:
         threading.Thread(target=self._simulate, args=(run,), name="robot-sim", daemon=True).start()
         turn = 0
         while self._alive(run):
+            if self.replaying:          # the recording renders the sensors itself
+                time.sleep(0.05)
+                continue
             wanted = self.rendering()   # a sensor nobody shows is not rendered
             with self.lock:
                 order = [n for n in self.cameras if n in wanted]
@@ -302,15 +386,18 @@ class RobotSession:
                     camera = self.cameras[name]
                     request = world.request(camera, spp=256 if settled else 16, denoise=not settled, preview=False)
                     view, look = self._sensor_view(request, template, camera.spec.sensor.cfa.startswith("polar_"))
-                    if settled and view.get("mode") == "rgb":   # unpolarized: a pass costs a fifth, and has more outliers
-                        view["spp"] = 1024
-                    spp = int(view["spp"])
+                    # standing still: eight passes, fireflies held back, then the denoiser (clean_render). Unpolarized
+                    # a pass costs a fifth and has more outliers: four times the samples
+                    still_passes = 8
+                    if settled:
+                        view["spp"] = 128 if view.get("mode") == "rgb" else 32
+                    spp = int(view["spp"]) * (still_passes if settled else 1)
                     seq_at = self.pose_seq
                     have = self.frames.get(name, {})
                 if settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at:
                     time.sleep(0.03)
                     continue
-                out = world.client.render([view], "float32")[0]
+                out = clean_render(world.client, view, still_passes) if settled else world.client.render([view], "float32")[0]
                 raw, _ = world.expose(camera, request, out)
                 image = isp.process(raw, isp.Isp(tone="reinhard" if raw.bit_depth > 16 else "srgb"))
                 with self.lock:
@@ -401,6 +488,7 @@ class RobotSession:
             out = {"scene": self.scene, "running": self.running, "spawned": self.robot is not None, "message": self.message,
                    "error": self.error, "map": self.map_info, "sim_rate": round(self.sim_rate, 1),
                    "calibrated": self.calibrated, "config": self.config.summary(),
+                   "recording": {k: v for k, v in self.recording.items() if k != "cancel"},
                    "sensors": [{"name": n, "label": label, "enabled": n in rendering,
                                 "model": self.cameras[n].spec.model if n in self.cameras else "",
                                 **{k: v for k, v in self.frames.get(n, {}).items() if k not in ("jpeg", "look")}}
@@ -450,6 +538,12 @@ def get(handler, robot: RobotSession, parts: list, query: dict) -> None:
     if tail == ["configs"]:
         from .hw import config as robot_config
         return handler._json(200, {"configs": robot_config.available(), "current": robot.config.name})
+    if len(tail) == 2 and tail[0] == "recording" and tail[1].endswith(".mp4"):
+        from .robot_record import FOLDER
+        file = FOLDER / Path(tail[1]).name
+        if not file.is_file():
+            return handler._json(404, {"error": "no such recording"})
+        return handler._send(200, file.read_bytes(), "video/mp4")
     if tail == ["map.png"]:
         with robot.lock:
             png = robot.map_png
@@ -465,6 +559,7 @@ def robot_state(handler, robot: RobotSession) -> dict:
     session = getattr(handler, "viewer_session", None)
     if session is not None:
         out["follow"] = session.follow is not None
+        out["follow_mode"] = None if session.follow is None else "track" if session.follow == "track" else "ride"
     return out
 
 
@@ -485,7 +580,9 @@ def post(handler, robot: RobotSession, parts: list, body: dict) -> None:
     elif tail == ["despawn"] and session is not None:
         session.run("robot", session.despawn_robot)
     elif tail == ["follow"] and session is not None:
-        session.run("robot", session.set_follow, bool(body.get("on")))
+        session.run("robot", session.set_follow, bool(body.get("on")), str(body.get("mode") or "ride"))
+    elif tail == ["record"] and session is not None:
+        session.record(str(body.get("action") or "start"), body)
     else:
         return handler._json(404, {"error": "no such robot route"})
     handler._json(200, robot_state(handler, robot))

@@ -260,6 +260,8 @@ class Session:
         self.polarization = True          # False: the path tracer's plain RGB variant (no Stokes vectors: several times faster)
         self.render_on = True             # False: the editor's own view is not rendered (configure "editor_render"): its last picture stays
         self.pages_seen = False           # a page has connected: from then on, a view nobody watches is not rendered again
+        self.cam_now = (0.0, 0.0, 1.5, 0.0, 0.0)  # the editor camera: x, y, height, heading, elevation (set by every move)
+        self.rec_busy = False             # a recording renders (robot_record): it moves the camera itself
         self.modes: list[str] = ["polar"]  # the render server's modes (main sets them): "rgb" is the unpolarized one
         self.follow: tuple | None = None  # the camera rides with the robot: its place in the robot's frame (set_follow)
         self._local = threading.local()
@@ -417,6 +419,7 @@ class Session:
         self.robot = robot
         robot.view_source = self._view_now
         robot.viewers = self.viewed_sensors
+        robot.editor_pose = lambda: (self.cam_now, self.follow)
         threading.Thread(target=self._watch_robot, name="robot-watch", daemon=True).start()
 
     def viewed_sensors(self) -> set:
@@ -443,18 +446,79 @@ class Session:
             self.robot.despawn()
             self._moved()
 
-    def set_follow(self, on: bool) -> None:
-        """The camera rides with the robot (behind and above it at first; flying moves it to another place on the
-        robot, kept from then on), or stays where it is."""
-        self.follow = self.FOLLOW if on and self.robot is not None and self.robot.pose2d() is not None else None
+    def set_follow(self, on: bool, mode: str = "ride") -> None:
+        """The camera follows the robot, or stays where it is. ``mode`` "ride": it rides with the robot (behind and
+        above it at first; flying moves it to another place on the robot, kept from then on). "track": it stays where
+        it stands and turns to keep the robot in the middle of its view (a camera on a tripod, panned)."""
+        if mode not in ("ride", "track"):
+            raise ValueError("follow mode is 'ride' or 'track'")
+        there = on and self.robot is not None and self.robot.pose2d() is not None
+        self.follow = None if not there else self.FOLLOW if mode == "ride" else "track"
         if self.follow is not None:
             self._ride()
             self._moved()
+
+    @staticmethod
+    def follow_camera(follow, at: tuple, cam: tuple) -> tuple:
+        """(x, y, height, heading, elevation) of a camera following a robot at ``at`` (x, y, z, yaw in radians).
+        ``follow``: a ride's place on the robot (behind, left, above, heading off the robot's, elevation), or "track":
+        the camera stays at ``cam``'s place and looks at the robot (half a metre above its base)."""
+        rx, ry, rz, yaw = at
+        if follow == "track":
+            x, y, z = cam[:3]
+            dx, dy, dz = rx - x, ry - y, rz + 0.5 - z
+            return x, y, z, math.atan2(dx, dy), min(max(math.atan2(dz, math.hypot(dx, dy)), -0.9), 0.9)
+        back, left, above, dh, e = follow
+        return (rx + back * math.cos(yaw) - left * math.sin(yaw), ry + back * math.sin(yaw) + left * math.cos(yaw),
+                rz + above, math.pi / 2 - yaw + dh, e)
+
+    def record(self, action: str, options: dict | None = None) -> None:
+        """A recording of the robot's drive. "start": log every tick from now on. "stop": render what was logged,
+        frame by frame at full quality, and write an MP4 (robot_record.render; ``options``: fps, spp, sensor_spp,
+        sensors, name); the robot's real time holds meanwhile and ``robot.recording`` tells the progress. "cancel":
+        drop the log, or stop the rendering."""
+        from . import robot_record
+        robot, options = self.robot, dict(options or {})
+        if robot is None:
+            raise ValueError("this viewer has no robot")
+        if action == "start":
+            return robot.log_start()
+        if action == "cancel":
+            robot.log_stop()
+            if robot.replaying:
+                robot.recording["cancel"] = True
+            else:
+                robot.recording = {"phase": "idle"}
+            return None
+        if action != "stop":
+            raise ValueError("record action is 'start', 'stop' or 'cancel'")
+        if robot.replaying:
+            raise ValueError("a recording is being rendered")
+        log = robot.log_stop()
+        if len(log) < 2:
+            robot.recording = {"phase": "idle"}
+            raise ValueError("nothing was logged: start the recording, drive, then stop it")
+        kw = {"fps": float(options.get("fps", 20.0)), "spp": int(options.get("spp", 1024)), "sensor_spp": int(options.get("sensor_spp", 512)),
+              "sensors": options.get("sensors"), "name": re.sub(r"[^A-Za-z0-9_.-]+", "_", str(options["name"])) if options.get("name") else None}
+        if not (1.0 <= kw["fps"] <= 60.0 and 16 <= kw["spp"] <= 4096 and 8 <= kw["sensor_spp"] <= 4096):
+            raise ValueError("fps is 1..60, spp 16..4096, sensor_spp 8..4096")
+        robot.recording = {"phase": "rendering", "done": 0, "frames": int(len(log) * robot.world.dt * kw["fps"]) + 1, "seconds": 0.0}
+
+        def work() -> None:
+            try:
+                out = robot_record.render(self, robot, log, **kw)
+                robot.recording = {"phase": "done", "file": out.name, "path": str(out), "frames": robot.recording.get("frames"),
+                                   "seconds": robot.recording.get("seconds"), "size_mb": round(out.stat().st_size / 1e6, 2)}
+            except Exception as exc:  # noqa: BLE001 - shown on the page
+                robot.recording = {"phase": "error", "error": f"{type(exc).__name__}: {exc}"}
+        threading.Thread(target=work, name="recording", daemon=True).start()
 
     def _keep_follow(self) -> None:
         at = self.robot.pose2d() if self.robot is not None else None
         if at is None:
             self.follow = None
+            return
+        if self.follow == "track":   # flown while tracking: it tracks from the new place
             return
         st = self.sim.getState()[0]
         x, y, z = self.free_pose()
@@ -469,13 +533,10 @@ class Session:
         if at is None or self.follow is None:
             self.follow = None
             return
-        rx, ry, rz, yaw = at
-        back, left, above, dh, e = self.follow
         st = self.sim.getState()[0]
-        x = rx + back * math.cos(yaw) - left * math.sin(yaw)
-        y = ry + back * math.sin(yaw) + left * math.cos(yaw)
+        x, y, z, h, e = self.follow_camera(self.follow, at, (*self.free_pose(), st.heading, st.elevation))
         lo, hi = self.height_range(st.scanId)
-        self.sim.teleport([st.scanId], [[x, y, min(max(rz + above, lo), hi)]], [math.pi / 2 - yaw + dh], [e])
+        self.sim.teleport([st.scanId], [[x, y, min(max(z, lo), hi)]], [h], [e])
 
     def _watch_robot(self) -> None:
         """The robot moved (or came, or went): this view holds it, so render it again (as a flown camera does: the
@@ -485,6 +546,9 @@ class Session:
             time.sleep(0.04)
             robot = self.robot
             if robot.pose_seq == seen or not self.started:
+                continue
+            if self.rec_busy:                       # a recording renders: it places the camera for each of its frames
+                seen = robot.pose_seq
                 continue
             if self.pages_seen and not self.subs:   # every page has gone: nobody watches the editor's view, leave it
                 continue                            # (the next page finds the robot moved, and the view follows then)
@@ -655,6 +719,7 @@ class Session:
             if bodies:
                 view["bodies"] = bodies
         pos = st._free_position or (st.location.x, st.location.y)
+        self.cam_now = (*self.free_pose(), float(st.heading), float(st.elevation))
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
             self.trail.append((pos[0], pos[1]))
         height = float(c2w[1, 3])

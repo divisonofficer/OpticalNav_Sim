@@ -953,3 +953,89 @@ def test_a_camera_frame_from_an_unpolarized_render():
     frame = world.frame(request, {"radiance": rad}, ("s0", "s1", "s2"))
     assert frame.s0.shape == (k.height, k.width, 3) and abs(float(frame.s0[k.height // 2, k.width // 2, 0]) - 0.5) < 1e-6
     assert not frame.s1.any() and not frame.s2.any() and frame.s3 is None
+
+
+# --- recordings of the viewer's robot (robot_record.py) --------------------------------------------------------------
+def test_a_drive_is_logged_and_put_back():
+    """A recording logs the robot each tick (pose, wheels, odometry, the editor camera) and replays it exactly."""
+    from opticalnav_sim import robot_view
+    from opticalnav_sim.hw import config
+    session = robot_view.RobotSession("http://127.0.0.1:1", calibration="")
+    with pytest.raises(ValueError):
+        session.log_start()                                        # no robot yet
+    world = hw.World()
+    built = config.spawn(world, session.config, at=hw.pose2d(1.0, 2.0, 0.0, 90.0), name="robot")
+    session.world, session.robot, session.cameras, session.start_pose = world, built.base, dict(built.sensors), built.base.pose
+    session.editor_pose = lambda: ((0.0, 0.0, 1.5, 0.3, -0.2), "track")
+    session.log_start()
+    assert session.state()["recording"]["phase"] == "logging"
+    built.base.spec.apply(built.base.state, hw.RangerControl("ackermann", 0.5, 20.0))
+    log = []
+    for _ in range(30):
+        world.tick()
+        log.append(session._entry())
+    assert log[-1]["t"] > log[0]["t"] and log[0]["cam"] == (0.0, 0.0, 1.5, 0.3, -0.2) and log[0]["follow"] == "track"
+    end_pose, end_steer, cam_end = built.base.pose, built.base.state.steer.copy(), built.sensors["hdr"].world_matrix().copy()
+    session.restore(log[10])
+    mid = built.sensors["hdr"].world_matrix().copy()
+    assert built.base.pose == log[10]["pose"] and not np.allclose(mid, cam_end)                 # the cameras went back with it
+    assert np.allclose(built.base.state.steer, log[10]["state"]["steer"])
+    session.restore(log[-1])
+    assert built.base.pose == end_pose and np.allclose(built.base.state.steer, end_steer) and np.allclose(built.sensors["hdr"].world_matrix(), cam_end)
+    built.base.state.steer[:] = 9.0                                # a log's arrays are its own: the live state does not write into it
+    assert not np.allclose(log[-1]["state"]["steer"], 9.0)
+    # the odometry's place in the world: from the pose the drive started at (facing +y here)
+    assert abs(log[-1]["odometry_xy"][0] - 1.0) < 0.5 and log[-1]["odometry_xy"][1] > 2.3
+    assert session.log_stop() == [] and session.log is None        # the session's own log held nothing (no real-time thread here)
+
+
+def test_clean_render_holds_fireflies_back_before_the_denoiser():
+    """A still sensor frame: eight passes, a pass's pixel far above the others scaled down, then the denoiser."""
+    from opticalnav_sim import robot_view
+
+    class Client:
+        seeds, denoised = [], None
+
+        def render(self, views, dtype):
+            v = views[0]
+            self.seeds.append(v["seed"])
+            img = np.full((6, 8, 3), 0.5, np.float32)
+            if len(self.seeds) == 3:
+                img[2, 3] = 4000.0                                 # one firefly, in one pass
+            return [{"radiance": img, "depth": np.ones((6, 8), np.float32)}]
+
+        def denoise(self, images):
+            self.denoised = sorted(images)
+            return {k: v for k, v in images.items()}
+    client = Client()
+    out = robot_view.clean_render(client, {"scan": "s", "spp": 64, "seed": 7, "denoise": True}, passes=8)
+    assert len(set(client.seeds)) == 8 and client.denoised == ["s0"]
+    assert set(out) >= {"radiance", "depth"} and out["radiance"].shape == (6, 8, 3)
+    assert float(out["radiance"][2, 3].max()) < 1.0               # 4000 in one pass of eight: a plain mean would give 500
+    assert np.allclose(out["radiance"][0, 0], 0.5)
+
+
+def test_recording_frame_layout_and_follow_modes(tmp_path):
+    from opticalnav_sim import gui, robot_record
+    robot = {"x": 2.0, "y": 3.0, "z": 0.0, "yaw_deg": 30.0, "vx": 0.4, "vy": 0.0, "wz": 0.1, "command": [0.5, 0.0, 0.1],
+             "steer_deg": [10.0, 8.0, -10.0, -8.0], "wheel_speed": [0.4] * 4, "mu": [0.6] * 4, "slip": [0.0, 0.1, 0.0, 0.0], "collided": False,
+             "footprint": [[1.6, 2.7], [2.4, 2.7], [2.4, 3.3], [1.6, 3.3]], "material": "epoxy floor"}
+    layout = robot_record.Layout("OpticalNav Sim | scene | robot", ["hdr", "12bit"], None, None, size=(960, 540))
+    editor = np.full((96, 128, 3), 200, np.uint8)
+    images = {"hdr": (np.full((58, 90, 3), 90, np.uint8), "HDR"), "12bit": (np.full((48, 64, 3), 30, np.uint8), "12-bit")}
+    frame = np.asarray(layout.frame(1.25, editor, images, robot, [(1.0, 3.0), (2.0, 3.0)], [(1.0, 3.0), (2.1, 3.0)]))
+    assert frame.shape == (540, 960, 3)
+    assert frame[200, 300].tolist() == [200, 200, 200]            # the editor's view fills the left
+    assert abs(int(frame[120, 800, 0]) - 90) <= 2 and abs(int(frame[330, 800, 0]) - 30) <= 2   # the sensors down the right
+    for k in range(3):
+        layout.frame(k / 20, editor, images, robot, [], []).save(tmp_path / f"frame_{k:05d}.jpg")
+    import shutil
+    if shutil.which("ffmpeg"):
+        robot_record.encode(tmp_path, 20, tmp_path / "out.mp4")
+        assert (tmp_path / "out.mp4").stat().st_size > 1000
+    # the editor camera following a robot at (2, 3) facing +x: riding behind it, or standing where it is and looking at it
+    at = (2.0, 3.0, 0.0, 0.0)
+    x, y, z, h, e = gui.Session.follow_camera(gui.Session.FOLLOW, at, (9.0, 9.0, 9.0, 0.0, 0.0))
+    assert np.allclose([x, y, z], [2.0 + gui.Session.FOLLOW[0], 3.0, gui.Session.FOLLOW[2]]) and abs(h - math.pi / 2) < 1e-9
+    x, y, z, h, e = gui.Session.follow_camera("track", at, (2.0, 0.0, 2.0, 1.0, 0.5))
+    assert (x, y, z) == (2.0, 0.0, 2.0) and abs(h) < 1e-9 and abs(e - math.atan2(0.5 - 2.0, 3.0)) < 1e-9     # heading 0 looks along +y
