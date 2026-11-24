@@ -145,14 +145,20 @@ class SimWorld(World):
                      lens(out.get("s1")), lens(out.get("s2")), lens(out.get("s3")), lens(out.get("depth")),
                      dict(self.client.last_timing))
 
-    def capture(self, camera: Actor, exposure_s: float | None = None, gain_db: float = 0.0, noise: bool = True,
+    def capture(self, camera: Actor, exposure_s: float | None = None, gain_db: float | None = None, noise: bool = True,
                 spp: int | None = None, scale: float | None = None, binning: bool = False, **options) -> tuple:
         """Render a camera and expose its sensor: ``(raw, frame)``. ``raw`` (hw.sensor.Raw) is what the camera delivers:
-        its mosaic, noise, saturation and bit depth; ``hw.isp.process(raw)`` is the image. ``exposure_s`` None: the
-        camera's auto exposure. ``binning``: the rendered pixel is the mean of the sensor pixels it covers (their
-        noise averaged), instead of one pixel of a smaller sensor. ``frame`` keeps the Stokes images the raw was made
-        from (the ground truth)."""
+        its mosaic, noise, saturation and bit depth; ``hw.isp.process(raw)`` is the image.
+
+        The exposure is the camera's own (``camera.state.exposure``: auto exposure, on by default, which follows the
+        scene over the frames captured); ``exposure_s`` / ``gain_db`` given here take this one frame with those
+        instead and leave the camera's setting alone. ``binning``: the rendered pixel is the mean of the sensor pixels
+        it covers (their noise averaged), instead of one pixel of a smaller sensor. ``frame`` keeps the Stokes images
+        the raw was made from (the ground truth)."""
         frame = self.render(camera, spp, scale, **options)
+        if exposure_s is None:
+            exposure_s, auto_gain = camera.state.exposure.next(frame, camera.spec)
+            gain_db = auto_gain if gain_db is None else gain_db
         covered = (camera.spec.sensor.width / frame.intrinsics.width) ** 2 if binning else 1.0
-        return sensor_model.expose(frame, camera.spec, exposure_s, gain_db, noise, seed=self.seed,
+        return sensor_model.expose(frame, camera.spec, exposure_s, gain_db or 0.0, noise, seed=self.seed,
                                    pixels_per_sample=covered), frame

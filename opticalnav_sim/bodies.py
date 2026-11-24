@@ -158,7 +158,11 @@ def build_model(name: str, descriptor: dict, cache: Path | None = None) -> dict:
             file = folder / f"{safe(link)}_{i}.ply"
             if not file.is_file():
                 write_ply(file, v, f)
-            shapes += f'    <shape type="ply">\n      <string name="filename" value="{file}" />\n{mat}    </shape>\n'
+            # A file without normals gets smooth ones (each vertex the mean of its faces): right for a cylinder's side
+            # (its caps have vertices of their own), wrong for flat-sided shapes, whose faces then shade as if bent
+            # and turn black where the bent normal faces away. Those take their faces' normals.
+            flat = '' if vis["shape"] == "cylinder" else '      <boolean name="face_normals" value="true" />\n'
+            shapes += f'    <shape type="ply">\n      <string name="filename" value="{file}" />\n{flat}{mat}    </shape>\n'
         links[link] = f'  <shape type="shapegroup" id="{GROUP_PREFIX}{safe(name)}_{key}__{safe(link)}">\n{shapes}  </shape>\n'
     return {"name": name, "key": key, "links": links}
 

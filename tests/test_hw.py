@@ -303,6 +303,9 @@ def test_rig_calibration_places_the_cameras(tmp_path):
     assert np.abs(on_face[:, 1]).min() >= 0.004 - 1e-9  # nothing on the face inside the 8 mm slot
     model = bodies.build_model("mast", {"links": {"mast": [{"shape": "profile", "size": [0.03, 0.8], "material": list(rigs.ALUMINIUM)}]}}, tmp_path)
     assert 'value="Al"' in model["links"]["mast"] and "blendbsdf" in model["links"]["mast"]
+    assert 'name="face_normals" value="true"' in model["links"]["mast"]  # flat faces: not the smooth normals of a bare PLY
+    wheel = bodies.build_model("w", {"links": {"w": [{"shape": "cylinder", "size": [0.1, 0.05]}]}}, tmp_path)
+    assert "face_normals" not in wheel["links"]["w"]                      # a wheel's side stays round
 
 
 def _frame(spec, s0, s1=None, s2=None, pose=None):
@@ -360,8 +363,43 @@ def test_sensor_follows_the_emva_linear_model():
     assert np.ptp(corrected[8:-8, 8:-8]) < 0.01  # the ISP's shading correction undoes it
     grad = np.repeat(np.linspace(0.01, 1.0, k.width)[None, :, None], k.height, 0).repeat(3, 2)
     t = sensor.auto_exposure(_frame(spec, grad), spec)
-    raw = sensor.expose(_frame(spec, grad), spec, t, noise=False)
-    assert 0.4 < np.percentile(raw.linear(), 99.0) < 0.7 and np.mean(raw.data >= 4095) == 0.0
+    raw = sensor.expose(_frame(spec, grad), spec, t, noise=False, vignette=True)
+    assert abs(raw.linear().mean() - 0.27) < 0.01  # the meter's target: the image's mean at 0.27 of the range
+    assert np.array_equal(sensor.expose(_frame(spec, grad), spec, noise=False).data, raw.data)  # no exposure given: that one
+
+
+def test_auto_exposure_follows_the_scene_over_frames():
+    """On by default; a camera carried from a bright view to a dark one takes a few frames, time first, then gain."""
+    spec = cameras.LucidTRI032S()
+    k = spec.intrinsics()
+    world = hw.World()
+    cam = world.spawn(spec, at=Transform((0.0, 0.0, 1.0)))
+    ae = cam.state.exposure
+    assert ae.auto and ae.exposure_s is None and world.spawn(spec, at=Transform()).state.exposure is not ae
+    bright, dark = (_frame(spec, np.full((k.height, k.width, 3), v)) for v in (0.5, 0.02))
+    t0, g0 = ae.next(bright, spec)
+    assert abs(ae.level(bright, spec, t0, g0) - ae.target) < 1e-3 and g0 == 0.0  # the first frame: already settled
+    assert ae.next(bright, spec) == (t0, g0)                                      # and it stays there
+    seen = [ae.next(dark, spec) for _ in range(12)]
+    levels = [ae.level(dark, spec, t, g) for t, g in seen]
+    assert seen[0] == (t0, g0) and levels[0] < 0.05 * ae.target        # the frame after the change is still at the old setting
+    assert all(b >= a for a, b in zip(levels, levels[1:])) and levels[2] < 0.5 * ae.target  # it climbs, not jumps
+    assert abs(levels[-1] - ae.target) < 0.02
+    t_end, g_end = seen[-1]
+    assert t_end == ae.exposure_limits[1] and 0.0 < g_end <= ae.gain_limits[1]  # the time ran out at its limit: gain made up the rest
+    night = _frame(spec, np.full((k.height, k.width, 3), 1e-6))
+    for _ in range(30):
+        ae.next(night, spec)
+    assert (ae.exposure_s, ae.gain_db) == (ae.exposure_limits[1], ae.gain_limits[1])  # both at their limits, no further
+    # manual: what is set is what is used
+    ae.auto, ae.exposure_s, ae.gain_db = False, 0.002, 3.0
+    assert ae.next(bright, spec) == (0.002, 3.0) and ae.next(dark, spec) == (0.002, 3.0)
+    # an HDR sensor meters its most sensitive readouts: the highlights are left to the others
+    hdr = cameras.LucidTDR054S()
+    kh = hdr.intrinsics()
+    f = _frame(hdr, np.full((kh.height, kh.width, 3), 0.3))
+    raw = sensor.expose(f, hdr, vignette=False, noise=False)
+    assert 0.0005 < raw.linear().mean() < 0.05 and np.mean(raw.data >= raw.white) == 0.0
 
 
 def test_hdr_sensor_is_linear_across_its_readouts():

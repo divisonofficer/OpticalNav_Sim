@@ -100,6 +100,11 @@ IMX250MYR = SensorSpec("Sony IMX250MYR", 2448, 2048, 3.45, 12, "polar_RGGB", "gl
 
 
 @dataclass
+class CameraState:
+    exposure: object
+
+
+@dataclass
 class CameraSpec(Spec):
     kind = "camera"
     sensor: SensorSpec = IMX265
@@ -136,6 +141,12 @@ class CameraSpec(Spec):
 
     def intrinsics(self, scale: float | None = None) -> Intrinsics:
         return self.full_intrinsics().scaled(*self.image_size(scale))
+
+    def make_state(self):
+        """A camera's settings that change while it runs: ``state.exposure`` (hw.sensor.ExposureControl: auto exposure
+        on; set ``auto = False`` and ``exposure_s`` / ``gain_db`` for a fixed exposure)."""
+        from .sensor import ExposureControl
+        return CameraState(ExposureControl())
 
     def link_frames(self, state) -> dict:
         """``camera``: x along the optical axis, origin at the optical centre. ``optical``: OpenCV's frame there."""

@@ -6,8 +6,8 @@ saturation, the analogue-to-digital converter (EMVA 1288's linear camera model).
     image = isp.process(raw)
 
 The simulator's radiance is not in physical units, so one scale is free: ``RESPONSIVITY``, the electrons a second a
-plain 3.45 um pixel behind an f/4 lens collects from radiance 1. ``auto_exposure`` picks the exposure time as a camera
-would; exposures of two cameras of one rig are then in the right ratio (pixel size, f-number, sensitivity).
+plain 3.45 um pixel behind an f/4 lens collects from radiance 1. Auto exposure (``ExposureControl``, on by default)
+sets the exposure time as a camera would; exposures of two cameras of one rig are then in the right ratio (pixel size, f-number, sensitivity).
 """
 from __future__ import annotations
 
@@ -135,26 +135,73 @@ def irradiance(frame, spec, vignette: bool = True) -> np.ndarray:
     return np.maximum(light, 0.0)
 
 
-def auto_exposure(frame, spec, target: float = 0.6, percentile: float = 99.0, limits: tuple = (2e-5, 0.1)) -> float:
-    """The exposure time that puts the ``percentile`` brightest pixel at ``target`` of saturation (of the most
-    sensitive readout's range times 8, on an HDR sensor: its highlights go to the later readouts)."""
-    sensor = spec.sensor
-    level = float(np.percentile(irradiance(frame, spec), percentile)) * responsivity(spec)
-    well = sensor.readouts[0][1] * 8.0 if sensor.readouts else sensor.full_well_e
-    return float(np.clip(target * well / max(level, 1e-12), *limits))
+@dataclass
+class ExposureControl:
+    """A camera's exposure time and gain, and its auto exposure (a machine vision camera's ExposureAuto and GainAuto
+    set to Continuous: on by default here too).
+
+    Each frame is metered (the mean of the image as a share of the sensor's range) and the next frame's exposure moves
+    towards the one that would put that mean at ``target``, by ``1 - damping`` of the way in stops: a camera driven
+    from a bright room into a dark one takes a few frames to follow. The time is used first, up to its limit, then
+    gain. ``auto = False`` holds ``exposure_s`` and ``gain_db`` as set."""
+    auto: bool = True
+    exposure_s: float | None = None      # None: not started (the first frame starts settled, as a running camera is)
+    gain_db: float = 0.0
+    target: float = 0.27                 # LUCID's default target brightness, 70 of 255
+    damping: float = 0.5
+    exposure_limits: tuple = (2.0e-5, 0.03)
+    gain_limits: tuple = (0.0, 24.0)
+
+    def level(self, frame, spec, exposure_s: float, gain_db: float) -> float:
+        """What the meter reads: the mean of the image at this setting (clipped pixels count as full)."""
+        well = spec.sensor.readouts[0][1] * 8.0 if spec.sensor.readouts else spec.sensor.full_well_e
+        signal = irradiance(frame, spec) * responsivity(spec) * exposure_s * 10.0 ** (gain_db / 20.0) / well
+        return float(np.minimum(signal, 1.0).mean())
+
+    def _towards(self, frame, spec, exposure_s: float, gain_db: float, share: float) -> tuple[float, float]:
+        level = max(self.level(frame, spec, exposure_s, gain_db), 1e-9)
+        total = exposure_s * 10.0 ** (gain_db / 20.0) * (self.target / level) ** share   # time x gain: the sensitivity
+        low_gain = 10.0 ** (self.gain_limits[0] / 20.0)
+        t = float(np.clip(total / low_gain, *self.exposure_limits))
+        return t, float(np.clip(20.0 * math.log10(max(total / t, 1e-12)), *self.gain_limits))
+
+    def settle(self, frame, spec) -> tuple[float, float]:
+        """The setting the auto exposure ends at on this frame (as after many frames of the same view)."""
+        t, g = self.exposure_s or 0.005, self.gain_db
+        for _ in range(30):  # clipped highlights make it more than one step
+            t, g = self._towards(frame, spec, t, g, 1.0)
+        return t, g
+
+    def next(self, frame, spec) -> tuple[float, float]:
+        """(exposure, gain) to take ``frame`` with; the setting then moves on for the frame after it."""
+        if not self.auto:
+            if self.exposure_s is None:
+                self.exposure_s = 0.005
+            return self.exposure_s, self.gain_db
+        if self.exposure_s is None:
+            self.exposure_s, self.gain_db = self.settle(frame, spec)
+        used = (self.exposure_s, self.gain_db)
+        self.exposure_s, self.gain_db = self._towards(frame, spec, *used, 1.0 - self.damping)
+        return used
+
+
+def auto_exposure(frame, spec, **settings) -> float:
+    """The exposure time a camera's auto exposure settles at on ``frame`` (ExposureControl's ``settings``)."""
+    return ExposureControl(**settings).settle(frame, spec)[0]
 
 
 def expose(frame, spec, exposure_s: float | None = None, gain_db: float = 0.0, noise: bool = True, vignette: bool = True,
            seed: int | None = 0, pixels_per_sample: float = 1.0) -> Raw:
     """The raw frame a camera delivers of ``frame`` (a SimWorld render at the camera's image size).
 
-    ``exposure_s``: None picks it (``auto_exposure``). ``gain_db``: analogue gain. ``noise`` off gives the mean
+    ``exposure_s``: None is a settled auto exposure (ExposureControl). ``gain_db``: analogue gain. ``noise`` off gives the mean
     (still clipped and quantized). ``pixels_per_sample``: how many sensor pixels are averaged into one rendered pixel
     (binning: 4 for 2x2); the noise of the mean shrinks accordingly. The mosaic is laid over the rendered image: at a
     reduced render size it is a sensor of that size, not a crop of the real one."""
     sensor = spec.sensor
-    if exposure_s is None:
-        exposure_s = auto_exposure(frame, spec)
+    if exposure_s is None:  # a settled auto exposure, gain included
+        exposure_s, auto_gain = ExposureControl().settle(frame, spec)
+        gain_db = gain_db + auto_gain
     rng = np.random.default_rng(seed)
     electrons = irradiance(frame, spec, vignette) * responsivity(spec) * float(exposure_s)
     n = float(pixels_per_sample)
