@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .ground import Ground
 from .transform import Transform
 
 
@@ -85,6 +86,7 @@ class World:
     dt: float = 0.05
     time: float = 0.0
     actors: list = field(default_factory=list)
+    ground: Ground = field(default_factory=Ground)   # heights, obstacles and friction under the robots
 
     def spawn(self, spec: Spec, at: Transform | None = None, attach_to: Actor | None = None, mount: Transform | None = None,
               link: str | None = None, name: str | None = None) -> Actor:
@@ -103,6 +105,8 @@ class World:
         elif name in taken:
             raise ValueError(f"an actor named {name!r} exists")
         actor = Actor(self, spec, name, attach_to, link, mount or Transform(), at or Transform())
+        if hasattr(actor.state, "ground"):
+            actor.state.ground = self.ground
         if attach_to is not None:
             attach_to.link_matrix(link)  # an unknown link fails here, not at the first render
             attach_to.children.append(actor)
@@ -116,6 +120,37 @@ class World:
         if actor.parent is not None:
             actor.parent.children.remove(actor)
 
+    def _on_ground(self, actor: Actor, pose: Transform) -> Transform:
+        """A wheeled base's pose after a step, as the ground allows it: stopped where its footprint would cover
+        something higher than a step (it keeps its place, its speed is dropped), else set on the floor under its
+        wheels: their heights give the base's height and its roll and pitch."""
+        import math
+
+        import numpy as np
+
+        spec, state, ground = actor.spec, actor.state, self.ground
+        if ground.heights is None:
+            state.collided = False
+            return pose
+        yaw = math.radians(pose.rpy_deg[2])
+        c, s = math.cos(yaw), math.sin(yaw)
+        wheels = spec.wheel_xy()
+        # each wheel's contact height: the floor under it, unless that is more than a step from where the wheel stood
+        # (a kerb, a wall, a drop: the wheel does not take it, and the footprint test below stops the robot)
+        last = getattr(state, "contact", None)
+        z = np.array([ground.height(pose.xyz[0] + c * px - s * py, pose.xyz[1] + s * px + c * py,
+                                    near=None if last is None else float(last[i])) for i, (px, py) in enumerate(wheels)])
+        # the plane through the four contact points, in the base's own axes: z = a x + b y + z0
+        a, b, z0 = (float(v) for v in np.linalg.lstsq(np.c_[wheels, np.ones(4)], z, rcond=None)[0])
+        corners = (np.c_[spec.footprint(), np.zeros(4), np.ones(4)] @ pose.matrix().T)[:, :2]
+        if ground.blocked(corners, z0, (a * c - b * s, a * s + b * c), pose.xyz[:2]):
+            state.collided = True
+            state.speed, state.setpoint = np.zeros(4), np.zeros(4)
+            state.twist = type(state.twist)()
+            return actor.pose
+        state.collided, state.contact = False, z
+        return Transform((pose.xyz[0], pose.xyz[1], z0), (math.degrees(math.atan(b)), -math.degrees(math.atan(a)), pose.rpy_deg[2]))
+
     def roots(self) -> list[Actor]:
         return [a for a in self.actors if a.parent is None]
 
@@ -126,7 +161,8 @@ class World:
         """Advance by ``dt`` (default: the world's). Returns the new time."""
         dt = self.dt if dt is None else float(dt)
         for a in self.roots():
-            a.pose = a.spec.step(a.state, a.pose, dt)
+            pose = a.spec.step(a.state, a.pose, dt)
+            a.pose = self._on_ground(a, pose) if hasattr(a.spec, "footprint") else pose
         for a in self.actors:  # attached actors with a state of their own (a pan-tilt head) advance in place
             if a.parent is not None and a.state is not None:
                 a.spec.step(a.state, Transform(), dt)

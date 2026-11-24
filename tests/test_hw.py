@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from opticalnav_sim import bodies, frames, hw  # noqa: E402
+from opticalnav_sim import bodies, frames, groundmap, hw  # noqa: E402
 from opticalnav_sim.hw import Transform, cameras, isp, optics, rigs, robots, sensor  # noqa: E402
 from opticalnav_sim.hw.sim import Frame  # noqa: E402
 from opticalnav_sim.hw.transform import optical_pose  # noqa: E402
@@ -74,12 +74,23 @@ def test_ranger_modes_follow_their_kinematics():
             world.tick()
         return r
 
-    # Ackermann: both axles steer, the turning centre is abreast of the middle: radius (L / 2) / tan(steer)
+    # Ackermann, front and rear: the command is the inner wheel's angle (manual 3.2); the turning centre is abreast of
+    # the middle, (L / 2) / tan(angle) beyond the inner wheels
     r = run(hw.RangerControl("ackermann", 0.5, 20.0))
-    radius = (spec.wheelbase / 2.0) / math.tan(math.radians(20.0))
+    radius = (spec.wheelbase / 2.0) / math.tan(math.radians(20.0)) + spec.track / 2.0
     assert math.isclose(r.state.twist.wz, 0.5 / radius, rel_tol=1e-6) and abs(r.state.twist.vy) < 1e-9
     steer = np.degrees(r.state.steer)
-    assert steer[0] > steer[1] > 0 and np.allclose(steer[2:], -steer[:2])  # inner wheel turned more; rear mirrors front
+    assert math.isclose(steer[0], 20.0, abs_tol=1e-6) and steer[0] > steer[1] > 0 and np.allclose(steer[2:], -steer[:2])
+    # the chassis's own limits: 40 degrees of inner wheel, half speed past 20 degrees; at full lock the body's outer
+    # corner sweeps the manual's minimum turning radius (810 mm)
+    full = hw.RangerControl("ackermann", 1.5, 75.0).twist(spec.wheelbase, spec.track, spec)
+    assert math.isclose(full.vx, 0.75) and math.isclose(full.vx / full.wz, (spec.wheelbase / 2) / math.tan(math.radians(40.0)) + spec.track / 2)
+    centre = full.vx / full.wz
+    assert abs(math.hypot(centre + spec.size[1] / 2.0, spec.size[0] / 2.0) - 0.810) < 0.01
+    assert hw.RangerControl("ackermann", 1.5, 15.0).twist(spec.wheelbase, spec.track, spec).vx == 1.5
+    assert hw.RangerControl("ackermann", 0.5, -20.0).twist(spec.wheelbase, spec.track).wz < 0 < hw.RangerControl("ackermann", -0.5, -20.0).twist(spec.wheelbase, spec.track).wz
+    assert hw.RangerControl("spin", angular=9.0).twist(spec.wheelbase, spec.track, spec).wz == spec.max_spin
+    assert spec.mass == 64.5 + spec.payload and spec.size == (0.738, 0.500, 0.338)
     # oblique: every wheel at the angle, no turn
     r = run(hw.RangerControl("oblique", 0.4, 30.0))
     assert np.allclose(np.degrees(r.state.steer), 30.0) and abs(r.state.twist.wz) < 1e-9
@@ -469,3 +480,213 @@ def test_isp_makes_an_image_and_keeps_saturated_areas_neutral():
     out = isp.process(sensor.expose(_frame(hdr, big), hdr, vignette=False), isp.Isp(tone="reinhard"))
     cols = out[kh.height // 2, ::kh.width // 12, 1].astype(int)
     assert np.all(np.diff(cols) >= 0) and cols[-1] - cols[0] > 150  # five decades in one image, in order
+
+
+G = 9.81
+
+
+def _dynamic(mu=0.6, ground=None, **kw):
+    world = hw.World(dt=0.02, ground=ground or hw.Ground(mu=mu))
+    return world, world.spawn(robots.RangerMini2(dynamics=True, **kw), at=hw.pose2d(0.0, 0.0))
+
+
+def test_wheel_dynamics_keep_the_kinematic_path_when_there_is_grip():
+    wk = hw.World(dt=0.02)
+    rk = wk.spawn(robots.RangerMini2(), at=hw.pose2d(0.0, 0.0))
+    wd, rd = _dynamic(1.0)
+    for r in (rk, rd):
+        r.spec.apply(r.state, hw.RangerControl("ackermann", 0.8, 15.0))
+    for _ in range(250):
+        wk.tick(), wd.tick()
+    assert math.hypot(rk.pose.xyz[0] - rd.pose.xyz[0], rk.pose.xyz[1] - rd.pose.xyz[1]) < 0.06  # 4 m driven
+    assert abs(rk.pose.rpy_deg[2] - rd.pose.rpy_deg[2]) < 1.0 and rd.state.slip.max() < 0.01
+    assert np.allclose(rd.state.odometry[:2], rd.pose.xyz[:2], atol=0.01)  # the wheels did not slip: odometry is right
+    # standing still stays still
+    w, r = _dynamic(0.6)
+    for _ in range(100):
+        w.tick()
+    assert r.pose.xyz == (0.0, 0.0, 0.0) and r.state.twist.vx == 0.0
+
+
+def test_braking_distance_is_set_by_the_friction_coefficient():
+    """Wheels held from v0: the robot slides v0^2 / (2 mu g)."""
+    for mu in (0.6, 0.2, 0.1):
+        w, r = _dynamic(mu)
+        r.spec.apply(r.state, hw.Twist(1.0, 0.0, 0.0))
+        for _ in range(150):
+            w.tick()
+        v0, x0 = r.state.twist.vx, r.pose.xyz[0]
+        assert abs(v0 - 1.0) < 1e-3
+        r.spec.max_accel = 1000.0  # the drives stop the wheels at once
+        r.spec.apply(r.state, hw.Twist())
+        for _ in range(400):
+            w.tick()
+        assert abs(r.state.twist.vx) < 1e-3
+        assert abs((r.pose.xyz[0] - x0) / (v0 * v0 / (2.0 * mu * G)) - 1.0) < 0.03, mu
+
+
+def test_wheels_spin_on_ice_and_odometry_runs_ahead():
+    w, r = _dynamic(0.05, max_accel=20.0)
+    r.spec.apply(r.state, hw.Twist(1.0, 0.0, 0.0))
+    for _ in range(25):
+        w.tick()
+    assert abs(r.state.twist.vx - 0.05 * G * 0.5) < 0.01          # the ground gives mu g, whatever the wheels do
+    assert r.state.speed.mean() > 0.9 and r.state.slip.min() > 0.5   # they are at speed already, sliding
+    assert r.state.odometry[0] > 5.0 * r.pose.xyz[0] > 0.0           # encoders count the spin
+
+
+def test_cornering_is_held_to_the_friction_limit():
+    """The centripetal acceleration of the path never exceeds mu g: past it the tyres slide and the commanded circle
+    at the commanded speed is not what the robot does."""
+    def circle(mu):
+        w, r = _dynamic(mu)
+        r.spec.apply(r.state, hw.RangerControl("ackermann", 1.0, 15.0))
+        pts = []
+        for i in range(700):
+            w.tick()
+            if i >= 500:
+                pts.append(r.pose.xyz[:2])
+        p = np.array(pts)
+        cx, cy, c = np.linalg.lstsq(np.c_[2.0 * p, np.ones(len(p))], (p ** 2).sum(1), rcond=None)[0]
+        return math.sqrt(c + cx * cx + cy * cy), math.hypot(r.state.twist.vx, r.state.twist.vy), float(r.state.slip.max())
+    asked = (0.494 / 2.0) / math.tan(math.radians(15.0)) + 0.364 / 2.0   # 1.10 m: v^2 / R = 0.91 m/s^2
+    radius, speed, slip = circle(0.6)
+    assert abs(radius - asked) < 0.02 and abs(speed - 1.0) < 0.01 and slip < 0.02
+    radius, speed, slip = circle(0.05)                                    # mu g = 0.49 m/s^2: not enough for it
+    assert speed * speed / radius <= 0.05 * G * 1.05 and slip > 0.2
+    assert abs(speed * speed / radius - 1.0 / asked) > 0.3               # not the commanded motion
+
+
+def test_split_grip_turns_the_robot_towards_the_grip_when_braking():
+    ground = hw.Ground(mu=0.8)
+    ground.add_region([(-50.0, 0.0), (50.0, 0.0), (50.0, 50.0), (-50.0, 50.0)], 0.1)   # the left half: slippery
+    w, r = _dynamic(ground=ground)
+    r.spec.apply(r.state, hw.Twist(1.0, 0.0, 0.0))
+    for _ in range(150):
+        w.tick()
+    assert r.state.mu.tolist() == [0.1, 0.8, 0.1, 0.8]   # fl, fr, rl, rr: each wheel its own ground
+    r.spec.max_accel = 1000.0
+    r.spec.apply(r.state, hw.Twist())
+    yaw0 = r.pose.rpy_deg[2]
+    for _ in range(100):
+        w.tick()
+    assert r.pose.rpy_deg[2] - yaw0 < -3.0   # clockwise: the right wheels hold, the left ones slide on
+
+
+def test_ground_friction_from_regions_and_material_names():
+    g = hw.Ground(mu=0.6)
+    assert g.friction(0.0, 0.0) == 0.6
+    g.add_region([(0, 0), (2, 0), (2, 2), (0, 2)], 0.2)
+    g.add_region([(1, 1), (3, 1), (3, 3), (1, 3)], 0.9)   # a later region wins where they overlap
+    assert g.friction(0.5, 0.5) == 0.2 and g.friction(1.5, 1.5) == 0.9 and g.friction(2.5, 0.5) == 0.6
+    assert g.friction(9.0, 9.0, "Gray speckled epoxy floor") == 0.6 and g.friction(9.0, 9.0, "ph11_wet_stain") == 0.33
+    g.set_material("ph11_wet_stain", 0.12)
+    assert g.friction(9.0, 9.0, "ph11_wet_stain") == 0.12 and g.friction(0.5, 0.5, "ph11_wet_stain") == 0.2
+    with pytest.raises(ValueError):
+        g.add_region([(0, 0), (1, 1)], 0.5)
+
+
+def test_base_follows_the_floor_and_stops_at_obstacles():
+    """A height map: a flat floor, a ramp, a wall. The base's height, pitch and roll are its wheels' contact plane."""
+    cell = 0.05
+    x = np.arange(-2.0, 8.0 + 1e-9, cell)
+    y = np.arange(-2.0, 2.0 + 1e-9, cell)
+    heights = np.zeros((len(y), len(x)))
+    heights[:, x >= 2.0] = (x[x >= 2.0] - 2.0) * math.tan(math.radians(8.0))   # an 8 degree ramp from x = 2
+    heights[:, x >= 6.0] = 3.0                                                  # a wall at x = 6
+    ground = hw.Ground(step=0.03)
+    ground.set_height_map(heights, (x[0], y[0]), cell)
+    world = hw.World(dt=0.02, ground=ground)
+    spec = robots.RangerMini2()
+    r = world.spawn(spec, at=hw.pose2d(0.0, 0.0))
+    cam = world.spawn(cameras.LucidTRI032S(), attach_to=r, link="top_plate", mount=Transform((0.0, 0.0, 0.5)))
+    spec.apply(r.state, hw.Twist(1.0, 0.0, 0.0))
+    for _ in range(40):
+        world.tick()
+    assert abs(r.pose.xyz[2]) < 1e-9 and np.allclose(r.pose.rpy_deg[:2], 0.0, atol=1e-9) and not r.state.collided
+    for _ in range(400):
+        if r.pose.xyz[0] >= 4.0:
+            break
+        world.tick()
+    assert r.pose.xyz[0] >= 4.0 and not r.state.collided   # a ramp is floor, not an obstacle
+    # on the ramp: nose up 8 degrees (a negative pitch), the base at the ramp's height under its centre
+    assert abs(r.pose.rpy_deg[1] + 8.0) < 0.6 and abs(r.pose.rpy_deg[0]) < 0.2
+    assert abs(r.pose.xyz[2] - (r.pose.xyz[0] - 2.0) * math.tan(math.radians(8.0))) < 0.02
+    assert cam.world_matrix()[0, 0] < 1.0 and cam.world_matrix()[2, 0] > 0.1   # what it carries tilts with it
+    for _ in range(300):
+        world.tick()
+    front = r.pose.xyz[0] + spec.size[0] / 2.0 * math.cos(math.radians(8.0))
+    assert r.state.collided and 5.8 < front <= 6.0 + cell and r.state.twist.vx == 0.0   # stopped with its nose at the wall
+    spec.apply(r.state, hw.Twist(-0.5, 0.0, 0.0))                                       # and it can back away
+    for _ in range(50):
+        world.tick()
+    assert not r.state.collided and r.pose.xyz[0] < 5.5
+    # off the map is not driven onto
+    edge = world.spawn(robots.RangerMini2(), at=hw.pose2d(0.0, 1.6, 0.0, 90.0), name="edge")
+    edge.spec.apply(edge.state, hw.Twist(1.0, 0.0, 0.0))
+    for _ in range(100):
+        world.tick()
+    assert edge.state.collided and edge.pose.xyz[1] < 2.0 - spec.size[0] / 2.0 + cell
+
+
+def test_material_friction_reads_the_name_then_the_pbr_parameters():
+    f = groundmap.material_friction
+    assert f("asphalt_dark", 0.9, 0.0) == (0.8, "asphalt 0.80")
+    assert f("apron_wet", 0.2, 0.0)[0] == pytest.approx(0.75 * 0.55, abs=1e-3)       # the author's "wet" halves it
+    assert f("paint_yellow_wet")[0] < f("paint_yellow")[0]
+    assert f("icy_patch", 0.1, 0.0)[0] == 0.10
+    assert f("ph27_granite_floor", 0.15, 0.0)[0] < f("ph27_granite_floor", 0.6, 0.0)[0] == 0.55   # a polished finish
+    assert f("some_plate", 0.5, 1.0) == (0.45, "metallic 0.45") and f("thing", 0.5, 0.0)[0] == 0.6
+    assert f("CS02_r003_corrugated_kraft", 0.5, 0.0)[0] == 0.6                          # "corrugated" is not a rug
+    assert "wet" in f("apron_wet", 0.2, 0.0)[1] and "smooth" in f("floor_terrazzo_int", 0.1, 0.0)[1]
+
+
+def _write_scene(folder, shapes):
+    """A scene folder as the converter writes it: base.xml (each shape with its opticalnav-obj comment) and PLY files."""
+    (folder / "assets").mkdir(parents=True)
+    xml = "<scene version=\"3.0.0\">\n"
+    for name, material, alpha, verts, faces in shapes:
+        bodies.write_ply(folder / "assets" / f"{name}.ply", np.asarray(verts, np.float32), np.asarray(faces, np.int32))
+        xml += (f'<!--opticalnav-obj:{{"id":"{name}","material":"{material}"}}-->\n<shape type="ply" id="{name}">\n'
+                f'<string name="filename" value="assets/{name}.ply" />\n<bsdf type="twosided"><bsdf type="pplastic">'
+                f'<float name="alpha" value="{alpha}" /></bsdf></bsdf>\n</shape>\n')
+    (folder / "base.xml").write_text(xml + "</scene>\n")
+
+
+def _quad(x0, x1, y0, y1, z):
+    """A horizontal rectangle in the world (x, y, z up) as Mitsuba vertices (X, Y up, Z = -y)."""
+    return [[x0, z, -y0], [x1, z, -y0], [x1, z, -y1], [x0, z, -y1]], [[0, 1, 2], [0, 2, 3]]
+
+
+def test_ground_map_from_scene_files_gives_heights_obstacles_and_friction(tmp_path):
+    box_v, box_f = bodies.box((0.4, 1.0, 0.4))                      # Mitsuba axes: 0.4 wide, 1.0 tall, 0.4 deep
+    box_v = box_v + np.array([3.0, 0.5, 0.0])                       # a crate standing on the floor at x = 3, y = 0
+    _write_scene(tmp_path, [("floor", "hall_tile", 0.25, *_quad(-1.0, 5.0, -2.0, 2.0, 0.0)),
+                            ("stain", "hall_wet_stain", 0.0025, *_quad(0.5, 1.5, -2.0, 2.0, 0.002)),
+                            ("crate", "crate_wood", 0.25, box_v, box_f)])
+    surfaces = {s["id"]: s for s in groundmap.scene_surfaces(tmp_path)}
+    assert surfaces["floor"]["material"] == "hall_tile" and surfaces["floor"]["roughness"] == pytest.approx(0.5)
+    gm = groundmap.build(tmp_path, floor_z=0.0, top=1.4, cell=0.05)
+    assert gm.friction["hall_tile"]["mu"] == 0.5 and gm.friction["hall_wet_stain"]["mu"] == pytest.approx(0.33)
+    ground = gm.ground()
+    assert ground.material_at(0.0, 0.0) == "hall_tile" and ground.material_at(1.0, 0.0) == "hall_wet_stain"
+    assert ground.friction(0.0, 0.0) == 0.5 and ground.friction(1.0, 0.5) == pytest.approx(0.33)
+    assert abs(ground.height(0.0, 0.0)) < 1e-6 and ground.height(3.0, 0.0) == pytest.approx(1.0, abs=1e-3)   # the crate's top
+    gm.save(tmp_path / "ground.npz")
+    again = groundmap.GroundMap.load(tmp_path / "ground.npz")
+    assert np.array_equal(again.material, gm.material) and again.friction == gm.friction and again.origin == gm.origin
+    # a robot on it: the floor's height, each wheel its own surface, stopped by the crate
+    world = hw.World(dt=0.02, ground=ground)
+    spec = robots.RangerMini2(dynamics=True)
+    r = world.spawn(spec, at=hw.pose2d(0.0, 0.0))
+    spec.apply(r.state, hw.Twist(0.8, 0.0, 0.0))
+    seen = set()
+    for _ in range(400):
+        world.tick()
+        seen.add(tuple(np.round(r.state.mu, 2)))
+        if r.state.collided:
+            break
+    assert (0.33, 0.33, 0.5, 0.5) in seen          # the front wheels on the wet stain, the rear ones still on tile
+    assert r.state.collided and 2.3 < r.pose.xyz[0] + spec.size[0] / 2.0 <= 2.8 + 0.05   # its nose at the crate (x = 2.8)
+    ground.set_material("hall_wet_stain", 0.05)    # an override: the stain is ice now
+    assert ground.friction(1.0, 0.0) == 0.05

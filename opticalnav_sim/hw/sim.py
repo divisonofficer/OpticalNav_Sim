@@ -79,9 +79,51 @@ class SimWorld(World):
             raise ValueError(f"nothing under ({x:.2f}, {y:.2f}, {from_z:.2f}) in {self.scene}")
         return float(from_z) - hit
 
+    def load_ground(self, floor_z: float | None = None, top: float = 1.4, cell: float = 0.05, rebuild: bool = False):
+        """The scene's ground map as this world's ground (heights, obstacles, each surface's friction from the scene's
+        own materials: opticalnav_sim.groundmap). Read from ``<scene>/map/ground.npz`` when it fits, else built from the
+        scene's files (seconds; needs them on this machine) and saved there. ``floor_z``: the floor to stand on
+        (default: the one under the first start pose). Robots then follow the floor, stop at obstacles, and, with
+        ``dynamics``, grip as the surface under each wheel allows."""
+        from pathlib import Path
+
+        from .. import groundmap
+        folder = Path(str(self.meta.get("scene_dir") or ""))
+        if not (folder / "base.xml").is_file():
+            raise FileNotFoundError(f"the files of {self.scene} are not on this machine ({folder}): build the map where they are "
+                                    "(tools/build_ground_map.py) and load it with groundmap.GroundMap.load(...).ground()")
+        spawn = (self.meta.get("spawn") or [{"position": [0.0, 0.0, 1.5]}])[0]["position"]
+        if floor_z is None:
+            probe = groundmap.build(folder, spawn[2] - 1.5, top=0.5, cell=0.25, below=1.0,
+                                    bounds=(spawn[0] - 2, spawn[1] - 2, spawn[0] + 2, spawn[1] + 2))
+            floor_z = float(np.nanmedian(np.where(probe.material >= 0, probe.heights, np.nan)))
+        saved = folder / "map" / "ground.npz"
+        gm = None
+        if saved.is_file() and not rebuild:
+            gm = groundmap.GroundMap.load(saved)
+            if abs(gm.floor_z - floor_z) > 0.02 or gm.cell != cell or gm.top < top:
+                gm = None
+        if gm is None:
+            bounds = (self.meta.get("map") or {}).get("bounds")
+            if bounds is None and self.meta.get("spawn"):
+                p = np.array([s["position"][:2] for s in self.meta["spawn"]])
+                bounds = (p[:, 0].min() - 25, p[:, 1].min() - 25, p[:, 0].max() + 25, p[:, 1].max() + 25)
+            gm = groundmap.build(folder, floor_z, top, cell, bounds)
+            (folder / "map").mkdir(exist_ok=True)
+            gm.save(saved)
+        self.ground = gm.ground(self.ground.step)
+        for a in self.actors:
+            if hasattr(a.state, "ground"):
+                a.state.ground = self.ground
+        return gm
+
     def on_floor(self, x: float, y: float, yaw_deg: float = 0.0, from_z: float | None = None) -> Transform:
-        """A pose standing on the floor at (x, y). ``from_z``: where to look down from (default: the scene's first
-        start pose's height)."""
+        """A pose standing on the floor at (x, y): by the ground map when one is loaded (``load_ground``), else by a ray
+        down through the render server. ``from_z``: where to look down from (default: the scene's first start pose's
+        height)."""
+        if self.ground.heights is not None and from_z is None:
+            z = self.ground.height(x, y, near=self.ground.z)
+            return pose2d(x, y, z, yaw_deg)
         if from_z is None:
             from_z = float((self.meta.get("spawn") or [{"position": [0.0, 0.0, 1.5]}])[0]["position"][2])
         return pose2d(x, y, self.floor_height(x, y, from_z), yaw_deg)
