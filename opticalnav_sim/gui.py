@@ -1568,7 +1568,7 @@ def main() -> int:
                          "entries of it; without it they stand at the configuration's mounts with their datasheet lens")
     ap.add_argument("--robot", default=os.environ.get("OPTICALNAV_ROBOT"),
                     help="the robot a page spawns: a registered configuration's name or the path of its robot.yaml "
-                         "(hw/config.py; default ranger_mini_rig). The page lists the registered ones")
+                         "(hw/config.py; default ranger_mini). The page lists the registered ones")
     ap.add_argument("--token", default=os.environ.get("OPTICALNAV_GUI_TOKEN"),
                     help="required to listen beyond localhost (default $OPTICALNAV_GUI_TOKEN); open /?token=<token>")
     args = ap.parse_args()

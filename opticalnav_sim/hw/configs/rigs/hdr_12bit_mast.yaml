@@ -1,0 +1,30 @@
+# The rig of docs/hardware_platform_plan.md: an 80 cm mast of T-slot extrusions with the LUCID HDR and 12-bit cameras.
+# The mast's dimensions are estimates from a photograph, its mass too.
+kind: rig
+label: 80 cm 마스트 · HDR + 12-bit
+description: 30 mm 프로파일 마스트 0.8 m, LUCID TDR054S(HDR) + TRI032S(12-bit)
+mass: 12.0
+parts:
+  - {name: mast, type: mast, params: {height: 0.80, footprint: [0.20, 0.24], profile: 0.03}}
+  # "mount" is where each camera stands without a measured calibration (side by side, datasheet lens); with one
+  # (calibration.file, or the viewer's --rig-calibration), "calibrated" names its entry there: the intrinsics and the
+  # cameras' poses relative to one another are then the measured ones.
+  - name: hdr
+    type: camera
+    model: lucid_tdr054s             # Sony IMX490, 24-bit HDR; Fujinon HF6XA-5M
+    label: HDR 카메라
+    parent: mast
+    link: top
+    mount: {xyz: [0.10, 0.04, 0.05]}
+    calibrated: {camera: left, size: [1440, 928]}
+  - name: 12bit
+    type: camera
+    model: lucid_tri032s             # Sony IMX265, 12-bit; Fujinon HF6XA-5M
+    label: 12-bit 카메라
+    parent: mast
+    link: top
+    mount: {xyz: [0.10, -0.06, 0.05]}
+    calibrated: {camera: 12_left, size: [1024, 768]}
+calibration:
+  file: $OPTICALNAV_RIG_CALIBRATION  # an OpenCV multi-camera YAML; unset or missing: the mounts above
+  reference: {parent: mast, link: top, mount: {xyz: [0.03, 0.0, 0.14]}}   # the reference camera on the mast: an estimate

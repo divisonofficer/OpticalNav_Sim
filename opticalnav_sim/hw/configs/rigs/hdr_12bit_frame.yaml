@@ -1,0 +1,41 @@
+# A low frame of 20 mm extrusions with the same two cameras, small enough for a TurtleBot 4's sensor plate. Every bar is
+# written out: change them, add or move cameras, and save under another name for another rig. Dimensions and mass: a design,
+# not a measured rig. Origin: the middle of the robot's deck; x forward, y left, z up (metres).
+kind: rig
+label: 낮은 프레임 · HDR + 12-bit
+description: 20 mm 프로파일 프레임 0.25 m, LUCID TDR054S(HDR) + TRI032S(12-bit)
+mass: 1.4
+parts:
+  - name: frame
+    type: frame
+    params:
+      profile: 0.02
+      bars:
+        - {from: [0.06, 0.08, 0.0], to: [0.06, 0.08, 0.25]}         # posts
+        - {from: [0.06, -0.08, 0.0], to: [0.06, -0.08, 0.25]}
+        - {from: [-0.06, 0.08, 0.0], to: [-0.06, 0.08, 0.25]}
+        - {from: [-0.06, -0.08, 0.0], to: [-0.06, -0.08, 0.25]}
+        - {from: [0.06, -0.07, 0.01], to: [0.06, 0.07, 0.01]}       # foot
+        - {from: [-0.06, -0.07, 0.01], to: [-0.06, 0.07, 0.01]}
+        - {from: [-0.05, 0.08, 0.01], to: [0.05, 0.08, 0.01]}
+        - {from: [-0.05, -0.08, 0.01], to: [0.05, -0.08, 0.01]}
+        - {from: [0.06, -0.11, 0.26], to: [0.06, 0.11, 0.26]}       # head: the cameras' bar
+        - {from: [-0.06, -0.07, 0.24], to: [-0.06, 0.07, 0.24]}
+        - {from: [-0.05, 0.08, 0.24], to: [0.05, 0.08, 0.24]}
+        - {from: [-0.05, -0.08, 0.24], to: [0.05, -0.08, 0.24]}
+      points:
+        top: {xyz: [0.06, 0.0, 0.27]}
+  - name: hdr
+    type: camera
+    model: lucid_tdr054s
+    label: HDR 카메라
+    parent: frame
+    link: top
+    mount: {xyz: [0.06, 0.05, 0.02]}
+  - name: 12bit
+    type: camera
+    model: lucid_tri032s
+    label: 12-bit 카메라
+    parent: frame
+    link: top
+    mount: {xyz: [0.06, -0.05, 0.02]}

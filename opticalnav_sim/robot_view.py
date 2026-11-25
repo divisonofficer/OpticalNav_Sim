@@ -9,9 +9,12 @@ on through the render server, with the editor's lighting:
     GET  /api/robot/state                  pose, velocity, odometry, slip and friction per wheel, sensors, messages
     GET  /api/robot/frame/<sensor>.jpg     that sensor's latest image (through its sensor model and ISP)
     GET  /api/robot/map.png                the ground map around the robot: friction (red slippery .. green grippy), obstacles
-    GET  /api/robot/configs                the registered robots (hw.config.available) and the one in use
-    POST /api/robot/spawn    {"config"}    put the robot (that configuration, or the one in use) on the floor in front
-                                           of the editor camera
+    GET  /api/robot/configs                the registered robots and rigs (hw.config), and the ones in use
+    POST /api/robot/config   {"config", "rig"}   another robot, or another rig on it ("none": no rig); a robot that stands
+                                           in the scene is exchanged where it stands
+    GET  /api/robot/rig?name=              a rig's file, as text
+    POST /api/robot/rig      {"name", "text"}    check a rig written by hand, keep it (packs/hardware/rigs) and use it
+    POST /api/robot/spawn    {"config", "rig"}   put the robot on the floor in front of the editor camera
     POST /api/robot/despawn
     POST /api/robot/sensors  {"hdr": true, "12bit": false}       sensors rendered whoever watches (a script's; a page's
                                                                  sub viewers name theirs in its socket subscription:
@@ -32,6 +35,7 @@ import io
 import json
 import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -39,7 +43,7 @@ from pathlib import Path
 import numpy as np
 
 CONTROL_TIMEOUT_S = 0.5      # the Ranger's CAN command timeout: no command for this long stops it
-DEFAULT_CONFIG = "ranger_mini_rig"
+DEFAULT_CONFIG = "ranger_mini"
 # what a sensor's view takes from the editor's: the scene as it is lit and dressed there (and so the same resident
 # scene on the render server: another variant or lighting would not load a second one, but these keep one picture)
 LOOK = ("variant", "lights", "env", "flash_band", "nir", "lighting", "lamps", "flash_scale", "flash_offset", "max_depth",
@@ -80,14 +84,15 @@ class RobotSession:
         from .hw import config as robot_config
         self.server_url, self.client = server_url, client
         self.calibration = calibration or os.environ.get("OPTICALNAV_RIG_CALIBRATION")
-        self.config = robot_config.load(config or os.environ.get("OPTICALNAV_ROBOT") or DEFAULT_CONFIG)   # what the robot is
+        self.source = config or os.environ.get("OPTICALNAV_ROBOT") or DEFAULT_CONFIG   # the robot's name or file
+        self.config = robot_config.load(self.source)     # what it is, with its rig
         self.calibrated = False
         self.lock = threading.RLock()
         self.view_source = None          # () -> the editor's current view (dict) or None: the viewer sets it
         self.viewers = None              # () -> the sensors some page shows now (the viewer sets it): rendered while shown
         self.world = None
         self.robot = None
-        self.cameras: dict = {}          # sensor name -> actor
+        self.sensors: dict = {}          # sensor name -> actor (its spec a hw.sensing.Sensor)
         self.enabled: set = set()        # the sensors switched on by a call (POST /api/robot/sensors): rendered whoever watches
         self.frames: dict = {}           # name -> {"jpeg", "seq", "spp", "exposure_ms", "gain_db", "size", "seconds"}
         self.message, self.error = "", ""
@@ -109,31 +114,59 @@ class RobotSession:
         self._bodies: list = []          # the robot's links as the render server's view field, as of pose_seq
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
-    def use(self, config) -> None:
-        """Another robot (a registered name, or the path of a structure file) for the next spawn."""
+    def use(self, config=None, rig=None) -> None:
+        """Another robot (a registered name, or the path of a structure file; None: the one in use) and another rig on it
+        (None: the robot's own; "none": no rig). A wrong one fails here and changes nothing. A robot that stands in the
+        scene is exchanged where it stands."""
         from .hw import config as robot_config
-        cfg = robot_config.load(config)
+        cfg = robot_config.load(config if config else self.source, rig)
         with self.lock:
+            changed = (cfg.name, cfg.rig, cfg.data) != (self.config.name, self.config.rig, self.config.data)
+            self.source = config if config else self.source
             self.config = cfg
             self.enabled &= {s["name"] for s in cfg.sensors()}
+            there = (self.scene, self.robot.pose) if self.robot is not None and changed else None
+        if there is not None:
+            self._start(there[0], lambda *a: self._build_at(*a, pose=there[1]))
+
+    def save_rig(self, name: str, text: str) -> None:
+        """A rig written by hand: checked on the robot in use (it must build), kept beside the other hardware, and put on."""
+        import yaml
+
+        from . import hw
+        from .hw import config as robot_config, robots
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+            raise ValueError("a rig's name is 1..40 letters, digits, '_' or '-'")
+        if any(f.stem == name for f in (robot_config.BUILTIN / "rigs").glob("*")):
+            raise ValueError(f"{name!r} is a shipped rig: save it under another name")
+        data = yaml.safe_load(text)
+        robot_config.plain_keys(data, "the rig")
+        if not isinstance(data, dict):
+            raise ValueError("the rig's file is a mapping (kind: rig, parts: [...])")
+        robot_config.spawn(hw.World(), self.source, rig=data)
+        folder = Path(robots.MODELS) / "rigs"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{name}.yaml").write_text(text, encoding="utf-8")
+        self.use(rig=name)
 
     def labels(self) -> dict:
         return {s["name"]: s["label"] for s in self.config.sensors()}
 
-    def spawn(self, scene: str, eye, heading: float = 0.0, elevation: float = 0.0, config=None) -> dict:
+    def spawn(self, scene: str, eye, heading: float = 0.0, elevation: float = 0.0) -> dict:
         """Put the robot into ``scene`` on the floor in front of a camera: ``eye`` its (x, y, height), ``heading`` and
         ``elevation`` in radians as MatterSim counts them (heading 0 looks along +y, positive turns right)."""
+        eye = tuple(float(v) for v in eye)
+        return self._start(scene, lambda run, sc: self._build(run, sc, eye, float(heading), float(elevation)))
+
+    def _start(self, scene: str, build) -> dict:
         self.despawn()
-        if config:
-            self.use(config)
         with self.lock:
             self.run_id += 1
             self.scene, self.message, self.error = scene, "로봇을 준비하는 중", ""
             self.frames, self.trail, self.odo_trail, self.map_png, self.map_info = {}, [], [], None, None
             self.running = True
             run = self.run_id
-        threading.Thread(target=self._run, args=(run, scene, tuple(float(v) for v in eye), float(heading), float(elevation)),
-                         name="robot", daemon=True).start()
+        threading.Thread(target=self._run, args=(run, scene, build), name="robot", daemon=True).start()
         return self.state()
 
     def despawn(self) -> None:
@@ -142,7 +175,7 @@ class RobotSession:
             self.run_id += 1
             self.running = False
             self.world = self.robot = None
-            self.cameras, self.frames, self._bodies, self.control = {}, {}, [], None
+            self.sensors, self.frames, self._bodies, self.control = {}, {}, [], None
             self.message = ""
             if had:
                 self.pose_seq += 1
@@ -194,13 +227,27 @@ class RobotSession:
         with self.lock:
             self.message = text
 
+    def _headroom(self) -> float:
+        from .hw import config as robot_config
+        return max(0.3, robot_config.height(self.config) + 0.03)
+
+    def _world(self, scene: str):
+        from . import hw
+        self._say("렌더 서버에 연결하는 중")
+        return hw.SimWorld(self.server_url, scene=scene, spp=16) if self.client is None else \
+            hw.SimWorld(scene=scene, spp=16, client=self.client)
+
+    def _build_at(self, run: int, scene: str, pose) -> None:
+        """The robot at a pose another stood at."""
+        world = self._world(scene)
+        self._say("지면 지도 읽는 중")
+        gm = world.load_ground(floor_z=pose.xyz[2], center=pose.xyz[:2], top=self._headroom())
+        self._map(gm)
+        self._put(run, world, pose.xyz[0], pose.xyz[1], pose.rpy_deg[2])
+
     def _build(self, run: int, scene: str, eye, heading: float, elevation: float) -> None:
         from . import groundmap, hw
-        from .hw import config as robot_config
-
-        self._say("렌더 서버에 연결하는 중")
-        world = hw.SimWorld(self.server_url, scene=scene, spp=16) if self.client is None else \
-            hw.SimWorld(scene=scene, spp=16, client=self.client)
+        world = self._world(scene)
         # the floor under the camera: the scene's own surfaces below it, around where it stands
         self._say("바닥 찾는 중 (씬 파일에서)")
         folder = Path(str(world.meta.get("scene_dir") or ""))
@@ -221,21 +268,25 @@ class RobotSession:
         x, y = eye[0] + ahead * math.sin(heading), eye[1] + ahead * math.cos(heading)
         yaw_deg = math.degrees(hw.transform.yaw_from_heading(heading))
         self._say("지면 지도 만드는 중: 높이·장애물·마찰 (씬 파일의 재질에서, 처음 한 번)")
-        gm = world.load_ground(floor_z=floor_z, center=(x, y))
+        gm = world.load_ground(floor_z=floor_z, center=(x, y), top=self._headroom())
         self._map(gm)
+        self._put(run, world, x, y, yaw_deg)
+
+    def _put(self, run: int, world, x: float, y: float, yaw_deg: float) -> None:
+        from .hw import config as robot_config
         cfg = self.config
         x, y = self._free_spot(world, robot_config.base_spec(cfg), x, y, yaw_deg)
         start = world.on_floor(x, y, yaw_deg)
         # the robot as its configuration lists it: the base, then its lights, masts and cameras on their links
         built = robot_config.spawn(world, cfg, at=start, name="robot",
                                    calibration=self.calibration if self.calibration and Path(self.calibration).is_file() else None)
-        robot, cams = built.base, dict(built.sensors)
+        robot = built.base
         self._say("로봇 모델을 렌더 서버에 올리는 중")
         bodies = world.bodies()   # registers the models
         with self.lock:
             if self.run_id != run:
                 return
-            self.world, self.robot, self.cameras, self.start_pose = world, robot, cams, start
+            self.world, self.robot, self.sensors, self.start_pose = world, robot, dict(built.sensors), start
             self.calibrated = built.calibrated
             self._bodies = bodies
             self.pose_seq += 1
@@ -245,8 +296,9 @@ class RobotSession:
     def _free_spot(world, spec, x: float, y: float, yaw_deg: float) -> tuple[float, float]:
         """(x, y) or the nearest place around it where the robot's footprint is clear (in front of a camera may be a
         table)."""
+        from .hw.drive import Drive
         ground = world.ground
-        if ground.heights is None or not hasattr(spec, "footprint"):
+        if ground.heights is None or not isinstance(spec, Drive):
             return x, y
         c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
         foot = spec.footprint()
@@ -284,7 +336,11 @@ class RobotSession:
         """The robot's own time: the command (or none: the chassis stops 0.5 s after the last one), a tick of the
         world every ``dt`` of real time, the trail. Never waits for an image."""
         from . import hw
+        from .hw.drive import Drive
         world, robot = self.world, self.robot
+        if robot is None:
+            return
+        drives = isinstance(robot.spec, Drive)
         last, ticks, t_rate = time.monotonic(), 0, time.monotonic()
         drawn = None
         while self._alive(run):
@@ -299,7 +355,7 @@ class RobotSession:
                     if self.run_id != run:
                         return
                     control = self.control
-                    if hasattr(robot.spec, "apply"):   # a base that drives
+                    if drives:
                         robot.spec.apply(robot.state, hw.Twist() if control is None or now - control[1] > CONTROL_TIMEOUT_S else control[0])
                     for _ in range(steps):
                         world.tick()
@@ -311,19 +367,18 @@ class RobotSession:
                                 break
                     last += steps * world.dt if steps < 20 else (now - last)
                     ticks += steps
-                    p, t = robot.pose, getattr(robot.state, "twist", None) or hw.Twist()
+                    p, t = robot.pose, robot.state.twist if drives else hw.Twist()
                     if abs(t.vx) + abs(t.vy) + abs(t.wz) > 1e-3:
                         self.moved_at = now
                     # the links as they stand now, for the viewer's own camera: a new sequence number when one moved
-                    stand = np.r_[p.xyz, p.rpy_deg, np.degrees(getattr(robot.state, "steer", np.zeros(0)))]
+                    stand = np.r_[p.xyz, p.rpy_deg, robot.spec.posture(robot.state) if drives else np.zeros(0)]
                     if drawn is None or np.abs(stand[:3] - drawn[:3]).max() > 5e-4 or np.abs(stand[3:] - drawn[3:]).max() > 0.05:
                         drawn = stand
                         self._bodies = world.bodies()
                         self.pose_seq += 1
                     if not self.trail or math.hypot(p.xyz[0] - self.trail[-1][0], p.xyz[1] - self.trail[-1][1]) > 0.02:
                         self.trail.append([round(p.xyz[0], 3), round(p.xyz[1], 3)])
-                        o = getattr(robot.state, "odometry", None)
-                        o = np.zeros(3) if o is None else o
+                        o = robot.state.odometry if drives else np.zeros(3)
                         c, s = math.cos(math.radians(self.start_pose.rpy_deg[2])), math.sin(math.radians(self.start_pose.rpy_deg[2]))
                         self.odo_trail.append([round(self.start_pose.xyz[0] + c * o[0] - s * o[1], 3),
                                                round(self.start_pose.xyz[1] + s * o[0] + c * o[1], 3)])
@@ -332,25 +387,44 @@ class RobotSession:
                 self.sim_rate, ticks, t_rate = ticks / (now - t_rate), 0, now
             time.sleep(max(0.0, world.dt * 0.5 - (time.monotonic() - now)))
 
-    def _sensor_view(self, request: dict, template: dict | None, polarized: bool = False) -> tuple[dict, str]:
-        """The sensor's view with the editor's look, and that look as a key (a still image is of one look).
+    def _sensor_view(self, view: dict, template: dict | None, polarized: bool = False) -> tuple[dict, str]:
+        """A sensor's view with the editor's look, and that look as a key (a still image is of one look).
         ``polarized``: the sensor measures polarization, so its view is a polarized render whatever the editor's is;
         any other sensor takes the editor's mode (unpolarized RGB when polarization is off there: the same resident
         scene as the editor's view, and several times faster)."""
-        view = request["view"]
         if template is not None and template.get("scan") == self.scene:
             for k in LOOK:
                 if k in template:
                     view[k] = template[k]
             if not polarized and template.get("mode") in ("polar", "rgb"):
                 view["mode"] = template["mode"]
-        view["bands"], view["renderer"], view["depth"] = "rgb", "path", False
+        view["bands"] = "rgb"
+        if view.get("renderer") != "depth":
+            view["renderer"], view["depth"] = "path", False
         return view, json.dumps({k: view.get(k) for k in (*LOOK, "mode")}, sort_keys=True, default=str)
 
-    def _run(self, run: int, scene: str, eye, heading: float, elevation: float) -> None:
-        from .hw import isp
+    def sense(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None):
+        """A measurement of a sensor now, with the editor's look: ``(Reading, spp, look)``, or None when ``before(look)``
+        says it is not needed. ``settled``: a clean one (eight passes of ``spp``, fireflies held back, denoised), else
+        one denoised pass. A sensor of geometry alone is one exact render either way. ``client``: the calling thread's own."""
+        with self.lock:   # the poses of this moment
+            world, actor = self.world, self.sensors[name]
+            spec = actor.spec
+            request = spec.request(world, actor, spp=spp, denoise=bool(spec.lit and not settled), preview=False)
+            looks = [self._sensor_view(v, template, spec.polarized) for v in request["views"]]
+        views, look = [v for v, _ in looks], looks[0][1]
+        if before is not None and not before(look):
+            return None
+        client = client or world.client
+        if spec.lit and settled:
+            outs = [clean_render(client, v, 8) for v in views]
+        else:
+            outs = client.render(views, "float32")
+        return spec.read(world, actor, request, outs), (spp * (8 if settled else 1) if spec.lit else 0), look
+
+    def _run(self, run: int, scene: str, build) -> None:
         try:
-            self._build(run, scene, eye, heading, elevation)
+            build(run, scene)
         except Exception as exc:  # noqa: BLE001 - shown on the page
             with self.lock:
                 if self.run_id == run:
@@ -361,6 +435,14 @@ class RobotSession:
             return
         self.moved_at = time.monotonic()
         threading.Thread(target=self._simulate, args=(run,), name="robot-sim", daemon=True).start()
+        # two loops: a depth camera or a LiDAR does not wait for the cameras' light
+        threading.Thread(target=self._measure, args=(run, False), name="robot-geometry", daemon=True).start()
+        self._measure(run, True)
+
+    def _measure(self, run: int, lit: bool) -> None:
+        """Measure the sensors that are shown, in turn: the cameras (``lit``) or those of geometry alone."""
+        from .client import RenderClient
+        client = RenderClient(self.server_url) if self.client is None and not lit else None
         turn = 0
         while self._alive(run):
             if self.replaying:          # the recording renders the sensors itself
@@ -368,7 +450,7 @@ class RobotSession:
                 continue
             wanted = self.rendering()   # a sensor nobody shows is not rendered
             with self.lock:
-                order = [n for n in self.cameras if n in wanted]
+                order = [n for n, a in self.sensors.items() if n in wanted and a.spec.lit == lit]
             if not order:
                 time.sleep(0.05)
                 continue
@@ -380,35 +462,29 @@ class RobotSession:
             settled = time.monotonic() - self.moved_at > 0.6
             try:
                 t0 = time.monotonic()
-                with self.lock:  # the poses of this moment
-                    if self.run_id != run:
-                        return
-                    camera = self.cameras[name]
-                    request = world.request(camera, spp=256 if settled else 16, denoise=not settled, preview=False)
-                    view, look = self._sensor_view(request, template, camera.spec.sensor.cfa.startswith("polar_"))
-                    # standing still: eight passes, fireflies held back, then the denoiser (clean_render). Unpolarized
-                    # a pass costs a fifth and has more outliers: four times the samples
-                    still_passes = 8
-                    if settled:
-                        view["spp"] = 128 if view.get("mode") == "rgb" else 32
-                    spp = int(view["spp"]) * (still_passes if settled else 1)
-                    seq_at = self.pose_seq
-                    have = self.frames.get(name, {})
-                if settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at:
-                    time.sleep(0.03)
-                    continue
-                out = clean_render(world.client, view, still_passes) if settled else world.client.render([view], "float32")[0]
-                raw, _ = world.expose(camera, request, out)
-                image = isp.process(raw, isp.Isp(tone="reinhard" if raw.bit_depth > 16 else "srgb"))
                 with self.lock:
                     if self.run_id != run:
                         return
-                    seq = self.frames.get(name, {}).get("seq", 0) + 1
-                    self.frames[name] = {"jpeg": _jpeg(image), "seq": seq, "spp": spp, "still": settled,
-                                         "look": look, "pose_seq": seq_at,
-                                         "exposure_ms": round(raw.exposure_s * 1e3, 3), "gain_db": round(raw.gain_db, 2),
-                                         "size": [int(image.shape[1]), int(image.shape[0])], "seconds": round(time.monotonic() - t0, 3),
-                                         "model": camera.spec.model, "format": f"{raw.cfa} {raw.bit_depth}-bit"}
+                    spec, seq_at, have = self.sensors[name].spec, self.pose_seq, self.frames.get(name, {})
+                if spec.rate_hz and t0 - have.get("at", 0.0) < 1.0 / spec.rate_hz:   # not due yet
+                    time.sleep(0.01)
+                    continue
+                mode = (template or {}).get("mode")
+                # standing still: eight passes, fireflies held back, then the denoiser (clean_render). Unpolarized a pass
+                # costs a fifth and has more outliers: four times the samples
+                spp = (128 if mode == "rgb" and not spec.polarized else 32) if settled else 16
+                done = self.sense(name, settled, spp, template, lambda look: not (
+                    settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at), client)
+                if done is None:
+                    time.sleep(0.03)
+                    continue
+                reading, shown_spp, look = done
+                with self.lock:
+                    if self.run_id != run:
+                        return
+                    self.frames[name] = {"jpeg": _jpeg(reading.picture), "seq": self.frames.get(name, {}).get("seq", 0) + 1,
+                                         "spp": shown_spp, "still": settled, "look": look, "pose_seq": seq_at, "at": t0,
+                                         "modality": reading.modality, "info": reading.info, "seconds": round(time.monotonic() - t0, 3)}
                     self.error = ""
                     if self.message.startswith("로봇이 든 씬"):
                         self.message = ""
@@ -471,54 +547,43 @@ class RobotSession:
                     self.frames.pop(name, None)
 
     def command(self, body: dict) -> dict:
-        from . import hw
-        mode = str(body.get("mode", "ackermann"))
-        if mode == "twist":
-            control = hw.Twist(float(body.get("vx", 0.0)), float(body.get("vy", 0.0)), float(body.get("wz", 0.0)))
-        else:
-            control = hw.RangerControl(mode, float(body.get("linear", 0.0)), float(body.get("steering_deg", 0.0)), float(body.get("angular", 0.0)))
-            control.twist(0.494)  # an unknown mode fails here, as a 400
+        from .hw import config as robot_config
+        from .hw.drive import Drive
+        with self.lock:
+            spec = self.robot.spec if self.robot is not None else None
+        spec = spec or robot_config.base_spec(self.config)
+        if not isinstance(spec, Drive):
+            raise ValueError(f"{self.config.name} does not drive")
+        control = spec.control(body)   # an unknown mode fails here, as a 400
         with self.lock:
             self.control = (control, time.monotonic())
         return {"ok": True}
 
     def state(self) -> dict:
+        from .hw.drive import Drive
         rendering = self.rendering()
         with self.lock:
             out = {"scene": self.scene, "running": self.running, "spawned": self.robot is not None, "message": self.message,
                    "error": self.error, "map": self.map_info, "sim_rate": round(self.sim_rate, 1),
                    "calibrated": self.calibrated, "config": self.config.summary(),
                    "recording": {k: v for k, v in self.recording.items() if k != "cancel"},
-                   "sensors": [{"name": n, "label": label, "enabled": n in rendering,
-                                "model": self.cameras[n].spec.model if n in self.cameras else "",
-                                **{k: v for k, v in self.frames.get(n, {}).items() if k not in ("jpeg", "look")}}
-                               for n, label in self.labels().items()]}
-            for s, listed in zip(out["sensors"], self.config.sensors()):
-                s["model"] = s["model"] or listed["model"]
+                   "sensors": [{**listed, "enabled": listed["name"] in rendering,
+                                **{k: v for k, v in self.frames.get(listed["name"], {}).items() if k not in ("jpeg", "look", "at")}}
+                               for listed in self.config.sensors()]}
             robot = self.robot
             if robot is None:
                 return out
-            st, p = robot.state, robot.pose
-            spec = robot.spec
+            st, p, spec = robot.state, robot.pose, robot.spec
+            drives = isinstance(spec, Drive)
+            twist = lambda t: [round(t.vx, 3), round(t.vy, 3), round(t.wz, 3)]  # noqa: E731
             c, s = math.cos(math.radians(p.rpy_deg[2])), math.sin(math.radians(p.rpy_deg[2]))
-            if not hasattr(spec, "footprint"):   # a base that does not drive: where it stands
-                out["robot"] = {"x": round(p.xyz[0], 3), "y": round(p.xyz[1], 3), "z": round(p.xyz[2], 3), "yaw_deg": round(p.rpy_deg[2], 2),
-                                "roll_deg": 0.0, "pitch_deg": 0.0, "vx": 0.0, "vy": 0.0, "wz": 0.0, "command": [0.0, 0.0, 0.0],
-                                "steer_deg": [], "wheel_speed": [], "slip": [], "mu": [], "collided": False, "material": None,
-                                "footprint": [[round(p.xyz[0] + dx, 3), round(p.xyz[1] + dy, 3)] for dx, dy in ((-.2, -.2), (.2, -.2), (.2, .2), (-.2, .2))]}
-                out["trail"], out["odometry_trail"] = self.trail[-1500:], self.odo_trail[-1500:]
-                return out
-            foot = spec.footprint()
+            foot = spec.footprint() if drives else np.array([[-.2, -.2], [.2, -.2], [.2, .2], [-.2, .2]])
+            v = twist(st.twist) if drives else [0.0, 0.0, 0.0]
             out["robot"] = {
                 "x": round(p.xyz[0], 3), "y": round(p.xyz[1], 3), "z": round(p.xyz[2], 3), "yaw_deg": round(p.rpy_deg[2], 2),
-                "roll_deg": round(p.rpy_deg[0], 2), "pitch_deg": round(p.rpy_deg[1], 2),
-                "vx": round(st.twist.vx, 3), "vy": round(st.twist.vy, 3), "wz": round(st.twist.wz, 3),
-                "command": [round(st.command.vx, 3), round(st.command.vy, 3), round(st.command.wz, 3)],
-                "steer_deg": [round(float(v), 1) for v in np.degrees(st.steer)],
-                "wheel_speed": [round(float(v), 3) for v in st.speed],
-                "slip": [round(float(v), 3) for v in (st.slip if st.slip is not None else np.zeros(4))],
-                "mu": [round(float(v), 3) for v in (st.mu if st.mu is not None else np.zeros(4))],
-                "collided": bool(st.collided),
+                "roll_deg": round(p.rpy_deg[0], 2), "pitch_deg": round(p.rpy_deg[1], 2), "vx": v[0], "vy": v[1], "wz": v[2],
+                "command": twist(st.command) if drives else [0.0, 0.0, 0.0], "collided": bool(st.collided) if drives else False,
+                "drive": spec.capabilities() if drives else None, "wheels": spec.wheel_report(st) if drives else [],
                 "footprint": [[round(p.xyz[0] + c * fx - s * fy, 3), round(p.xyz[1] + s * fx + c * fy, 3)] for fx, fy in foot],
                 "material": self.world.ground.material_at(p.xyz[0], p.xyz[1]) if self.world is not None else None}
             out["trail"], out["odometry_trail"] = self.trail[-1500:], self.odo_trail[-1500:]
@@ -537,7 +602,15 @@ def get(handler, robot: RobotSession, parts: list, query: dict) -> None:
         return handler._json(200, robot_state(handler, robot))
     if tail == ["configs"]:
         from .hw import config as robot_config
-        return handler._json(200, {"configs": robot_config.available(), "current": robot.config.name})
+        return handler._json(200, {"configs": robot_config.available(), "rigs": robot_config.available_rigs(),
+                                   "current": robot.config.name, "current_rig": robot.config.rig})
+    if tail == ["rig"]:
+        from .hw import config as robot_config
+        file = robot_config.rig_files().get(str(query.get("name") or ""))
+        if file is None:
+            return handler._json(404, {"error": "no such rig"})
+        return handler._json(200, {"name": file.stem, "text": file.read_text(encoding="utf-8"),
+                                   "shipped": file.parent == robot_config.BUILTIN / "rigs"})
     if len(tail) == 2 and tail[0] == "recording" and tail[1].endswith(".mp4"):
         from .robot_record import FOLDER
         file = FOLDER / Path(tail[1]).name
@@ -572,11 +645,13 @@ def post(handler, robot: RobotSession, parts: list, body: dict) -> None:
     if tail == ["sensors"]:
         robot.set_sensors({str(k): bool(v) for k, v in body.items()})
     elif tail == ["spawn"] and session is not None:
-        if body.get("config"):
-            robot.use(str(body["config"]))   # an unknown robot fails here, as a 400
+        if body.get("config") or body.get("rig") is not None:
+            robot.use(body.get("config"), body.get("rig"))   # an unknown one fails here, as a 400
         session.run("robot", session.spawn_robot)
     elif tail == ["config"]:
-        robot.use(str(body["config"]))
+        robot.use(body.get("config"), body.get("rig"))
+    elif tail == ["rig"]:
+        robot.save_rig(str(body.get("name") or ""), str(body.get("text") or ""))
     elif tail == ["despawn"] and session is not None:
         session.run("robot", session.despawn_robot)
     elif tail == ["follow"] and session is not None:

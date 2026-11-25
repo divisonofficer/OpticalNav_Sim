@@ -1,0 +1,81 @@
+# TurtleBot 4 (Standard) on an iRobot Create 3. Sources: the TurtleBot 4 user manual (features: 342 x 339 x 351 mm, 3.945 kg,
+# 72 mm wheels, 4.5 mm clearance, 0.31 m/s safe / 0.46 m/s, 1.90 rad/s, 9 kg payload) and the maker's descriptions
+# (create3.urdf.xacro: track 0.233, caster at x = 0.125, body radius 0.164, mass centre at x = 0.0228;
+# turtlebot4.urdf.xacro: sensor plate 0.347 m up, RPLIDAR and OAK-D places, standoffs).
+# Estimates: acceleration, motor torque, wheel inertia and width. Its body is drawn as simple shapes; with the maker's
+# URDF at hand, replace `visuals` by   urdf: turtlebot4.urdf   joints: {wheels: [left_wheel_joint, right_wheel_joint]}
+# geometry: {wheel_radius: 0.036}   (its meshes as .obj, .ply or .stl).
+name: turtlebot4
+label: TurtleBot 4
+description: TurtleBot 4 Standard (iRobot Create 3 차동 구동), RPLIDAR A1M8, OAK-D Pro
+
+base:
+  type: differential
+  params:
+    track: 0.233
+    wheel_radius: 0.036
+    wheel_width: 0.02
+    casters: [[0.125, 0.0]]
+    radius: 0.171
+    size: [0.342, 0.339, 0.347]      # to the sensor plate; the 351 mm of the manual include what is on it
+    clearance: 0.0045
+    com_xy: [0.0228, 0.0]
+    kerb_mass: 3.945
+    max_payload: 9.0
+    max_speed: 0.31                  # the base's safe mode; 0.46 without it
+    max_spin: 1.90
+    max_accel: 0.9
+    motor_torque: 1.0
+    wheel_inertia: 0.0004
+    dynamics: true
+  mounts:
+    deck: {link: base_link, mount: {xyz: [0.0, 0.0, 0.347]}}            # the sensor plate
+    shell: {link: base_link, mount: {xyz: [0.0, 0.0, 0.0942]}}          # shell_link
+  visuals:
+    - {shape: cylinder, axis: z, size: [0.164, 0.072], xyz: [0, 0, 0.0475], material: plastic, color: [0.75, 0.76, 0.77], roughness: 0.4}   # Create 3
+    - {shape: cylinder, axis: z, size: [0.171, 0.028], xyz: [0, 0, 0.045], material: plastic, color: [0.06, 0.06, 0.065], roughness: 0.5}   # bumper
+    - {shape: cylinder, axis: z, size: [0.155, 0.055], xyz: [0, 0, 0.111], material: plastic, color: [0.05, 0.05, 0.055], roughness: 0.45}  # shell
+    - {shape: cylinder, axis: z, size: [0.155, 0.006], xyz: [0, 0, 0.344], material: plastic, color: [0.05, 0.05, 0.055], roughness: 0.35}  # sensor plate
+    - {shape: cylinder, axis: z, size: [0.005, 0.205], xyz: [0.03063, 0.11431, 0.2395], material: metal, color: [0.7, 0.7, 0.72], roughness: 0.3}
+    - {shape: cylinder, axis: z, size: [0.005, 0.205], xyz: [0.03063, -0.11431, 0.2395], material: metal, color: [0.7, 0.7, 0.72], roughness: 0.3}
+    - {shape: cylinder, axis: z, size: [0.005, 0.205], xyz: [-0.07607, 0.09066, 0.2395], material: metal, color: [0.7, 0.7, 0.72], roughness: 0.3}
+    - {shape: cylinder, axis: z, size: [0.005, 0.205], xyz: [-0.07607, -0.09066, 0.2395], material: metal, color: [0.7, 0.7, 0.72], roughness: 0.3}
+    - {shape: box, size: [0.012, 0.05, 0.11], xyz: [-0.075, 0, 0.19], material: plastic, color: [0.05, 0.05, 0.055]}                        # camera bracket
+
+parts:
+  - name: lidar
+    type: lidar
+    label: RPLIDAR A1M8
+    link: shell
+    mount: {xyz: [-0.04, 0.0, 0.0987]}
+    params:                          # 0.15-12 m, 1 degree at 5.5 Hz, error under 1% of the distance
+      samples: 360
+      range_m: [0.15, 12.0]
+      noise_share: 0.005
+      rate_hz: 5.5
+      body_mm: [76.0, 41.0]
+      model: RPLIDAR A1M8
+  - name: depth
+    type: depth
+    label: OAK-D Pro 깊이
+    link: base_link
+    mount: {xyz: [-0.05, 0.0, 0.2436]}
+    params:                          # 1280 x 800, HFOV 80 degrees, baseline 75 mm; closest 0.8 m without extended disparity
+      width: 1280
+      height: 800
+      hfov_deg: 80.0
+      range_m: [0.8, 12.0]
+      baseline_m: 0.075
+      disparity_noise_px: 0.2        # estimate
+      render_scale: 0.4
+      body_mm: [97.0, 29.5, 23.0]
+      model: OAK-D Pro
+  - name: oak_rgb
+    type: camera
+    label: OAK-D Pro 컬러
+    model: oak_d_pro_rgb
+    link: base_link
+    mount: {xyz: [-0.048, 0.0, 0.2436]}
+    params: {drawn: false}           # in the depth camera's housing
+
+rig: none

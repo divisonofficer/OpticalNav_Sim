@@ -9,7 +9,6 @@ and encoded with ffmpeg. A live drive is noisy (16 samples, as fast as it comes)
 """
 from __future__ import annotations
 
-import copy
 import io
 import math
 import shutil
@@ -57,6 +56,9 @@ def _fit(image: np.ndarray, width: int, height: int):
     k = min(width / im.width, height / im.height)
     size = (max(1, round(im.width * k)), max(1, round(im.height * k)))
     return im.resize(size, Image.LANCZOS), ((width - size[0]) // 2, (height - size[1]) // 2)
+
+
+WHEEL_NAMES = {"fl": "front left", "fr": "front right", "rl": "rear left", "rr": "rear right", "left": "left", "right": "right"}
 
 
 class Layout:
@@ -140,14 +142,17 @@ class Layout:
         d.text((32, y + 4), f"{speed:4.2f} m/s", font=f["big"], fill=INK)
         d.text((32, y + 44), f"yaw rate {robot['wz']:+5.2f} rad/s", font=f["mono"], fill=MUTED)
         d.text((32, y + 70), f"command  vx {robot['command'][0]:+4.2f}  vy {robot['command'][1]:+4.2f}  w {robot['command'][2]:+4.2f}", font=f["mono"], fill=MUTED)
-        cols = [("wheel", ["front left", "front right", "rear left", "rear right"]),
-                ("steer", [f"{v:+6.1f} deg" for v in robot["steer_deg"]]), ("speed", [f"{v:+5.2f} m/s" for v in robot["wheel_speed"]]),
-                ("friction", [f"{v:4.2f}" for v in robot["mu"]]), ("slip", [f"{v:5.3f} m/s" for v in robot["slip"]])]
+        wheels = robot["wheels"][:4]
+        cols = [("wheel", [WHEEL_NAMES.get(w["name"], w["name"]) for w in wheels])]
+        if any(w["steer_deg"] is not None for w in wheels):
+            cols.append(("steer", [f"{w['steer_deg']:+6.1f} deg" for w in wheels]))
+        cols += [("speed", [f"{w['speed']:+5.2f} m/s" for w in wheels]), ("friction", [f"{w['mu']:4.2f}" for w in wheels]),
+                 ("slip", [f"{w['slip']:5.3f} m/s" for w in wheels])]
         x = 470
         for head, values in cols:
             d.text((x, y), head, font=f["small"], fill=MUTED)
-            for i, v in enumerate(values[:4]):
-                hot = head == "slip" and i < len(robot["slip"]) and robot["slip"][i] > 0.05
+            for i, v in enumerate(values):
+                hot = head == "slip" and wheels[i]["slip"] > 0.05
                 d.text((x, y + 23 + 20 * i), v, font=f["mono"], fill=WARM if hot else INK)
             x += 190 if head == "wheel" else 170
         d.text((x + 20, y), "floor", font=f["small"], fill=MUTED)
@@ -191,15 +196,12 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
     ``sensors``: the sensors in the video (default: all the robot has). The robot's real time is held meanwhile;
     ``robot.recording`` tells the progress. Measured on CS02, unpolarized: the denoiser does not remove fireflies, so
     128 samples leave white specks in every frame; 1024 samples with the hold-back are clean."""
-    from .hw import isp
-    from .robot_view import clean_render
-    from .hw.sensor import ExposureControl
     if len(log) < 2:
         raise ValueError("nothing was logged: start the recording, drive, then stop it")
     world, base = robot.world, robot.robot
     if world is None or base is None:
         raise ValueError("the robot is gone")
-    names = [n for n in (sensors if sensors is not None else list(robot.cameras)) if n in robot.cameras]
+    names = [n for n in (sensors if sensors is not None else list(robot.sensors)) if n in robot.sensors]
     t0 = log[0]["t"]
     times = np.arange(0.0, log[-1]["t"] - t0 + 1e-9, 1.0 / fps)
     stamps = np.array([e["t"] - t0 for e in log])
@@ -210,7 +212,7 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
     layout = Layout(f"OpticalNav Sim  |  {robot.scene}  |  {robot.config.label}", names, robot.map_png, robot.map_info)
     labels = robot.labels()
     kept = {"target": session.target_spp, "denoise": session.sim.denoise, "render_on": session.render_on, "follow": session.follow,
-            "cam": session.cam_now, "exposure": {n: robot.cameras[n].state.exposure for n in names}}
+            "cam": session.cam_now, "sensors": {n: robot.sensors[n].state for n in names}}
     frames_dir = Path(tempfile.mkdtemp(prefix="opticalnav_rec_"))
     started = time.time()
     robot.replaying = session.rec_busy = True
@@ -219,8 +221,8 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
             session.follow = None
             session.target_spp, session.render_on = spp, True
             session.sim.setDenoiser(True)
-        for n in names:   # each camera's exposure settles on the first frame again, then follows the drive
-            robot.cameras[n].state.exposure = ExposureControl()
+        for n in names:   # each sensor starts fresh: a camera's exposure settles on the first frame, then follows the drive
+            robot.sensors[n].state = robot.sensors[n].spec.make_state()
         trail, odometry = [], []
 
         def frame_of(e: dict):
@@ -230,11 +232,6 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
                 robot._bodies = world.bodies()
                 robot.pose_seq += 1
                 state = robot.state()["robot"]
-                requests = {}
-                for n in names:
-                    cam = robot.cameras[n]
-                    req = world.request(cam, spp=max(1, int(sensor_spp) // 8), denoise=False, preview=False)
-                    requests[n] = (cam, req)
             # the editor camera of that moment: where it was, or where its following of the robot puts it
             at = (state["x"], state["y"], state["z"], math.radians(state["yaw_deg"]))
             x, y, z, h, el = session.follow_camera(e["follow"], at, e["cam"]) if e["follow"] is not None else e["cam"]
@@ -248,19 +245,16 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
             if editor.dtype != np.uint8:
                 editor = np.clip(np.rint(editor * (255.0 if editor.max() <= 1.0 else 1.0)), 0, 255).astype(np.uint8)
             images = {}
-            for n, (cam, req) in requests.items():
-                view, _ = robot._sensor_view(req, session._view_now(), cam.spec.sensor.cfa.startswith("polar_"))
-                raw, _ = world.expose(cam, req, clean_render(world.client, view, 8))
-                image = isp.process(raw, isp.Isp(tone="reinhard" if raw.bit_depth > 16 else "srgb"))
-                gain = f" +{raw.gain_db:.1f} dB" if raw.gain_db > 0.05 else ""
-                images[n] = (image, f"{labels.get(n, n)}  |  {cam.spec.model}  |  {raw.exposure_s * 1e3:.1f} ms{gain}")
+            for n in names:
+                reading, _, _ = robot.sense(n, True, max(1, int(sensor_spp) // 8), session._view_now())
+                images[n] = (reading.picture, "  |  ".join([labels.get(n, n), *(v for k, v in reading.info.items() if k in ("model", "exposure", "range"))]))
             return state, editor, images
 
         retries = 0
         for k, (t, i) in enumerate(zip(times, picks)):
             if robot.recording.get("cancel"):
                 raise RuntimeError("cancelled")
-            exposures = {n: copy.copy(robot.cameras[n].state.exposure) for n in names}   # a frame done twice meters once
+            before = {n: robot.sensors[n].spec.snapshot(robot.sensors[n].state) for n in names}   # a frame done twice meters once
             for attempt in range(6):
                 try:
                     state, editor, images = frame_of(log[i])
@@ -270,8 +264,8 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
                         raise
                     retries += 1
                     robot.recording.update(waiting=f"{type(exc).__name__}: {str(exc)[:120]}", retries=retries)
-                    for n, exposure in exposures.items():
-                        robot.cameras[n].state.exposure = copy.copy(exposure)
+                    for n, snap in before.items():
+                        robot.sensors[n].spec.restore(robot.sensors[n].state, snap)
                     _wait_for_server(world.client, 600.0)
                     robot.reregister()   # a restarted server knows no body models
                     robot.recording.pop("waiting", None)
@@ -285,8 +279,9 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
         encode(frames_dir, fps, out)
         return out
     finally:
-        for n, exposure in kept["exposure"].items():
-            robot.cameras[n].state.exposure = exposure
+        for n, state in kept["sensors"].items():
+            if n in robot.sensors:
+                robot.sensors[n].state = state
         with robot.lock:
             robot.restore(log[-1])   # where the drive ended: the robot's real time goes on from there
             if robot.world is not None:

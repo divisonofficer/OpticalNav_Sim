@@ -87,7 +87,8 @@ class SimWorld(World):
         """The scene's ground map as this world's ground (heights, obstacles, each surface's friction from the scene's
         own materials: opticalnav_sim.groundmap). Read from ``<scene>/map/ground.npz`` when it fits, else built from the
         scene's files (seconds; needs them on this machine) and saved there. ``floor_z``: the floor to stand on
-        (default: the one under the first start pose); ``around``: metres mapped around the scene's start poses, or
+        (default: the one under the first start pose); ``top``: how high an obstacle matters, the robot's height (a low
+        robot passes under a table); ``around``: metres mapped around the scene's start poses, or
         around ``center`` (x, y) when one is given (a robot put down elsewhere: a scene's own map can span a campus).
         Robots then follow the floor, stop at obstacles, and, with ``dynamics``, grip as the surface under each wheel
         allows."""
@@ -112,11 +113,12 @@ class SimWorld(World):
             bounds = [p[:, 0].min() - around, p[:, 1].min() - around, p[:, 0].max() + around, p[:, 1].max() + around]
         if bounds is not None and whole:
             bounds = [max(bounds[0], whole[0]), max(bounds[1], whole[1]), min(bounds[2], whole[2]), min(bounds[3], whole[3])]
-        saved = folder / "map" / "ground.npz"
+        top = math.ceil(top * 10.0 - 1e-6) / 10.0      # one map per 10 cm of robot
+        saved = folder / "map" / ("ground.npz" if top == 1.4 else f"ground_{top:.1f}m.npz")
         gm = None
         if saved.is_file() and not rebuild:
             gm = groundmap.GroundMap.load(saved)
-            fits = gm.cell == cell and gm.top >= top
+            fits = gm.cell == cell and abs(gm.top - top) < 1e-6
             if center is None:
                 fits = fits and abs(gm.floor_z - floor_z) <= 0.02 and gm.meta.get("around") == around and not gm.meta.get("center")
             else:   # a map made for another place does while it holds this one with room to drive (or to the scene's edge)
@@ -136,10 +138,7 @@ class SimWorld(World):
                 gm.meta["center"] = [float(center[0]), float(center[1])]
             (folder / "map").mkdir(exist_ok=True)
             gm.save(saved)
-        self.ground = gm.ground(self.ground.step)
-        for a in self.actors:
-            if hasattr(a.state, "ground"):
-                a.state.ground = self.ground
+        self.set_ground(gm.ground(self.ground.step))
         return gm
 
     def on_floor(self, x: float, y: float, yaw_deg: float = 0.0, from_z: float | None = None) -> Transform:
@@ -155,8 +154,6 @@ class SimWorld(World):
 
     # --- bodies ---------------------------------------------------------------------------------------------------
     def _model(self, spec: Spec) -> tuple[str, dict] | None:
-        if not hasattr(spec, "visuals"):
-            return None
         if id(spec) not in self._models:
             links = {link: [_visual_dict(v) for v in vs] for link, vs in spec.visuals().items()}
             # named by what is drawn too: two lamps of one model with other colours are two models
@@ -242,6 +239,11 @@ class SimWorld(World):
         the raw was made from (the ground truth)."""
         request = self.request(camera, spp, scale, **options)
         return self.expose(camera, request, self.client.render([request["view"]], "float32")[0], exposure_s, gain_db, noise, binning)
+
+    def sense(self, actor: Actor, **quality):
+        """A measurement of any sensor now (hw.sensing.Reading): its request, the render, its reading."""
+        request = actor.spec.request(self, actor, **quality)
+        return actor.spec.read(self, actor, request, self.client.render(request["views"], "float32"))
 
     def expose(self, camera: Actor, request: dict, out: dict, exposure_s: float | None = None, gain_db: float | None = None,
                noise: bool = True, binning: bool = False) -> tuple:

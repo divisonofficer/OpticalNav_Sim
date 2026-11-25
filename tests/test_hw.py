@@ -724,15 +724,15 @@ def test_robot_routes_sensors_and_commands():
     assert session.frame("hdr") is None
     # a sensor's view takes the editor's look (its lighting, its variant), but is always the path tracer's RGB
     session.scene = "scene"
-    view, look = session._sensor_view({"view": {"scan": "scene", "variant": "base", "spp": 16}},
+    view, look = session._sensor_view({"scan": "scene", "variant": "base", "spp": 16},
                                       {"scan": "scene", "variant": "perturbed", "lighting": "all", "bands": "both", "renderer": "raster", "width": 9})
     assert view["variant"] == "perturbed" and view["lighting"] == "all" and view["bands"] == "rgb" and view["renderer"] == "path"
     assert "width" not in view and view["depth"] is False and "perturbed" in look
     # polarization off in the editor: a plain camera renders unpolarized too (one resident scene), a polarization camera does not
-    plain, _ = session._sensor_view({"view": {"scan": "scene", "mode": "polar"}}, {"scan": "scene", "mode": "rgb"})
-    polar, _ = session._sensor_view({"view": {"scan": "scene", "mode": "polar"}}, {"scan": "scene", "mode": "rgb"}, polarized=True)
+    plain, _ = session._sensor_view({"scan": "scene", "mode": "polar"}, {"scan": "scene", "mode": "rgb"})
+    polar, _ = session._sensor_view({"scan": "scene", "mode": "polar"}, {"scan": "scene", "mode": "rgb"}, polarized=True)
     assert plain["mode"] == "rgb" and polar["mode"] == "polar"
-    other, _ = session._sensor_view({"view": {"scan": "scene", "variant": "base"}}, {"scan": "elsewhere", "variant": "perturbed"})
+    other, _ = session._sensor_view({"scan": "scene", "variant": "base"}, {"scan": "elsewhere", "variant": "perturbed"})
     assert other["variant"] == "base"                                      # the editor shows another scene: not its look
 
     class Fake:
@@ -861,7 +861,7 @@ def test_robot_from_a_structure_file(tmp_path, monkeypatch):
     folder = _cart(tmp_path)
     monkeypatch.setenv("OPTICALNAV_ROBOTS", str(tmp_path))
     names = [r["name"] for r in config.available()]
-    assert "cart" in names and "ranger_mini_rig" in names              # the one beside it, and the one shipped
+    assert "cart" in names and "ranger_mini" in names and "turtlebot4" in names              # the one beside it, and the one shipped
     cfg = config.load("cart")
     assert cfg.label == "A cart" and [s["name"] for s in cfg.sensors()] == ["front", "polar"]
     assert cfg.sensors()[0] == {"name": "front", "label": "Front camera", "type": "camera", "model": "LUCID TRI032S"}
@@ -909,7 +909,7 @@ def test_robot_from_a_structure_file(tmp_path, monkeypatch):
 def test_shipped_ranger_configuration_is_the_rig():
     """The Ranger Mini with its rig comes from its structure file: two lamps in the front face, the mast, two cameras."""
     from opticalnav_sim.hw import config
-    cfg = config.load("ranger_mini_rig")
+    cfg = config.load("ranger_mini")
     assert [(p["name"], p["type"]) for p in cfg.parts()] == [("headlight_left", "light"), ("headlight_right", "light"), ("mast", "mast"),
                                                              ("hdr", "camera"), ("12bit", "camera")]
     robot = config.spawn(hw.World(), cfg)
@@ -965,7 +965,7 @@ def test_a_drive_is_logged_and_put_back():
         session.log_start()                                        # no robot yet
     world = hw.World()
     built = config.spawn(world, session.config, at=hw.pose2d(1.0, 2.0, 0.0, 90.0), name="robot")
-    session.world, session.robot, session.cameras, session.start_pose = world, built.base, dict(built.sensors), built.base.pose
+    session.world, session.robot, session.sensors, session.start_pose = world, built.base, dict(built.sensors), built.base.pose
     session.editor_pose = lambda: ((0.0, 0.0, 1.5, 0.3, -0.2), "track")
     session.log_start()
     assert session.state()["recording"]["phase"] == "logging"
@@ -1018,7 +1018,7 @@ def test_clean_render_holds_fireflies_back_before_the_denoiser():
 def test_recording_frame_layout_and_follow_modes(tmp_path):
     from opticalnav_sim import gui, robot_record
     robot = {"x": 2.0, "y": 3.0, "z": 0.0, "yaw_deg": 30.0, "vx": 0.4, "vy": 0.0, "wz": 0.1, "command": [0.5, 0.0, 0.1],
-             "steer_deg": [10.0, 8.0, -10.0, -8.0], "wheel_speed": [0.4] * 4, "mu": [0.6] * 4, "slip": [0.0, 0.1, 0.0, 0.0], "collided": False,
+             "wheels": [{"name": n, "label": n, "steer_deg": a, "speed": 0.4, "slip": 0.0, "mu": 0.6} for n, a in zip(("fl", "fr", "rl", "rr"), (10.0, 8.0, -10.0, -8.0))], "collided": False,
              "footprint": [[1.6, 2.7], [2.4, 2.7], [2.4, 3.3], [1.6, 3.3]], "material": "epoxy floor"}
     layout = robot_record.Layout("OpticalNav Sim | scene | robot", ["hdr", "12bit"], None, None, size=(960, 540))
     editor = np.full((96, 128, 3), 200, np.uint8)
@@ -1039,3 +1039,269 @@ def test_recording_frame_layout_and_follow_modes(tmp_path):
     assert np.allclose([x, y, z], [2.0 + gui.Session.FOLLOW[0], 3.0, gui.Session.FOLLOW[2]]) and abs(h - math.pi / 2) < 1e-9
     x, y, z, h, e = gui.Session.follow_camera("track", at, (2.0, 0.0, 2.0, 1.0, 0.5))
     assert (x, y, z) == (2.0, 0.0, 2.0) and abs(h) < 1e-9 and abs(e - math.atan2(0.5 - 2.0, 3.0)) < 1e-9     # heading 0 looks along +y
+
+
+# --- other robots: the differential drive, the TurtleBot 4 ------------------------------------------------------------
+def _diff(**kw):
+    from opticalnav_sim.hw import drive
+    kw = {"track": 0.3, "wheel_radius": 0.05, "max_speed": 1.0, "max_spin": 4.0, "max_accel": 100.0, "casters": ((0.12, 0.0),), "radius": 0.2,
+          "size": (0.4, 0.4, 0.3), "kerb_mass": 10.0, **kw}
+    world = hw.World(dt=0.02)
+    return world, world.spawn(drive.DifferentialDrive(**kw), at=hw.pose2d(0.0, 0.0))
+
+
+def test_differential_drive_kinematics_and_limits():
+    world, r = _diff()
+    spec = r.spec
+    spec.apply(r.state, hw.Twist(0.5, 0.3, 1.0))                    # sideways is not something it does
+    assert r.state.command.vy == 0.0
+    for _ in range(100):
+        world.tick()
+    # an arc of radius v/w = 0.5 m for 2 s: 2 rad
+    assert np.allclose([*r.pose.xyz[:2], math.radians(r.pose.rpy_deg[2])], [0.5 * math.sin(2.0), 0.5 * (1 - math.cos(2.0)), 2.0], atol=2e-2)
+    assert np.allclose(r.state.speed, [0.5 - 0.15, 0.5 + 0.15])     # left slower in a left turn
+    assert np.allclose(r.state.odometry[:2], r.pose.xyz[:2], atol=1e-9)
+    spec.apply(r.state, hw.Twist(2.0, 0.0, 4.0))                    # over the top speed: the same curve, slower
+    assert abs(r.state.command.vx / r.state.command.wz - 0.5) < 1e-9 and abs(r.state.command.vx + r.state.command.wz * 0.15 - 1.0) < 1e-9
+    assert [w["steer_deg"] for w in spec.wheel_report(r.state)] == [None, None] and not spec.capabilities()["lateral"]
+    assert spec.control({"mode": "drive", "forward": 1, "turn": 0, "side": 1, "speed": 0.4}) == hw.Twist(0.4, 0.0, 0.0)
+    with pytest.raises(ValueError):
+        spec.control({"mode": "ackermann", "linear": 0.5})          # a Ranger's mode
+    assert "steer_left" not in spec.link_frames(None) and {"wheel_left", "wheel_right"} <= set(spec.visuals())
+
+
+def test_differential_drive_dynamics_and_loads():
+    # statics: the mass 0.03 m ahead of the axle and the caster 0.12 m ahead carry 3/4 and 1/4
+    world, r = _diff(com_xy=(0.03, 0.0), dynamics=True, motor_torque=50.0)
+    assert np.allclose(r.spec.load_share(), [0.375, 0.375, 0.25])
+    world.ground.mu = 0.4
+    r.spec.apply(r.state, hw.Twist(1.0))
+    for _ in range(150):
+        world.tick()
+    assert abs(r.state.twist.vx - 1.0) < 0.03
+    # wheels held: only they brake (0.75 of the weight), the caster rolls: v^2 / (2 mu g 0.75)
+    x0, v0 = r.pose.xyz[0], r.state.twist.vx
+    r.spec.max_accel = 1e6
+    r.spec.apply(r.state, hw.Twist())
+    for _ in range(150):
+        world.tick()
+    assert abs((r.pose.xyz[0] - x0) - v0 ** 2 / (2 * 0.4 * 9.81 * 0.75)) < 0.03 and abs(r.state.twist.vx) < 0.02
+
+
+def test_round_base_on_a_map_follows_the_floor_and_stops_at_things():
+    x = np.arange(-3.0, 3.0 + 1e-9, 0.05)
+    heights = np.zeros((len(x), len(x)))
+    heights[:, x >= 1.5] = 1.0                                       # a wall
+    ground = hw.Ground()
+    ground.set_height_map(heights, (-3.0, -3.0), 0.05)
+    world, r = _diff()
+    world.set_ground(ground)
+    assert r.state.ground is ground
+    r.spec.apply(r.state, hw.Twist(0.5))
+    for _ in range(300):
+        world.tick()
+    assert r.state.collided and 1.20 < r.pose.xyz[0] <= 1.5 - 0.2 + 0.03 and np.allclose(r.state.speed, 0.0)
+    r.spec.apply(r.state, hw.Twist(0.0, 0.0, 1.0))                   # against the wall it still turns: it is round
+    for _ in range(50):
+        world.tick()
+    assert r.pose.rpy_deg[2] > 30.0
+    ramp = hw.Ground(step=0.06)                                      # 5 degrees up along x: three contacts make the plane
+    ramp.set_height_map(np.tile(np.tan(math.radians(5.0)) * (x + 3.0), (len(x), 1)), (-3.0, -3.0), 0.05)
+    world, r = _diff()
+    world.set_ground(ramp)
+    r.state.contact = None
+    world.tick()
+    assert abs(r.pose.rpy_deg[1] + 5.0) < 1.0 and abs(r.pose.rpy_deg[0]) < 0.5
+
+
+def test_turtlebot4_and_rigs_on_either_robot():
+    from opticalnav_sim.hw import config, drive, sensing
+    world = hw.World()
+    tb = config.spawn(world, "turtlebot4")
+    assert isinstance(tb.base.spec, drive.DifferentialDrive) and tb.base.spec.max_speed == 0.31 and tb.config.rig == ""
+    assert set(tb.sensors) == {"lidar", "depth", "oak_rgb"} and isinstance(tb.sensors["lidar"].spec, sensing.Lidar)
+    assert np.allclose(tb.sensors["lidar"].world_matrix()[:3, 3], [-0.04, 0.0, 0.1929])
+    cam = tb.sensors["oak_rgb"].spec
+    assert abs(cam.full_intrinsics().hfov_deg() - 69.0) < 0.5 if callable(cam.full_intrinsics().hfov_deg) else abs(cam.full_intrinsics().hfov_deg - 69.0) < 0.5
+    # the same rig on both: on each one's own deck
+    for robot, deck in (("turtlebot4", 0.347), ("ranger_mini", None)):
+        r = config.spawn(hw.World(), robot, rig="hdr_12bit_frame")
+        deck = deck or r.base.spec.size[2]
+        assert np.allclose(r.sensors["hdr"].world_matrix()[:3, 3], [0.12, 0.05, deck + 0.27 + 0.02])
+        assert abs(r.base.spec.payload - 1.4) < 1e-9 and r.parts["frame"].spec.visuals()["frame"][0].shape == "profile"
+    assert abs(config.height(config.load("turtlebot4")) - 0.347) < 0.01          # its sensor plate, the LiDAR and camera are under it
+    assert 0.63 < config.height(config.load("turtlebot4", rig="hdr_12bit_frame")) < 0.70 and 1.15 < config.height("ranger_mini") < 1.35
+    heavy = config.load("turtlebot4", rig="hdr_12bit_mast")
+    assert heavy.warnings() and not config.load("ranger_mini", rig="hdr_12bit_mast").warnings()
+    assert config.load("ranger_mini", rig="none").sensors() == [] and config.load("ranger_mini").rig == "hdr_12bit_mast"
+    # a rig changed where it is used: a part's numbers, a part left out
+    cfg = config.load("turtlebot4", rig="hdr_12bit_frame", edits={"hdr": {"mount": {"rpy_deg": [0, 10, 0]}}, "12bit": None})
+    r = config.spawn(hw.World(), cfg)
+    assert "12bit" not in r.sensors and np.allclose(r.sensors["hdr"].mount.xyz, (0.06, 0.05, 0.02)) and r.sensors["hdr"].mount.rpy_deg == (0.0, 10.0, 0.0)
+    with pytest.raises(ValueError):
+        config.load("turtlebot4", rig="hdr_12bit_frame", edits={"hrd": {}})
+    with pytest.raises(FileNotFoundError, match="hdr_12bit_frame"):
+        config.load("turtlebot4", rig="hdr_12bit_fram")
+
+
+def test_profile_frame_bars_stand_where_they_are_written():
+    f = rigs.ProfileFrame(profile=0.02, bars=({"from": [0, 0, 0], "to": [0, 0, 0.5]}, {"from": [0.1, -0.2, 0.3], "to": [0.1, 0.2, 0.3]}),
+                          points={"top": {"xyz": [0, 0, 0.5]}})
+    for v, (a, b) in zip(f.visuals()["frame"], (((0, 0, 0), (0, 0, 0.5)), ((0.1, -0.2, 0.3), (0.1, 0.2, 0.3)))):
+        m = v.origin.matrix()
+        ends = [m @ [0, 0, s * v.size[1] / 2, 1] for s in (-1, 1)]
+        assert np.allclose([e[:3] for e in ends], [a, b], atol=1e-9) and abs(np.linalg.det(m[:3, :3]) - 1.0) < 1e-9
+    assert np.allclose(f.link_frames(None)["top"][:3, 3], [0, 0, 0.5])
+    with pytest.raises(ValueError):
+        rigs.ProfileFrame(bars=({"from": [0, 0, 0], "too": [0, 0, 1]},))
+
+
+def test_configuration_mistakes_are_named():
+    """Nothing a file says is passed over: an unknown key, at any level, names the nearest known one."""
+    from opticalnav_sim.hw import config
+    base = {"type": "differential", "params": {"track": 0.3}}
+    cam = {"name": "c", "type": "camera", "model": "lucid_tri032s"}
+    for data, word in (({"bse": base, "base": base}, "base"), ({"base": {**base, "parms": {}}}, "params"), ({"base": {"type": "diferential"}}, "differential"),
+                       ({"base": base, "parts": [{**cam, "mnt": {"xyz": [0, 0, 0]}}]}, "mount"), ({"base": base, "parts": [{**cam, "mount": {"xzy": [0, 0, 0]}}]}, "xyz"),
+                       ({"base": base, "parts": [{**cam, "name": "m", "type": "mast", "mode": 1}]}, "model|has:")):
+        with pytest.raises(ValueError, match=word):
+            config.load({"name": "x", **data})
+    for part, word in (({**cam, "params": {"render_scal": 0.5}}, "render_scale"), ({**cam, "isp": {"tonee": "srgb"}}, "tone"), ({**cam, "exposure": {"autoo": True}}, "auto"),
+                       ({**cam, "sensor": "imx26"}, "imx265"), ({**cam, "model": "lucid_tri32s"}, "lucid_tri032s"), ({"name": "l", "type": "lidar", "params": {"sample": 3}}, "samples")):
+        with pytest.raises(ValueError, match=word):
+            config.spawn(hw.World(), {"name": "x", "base": base, "parts": [part]})
+    # what a camera's entry says about its picture is used
+    r = config.spawn(hw.World(), {"name": "x", "base": base, "parts": [{**cam, "isp": {"tone": "linear"}, "exposure": {"auto": False, "exposure_s": 0.01}}]})
+    assert r.sensors["c"].spec.processing().tone == "linear" and r.sensors["c"].state.exposure.exposure_s == 0.01 and not r.sensors["c"].state.exposure.auto
+
+
+def test_extends_and_broken_files(tmp_path, monkeypatch):
+    from opticalnav_sim.hw import config
+    monkeypatch.setenv("OPTICALNAV_ROBOTS", str(tmp_path))
+    (tmp_path / "tb_lab").mkdir()
+    (tmp_path / "tb_lab" / "robot.yaml").write_text("name: tb_lab\nextends: turtlebot4\nlabel: Lab\nbase: {params: {max_speed: 0.46}}\nremove: [oak_rgb]\n"
+                                                    "parts:\n  - {name: lidar, params: {samples: 720}}\n  - {name: cam, type: camera, model: lucid_tri032s, link: deck}\nrig: polar_frame\nedits: {polar: {label: P}}\n")
+    (tmp_path / "rigs").mkdir()
+    (tmp_path / "rigs" / "mine.yaml").write_text("kind: rig\nlabel: Mine\nmass: 0.2\nparts:\n  - {name: c2, type: camera, model: lucid_tri032s}\n")
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "robot.yaml").write_text("name: bad\nbase: {type: differential, prams: {}}\n")
+    cfg = config.load("tb_lab")
+    assert [s["name"] for s in cfg.sensors()] == ["lidar", "depth", "cam", "polar"] and cfg.label == "Lab" and cfg.rig == "polar_frame"
+    r = config.spawn(hw.World(), cfg)
+    assert r.base.spec.max_speed == 0.46 and r.base.spec.track == 0.233 and r.sensors["lidar"].spec.samples == 720 and r.sensors["lidar"].spec.range_m == (0.15, 12.0)
+    assert cfg.parts()[-1]["label"] == "P" and config.load("tb_lab", rig="mine").sensors()[-1]["name"] == "c2"   # the file's edits are of its own rig
+    listed = {c["name"]: c for c in config.available()}
+    assert "params" in listed["bad"]["error"] and "mine" in [g["name"] for g in config.available_rigs()]
+    (tmp_path / "a.yaml").write_text("name: a\nextends: b\nbase: {}\n")
+    (tmp_path / "b.yaml").write_text("name: b\nextends: a\nbase: {}\n")
+    with pytest.raises(ValueError, match="circle"):
+        config.load("a")
+
+
+# --- sensors other than cameras ----------------------------------------------------------------------------------------
+class _Room:
+    """A render server of an empty room, 8 x 6 m, floor at 0: exact depth along the axis, for depth views."""
+    def __init__(self):
+        self.views = []
+
+    def register_body(self, name, links):
+        return {}
+
+    def render(self, views, dtype="float32"):
+        out = []
+        for v in views:
+            assert v["renderer"] == "depth"
+            self.views.append(v)
+            c2w = np.asarray(v["camera_to_world"])                   # dataset convention: x right, y up, looks along -z; y up world
+            w, h = v["width"], v["height"]
+            t = math.tan(math.radians(v["hfov_deg"]) / 2)
+            u, r = np.meshgrid((2 * (np.arange(w) + 0.5) / w - 1) * t, (1 - 2 * (np.arange(h) + 0.5) / h) * t * h / w)
+            d = np.stack([u, r, -np.ones_like(u)], -1) @ c2w[:3, :3].T
+            o = c2w[:3, 3]
+            # the world's x, y, z here are Mitsuba's x, height, -y
+            best = np.full(u.shape, np.inf)
+            for axis, planes in ((0, (-4.0, 4.0)), (2, (-3.0, 3.0)), (1, (0.0, 3.0))):
+                for at in planes:
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        s = (at - o[axis]) / d[..., axis]
+                    best = np.where((s > 1e-6) & (s < best), s, best)
+            out.append({"depth": best.astype(np.float32)})
+        return out
+
+
+def test_lidar_and_depth_camera_measure_a_room():
+    from opticalnav_sim.hw import sensing
+    room = _Room()
+    world = hw.SimWorld(scene="", client=room)
+    base = world.spawn(hw.drive.DifferentialDrive(), at=hw.pose2d(1.0, 0.5, 0.0, 30.0))
+    lidar = world.spawn(sensing.Lidar(samples=360, elevations_deg=(0.0, 10.0), resolution_px=1024, range_m=(0.1, 50.0)), attach_to=base, link="base_link", mount=Transform((0.0, 0.0, 0.5)))
+    got = world.sense(lidar)
+    assert got.modality == "lidar" and len(room.views) == 4 and got.data["ranges"].shape == (2, 360) and got.picture.shape[2] == 3
+    # each direction to the walls x = -4, 4 and y = -3, 3
+    az = np.radians(got.data["azimuth_deg"] + 30.0)
+    with np.errstate(divide="ignore"):
+        wall = np.minimum(np.where(np.cos(az) > 0, (4.0 - 1.0) / np.cos(az), (-4.0 - 1.0) / np.cos(az)), np.where(np.sin(az) > 0, (3.0 - 0.5) / np.sin(az), (-3.0 - 0.5) / np.sin(az)))
+    assert np.abs(got.data["ranges"][0] - wall).max() < 0.04 and np.abs(got.data["ranges"][1] * math.cos(math.radians(10.0)) - wall).max() < 0.05
+    front = got.data["points"][np.argmin(np.abs(got.data["azimuth_deg"]))]   # straight ahead, in the lidar's frame
+    assert front[0] > 2.0 and abs(front[1]) < 0.05
+    far = world.spawn(sensing.Lidar(range_m=(0.15, 3.0)), attach_to=base, link="base_link", mount=Transform((0.0, 0.0, 0.5)))
+    r = world.sense(far).data["ranges"]
+    assert (r[r > 0] <= 3.0).all() and (r == 0).any()                # out of range: no return
+    cam = world.spawn(sensing.DepthCamera(width=640, height=400, hfov_deg=80.0, range_m=(0.2, 20.0)), attach_to=base, link="base_link", mount=Transform((0.0, 0.0, 0.5), (0.0, 20.0, 0.0)))
+    got = world.sense(cam)
+    z = got.data["depth"]
+    assert z.shape == (200, 320) and got.data["valid"].all()
+    # the floor 0.5 m under a camera pitched 20 degrees down: straight ahead at 0.5 / sin 20
+    assert abs(z[100, 160] - min(0.5 / math.sin(math.radians(20.0)), 99)) < 0.02
+    noisy = world.spawn(sensing.DepthCamera(width=640, height=400, hfov_deg=80.0, range_m=(0.2, 20.0), baseline_m=0.075, disparity_noise_px=0.2), attach_to=base, link="base_link", mount=Transform((0.0, 0.0, 0.5), (0.0, 20.0, 0.0)))
+    e = world.sense(noisy).data["depth"] - z
+    sigma = z ** 2 * 0.2 / (noisy.spec.focal_px(640) * 0.075)
+    assert abs(float((e / sigma).std()) - 1.0) < 0.05 and np.array_equal(world.sense(noisy).data["depth"], world.sense(noisy).data["depth"])
+    with pytest.raises(ValueError):
+        world.request(lidar)                                         # a camera's request is a camera's
+
+
+def test_robot_session_exchanges_robots_and_keeps_rigs(tmp_path, monkeypatch):
+    from opticalnav_sim import robot_view
+    from opticalnav_sim.hw import config, robots as robot_models
+    monkeypatch.setattr(robot_models, "MODELS", tmp_path)
+    session = robot_view.RobotSession("http://127.0.0.1:1", calibration="")
+    assert session.state()["config"]["rig"] == "hdr_12bit_mast"
+    session.use(rig="hdr_12bit_frame")
+    assert session.state()["config"]["name"] == "ranger_mini" and session.state()["config"]["rig"] == "hdr_12bit_frame"
+    session.use("turtlebot4")
+    assert [s["name"] for s in session.state()["sensors"]] == ["lidar", "depth", "oak_rgb"]
+    session.command({"mode": "drive", "forward": 1, "speed": 0.2})
+    assert session.control[0] == hw.Twist(0.2, 0.0, 0.0)
+    with pytest.raises(FileNotFoundError):
+        session.use(rig="nothing")
+    assert session.state()["config"]["name"] == "turtlebot4"         # a wrong one changes nothing
+    text = (config.BUILTIN / "rigs" / "polar_frame.yaml").read_text().replace("0.2]}]", "0.4]}]")
+    session.save_rig("tall_post", text)
+    assert session.state()["config"]["rig"] == "tall_post" and (tmp_path / "rigs" / "tall_post.yaml").read_text() == text
+    for name, body in (("polar_frame", text), ("bad name", text), ("broken", text.replace("profile:", "profle:")), ("broken", "kind: rig\nparts: [{name: c, type: camera, model: nope}]")):
+        with pytest.raises((ValueError, KeyError)):
+            session.save_rig(name, body)
+    assert not (tmp_path / "rigs" / "broken.yaml").exists()
+    # a robot that stands somewhere is exchanged there
+    started = []
+    session.robot = type("A", (), {"pose": hw.pose2d(3.0, 4.0, 0.1, 50.0)})()
+    session.scene = "scene"
+    monkeypatch.setattr(session, "_start", lambda scene, build: started.append((scene, build)))
+    monkeypatch.setattr(session, "_build_at", lambda run, scene, pose: started.append(pose))
+    session.use("ranger_mini")
+    started[0][1](1, "scene")
+    assert started[0][0] == "scene" and started[1].xyz[:2] == (3.0, 4.0)
+
+
+def test_a_light_wheel_with_a_strong_drive_is_stable():
+    """The TurtleBot 4's numbers: its drive's gain over its wheel's inertia is far past what an explicit step takes."""
+    from opticalnav_sim.hw import config
+    for command, want in ((hw.Twist(0, 0, 1.0), (0, 0, 1.0)), (hw.Twist(0.3), (0.3, 0, 0)), (hw.Twist(0.2, 0, 0.5), (0.2, 0, 0.5))):
+        world = hw.World()
+        r = config.spawn(world, "turtlebot4")
+        r.base.spec.apply(r.base.state, command)
+        for _ in range(60):
+            world.tick()
+        t = r.base.state.twist
+        assert np.allclose([t.vx, t.vy, t.wz], want, atol=0.01) and np.abs(r.base.state.slip).max() < 0.005

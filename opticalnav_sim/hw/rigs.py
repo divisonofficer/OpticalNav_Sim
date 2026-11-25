@@ -8,7 +8,7 @@ sits on the mast (``reference_mount``) is not in a camera calibration: it is mea
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -50,6 +50,50 @@ class Mast(Spec):
             bars += [Visual("profile", (p, lx - 2 * p), Transform((0.0, sy * y, z), along_x), m) for sy in (-1, 1)]
         bars.append(Visual("profile", (p, self.camera_bar), Transform((x + p, 0.0, h - p / 2.0), along_y), m))
         return {"mast": bars}
+
+
+@dataclass
+class ProfileFrame(Spec):
+    """A free structure of T-slot aluminium extrusions and plates. ``bars``: each ``{"from": [x, y, z], "to": [x, y, z]}``
+    (the profile's centre line, metres; ``"profile"``: another side than the frame's). ``plates``: each ``{"size": [x, y,
+    z], "at": [x, y, z]}``. ``points``: named places things mount on, ``{"top": {"xyz": ..., "rpy_deg": ...}}``.
+    Links: ``frame`` (the structure's origin) and the points."""
+    kind = "structure"
+    profile: float = 0.02
+    bars: tuple = ()
+    plates: tuple = ()
+    points: dict = field(default_factory=dict)
+    material: tuple = ALUMINIUM
+    model: str = "frame"
+
+    def __post_init__(self):
+        for b in self.bars:
+            if set(b) - {"from", "to", "profile"} or not {"from", "to"} <= set(b):
+                raise ValueError(f"a bar is {{from, to[, profile]}}, not {b}")
+            if np.linalg.norm(np.subtract(b["to"], b["from"])) < 1e-6:
+                raise ValueError(f"a bar of no length: {b}")
+        for q in self.plates:
+            if set(q) != {"size", "at"}:
+                raise ValueError(f"a plate is {{size, at}}, not {q}")
+
+    def link_frames(self, state) -> dict:
+        out = {"frame": np.eye(4)}
+        for name, at in self.points.items():
+            out[name] = Transform(tuple(float(v) for v in at.get("xyz", (0, 0, 0))), tuple(float(v) for v in at.get("rpy_deg", (0, 0, 0)))).matrix()
+        return out
+
+    def visuals(self) -> dict:
+        vis = []
+        for b in self.bars:
+            a, z = np.asarray(b["from"], dtype=np.float64), np.asarray(b["to"], dtype=np.float64)
+            along = (z - a) / np.linalg.norm(z - a)
+            side = np.cross([0.0, 1.0, 0.0] if abs(along[1]) < 0.9 else [1.0, 0.0, 0.0], along)
+            side /= np.linalg.norm(side)
+            m = np.eye(4)
+            m[:3, :3], m[:3, 3] = np.stack([side, np.cross(along, side), along], 1), (a + z) / 2.0
+            vis.append(Visual("profile", (float(b.get("profile", self.profile)), float(np.linalg.norm(z - a))), Transform.from_matrix(m), self.material))
+        vis += [Visual("box", tuple(float(v) for v in q["size"]), Transform(tuple(float(v) for v in q["at"])), self.material) for q in self.plates]
+        return {"frame": vis} if vis else {}
 
 
 def camera_for(name: str, calibrated, render_scale: float = 0.25):

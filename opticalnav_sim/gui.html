@@ -434,7 +434,14 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <p class="hint">렌더 서버에 올라간 씬 기준, 5초마다 갱신. GPU는 장치 전체 사용량(다른 프로세스 포함).</p>
       </section>
       <section class="ppanel" role="tabpanel" id="p-robot" aria-labelledby="t-robot" hidden>
-        <label class="f" for="robot-config" title="스폰할 로봇: 구조 파일(robot.yaml)이 있는 폴더를 packs/hardware 나 $OPTICALNAV_ROBOTS 에 넣으면 여기에 뜹니다. 베이스·조명·마스트·카메라가 모두 그 파일에서 옵니다."><span>로봇</span><select id="robot-config"></select></label>
+        <label class="f" for="robot-config" title="로봇(베이스). 구조 파일(robot.yaml)이 있는 폴더를 packs/hardware 나 $OPTICALNAV_ROBOTS 에 넣으면 여기에 뜹니다. 로봇이 서 있을 때 바꾸면 그 자리에서 교체됩니다."><span>로봇</span><select id="robot-config"></select></label>
+        <label class="f" for="robot-rig" title="로봇 위에 올리는 구조물과 카메라(리그). rigs/<이름>.yaml 이 여기에 뜨고, 어느 로봇에나 올릴 수 있습니다. 로봇이 서 있을 때 바꾸면 그 자리에서 교체됩니다."><span>상부 구성</span><select id="robot-rig"></select><button type="button" class="icon-btn" id="rig-edit" title="이 상부 구성을 편집: 프로파일 구조물의 봉, 카메라의 종류·위치를 바꿔 새 이름으로 저장합니다">편집</button></label>
+        <div id="rig-editor" hidden>
+          <label class="f" for="rig-name"><span>이름</span><input id="rig-name" type="text" maxlength="40" spellcheck="false" style="flex:1;min-width:0;background:var(--panel-2);color:var(--ink);border:1px solid var(--rule);border-radius:7px;padding:4px 8px;font:12.5px var(--mono)"></label>
+          <textarea id="rig-text" rows="16" spellcheck="false" aria-label="상부 구성 파일 (YAML)" style="width:100%;box-sizing:border-box;margin-top:6px;background:var(--panel-2);color:var(--ink);border:1px solid var(--rule);border-radius:7px;padding:8px;font:12px/1.4 var(--mono);resize:vertical;white-space:pre;overflow:auto"></textarea>
+          <div class="rig-tools"><button type="button" class="flash primary" id="rig-save">저장하고 올리기</button><button type="button" class="flash" id="rig-cancel">닫기</button></div>
+          <p class="hint" id="rig-note" role="status" style="color:var(--bad)"></p>
+        </div>
         <dl id="robot-parts"></dl>
         <div class="rig-tools">
           <button type="button" class="flash primary" id="robot-spawn" title="지금 에디터 카메라가 보는 바닥에 위에서 고른 로봇을 놓습니다(베이스·조명·마스트·카메라 모두 그 로봇의 설정 파일대로). 이 화면에 로봇이 나타나고, 센서 뷰어를 켜면 로봇 카메라의 영상이 서브 뷰어로 열립니다.">로봇 스폰</button>
@@ -450,8 +457,8 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
             <label class="tg" for="robot-zoom" title="지도를 로봇 주변으로 확대하고, 지면 지도(마찰·장애물)를 깝니다"><input type="checkbox" class="sw" id="robot-zoom" checked> 지도를 로봇 주변으로</label>
           </div>
           <div class="fields one" style="margin-top:8px">
-            <label class="f" for="robot-speed" title="W/S를 누르고 있을 때의 속도 (Ranger Mini 2.0: 최대 1.5 m/s)"><span>로봇 속도</span><select id="robot-speed" class="as-slider"><option value="0.3">0.3 m/s</option><option value="0.6" selected>0.6 m/s</option><option value="1">1.0 m/s</option><option value="1.5">1.5 m/s</option></select></label>
-            <label class="f" for="robot-steer" title="A/D를 누르고 있을 때의 조향각 (안쪽 바퀴, 최대 40°)"><span>조향각</span><select id="robot-steer" class="as-slider"><option value="10">10°</option><option value="20" selected>20°</option><option value="30">30°</option><option value="40">40°</option></select></label>
+            <label class="f" for="robot-speed" title="W/S를 누르고 있을 때의 속도 (로봇의 최대 속도까지)"><span>로봇 속도</span><select id="robot-speed" class="as-slider"><option value="0.3">0.3 m/s</option><option value="0.6" selected>0.6 m/s</option><option value="1">1.0 m/s</option><option value="1.5">1.5 m/s</option></select></label>
+            <label class="f" for="robot-steer" id="robot-steer-row" title="A/D를 누르고 있을 때의 조향각 (안쪽 바퀴, 최대 40°)"><span>조향각</span><select id="robot-steer" class="as-slider"><option value="10">10°</option><option value="20" selected>20°</option><option value="30">30°</option><option value="40">40°</option></select></label>
           </div>
           <div class="rig-tools">
             <button type="button" class="flash" id="robot-rec" title="녹화: 누른 뒤 로봇을 몰고, 다시 누르면 그 주행을 프레임마다 고품질로 다시 렌더해 MP4로 만듭니다(에디터 뷰 + 열려 있는 센서 뷰어 + 지도). 몰 때의 화면은 거칠어도 영상은 깨끗합니다. 렌더하는 동안 로봇은 멈춰 있습니다.">● 녹화 시작</button>
@@ -463,8 +470,8 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
           <dl id="robot-readout" style="margin-top:8px"></dl>
           <div class="keys desk-only" style="margin-top:8px">
             <span><kbd>W</kbd> <kbd>S</kbd></span><span>전진 / 후진</span>
-            <span><kbd>A</kbd> <kbd>D</kbd></span><span>좌 / 우 조향 (전후진 없이 누르면 제자리 회전)</span>
-            <span><kbd>Q</kbd> <kbd>E</kbd></span><span>좌 / 우 횡이동</span>
+            <span><kbd>A</kbd> <kbd>D</kbd></span><span id="k-turn-robot">좌 / 우 조향 (전후진 없이 누르면 제자리 회전)</span>
+            <span class="k-side"><kbd>Q</kbd> <kbd>E</kbd></span><span class="k-side">좌 / 우 횡이동</span>
             <span><kbd>Space</kbd></span><span>정지 (키를 놓아도 0.5초 뒤 멈춤)</span>
           </div>
         </div>
@@ -1618,7 +1625,7 @@ function keyOf(ev) {
   return ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
 }
 document.addEventListener("keydown", (ev) => {
-  if (ev.target.closest("select, input, #rig3d, dialog") || $("help").open || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
+  if (ev.target.closest("select, input, textarea, #rig3d, dialog") || $("help").open || ev.ctrlKey || ev.metaKey || ev.altKey || !S || !S.started) return;
   const key = keyOf(ev), k = key;
   let handled = true;
   if (key === "t" && R && R.spawned) { $("robot-drive").checked = !$("robot-drive").checked; syncDrive(); }
@@ -2007,21 +2014,21 @@ const ROBOT_KEYS = ["w", "a", "s", "d", "q", "e", " "];
 const rheld = new Set();
 const driving = () => !!(R && R.spawned && $("robot-drive").checked);
 async function robotApi(path, body) { R = await api(`/api/robot/${path}`, body); renderRobot(); return R; }
-function robotNote(text, bad) { const n = $("robot-note"); n.textContent = text || ""; n.classList.toggle("bad", !!bad); }
+let robotFail = { text: "", until: 0 };  // what a click failed with stays 8 s (the state is polled 5 times a second)
+function robotNote(text, bad) {
+  if (bad && text) robotFail = { text, until: performance.now() + 8000 };
+  else if (robotFail.text && performance.now() < robotFail.until) return;
+  const n = $("robot-note"); n.textContent = text || ""; n.classList.toggle("bad", !!bad); }
 function syncDrive() {
   rheld.clear();
   if (driving()) for (const k of ROBOT_KEYS) held.delete(k);
   renderRobot();
 }
-function driveCommand() {
-  const v = Number($("robot-speed").value), st = Number($("robot-steer").value);
-  const fwd = (rheld.has("w") ? 1 : 0) - (rheld.has("s") ? 1 : 0), turn = (rheld.has("a") ? 1 : 0) - (rheld.has("d") ? 1 : 0);
-  const side = (rheld.has("q") ? 1 : 0) - (rheld.has("e") ? 1 : 0);
+function driveCommand() {  // what the keys ask for: the robot's drive (hw/drive.py) makes it a command of its own
+  const ax = (a, b) => (rheld.has(a) ? 1 : 0) - (rheld.has(b) ? 1 : 0);
   if (rheld.has(" ")) return { mode: "twist" };
-  if (side) return { mode: "lateral", linear: side * Math.min(v, 0.75) };
-  if (fwd) return { mode: "ackermann", linear: fwd * v, steering_deg: turn * st };
-  if (turn) return { mode: "spin", angular: turn * 1.0 };
-  return null;
+  const c = { mode: "drive", forward: ax("w", "s"), turn: ax("a", "d"), side: ax("q", "e"), speed: Number($("robot-speed").value), steer_deg: Number($("robot-steer").value) };
+  return c.forward || c.turn || c.side ? c : null;
 }
 // a held key sends its command ten times a second (the chassis keeps one for 0.5 s)
 function sendDrive() { const c = driving() && driveCommand(); if (c) api("/api/robot/control", c).catch(() => {}); }
@@ -2034,7 +2041,9 @@ function renderRobot() {
   $("robot-despawn").hidden = !on && !busy;
   $("robot-on").hidden = !on; $("robot-hint").hidden = on;
   const raster = on && S && S.render_mode && S.render_mode !== "path" ? "지금 렌더러는 로봇을 그리지 않습니다 (Mitsuba 경로 추적에서만 보입니다). " : "";
-  robotNote(R.error ? `로봇: ${R.error}` : raster + (R.message || ""), !!R.error);
+  $("robot-note").classList.remove("bad");
+  if (R.error) { const n = $("robot-note"); n.textContent = `로봇: ${R.error}`; n.classList.add("bad"); }
+  else { robotNote(raster + (R.message || "")); if (performance.now() < robotFail.until) $("robot-note").classList.add("bad"); }
   if ($("robot-follow").checked !== (R.follow_mode === "ride")) $("robot-follow").checked = R.follow_mode === "ride";
   if ($("robot-track").checked !== (R.follow_mode === "track")) $("robot-track").checked = R.follow_mode === "track";
   const rec = R.recording || { phase: "idle" };
@@ -2048,15 +2057,20 @@ function renderRobot() {
     : rec.phase === "rendering" ? `렌더 중: ${rec.done} / ${rec.frames} 프레임 · ${Math.round(rec.seconds || 0)} s 지남${rec.eta_s != null ? ` · 약 ${Math.round(rec.eta_s)} s 남음` : ""}`
     : rec.phase === "encoding" ? "MP4로 묶는 중…" : rec.phase === "done" ? `완료: ${rec.file} (${rec.size_mb} MB, ${rec.frames} 프레임, 렌더 ${Math.round(rec.seconds || 0)} s)`
     : rec.phase === "error" ? `녹화 실패: ${rec.error}` : "";
-  $("robot-config").disabled = on || busy;
-  if (R.config && $("robot-config").value !== R.config.name && [...$("robot-config").options].some((o) => o.value === R.config.name)) $("robot-config").value = R.config.name;
+  for (const [id, v] of [["robot-config", R.config && R.config.name], ["robot-rig", R.config && (R.config.rig || "none")]]) {
+    const sel = $(id);
+    sel.disabled = busy;
+    if (v && document.activeElement !== sel && sel.value !== v && [...sel.options].some((o) => o.value === v)) sel.value = v;
+  }
   const partsKey = JSON.stringify(R.config || null);
-  if (partsKey !== renderRobot.parts) {  // what this robot is made of, as its structure file lists it
+  if (partsKey !== renderRobot.parts) {  // what this robot is made of, as its files list it
     renderRobot.parts = partsKey;
-    const kinds = { light: "조명", mast: "마스트", camera: "카메라", urdf: "URDF" };
+    const kinds = { light: "조명", mast: "마스트", frame: "프레임", camera: "카메라", depth: "깊이", lidar: "LiDAR", urdf: "URDF" };
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
     const c = R.config || { parts: [] };
-    $("robot-parts").innerHTML = [["베이스", c.base || "—"], ...c.parts.map((p) => [kinds[p.type] || p.type, `${p.label} → ${p.parent}${p.link ? "." + p.link : ""}`])]
-      .map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
+    $("robot-parts").innerHTML = [["베이스", c.base || "—"], ...c.parts.map((p) => [(p.rig ? "↑ " : "") + (kinds[p.type] || p.type), `${p.label} → ${p.parent}${p.link ? "." + p.link : ""}`]),
+      ["탑재", `${c.mass} kg${(c.warnings || []).length ? " · ⚠ " + c.warnings.join(", ") : ""}`]]
+      .map(([k, v]) => `<div><dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join("");
   }
   syncSensorList();
   for (const sn of R.sensors || []) {
@@ -2071,23 +2085,26 @@ function renderRobot() {
       } else if (sn.seq && sub.seq !== sn.seq) {
         sub.seq = sn.seq;
         img.src = `/api/robot/frame/${sn.name}.jpg?seq=${sn.seq}`; img.hidden = false; wait.hidden = true;
-        $(`title-${sub.id}`).innerHTML = `<small>${sn.model} · ${sn.format} · ${sn.size[0]}×${sn.size[1]} · 노출 ${sn.exposure_ms} ms${sn.gain_db ? ` +${sn.gain_db} dB` : ""} · ${sn.spp} spp</small>`;
+        $(`title-${sub.id}`).innerHTML = `<small>${[...Object.values(sn.info || {}), sn.spp ? `${sn.spp} spp` : ""].filter(Boolean).join(" · ")}</small>`;
       } else if (!sn.seq) { img.hidden = true; wait.hidden = false; wait.textContent = "첫 프레임을 기다리는 중… (센서마다 처음 한 번 freeze 기록, 20–30초)"; }
     }
   }
   $("map-legend").hidden = !(on && R.map && $("robot-zoom").checked);
   const r = R.robot;
   if (!r) { $("robot-wheels").innerHTML = ""; $("robot-readout").innerHTML = ""; drawMap(); return; }
-  const names = ["앞 왼쪽", "앞 오른쪽", "뒤 왼쪽", "뒤 오른쪽"];
-  $("robot-wheels").innerHTML = "<tr><th>바퀴</th><th>조향</th><th>속도</th><th>마찰 μ</th><th>미끄럼</th></tr>" + names.map((n, i) =>
-    `<tr><td>${n}</td><td>${r.steer_deg[i].toFixed(1)}°</td><td>${r.wheel_speed[i].toFixed(2)}</td><td>${r.mu[i].toFixed(2)}</td>` +
-    `<td class="${r.slip[i] > 0.05 ? "hot" : ""}">${r.slip[i].toFixed(3)}</td></tr>`).join("");
+  const steers = r.wheels.some((w) => w.steer_deg != null), cap = r.drive || {};
+  $("robot-wheels").innerHTML = !r.wheels.length ? "" : `<tr><th>바퀴</th>${steers ? "<th>조향</th>" : ""}<th>속도</th><th>마찰 μ</th><th>미끄럼</th></tr>` + r.wheels.map((w) =>
+    `<tr><td>${w.label}</td>${steers ? `<td>${w.steer_deg == null ? "—" : w.steer_deg.toFixed(1) + "°"}</td>` : ""}<td>${w.speed.toFixed(2)}</td><td>${w.mu.toFixed(2)}</td>` +
+    `<td class="${w.slip > 0.05 ? "hot" : ""}">${w.slip.toFixed(3)}</td></tr>`).join("");
+  $("robot-steer-row").hidden = cap.steer_deg == null;
+  document.querySelectorAll(".k-side").forEach((e) => { e.hidden = !cap.lateral; });
+  $("k-turn-robot").textContent = cap.steer_deg == null ? "좌 / 우 회전" : "좌 / 우 조향 (전후진 없이 누르면 제자리 회전)";
   const rows = [["위치 (x, y, z)", `${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(2)} m`],
     ["방위 · 롤 · 피치", `${r.yaw_deg.toFixed(1)}° · ${r.roll_deg.toFixed(1)}° · ${r.pitch_deg.toFixed(1)}°`],
     ["속도 (실제)", `${Math.hypot(r.vx, r.vy).toFixed(2)} m/s · ${r.wz.toFixed(2)} rad/s`],
     ["명령 (vx, vy, ω)", r.command.map((v) => v.toFixed(2)).join(", ")],
     ["바닥 재질", r.material || "—"], ["충돌", r.collided ? "막힘: 장애물" : "없음"],
-    ["리그", R.calibrated ? "캘리브레이션 파일" : "데이터시트 모델"], ["시뮬레이션", `${R.sim_rate} Hz`]];
+    ["구동", `${cap.type || "없음"}${cap.max_speed ? ` · 최대 ${cap.max_speed} m/s` : ""}`], ["카메라 위치", R.calibrated ? "캘리브레이션 파일" : "설정 파일"], ["시뮬레이션", `${R.sim_rate} Hz`]];
   $("robot-readout").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd title="${v}">${v}</dd></div>`).join("");
   drawMap();
 }
@@ -2127,7 +2144,7 @@ async function pollRobot() {
   robotTimer = setTimeout(pollRobot, R && R.running ? 200 : 1500);
 }
 $("robot-spawn").addEventListener("click", async () => {
-  try { robotNote("로봇을 준비하는 중…"); await robotApi("spawn", { config: $("robot-config").value || undefined }); pollRobot(); } catch (e) { robotNote(e.message, true); }
+  try { robotNote("로봇을 준비하는 중…"); await robotApi("spawn", { config: $("robot-config").value || undefined, rig: $("robot-rig").value || undefined }); pollRobot(); } catch (e) { robotNote(e.message, true); }
 });
 $("robot-despawn").addEventListener("click", () => robotApi("despawn", {}).catch((e) => robotNote(e.message, true)));
 $("robot-follow").addEventListener("change", (ev) => robotApi("follow", { on: ev.target.checked, mode: "ride" }).catch((e) => robotNote(e.message, true)));
@@ -2330,12 +2347,35 @@ window.addEventListener("resize", layout);
   for (const spec of (saved.subs || []).slice(0, 8)) addSub(spec, true);
   layout();
 })();
-// the registered robots (hw/config.py): choosing one sets what the next spawn builds
-api("/api/robot/configs").then(({ configs, current }) => {
-  $("robot-config").innerHTML = configs.map((c) => `<option value="${c.name}" title="${c.description}">${c.label}</option>`).join("");
-  $("robot-config").value = current;
-}).catch(() => {});
-$("robot-config").addEventListener("change", (ev) => robotApi("config", { config: ev.target.value }).catch((e) => robotNote(e.message, true)));
+// the registered robots and rigs (hw/config.py): choosing one sets what the next spawn builds, or exchanges the robot
+// that stands in the scene where it stands
+async function loadConfigs() {
+  const { configs, rigs, current, current_rig } = await api("/api/robot/configs");
+  const opt = (c) => { const o = document.createElement("option"); o.value = c.name; o.textContent = c.error ? `${c.label} (오류)` : c.label; o.title = c.error || c.description || ""; o.disabled = !!c.error; return o; };
+  $("robot-config").replaceChildren(...configs.map(opt));
+  $("robot-rig").replaceChildren(opt({ name: "none", label: "없음", description: "로봇만" }), ...rigs.map(opt));
+  $("robot-config").value = current; $("robot-rig").value = current_rig || "none";
+}
+loadConfigs().catch(() => {});
+const exchange = (body) => robotApi("config", body).then(() => { if (R.running) pollRobot(); }).catch((e) => { robotNote(e.message, true); loadConfigs().catch(() => {}); });
+$("robot-config").addEventListener("change", (ev) => exchange({ config: ev.target.value }));
+$("robot-rig").addEventListener("change", (ev) => exchange({ rig: ev.target.value }));
+$("rig-edit").addEventListener("click", async (ev) => {
+  ev.preventDefault();
+  if (!$("rig-editor").hidden) { $("rig-editor").hidden = true; return; }
+  const name = $("robot-rig").value;
+  try {
+    const r = name === "none" ? { text: "kind: rig\nlabel: 새 구성\nmass: 1.0\nparts:\n  - name: frame\n    type: frame\n    params:\n      profile: 0.02\n      bars:\n        - {from: [0, 0, 0], to: [0, 0, 0.2]}\n      points: {top: {xyz: [0, 0, 0.2]}}\n  - {name: cam, type: camera, model: lucid_tri032s, label: 카메라, parent: frame, link: top, mount: {xyz: [0.06, 0, 0.02]}}\n", shipped: true }
+      : await api(`/api/robot/rig?name=${encodeURIComponent(name)}`);
+    $("rig-text").value = r.text; $("rig-name").value = r.shipped ? `${name === "none" ? "my" : "my_" + name}` : name;
+    $("rig-note").textContent = ""; $("rig-editor").hidden = false;
+  } catch (e) { robotNote(e.message, true); }
+});
+$("rig-cancel").addEventListener("click", () => { $("rig-editor").hidden = true; });
+$("rig-save").addEventListener("click", async () => {
+  try { await robotApi("rig", { name: $("rig-name").value.trim(), text: $("rig-text").value }); $("rig-note").textContent = ""; $("rig-editor").hidden = true; robotFail.until = 0; await loadConfigs(); pollRobot(); }
+  catch (e) { $("rig-note").textContent = e.message; }
+});
 pollRobot();
 try { showTab(localStorage.getItem("opticalnav-panel-tab") || "state"); } catch (e) { showTab("state"); }
 
@@ -2344,7 +2384,7 @@ $("help-btn").addEventListener("click", openHelp);
 $("help-close").addEventListener("click", () => $("help").close());
 $("help").addEventListener("click", (ev) => { if (ev.target === $("help")) $("help").close(); });  // the backdrop
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "?" && !ev.target.closest("select, input, #rig3d")) { ev.preventDefault(); openHelp(); }
+  if (ev.key === "?" && !ev.target.closest("select, input, textarea, #rig3d")) { ev.preventDefault(); openHelp(); }
 });
 boot().catch((e) => showError(`시작 실패: ${e.message}`));
 </script>

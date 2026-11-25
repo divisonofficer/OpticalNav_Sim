@@ -8,12 +8,13 @@ Another camera is a ``SensorSpec`` and a ``LensSpec`` (or a calibration) in a ``
 """
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from .actor import Spec
+from .sensing import Reading, Sensor
 from .optics import Intrinsics
 from .robots import Visual
 from .transform import BODY_TO_OPTICAL, Transform
@@ -105,8 +106,12 @@ class CameraState:
 
 
 @dataclass
-class CameraSpec(Spec):
+class CameraSpec(Sensor):
+    """A camera. ``isp``: how its picture is made from its raw (hw.isp.Isp; None: Reinhard's operator for more than 16
+    bits, the sRGB curve otherwise). ``exposure``: settings of its ``hw.sensor.ExposureControl`` (auto exposure on,
+    unless it says otherwise)."""
     kind = "camera"
+    modality = "image"
     sensor: SensorSpec = IMX265
     lens: LensSpec = field(default_factory=FujinonHF6XA5M)
     model: str = "camera"
@@ -114,6 +119,34 @@ class CameraSpec(Spec):
     body_mm: tuple = (29.0, 29.0, 45.0)      # width, height, length of the housing (drawn behind the lens)
     calibration: Intrinsics | None = None    # measured intrinsics, at the size they were measured: replaces the lens model
     drawn: bool = True                       # False: no housing in the scene (an observer's eye, not a piece of hardware)
+    isp: object = None
+    exposure: dict = field(default_factory=dict)
+
+    @property
+    def polarized(self) -> bool:
+        return self.sensor.cfa.startswith("polar_")
+
+    def processing(self):
+        from .isp import Isp
+        return self.isp if self.isp is not None else Isp(tone="reinhard" if self.sensor.bit_depth > 16 else "srgb")
+
+    def request(self, world, actor, spp=None, **options) -> dict:
+        r = world.request(actor, spp=spp, **options)
+        return dict(r, views=[r["view"]])
+
+    def read(self, world, actor, request, outs) -> Reading:
+        from . import isp
+        raw, frame = world.expose(actor, request, outs[0])
+        picture = isp.process(raw, self.processing())
+        return Reading(actor.name, self.modality, raw.time, raw.pose, {"raw": raw, "frame": frame}, picture,
+                       {"model": self.model, "format": f"{raw.cfa} {raw.bit_depth}-bit", "size": f"{picture.shape[1]}x{picture.shape[0]}",
+                        "exposure": f"{raw.exposure_s * 1e3:.2f} ms" + (f" +{raw.gain_db:.1f} dB" if raw.gain_db > 0.05 else "")})
+
+    def snapshot(self, state):
+        return copy.copy(state.exposure)
+
+    def restore(self, state, snap) -> None:
+        state.exposure = copy.copy(snap)
 
     def __post_init__(self):
         w, h = self.sensor.size_mm()
@@ -147,7 +180,7 @@ class CameraSpec(Spec):
         """A camera's settings that change while it runs: ``state.exposure`` (hw.sensor.ExposureControl: auto exposure
         on; set ``auto = False`` and ``exposure_s`` / ``gain_db`` for a fixed exposure)."""
         from .sensor import ExposureControl
-        return CameraState(ExposureControl())
+        return CameraState(ExposureControl(**self.exposure))
 
     def link_frames(self, state) -> dict:
         """``camera``: x along the optical axis, origin at the optical centre. ``optical``: OpenCV's frame there."""

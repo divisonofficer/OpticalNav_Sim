@@ -1,0 +1,14 @@
+# One colour polarization camera on a post: how small a rig can be.
+kind: rig
+label: 편광 카메라 1대
+description: 20 mm 프로파일 기둥 0.2 m, FLIR BFS-U3-51S5PC-C(편광)
+mass: 0.6
+parts:
+  - name: post
+    type: frame
+    params:
+      profile: 0.02
+      bars: [{from: [0.0, 0.0, 0.0], to: [0.0, 0.0, 0.2]}]
+      plates: [{size: [0.08, 0.08, 0.004], at: [0.0, 0.0, 0.002]}]
+      points: {top: {xyz: [0.0, 0.0, 0.2]}}
+  - {name: polar, type: camera, model: flir_bfs_51s5pc, label: 편광 카메라, parent: post, link: top, mount: {xyz: [0.06, 0.0, 0.02]}}

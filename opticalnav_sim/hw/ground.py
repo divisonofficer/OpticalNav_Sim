@@ -111,17 +111,25 @@ class Ground:
         return h
 
     def blocked(self, corners, floor: float, slope=(0.0, 0.0), at=(0.0, 0.0)) -> bool:
-        """Is anything more than a step above the floor under the footprint (4 x 2 world corners, in order)? The floor
+        """Is anything more than a step above the floor under the footprint (N x 2 world corners of a convex polygon, in order)? The floor
         is the plane the robot stands on: height ``floor`` at the point ``at``, rising by ``slope`` (per metre along
         world x and y), so a ramp is floor and a kerb on it is not. Outside the map, and where it was not seen,
         counts as blocked: a robot does not drive off what is known."""
         if self.heights is None:
             return False
-        c = np.asarray(corners, dtype=np.float64).reshape(4, 2)
-        along, across = c[1] - c[0], c[3] - c[0]
-        n, m = (max(2, int(np.ceil(np.linalg.norm(v) / (self.cell * 0.5))) + 1) for v in (along, across))
-        s, t = np.meshgrid(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, m))
-        pts = c[0] + s[..., None] * along + t[..., None] * across
+        c = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+        if len(c) == 4:
+            along, across = c[1] - c[0], c[3] - c[0]
+            n, m = (max(2, int(np.ceil(np.linalg.norm(v) / (self.cell * 0.5))) + 1) for v in (along, across))
+            s, t = np.meshgrid(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, m))
+            pts = c[0] + s[..., None] * along + t[..., None] * across
+        else:  # rings of the outline, shrunk towards its middle
+            mid, nxt = c.mean(axis=0), np.roll(c, -1, axis=0)
+            edge = max(2, int(np.ceil(np.linalg.norm(nxt - c, axis=1).max() / (self.cell * 0.5))) + 1)
+            rings = max(2, int(np.ceil(np.linalg.norm(c - mid, axis=1).max() / (self.cell * 0.5))) + 1)
+            t = np.linspace(0.0, 1.0, edge)[:, None, None]
+            outline = ((1.0 - t) * c[None] + t * nxt[None]).reshape(-1, 2)
+            pts = mid + np.linspace(0.0, 1.0, rings)[:, None, None] * (outline - mid)[None]
         i, j = self._index(pts[..., 0], pts[..., 1])
         ok = (i >= 0) & (i < self.heights.shape[0]) & (j >= 0) & (j < self.heights.shape[1])
         if not ok.all():

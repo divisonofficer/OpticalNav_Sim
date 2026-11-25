@@ -2771,8 +2771,9 @@ class Renderer:
             if not (0.0 <= mirrors[0] <= 100.0 and 0 <= mirrors[1] <= 64):
                 raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
         renderer = str(view.get("renderer", "path"))  # "raster": the rasterized preview (raster.py); "cycles": its .blend
-        if renderer not in ("path", "raster", "cycles"):
-            raise ValueError("renderer must be 'path', 'raster' or 'cycles'")
+        # "depth": no image, the depth alone (one ray a pixel, nothing sampled or recorded: hw.sensing's depth sensors)
+        if renderer not in ("path", "raster", "cycles", "depth"):
+            raise ValueError("renderer must be 'path', 'raster', 'cycles' or 'depth'")
         if renderer == "cycles" and self.blend_of(scan) is None:
             raise ValueError(f"{scan} has no .blend for the Cycles backend (tools/attach_blend.py)")
         if renderer == "cycles" and bands == "nir":
@@ -2799,8 +2800,8 @@ class Renderer:
         placed = tuple(sorted(placed))
         if len({p[0] for p in placed}) != len(placed):
             raise ValueError("body ids repeat in one view")
-        if placed and renderer != "path":
-            raise ValueError("bodies are drawn by the path tracer only (renderer 'path')")
+        if placed and renderer not in ("path", "depth"):
+            raise ValueError("bodies are drawn by the path tracer only (renderer 'path', or its 'depth')")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
                 mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth,
                 renderer, raster_aa, placed)
@@ -2854,6 +2855,8 @@ class Renderer:
             if renderer == "raster":  # the rasterized preview (raster.py): drawn here, one image a view
                 return self._raster_start(key, resident, cams, next(iter(looks.values())), follow, started - submitted,
                                           bands, depth, raster_aa)
+            if renderer == "depth":
+                return self._depth_start(resident, cams, width, height, hfov, next(iter(looks.values())), started - submitted)
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
             t0 = time.perf_counter()
@@ -2955,6 +2958,19 @@ class Renderer:
                        "launch_s": 0.0, "split_s": 0.0}
             return outs, kernels, render_s, 0.0
         return lambda: assemble
+
+    def _depth_start(self, resident, cams: list, width: int, height: int, hfov: float, look, queue_s: float):
+        """_start for a view that asks for depth alone: the look written into the scene as a launch would write it, one
+        ray a pixel (Resident.depth_image)."""
+        t0 = time.perf_counter()
+        with ACTIVITY.doing("rendering"):
+            resident._set_camera(cams[0], width, height, hfov, False, look)
+            depths = [resident.depth_image(c, width, height, hfov) for c in cams]
+            self.dr.eval(*depths)
+            maps = [np.array(z, dtype=np.float32).reshape(int(height), int(width)) for z in depths]
+        render_s = time.perf_counter() - t0
+        kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0, "queue_s": queue_s, "launch_s": 0.0, "split_s": 0.0}
+        return lambda: lambda: ([{"depth": z} for z in maps], kernels, render_s, 0.0)
 
     def _raster_start(self, key: tuple, resident, cams: list, look, follow: bool, queue_s: float, bands: str,
                       depth: bool, aa: str = "off"):
