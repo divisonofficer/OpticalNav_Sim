@@ -1,6 +1,7 @@
 """CUDA kernels of the rasterized preview (raster.py), built once with torch's cpp_extension and cached:
 ``soft_shadows`` is the PCSS filter, a thread a light and pixel; in torch, its 20 taps of a dozen tensor ops each
-took 60 ms a frame, here under one. ``kernels()`` is None where they cannot be built (no compiler): the preview
+took 60 ms a frame, here under one. Also the polarized shading's (direct light, the rest of a pixel's light, glass),
+probe lookup, texture sampling and ambient occlusion. ``kernels()`` is None where they cannot be built (no compiler): the preview
 then falls back to hard shadows."""
 from __future__ import annotations
 
@@ -24,6 +25,12 @@ torch::Tensor shade_lights(torch::Tensor x, torch::Tensor n, torch::Tensor ng, t
                            torch::Tensor spec, torch::Tensor vis, torch::Tensor lpos, torch::Tensor lnorm,
                            torch::Tensor lmode, torch::Tensor lpower, torch::Tensor lr2, torch::Tensor lpol,
                            torch::Tensor lframe, torch::Tensor up, double graze);
+torch::Tensor finish_pixels(torch::Tensor kd, torch::Tensor f0, torch::Tensor alpha, torch::Tensor spec,
+                            torch::Tensor coat, torch::Tensor n, torch::Tensor view, torch::Tensor irr,
+                            torch::Tensor shade, torch::Tensor gloss, torch::Tensor stokes, torch::Tensor emission,
+                            torch::Tensor up);
+torch::Tensor through_glass(torch::Tensor behind, torch::Tensor out, torch::Tensor normal, torch::Tensor up,
+                            torch::Tensor reflected);
 """
 
 _CUDA = r"""
@@ -508,6 +515,112 @@ torch::Tensor shade_lights(torch::Tensor x, torch::Tensor n, torch::Tensor ng, t
         lframe.data_ptr<float>(), up.data_ptr<float>(), (float)graze, A, P, out.data_ptr<float>());
     return out;
 }
+
+// --- the rest of a pixel's light, polarized (RasterScene._shade, after the lights) ---
+// the camera's Stokes basis for light reaching it along `v` (raster._reference)
+__device__ __forceinline__ float3 reference_basis(float3 v, float3 up) {
+    float3 r = cross3(make_float3(-v.x, -v.y, -v.z), up);
+    return dot3(r, r) > 1e-12f ? unit3(r) : any_across(v);
+}
+
+__global__ void finish_kernel(const float* __restrict__ kd, const float* __restrict__ f0, const float* __restrict__ alpha,
+                              const float* __restrict__ spec, const float* __restrict__ coat, const float* __restrict__ n,
+                              const float* __restrict__ view, const float* __restrict__ irr,
+                              const float* __restrict__ shade, const float* __restrict__ gloss,
+                              const float* __restrict__ stokes, const float* __restrict__ emission,
+                              const float* __restrict__ up, int P, float* __restrict__ out) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= P) return;
+    float3 N = f3(n + p * 3), V = f3(view + p * 3);
+    float nv = fmaxf(dot3(N, V), 1e-4f);
+    float rough = sqrtf(alpha[p]);
+    // Karis' analytic environment BRDF
+    float r00 = -rough + 1.f, r01 = -0.0275f * rough + 0.0425f, r02 = -0.572f * rough + 1.04f, r03 = 0.022f * rough - 0.04f;
+    float a004 = fminf(r00 * r00, exp2f(-9.28f * nv)) * r00 + r01;
+    float env_a = -1.04f * a004 + r02, env_b = 1.04f * a004 + r03;
+    // pplastic's diffuse light out through its coat: (Rp - Rs) / (2 - Rs - Rp)
+    float3 fc = fresnel_abc(nv, coat[p], 0.f);
+    float rs = fc.x + fc.y, rp = fc.x - fc.y, out_diffuse = (rp - rs) / fmaxf(2.f - rs - rp, 1e-6f);
+    const float* sp = spec + (long)p * 26;
+    float3 sn_ax = cross3(N, V);
+    sn_ax = dot3(sn_ax, sn_ax) > 1e-12f ? unit3(sn_ax) : any_across(V);
+    float2 t = basis_turn(V, sn_ax, reference_basis(V, f3(up)));
+    float* o = out + (long)p * 12;
+    for (int l = 0; l < 4; ++l) {
+        float fa = 0.f, fb = 0.f;
+        for (int j = 0; j < 2; ++j) {
+            float share = sp[j];
+            if (share <= 0.f) continue;
+            float w = share * sp[18 + j * 4 + l];
+            float3 f = fresnel_abc(nv, sp[2 + j * 4 + l], sp[10 + j * 4 + l]);
+            fa += w * f.x; fb += w * f.y;
+        }
+        long q = (long)p * 4 + l;
+        float diffused = kd[q] / 3.14159265f * (irr[q] + shade[q]);
+        float glossy = (f0[q] * env_a + env_b) * gloss[q] / 3.14159265f;
+        const float* st = stokes + (long)p * 12;
+        // a rough surface's glossy light comes from a lobe of mirror directions: its polarization partly cancels
+        float across = out_diffuse * diffused + fb / fmaxf(fa, 1e-6f) * glossy * (1.f - rough);
+        o[l] = diffused + st[l] + glossy + emission[q];
+        o[4 + l] = st[4 + l] + t.y * across;
+        o[8 + l] = st[8 + l] - t.x * across;
+    }
+}
+
+torch::Tensor finish_pixels(torch::Tensor kd, torch::Tensor f0, torch::Tensor alpha, torch::Tensor spec,
+                            torch::Tensor coat, torch::Tensor n, torch::Tensor view, torch::Tensor irr,
+                            torch::Tensor shade, torch::Tensor gloss, torch::Tensor stokes, torch::Tensor emission,
+                            torch::Tensor up) {
+    int P = kd.size(0);
+    auto out = torch::empty({P, 12}, kd.options());
+    if (P == 0) return out;
+    int threads = 128, blocks = (P + threads - 1) / threads;
+    finish_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        kd.data_ptr<float>(), f0.data_ptr<float>(), alpha.data_ptr<float>(), spec.data_ptr<float>(),
+        coat.data_ptr<float>(), n.data_ptr<float>(), view.data_ptr<float>(), irr.data_ptr<float>(),
+        shade.data_ptr<float>(), gloss.data_ptr<float>(), stokes.data_ptr<float>(), emission.data_ptr<float>(),
+        up.data_ptr<float>(), P, out.data_ptr<float>());
+    return out;
+}
+
+// a pane of glass (ior 1.5) in front of `behind` (RasterScene._through_glass)
+__global__ void glass_kernel(const float* __restrict__ behind, const float* __restrict__ outd,
+                             const float* __restrict__ normal, const float* __restrict__ up,
+                             const float* __restrict__ reflected, int per_pixel, int P, float* __restrict__ res) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= P) return;
+    float3 O = f3(outd + p * 3), Nn = f3(normal + p * 3);
+    float c = fminf(fabsf(dot3(O, Nn)), 1.f);
+    float3 f = fresnel_abc(c, 1.5f, 0.f);
+    float rs = f.x + f.y, rp = f.x - f.y, ts = (1.f - rs) * (1.f - rs), tp = (1.f - rp) * (1.f - rp);
+    float A = 0.5f * (ts + tp), B = 0.5f * (ts - tp), C = sqrtf(ts * tp), ra = f.x, rb = f.y;
+    float3 s_ax = cross3(Nn, O);
+    s_ax = dot3(s_ax, s_ax) > 1e-12f ? unit3(s_ax) : any_across(O);
+    float2 t = basis_turn(O, reference_basis(O, f3(up)), s_ax);
+    const float* b = behind + (long)p * 12;
+    const float* rr = reflected + (per_pixel ? (long)p * 4 : 0);
+    float* o = res + (long)p * 12;
+    for (int l = 0; l < 4; ++l) {
+        float s0 = b[l], s1 = b[4 + l], s2 = b[8 + l];
+        float p1 = t.y * s1 + t.x * s2, p2 = -t.x * s1 + t.y * s2;
+        float q0 = A * s0 + B * p1 + ra * rr[l], q1 = B * s0 + A * p1 + rb * rr[l], q2 = C * p2;
+        o[l] = q0;
+        o[4 + l] = t.y * q1 - t.x * q2;
+        o[8 + l] = t.x * q1 + t.y * q2;
+    }
+}
+
+torch::Tensor through_glass(torch::Tensor behind, torch::Tensor out, torch::Tensor normal, torch::Tensor up,
+                            torch::Tensor reflected) {
+    int P = behind.size(0);
+    auto res = torch::empty({P, 12}, behind.options());
+    if (P == 0) return res;
+    int threads = 128, blocks = (P + threads - 1) / threads;
+    glass_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        behind.data_ptr<float>(), out.data_ptr<float>(), normal.data_ptr<float>(), up.data_ptr<float>(),
+        reflected.data_ptr<float>(), reflected.size(0) == P && P > 1 ? 1 : 0, P, res.data_ptr<float>());
+    return res;
+}
 """
 
 _module = None
@@ -520,7 +633,9 @@ def kernels():
     if _module is None and not _failed:
         try:
             _module = torch.utils.cpp_extension.load_inline(
-                "opticalnav_raster_kernels", _CPP, cuda_sources=_CUDA, functions=["soft_shadows", "occlusion", "probe_irradiance", "texture_sample", "shade_lights"],
+                "opticalnav_raster_kernels", _CPP, cuda_sources=_CUDA,
+                functions=["soft_shadows", "occlusion", "probe_irradiance", "texture_sample", "shade_lights",
+                           "finish_pixels", "through_glass"],
                 extra_cuda_cflags=["-O3", "--use_fast_math"], verbose=False)
         except Exception as exc:  # noqa: BLE001 - no compiler, no headers: hard shadows instead
             print(f"[raster] CUDA kernels not built ({type(exc).__name__}: {str(exc)[:200]}): hard shadows", flush=True)

@@ -1145,6 +1145,13 @@ class RasterScene:
         else:
             shade = gloss = ambient[None] * occluded
         tick("indirect")
+        if kernels is not None:  # the rest below, in one CUDA kernel
+            out = kernels.finish_pixels(kd.contiguous(), f0.contiguous(), alpha.contiguous(), spec_pol.contiguous(),
+                                        coat.contiguous(), n.contiguous(), view.contiguous(), diffuse.contiguous(),
+                                        shade.contiguous(), gloss.contiguous(), stokes.contiguous(),
+                                        emission.contiguous(), frame.up)
+            tick("polarization")
+            return out, spec_pol, ambient
         rough = alpha.sqrt()
         r0 = rough[:, None] * torch.tensor([-1.0, -0.0275, -0.572, 0.022], device=dev) + \
             torch.tensor([1.0, 0.0425, 1.04, -0.04], device=dev)
@@ -1318,6 +1325,10 @@ class RasterScene:
         (toward the camera; the pane's normal ``normal``): what lies behind through both faces' Fresnel
         transmission, plus the unpolarized ``reflected`` radiance (P x 4 or 1 x 4) by its Fresnel reflection,
         in the basis across the plane of incidence."""
+        kernels = raster_kernels.kernels()
+        if kernels is not None:
+            return kernels.through_glass(behind.contiguous(), out.contiguous(), normal.contiguous(), up,
+                                         reflected.contiguous())
         cos = (out * normal).sum(1).abs().clamp(0, 1)
         rs, rp = _fresnel_rs_rp(cos, torch.full_like(cos, 1.5))
         ts, tp = (1 - rs) ** 2, (1 - rp) ** 2  # two faces
