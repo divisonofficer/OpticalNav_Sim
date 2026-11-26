@@ -713,6 +713,15 @@ class Session:
         """The camera MatterSim would render for this state (MatterSim._render)."""
         return self.sim._camera(st)
 
+    PROBE_DEPTH_S = 30.0   # after a pixel probe, frames bring their depth this long (the probe reads it)
+
+    def wants_depth(self) -> bool:
+        """Whether frames should bring the render server's depth (an extra ray a pixel and 0.8 MB at 512 x 384): only
+        while a page shows a depth pane, or probed a pixel lately."""
+        with self.cv:
+            panes = [ch for sub in self.subs.values() for ch in sub.get("panes", {}).values() if ch]
+        return any(str(ch).endswith(".depth") for ch in panes) or time.time() < getattr(self, "probe_until", 0.0)
+
     def _moved(self) -> None:
         """The state changed: describe it, and point the render loop at the new camera."""
         sim = self.sim
@@ -723,7 +732,7 @@ class Session:
         mode = self.render_mode_now()
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": mode,
-                "denoise": False, "preview": False, "s3": False, "depth": True, "lights": sim.lights, "env": dict(sim.env),
+                "denoise": False, "preview": False, "s3": False, "depth": self.wants_depth(), "lights": sim.lights, "env": dict(sim.env),
                 "bands": sim.bands, "flash_band": sim.flash_band, "nir": dict(sim.nir), "lighting": sim.lighting, "lamps": sim.lamps,
                 "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                 "renderer": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
@@ -1557,6 +1566,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                         except Exception as exc:  # noqa: BLE001 - shown on the page
                             ws.send_json({"type": "ack", "id": msg.get("id"), "error": f"{type(exc).__name__}: {exc}"})
                     elif kind == "subscribe":
+                        had_depth = session.wants_depth()
                         with session.cv:  # wake the sender to resend this frame's panes
                             sub["panes"] = {str(k): v for k, v in list(dict(msg.get("panes") or sub["panes"]).items())[:MAX_PANES]}
                             sub["scale"] = float(msg.get("scale", sub["scale"]))
@@ -1566,7 +1576,15 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                             sub["dirty"] = True
                             session.version += 1
                             session.cv.notify_all()
+                        if session.wants_depth() and not had_depth and session.started:   # a depth pane opened: render it
+                            with session.lock:
+                                session._moved()
                     elif kind == "probe":
+                        if time.time() >= getattr(session, "probe_until", 0.0) and session.started:   # depth from now on
+                            session.probe_until = time.time() + session.PROBE_DEPTH_S
+                            with session.lock:
+                                session._moved()
+                        session.probe_until = time.time() + session.PROBE_DEPTH_S
                         try:
                             ws.send_json({"type": "probe", **session.probe(int(msg["frame"]), int(msg["x"]), int(msg["y"]),
                                                                            str(msg.get("pol", "luma")))})
