@@ -17,6 +17,16 @@ from opticalnav_sim.hw.calibration import RigCalibration, load_opencv_yaml  # no
 from opticalnav_sim.hw.transform import yaw_from_heading  # noqa: E402
 
 
+
+def _cv2_or_skip():
+    """OpenCV, or the test skipped: an install built against another numpy fails at import with a TypeError, which
+    pytest.importorskip does not catch."""
+    try:
+        import cv2
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"OpenCV does not load here: {type(exc).__name__}")
+    return cv2
+
 def test_transform_composes_and_inverts():
     a, b = Transform((1.0, 2.0, 0.5), (10.0, -20.0, 75.0)), Transform((0.2, 0.0, 0.4), (0.0, 8.0, -30.0))
     assert np.allclose((a @ b).matrix(), a.matrix() @ b.matrix(), atol=1e-12)
@@ -150,7 +160,7 @@ def test_cameras_and_lens_reproduce_the_datasheets():
 
 
 def test_distortion_matches_opencv():
-    cv2 = pytest.importorskip("cv2")
+    cv2 = _cv2_or_skip()
     k = optics.Intrinsics(1920, 1200, 1500.0, 1490.0, 950.0, 610.0, (-0.21, 0.07, 0.001, -0.0007, -0.01))
     pts = np.random.default_rng(0).uniform([-0.55, -0.35, 1.0], [0.55, 0.35, 3.0], (500, 3))
     ref, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), k.matrix(), np.array(k.dist))
@@ -259,7 +269,7 @@ d_left: !!opencv-matrix
 
 def test_rational_and_thin_prism_distortion_matches_opencv_and_inverts():
     """A 12-coefficient calibration (the rig's): projection as OpenCV's, and every pixel's ray found back."""
-    cv2 = pytest.importorskip("cv2")
+    cv2 = _cv2_or_skip()
     d = (-0.115, -0.0118, 0.0088, -0.0036, 3.203, 0.0814, -0.2285, 3.604, 0.0034, 0.0053, -0.0118, -0.0007)
     k = optics.Intrinsics(1024, 768, 910.5, 910.3, 501.9, 408.5, d)
     pts = np.random.default_rng(1).uniform([-0.6, -0.45, 1.0], [0.6, 0.45, 2.0], (400, 3))
