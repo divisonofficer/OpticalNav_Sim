@@ -336,7 +336,7 @@ class Session:
         with self.cv:
             if self.opening and not self.opening.get("error"):
                 return self.status()  # one at a time
-            self.opening = {"id": ident, "t0": time.time(), "error": ""}
+            self.opening = {"id": ident, "t0": time.monotonic(), "error": ""}
             self.version += 1
             self.cv.notify_all()
         threading.Thread(target=self._open_blend_job, args=(ident,), name="open-blend", daemon=True).start()
@@ -350,7 +350,7 @@ class Session:
             self.run("start", self.start, info["scan"])
             result = None
         except Exception as exc:  # noqa: BLE001 - shown on the page
-            result = {"id": ident, "t0": self.opening["t0"] if self.opening else time.time(), "error": f"{type(exc).__name__}: {exc}"}
+            result = {"id": ident, "t0": self.opening["t0"] if self.opening else time.monotonic(), "error": f"{type(exc).__name__}: {exc}"}
         with self.cv:
             self.opening = result
             self.version += 1
@@ -731,7 +731,7 @@ class Session:
         while a page shows a depth pane, or probed a pixel lately."""
         with self.cv:
             panes = [ch for sub in self.subs.values() for ch in sub.get("panes", {}).values() if ch]
-        return any(str(ch).endswith(".depth") for ch in panes) or time.time() < getattr(self, "probe_until", 0.0)
+        return any(str(ch).endswith(".depth") for ch in panes) or time.monotonic() < getattr(self, "probe_until", 0.0)
 
     def _moved(self) -> None:
         """The state changed: describe it, and point the render loop at the new camera."""
@@ -777,7 +777,7 @@ class Session:
         }
         with self.cv:
             self.gen += 1
-            self.view, self.gen_started = view, time.time()
+            self.view, self.gen_started = view, time.monotonic()
             self.issued = self.published = 0
             self.spp_issued = 0
             with self._acc_lock:
@@ -822,7 +822,7 @@ class Session:
             return True
         if self.view.get("renderer") == "raster":  # noiseless: one image is the frame
             return False
-        if time.time() - self.gen_started < STILL_S:   # still moving, maybe: the slot waits for the next camera (_loop)
+        if time.monotonic() - self.gen_started < STILL_S:   # still moving, maybe: the slot waits for the next camera (_loop)
             return False
         return self.auto and self.spp_issued < self.target_spp
 
@@ -831,7 +831,7 @@ class Session:
             with self.cv:
                 while not self._wants_pass():
                     # a camera that has not moved for STILL_S gets its next passes then: wake for it
-                    still = STILL_S - (time.time() - self.gen_started)
+                    still = STILL_S - (time.monotonic() - self.gen_started)
                     self.cv.wait(still + 0.002 if self.view is not None and self.issued and 0 < still <= STILL_S else None)
                 gen, seed = self.gen, self.issued
                 spp = self._next_pass_spp()
@@ -1030,8 +1030,8 @@ class Session:
             self.frames[self.frame_id] = frame
             for old in [k for k in self.frames if k < self.frame_id - 3]:
                 del self.frames[old]
-            self.arrivals.append(time.time())
-            self.timings.append((time.time(), frame["timing"]))
+            self.arrivals.append(time.monotonic())
+            self.timings.append((time.monotonic(), frame["timing"]))
             self.frame_meta = {"frame_id": self.frame_id, "frame_gen": gen, "frame_spp": frame["spp"],
                                "frame_variant": frame["variant"], "passes": passes,
                                "frame_c2w": frame["c2w"]}  # the camera the frame was rendered from
@@ -1061,12 +1061,12 @@ class Session:
     def status(self) -> dict:
         sim = self.sim
         with self.cv:
-            now = time.time()
+            now = time.monotonic()
             arrivals, timings, screens = list(self.arrivals), list(self.timings), list(self.screens)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error and self.render_on
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             conv = ((self.renderer or {}).get("converting") or {}).get(self.opening["id"]) if self.opening else None  # the converter's own progress
-            out = {"opening": ({**self.opening, "elapsed_s": round(time.time() - self.opening["t0"], 1),
+            out = {"opening": ({**self.opening, "elapsed_s": round(time.monotonic() - self.opening["t0"], 1),
                                 "fraction": conv.get("fraction") if conv else None, "stage": conv.get("stage") if conv else None}
                                if self.opening else None),
                    "scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "max_pass_spp": MAX_PASS_SPP, "target_spp": self.target_spp, "auto": self.auto,
@@ -1163,10 +1163,10 @@ class Session:
 
     def wait_frame(self, after_frame: int = 0, timeout: float = 10.0) -> dict:
         """Wait for a frame of the current camera newer than ``after_frame`` (for scripts and tests)."""
-        end = time.time() + timeout
+        end = time.monotonic() + timeout
         with self.cv:
             while not (self.frame_meta.get("frame_gen") == self.gen and self.frame_id > after_frame) and not self.error:
-                left = end - time.time()
+                left = end - time.monotonic()
                 if left <= 0:
                     raise TimeoutError("no frame")
                 self.cv.wait(left)
@@ -1174,14 +1174,14 @@ class Session:
 
     def wait_idle(self, timeout: float = 30.0) -> dict:
         """Wait until the current camera reached its target spp (or accumulation is off)."""
-        end = time.time() + timeout
+        end = time.monotonic() + timeout
         while True:
             st = self.status()
             if st.get("done") or st.get("error"):
                 return st
-            if time.time() > end:
+            if time.monotonic() > end:
                 raise TimeoutError("not idle")
-            self.wait(st["version"], end - time.time())
+            self.wait(st["version"], end - time.monotonic())
 
     POL_CHANNELS = ("luma", "r", "g", "b", "nir")  # probe channels (luma: the dataset's luminance Stokes)
 
@@ -1563,7 +1563,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                                         break
                                     ws.send(frame_id.to_bytes(4, "big") + bytes([code]) + img, opcode=0x2)
                             with session.cv:
-                                session.screens.append((time.time(), 1000.0 * (time.perf_counter() - shown)))
+                                session.screens.append((time.monotonic(), 1000.0 * (time.perf_counter() - shown)))
                 except (ConnectionError, OSError, ValueError):
                     alive.clear()
 
@@ -1602,11 +1602,11 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                             with session.lock:
                                 session._moved()
                     elif kind == "probe":
-                        if time.time() >= getattr(session, "probe_until", 0.0) and session.started:   # depth from now on
-                            session.probe_until = time.time() + session.PROBE_DEPTH_S
+                        if time.monotonic() >= getattr(session, "probe_until", 0.0) and session.started:   # depth from now on
+                            session.probe_until = time.monotonic() + session.PROBE_DEPTH_S
                             with session.lock:
                                 session._moved()
-                        session.probe_until = time.time() + session.PROBE_DEPTH_S
+                        session.probe_until = time.monotonic() + session.PROBE_DEPTH_S
                         try:
                             ws.send_json({"type": "probe", **session.probe(int(msg["frame"]), int(msg["x"]), int(msg["y"]),
                                                                            str(msg.get("pol", "luma")))})

@@ -177,13 +177,13 @@ def encode(folder: Path, fps: float, out: Path) -> None:
 
 def _wait_for_server(client, timeout: float) -> None:
     """Until the render server answers again (a supervisor restarts one that died), or ``timeout`` seconds."""
-    end = time.time() + timeout
+    end = time.monotonic() + timeout
     while True:
         try:
             client.info()
             return
         except Exception:  # noqa: BLE001 - still away
-            if time.time() > end:
+            if time.monotonic() > end:
                 raise
             time.sleep(3.0)
 
@@ -214,7 +214,7 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
     kept = {"target": session.target_spp, "denoise": session.sim.denoise, "render_on": session.render_on, "follow": session.follow,
             "cam": session.cam_now, "sensors": {n: robot.sensors[n].state for n in names}}
     frames_dir = Path(tempfile.mkdtemp(prefix="opticalnav_rec_"))
-    started = time.time()
+    started = time.monotonic()
     robot.replaying = session.rec_busy = True
     try:
         with session.lock:
@@ -273,8 +273,8 @@ def render(session, robot, log: list, fps: float = 20.0, spp: int = 1024, sensor
             odometry.append(tuple(log[i]["odometry_xy"]))
             layout.frame(float(t), editor, images, state, trail, odometry).save(frames_dir / f"frame_{k:05d}.jpg", quality=94)
             done = k + 1
-            robot.recording.update(done=done, frames=len(times), seconds=round(time.time() - started, 1),
-                                   eta_s=round((time.time() - started) / done * (len(times) - done), 1))
+            robot.recording.update(done=done, frames=len(times), seconds=round(time.monotonic() - started, 1),
+                                   eta_s=round((time.monotonic() - started) / done * (len(times) - done), 1))
         robot.recording.update(phase="encoding")
         encode(frames_dir, fps, out)
         return out

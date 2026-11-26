@@ -59,7 +59,7 @@ def ensure(pack: Path, sid: str, blend: Path, force: bool = False) -> float:
     if not force and up_to_date(pack, sid, blend):
         return 0.0
     pack.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
+    t0 = time.monotonic()
     print(f"[blend] converting {blend.name} -> {sid} (the first time takes seconds to minutes)", flush=True)
     PROGRESS[sid] = {"fraction": 0.01, "stage": "시작", "t0": t0}
     proc = subprocess.Popen([sys.executable, str(CONVERTER), "--pack", str(pack), "--blend", str(blend), "--scene-id", sid, "--link-blend"],
@@ -79,8 +79,8 @@ def ensure(pack: Path, sid: str, blend: Path, force: bool = False) -> float:
     st = blend.stat()
     (pack / "scenes" / sid / ".source.json").write_text(json.dumps(
         {"blend": str(blend), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "converter": converter_version()}))
-    print(f"[blend] {sid} converted in {time.time() - t0:.0f} s", flush=True)
-    return time.time() - t0
+    print(f"[blend] {sid} converted in {time.monotonic() - t0:.0f} s", flush=True)
+    return time.monotonic() - t0
 
 
 def listed(dirs: list[str], tsvs: list[str]) -> dict[str, Path]:

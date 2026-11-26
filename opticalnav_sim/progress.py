@@ -79,12 +79,12 @@ class FreezeProgress:
         with self.lock:
             self._reset()
             self.key, self.calls, self.remember, self.score = key, calls, remember, int(score)
-            self.started = self.stage_since = time.time()
+            self.started = self.stage_since = time.monotonic()
 
     # --- a wait made of several recordings (a scene's first frame: its passes, then settling), shown as one ---
     def job_begin(self, steps: int) -> None:
         with self.lock:
-            self.job = {"step": 0, "steps": max(1, int(steps)), "phase": "", "since": time.time()}
+            self.job = {"step": 0, "steps": max(1, int(steps)), "phase": "", "since": time.monotonic()}
 
     def job_step(self, phase: str) -> None:
         with self.lock:
@@ -99,7 +99,7 @@ class FreezeProgress:
     def next_call(self) -> None:
         with self.lock:
             self.call += 1
-            self.stage, self.stage_since, self.kernels = "tracing", time.time(), [0, 0]
+            self.stage, self.stage_since, self.kernels = "tracing", time.monotonic(), [0, 0]
 
     def save(self) -> None:
         try:
@@ -111,7 +111,7 @@ class FreezeProgress:
     def end(self, ok: bool = True) -> None:
         with self.lock:
             if ok and self.key is not None and self.remember:  # seconds per call, and the scene's score
-                self.history[self.key] = {"per_call": round((time.time() - self.started) / max(1, self.calls), 1),
+                self.history[self.key] = {"per_call": round((time.monotonic() - self.started) / max(1, self.calls), 1),
                                           "score": self.score}
                 self.save()
             self.key = None
@@ -130,17 +130,17 @@ class FreezeProgress:
             self.recorded = True
             line = text.strip()
             if line and not line.startswith("jit_eval(): done"):
-                self.tail = (self.tail + [f"{time.time() - self.started:6.1f}s  {line[:160]}"])[-8:]
+                self.tail = (self.tail + [f"{time.monotonic() - self.started:6.1f}s  {line[:160]}"])[-8:]
             found = _LAUNCHING.search(text)
             if found:
-                self.stage, self.stage_since = "codegen", time.time()
+                self.stage, self.stage_since = "codegen", time.monotonic()
                 self.kernels = [0, int(found.group(1))]
             elif "-> launching" in text:
                 self.kernels[0] += 1
             elif "cache miss" in text:
                 self.misses += 1
             elif "jit_eval(): done" in text:
-                self.stage, self.stage_since = "tracing", time.time()
+                self.stage, self.stage_since = "tracing", time.monotonic()
 
     def snapshot(self) -> dict | None:
         with self.lock:
@@ -149,10 +149,10 @@ class FreezeProgress:
                 if job is None or not job["step"]:
                     return None  # a plain replay: nothing to report
                 # between the recordings of one wait (a replay that records nothing): the wait goes on
-                return {"stage": "replay", "call": 0, "calls": 0, "kernels": [0, 0], "elapsed_s": round(time.time() - job["since"], 1),
+                return {"stage": "replay", "call": 0, "calls": 0, "kernels": [0, 0], "elapsed_s": round(time.monotonic() - job["since"], 1),
                         "step": job["step"], "steps": job["steps"], "phase": job["phase"],
                         "overall": int(100 * (job["step"] - 1) / job["steps"])}
-            now = time.time()
+            now = time.monotonic()
             out = {"stage": self.stage or "tracing", "call": self.call, "calls": self.calls,
                    "kernels": list(self.kernels), "elapsed_s": round(now - self.started, 1),
                    "stage_s": round(now - self.stage_since, 1), "log": self.hooked}
@@ -187,7 +187,7 @@ class LoadProgress:
     def begin(self, scene_text: str) -> None:
         with self.lock:
             self.total = len(set(re.findall(r'name="filename" value="([^"]+)"', scene_text)))
-            self.seen, self.stage, self.started, self.active = set(), "files", time.time(), True
+            self.seen, self.stage, self.started, self.active = set(), "files", time.monotonic(), True
             loads = [v for k, v in FREEZE.history.items() if k.startswith("load|")]
             self.rate, self.basis = _rate(loads, "seconds", "files", SECONDS_PER_FILE)
 
@@ -205,7 +205,7 @@ class LoadProgress:
         """``name``: remember this load's time per file (the scene loaded)."""
         with self.lock:
             self.active = False
-            seconds = time.time() - self.started
+            seconds = time.monotonic() - self.started
         if name and self.total:
             with FREEZE.lock:
                 FREEZE.history[f"load|{name}"] = {"seconds": round(seconds, 1), "files": self.total}
@@ -216,7 +216,7 @@ class LoadProgress:
             if not self.active:
                 return None
             done = min(len(self.seen), self.total)
-            elapsed = time.time() - self.started
+            elapsed = time.monotonic() - self.started
             expected = self.rate * self.total
             return {"stage": self.stage, "files": [done, self.total], "elapsed_s": round(elapsed, 1),
                     "percent": int(100 * done / self.total) if self.total and self.stage == "files" else None,

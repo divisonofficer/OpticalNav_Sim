@@ -59,7 +59,7 @@ class Activity:
     def doing(self, what: str):
         with self.lock:
             prev = (self.what, self.since)
-            self.what, self.since = what, time.time()
+            self.what, self.since = what, time.monotonic()
         try:
             yield
         finally:
@@ -69,11 +69,11 @@ class Activity:
     def rename(self, what: str) -> None:
         """The same wait, now at another step (its elapsed time starts again)."""
         with self.lock:
-            self.what, self.since = what, time.time()
+            self.what, self.since = what, time.monotonic()
 
     def snapshot(self) -> dict:
         with self.lock:
-            out = {"what": self.what, "elapsed_s": round(time.time() - self.since, 1) if self.since else 0.0}
+            out = {"what": self.what, "elapsed_s": round(time.monotonic() - self.since, 1) if self.since else 0.0}
         # how far a scene load or a freeze recording has got (see progress.py)
         found = progress.FREEZE.snapshot() or progress.LOAD.snapshot()
         if found:
@@ -1365,7 +1365,7 @@ class Resident:
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
-        started = time.time()
+        started = time.monotonic()
         text = lit_scene_text(xml, flash_xml) if flash_xml is not None else xml.read_text()
         if bodies:  # robots and their equipment (bodies.scene_xml): instances a view places (set_bodies)
             end = text.rindex("</scene>")
@@ -1433,7 +1433,7 @@ class Resident:
         # OPTICALNAV_UNIFORM_EMITTERS=1: Mitsuba's default, every emitter picked as often (for comparisons)
         self.emitter_weights = {} if os.environ.get("OPTICALNAV_UNIFORM_EMITTERS") else \
             emitter_power_weights(mi, self.scene, radiance)
-        self.load_s = time.time() - started
+        self.load_s = time.monotonic() - started
         self.stats = scene_stats(mi, self.scene, text)  # the viewer's scene tab
         self.envs = envs  # name -> environment image at ENV_RES (Renderer.env_image)
         self.depth = {"own": integrator_spec(xml), "passive": integrator_spec(xml)}
@@ -1471,7 +1471,7 @@ class Resident:
         self.transforms: dict[str, np.ndarray] = {}  # shape id -> loaded to_world, for shapes hidden by shrinking
         self.originals: dict[str, np.ndarray] = {}  # vertex positions (N x 3) of the meshes holding them
         if hideable:
-            t = time.time()
+            t = time.monotonic()
             source = text  # the scene as loaded (with any pool shapes)
             params = mi.traverse(self.scene)
             meshes = {k: np.array(params[k], dtype=np.float32).reshape(-1, 3)
@@ -1484,7 +1484,7 @@ class Resident:
             self.originals = {key: meshes[key] for key, _, _ in self.blocks.values()}
             del meshes, params
             print(f"[resident] {len(self.blocks)} hideable shapes in {len(self.originals)} meshes "
-                  f"({sum(len(v) for v in self.originals.values())} vertices kept, {time.time() - t:.1f} s)", flush=True)
+                  f"({sum(len(v) for v in self.originals.values())} vertices kept, {time.monotonic() - t:.1f} s)", flush=True)
         # Indoor emitters: every emitter radiance but the camera flash's. Written back once (opaque) here.
         import drjit as dr
 
@@ -2582,7 +2582,7 @@ class Renderer:
             tool = Path(__file__).resolve().parents[1] / "tools" / "merge_meshes.py"
             if not tool.is_file() or scan not in self.pack_of:
                 return
-            started = time.time()
+            started = time.monotonic()
             with ACTIVITY.doing(f"merging meshes of {scan}"):
                 try:
                     done = subprocess.run([sys.executable, str(tool), "--pack", str(self.pack_of[scan]), "--scene", scan,
@@ -2597,7 +2597,7 @@ class Renderer:
                 return
             if "nothing to do" not in said:
                 self.reload_meta(scan)
-                print(f"[merge] {said[-400:]} ({time.time() - started:.0f} s)", flush=True)
+                print(f"[merge] {said[-400:]} ({time.monotonic() - started:.0f} s)", flush=True)
 
     def reload_meta(self, scan: str) -> None:
         """Read a scene's scene.json again (after compact_on_start rewrote it); its plans go with the old one."""
@@ -3512,7 +3512,7 @@ def make_handler(renderer: Renderer, token: str | None = None):
                 if not 0 < len(views) <= MAX_VIEWS:
                     raise ValueError(f"1..{MAX_VIEWS} views per request")
                 dtype = {"float16": np.float16, "float32": np.float32}[req.get("stokes_dtype", "float16")]
-                started = time.time()
+                started = time.monotonic()
                 results, total = renderer.render_views(views, dtype)
                 arrays = {f"{k}_{i}": v for i, result in enumerate(results) for k, v in result.items()}
                 t_enc = time.perf_counter()
@@ -3527,14 +3527,14 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     self._send_parts(200, [len(head).to_bytes(8, "little"), head] + [memoryview(v).cast("B")
                                                                                      for v in arrays.values()],
                                      RAW_ARRAYS_TYPE,
-                                     {"X-Render-Seconds": f"{time.time() - started:.4f}",
+                                     {"X-Render-Seconds": f"{time.monotonic() - started:.4f}",
                                       "X-Render-Timing": json.dumps({k: round(v, 4) for k, v in total.items()})})
                     return
                 buf = io.BytesIO()
                 np.savez(buf, **arrays)
                 total["encode_s"] = time.perf_counter() - t_enc
                 self._send(200, buf.getvalue(), "application/octet-stream",
-                           {"X-Render-Seconds": f"{time.time() - started:.4f}",
+                           {"X-Render-Seconds": f"{time.monotonic() - started:.4f}",
                             "X-Render-Timing": json.dumps({k: round(v, 4) for k, v in total.items()})})
             except (KeyError, ValueError, TypeError) as exc:
                 self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
@@ -3565,13 +3565,13 @@ def compact_on_start(renderer: Renderer, skip=()) -> None:
             and compact.needs_compaction(renderer.scene_dir(s))]
     print(f"[compact] {len(todo)} of {len(renderer.meta)} scenes need compacting: {todo}", flush=True)
     for scan in todo:
-        started = time.time()
+        started = time.monotonic()
         with ACTIVITY.doing(f"compacting {scan}"):
             done = subprocess.run([sys.executable, str(tool), "--pack", str(renderer.pack_of[scan]), "--scene", scan,
                                    "--if-needed"], check=False)
         if done.returncode == 0:
             renderer.reload_meta(scan)
-            print(f"[compact] {scan} in {time.time() - started:.0f} s", flush=True)
+            print(f"[compact] {scan} in {time.monotonic() - started:.0f} s", flush=True)
         else:
             print(f"[compact] {scan} failed (exit {done.returncode}): served as it is", flush=True)
 
