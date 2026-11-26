@@ -1430,3 +1430,69 @@ def test_camera_without_isp_is_its_render_through_the_lens():
     on = session._read("12bit", actor, request, [out], isp=True)
     assert off.picture.dtype == np.uint8 and off.picture.shape == on.picture.shape
     assert "ISP" in off.info["format"] and 30 < off.picture.mean() < 225
+
+
+def test_camera_reading_in_a_worker_process_is_the_same_as_here():
+    """hw.offload: the sensor model and ISP in a worker process give the raw and picture of the reading done here (and
+    of SimWorld.expose + isp.process, the way it was); a worker that dies leaves the reading to this process."""
+    import os
+    import signal
+
+    from opticalnav_sim.hw import offload
+    from opticalnav_sim.hw.sim import SimWorld
+
+    class Stub:
+        last_timing = {}
+
+        def register_body(self, *a, **k):
+            return {}
+
+        def meta(self, *a):
+            return {}
+    world = SimWorld(scene="", spp=16, client=Stub())
+    robot = hw.config.spawn(world, "ranger_mini", rig="hdr_12bit_mast")
+    pool = offload.Pool(1)
+    try:
+        assert pool.start(timeout=60.0), pool.off
+        rng = np.random.default_rng(0)
+        for name in ("hdr", "12bit"):
+            actor = robot.sensors[name]
+            spec = actor.spec
+            request = spec.request(world, actor, spp=16, scale=0.25)
+            v = request["views"][0]
+            out = {"radiance": rng.lognormal(-1.0, 1.0, (v["height"], v["width"], 3)).astype(np.float32)}
+            spec.read(world, actor, request, [out])            # the auto exposure started (it settles on its first frame)
+            snap, seed = spec.snapshot(actor.state), world.seed
+
+            def again():
+                spec.restore(actor.state, snap)
+                world.seed = seed
+            raw0, _ = world.expose(actor, request, out)
+            picture0 = isp.process(raw0, spec.processing())
+            exposure0 = (actor.state.exposure.exposure_s, actor.state.exposure.gain_db)
+            again()
+            here = spec.read(world, actor, request, [out])
+            again()
+            there = spec.read(world, actor, request, [out], develop=pool.develop)
+            assert pool.off is None
+            for r in (here, there):
+                raw = r.data["raw"]
+                assert raw.data.dtype == raw0.data.dtype and np.array_equal(raw.data, raw0.data)
+                assert (raw.exposure_s, raw.gain_db, raw.intrinsics, raw.time, raw.meta) == \
+                    (raw0.exposure_s, raw0.gain_db, raw0.intrinsics, raw0.time, raw0.meta)
+                assert np.array_equal(raw.pose, raw0.pose) and np.array_equal(r.picture, picture0)
+            assert here.info == there.info
+            assert (actor.state.exposure.exposure_s, actor.state.exposure.gain_db) == exposure0   # moved on the same way
+        # an error of the reading itself is raised as without the pool, which goes on
+        with pytest.raises(ValueError):   # no light, and no frame to take it from
+            pool.develop(spec, None, 0.01, 0.0, 1, 1.0, raw0.intrinsics, raw0.pose, 0.0)
+        assert pool.off is None and pool.develop(spec, np.ones((8, 8)), 0.01, 0.0, 1, 1.0, raw0.intrinsics, raw0.pose, 0.0)[1].shape == (8, 8, 3)
+        # a worker that dies: the reading is done here, the same, and the pool stays off
+        os.kill(pool.pids()[0], signal.SIGKILL)
+        again()
+        after = spec.read(world, actor, request, [out], develop=pool.develop)
+        assert pool.off is not None and np.array_equal(after.picture, here.picture)
+        assert np.array_equal(spec.read(world, actor, request, [out], develop=pool.develop).data["raw"].data.shape, raw0.data.shape)
+    finally:
+        pool.shutdown()
+    assert offload.Pool(0).develop is not None and offload.Pool(0).off   # 0 processes: readings here

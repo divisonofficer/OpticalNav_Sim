@@ -515,9 +515,14 @@ class RobotSession:
     def _read(self, name: str, actor, request: dict, outs: list, isp: bool = True):
         """sense's second half: the sensor's reading of the render (its model, a camera's ISP), or with ``isp`` off a
         camera's render as it is."""
+        from .hw import offload
+        from .hw.cameras import CameraSpec
         spec = actor.spec
         if not isp and getattr(spec, "kind", None) == "camera":
             return self.picture_without_isp(name, actor, request, outs[0])
+        pool = offload.shared() if isinstance(spec, CameraSpec) else None
+        if pool is not None:   # the sensor's noise and the ISP in a worker process, off the viewer's GIL (hw.offload)
+            return spec.read(self.world, actor, request, outs, develop=pool.develop)
         return spec.read(self.world, actor, request, outs)
 
     def picture_without_isp(self, name: str, actor, request: dict, out: dict):
@@ -552,6 +557,10 @@ class RobotSession:
         world = self.world
         if world is None:
             return
+        from .hw import offload
+        pool = offload.shared()
+        if pool is not None:   # its workers start while the scene with the robot loads (the readings go here till then)
+            pool.start()
         self.moved_at = time.monotonic()
         threading.Thread(target=self._simulate, args=(run,), name="robot-sim", daemon=True).start()
         # two loops: a depth camera or a LiDAR does not wait for the cameras' light

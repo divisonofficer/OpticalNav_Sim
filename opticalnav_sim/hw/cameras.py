@@ -134,10 +134,14 @@ class CameraSpec(Sensor):
         r = world.request(actor, spp=spp, **options)
         return dict(r, views=[r["view"]])
 
-    def read(self, world, actor, request, outs) -> Reading:
-        from . import isp
-        raw, frame = world.expose(actor, request, outs[0])
-        picture = isp.process(raw, self.processing())
+    def read(self, world, actor, request, outs, develop=None) -> Reading:
+        """The render through the camera's sensor (SimWorld.expose) and its ISP. ``develop``: what runs the pure part
+        of that, hw.offload.develop's arguments to its (raw, picture): a hw.offload.Pool's puts it in another process
+        (the same result); None, here."""
+        from . import offload
+        frame, light, exposure_s, gain_db, covered = world.meter(actor, request, outs[0])   # the auto exposure: here
+        raw, picture = (develop or offload.develop)(self, light, exposure_s, gain_db, world.seed, covered, frame.intrinsics,
+                                                    frame.pose, frame.time)
         return Reading(actor.name, self.modality, raw.time, raw.pose, {"raw": raw, "frame": frame}, picture,
                        {"model": self.model, "format": f"{raw.cfa} {raw.bit_depth}-bit", "size": f"{picture.shape[1]}x{picture.shape[0]}",
                         "exposure": f"{raw.exposure_s * 1e3:.2f} ms" + (f" +{raw.gain_db:.1f} dB" if raw.gain_db > 0.05 else "")})
