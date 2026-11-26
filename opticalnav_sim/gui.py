@@ -116,7 +116,6 @@ def pane_channel(name: str) -> tuple[str, str]:
 
 
 DEPTH_RANGE = (0.3, 12.0)  # metres shown from red (near) to blue (far), on a log scale
-DEPTH_GRID = 64  # cells across the depth grid the page warps frames with (and as many down as the aspect gives)
 
 
 MAX_PANES = 12  # the editor's pane and its sub viewers, per page
@@ -124,7 +123,7 @@ MAX_PANES = 12  # the editor's pane and its sub viewers, per page
 
 def pane_byte(pane: str) -> int | None:
     """The byte that names a pane in a pushed image: 0 "a" (the editor's), 1 "b", 3 + n the sub viewer "s<n>" (2 is
-    the depth grid)."""
+    not used: it was the motion warp's depth grid)."""
     if pane in ("a", "b"):
         return "ab".index(pane)
     if pane[:1] == "s" and pane[1:].isdigit() and int(pane[1:]) < 250:
@@ -142,17 +141,6 @@ def depth_rgb(z: np.ndarray) -> np.ndarray:
     b = 0.10667330 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973))))
     rgb = np.clip(np.stack([r, g, b], axis=-1), 0.0, 1.0) * (z > 0)[..., None]
     return (255.0 * rgb + 0.5).astype(np.uint8)
-
-
-def depth_grid(z: np.ndarray, cells: int = DEPTH_GRID) -> bytes:
-    """The depth at the corners of a ``cells`` x (by aspect) grid over the image, for the page's warp: uint16
-    columns and rows, then the corners row by row as uint16 millimetres (0: nothing hit), big-endian."""
-    h, w = z.shape
-    gw, gh = cells, max(1, round(cells * h / w))
-    ys = np.clip(np.round(np.linspace(0, h - 1, gh + 1)).astype(int), 0, h - 1)
-    xs = np.clip(np.round(np.linspace(0, w - 1, gw + 1)).astype(int), 0, w - 1)
-    mm = np.clip(np.round(z[np.ix_(ys, xs)] * 1000.0), 0, 65535).astype(">u2")
-    return np.array([gw, gh], dtype=">u2").tobytes() + mm.tobytes()
 
 
 def channel_image(frame: dict, channel: str, scale: float) -> np.ndarray:
@@ -256,11 +244,14 @@ class Session:
         self.frames: dict[int, dict] = {}  # the last four, so image requests that lag a frame or two still work
         self.arrivals: deque = deque(maxlen=64)
         self.timings: deque = deque(maxlen=64)  # (arrival, the pass's time split) of the frames shown
-        self.screens: deque = deque(maxlen=64)  # (sent, ms) a page's panes and depth grid took to make and send
+        self.screens: deque = deque(maxlen=64)  # (sent, ms) a page's panes took to make and send
         self.subs: dict[int, dict] = {}  # each page's panes, scale and exposure: the JPEGs a frame makes ahead
         self.trail: list[tuple[float, float]] = []
         self.robot = None                 # robot_view.RobotSession (attach_robot): its links are bodies of this view
         self.polarization = True          # False: the path tracer's plain RGB variant (no Stokes vectors: several times faster)
+        # with polarization on, the robot's cameras: "split" each by its model (a polarization camera polarized, any other
+        # unpolarized: two scenes on the GPU), "unified" all polarized (one scene); off, every camera unpolarized
+        self.polar_cameras = "unified"
         self.render_on = True             # False: the editor's own view is not rendered (configure "editor_render"): its last picture stays
         self.pages_seen = False           # a page has connected: from then on, a view nobody watches is not rendered again
         self.cam_now = (0.0, 0.0, 1.5, 0.0, 0.0)  # the editor camera: x, y, height, heading, elevation (set by every move)
@@ -421,6 +412,8 @@ class Session:
         """``robot``'s links are drawn in this session's view, its sensors take this view's lighting, and the view is
         rendered again whenever the robot has moved."""
         self.robot = robot
+        robot.modes = list(self.modes)    # the robot's cameras render polarized or not as polar_policy says
+        robot.polar_policy = self.polar_policy()
         robot.view_source = self._view_now
         robot.viewers = self.viewed_sensors
         robot.editor_pose = lambda: (self.cam_now, self.follow)
@@ -652,6 +645,8 @@ class Session:
             if want and "polar" not in self.modes:
                 raise ValueError("the render server has no polarized mode: start it with --modes polar,rgb")
             self.polarization = want
+            if self.robot is not None:
+                self.robot.polar_policy = self.polar_policy()
             self.pass_spp = min(self.pass_spp, MAX_PASS_SPP["polar" if want else "rgb"])   # a polarized pass carries Mueller matrices
             restart = True
         if "caustics" in settings:  # MatterSim.setCaustics
@@ -681,6 +676,13 @@ class Session:
             self.sim.setEnvironment(name, float(settings.get("env_scale", env["scale"])),
                                     float(settings.get("env_rotate_deg", env["rotate_deg"])))
             restart = True
+        if "polar_cameras" in settings:  # with polarization on: "split" (each camera by its model) or "unified" (all polarized)
+            want = str(settings["polar_cameras"])
+            if want not in ("split", "unified"):
+                raise ValueError("polar_cameras: 'split' or 'unified'")
+            self.polar_cameras = want
+            if self.robot is not None:
+                self.robot.polar_policy = self.polar_policy()
         if "pass_spp" in settings:
             want = int(settings["pass_spp"])
             top = MAX_PASS_SPP["polar" if self.polarization else "rgb"]
@@ -771,6 +773,10 @@ class Session:
         """The render server mode a frame asks for: polarization off is the path tracer's unpolarized variant (the preview
         rasteriser and Cycles have their own modes)."""
         return "polar" if self.polarization or self.sim.renderer != "path" or "rgb" not in self.modes else "rgb"
+
+    def polar_policy(self) -> str:
+        """How the robot's cameras choose their mode: "off" (polarization off: all unpolarized), "split" or "unified"."""
+        return self.polar_cameras if self.polarization else "off"
 
     def bands_here(self) -> list:
         """The bands the current mode renders ("rgb", and "nir" where it can)."""
@@ -976,7 +982,7 @@ class Session:
             self.timings.append((time.time(), frame["timing"]))
             self.frame_meta = {"frame_id": self.frame_id, "frame_gen": gen, "frame_spp": frame["spp"],
                                "frame_variant": frame["variant"], "passes": passes,
-                               "frame_c2w": frame["c2w"]}  # the page warps it toward camera_to_world while moving
+                               "frame_c2w": frame["c2w"]}  # the camera the frame was rendered from
             self.version += 1
             self.cv.notify_all()
 
@@ -1010,7 +1016,7 @@ class Session:
             split = [s for t, s in self.timings if now - t <= 5.0] or [s for _, s in list(self.timings)[-1:]]
             timing = {k: round(float(np.median([s[k] for s in split])), 1) for k in (split[0] if split else {})}
             screens = [ms for t, ms in self.screens if now - t <= 5.0]
-            if screens:  # per page: JPEGs (polarization, tone), the depth grid, the socket writes
+            if screens:  # per page: JPEGs (polarization, tone), the socket writes
                 timing["screen_ms"] = round(float(np.median(screens)), 1)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error and self.render_on
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
@@ -1025,7 +1031,7 @@ class Session:
                    "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                    "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
-                   "active_split": sim.active_split, "polarization": self.polarization, "modes": self.modes,
+                   "active_split": sim.active_split, "polarization": self.polarization, "polar_cameras": self.polar_cameras, "modes": self.modes,
                    "editor_render": self.render_on,
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
@@ -1137,7 +1143,7 @@ class Session:
         return str(channel), round(float(scale), 4), tuple(sorted((ev or {}).items()))
 
     def _prepare(self, frame: dict) -> None:
-        """Make a new frame's pane JPEGs (every page's subscribed channels) and depth grid before it is published,
+        """Make a new frame's pane JPEGs (every page's subscribed channels) before it is published,
         on the publisher's thread, several panes side by side (the encoder releases the interpreter): a page's
         sender only writes them out (Session.image falls back to making one, for a page that changed)."""
         with self.cv:
@@ -1150,7 +1156,6 @@ class Session:
             return key, None
         made = self._jpeg_pool.map(make, wanted) if len(wanted) > 1 else map(make, wanted)
         frame["jpegs"] = {key: img for key, img in made if img is not None}
-        frame["grid"] = None if frame.get("depth") is None else depth_grid(frame["depth"])
 
     def image(self, frame_id: int, channel: str, scale: float, ev: dict | None = None) -> bytes:
         """A pane's JPEG. ``channel``: a band and a view (pane_channel), e.g. ``"g.aolp"``: the image (the colour
@@ -1206,16 +1211,6 @@ class Session:
                 self.tones[(frame["scan"], frame["variant"] + "|nir")] = tonemap.global_params([grey])
             self.version += 1
             self.cv.notify_all()
-
-    def depth_grid(self, frame_id: int) -> bytes | None:
-        """The frame's depth grid for the page's warp (module depth_grid), None without depth."""
-        try:
-            frame = self._frame(frame_id)
-        except KeyError:
-            return None
-        if "grid" not in frame:
-            frame["grid"] = None if frame.get("depth") is None else depth_grid(frame["depth"])
-        return frame["grid"]
 
     def probe(self, frame_id: int, x: int, y: int, pol: str = "luma") -> dict:
         f = self._frame(frame_id)
@@ -1461,7 +1456,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
             """GET /ws: the page's one connection. The server pushes {"type": "state"} whenever anything
             changes and, for each new frame, the JPEGs of the panes the page subscribed to as binary messages
             (4-byte frame id, 1-byte pane, JPEG; pane_byte: 0 the editor's pane "a", 1 "b", 3 + n the sub viewer
-            "s<n>"; 2 is the depth grid). The page sends {"type": "input", "id", "path", "body"} (answered by
+            "s<n>"). The page sends {"type": "input", "id", "path", "body"} (answered by
             {"type": "ack"}), {"type": "subscribe", "panes": {"a": "rgb.img", "s0": "rgb.dolp", ...}, "scale",
             "sensors": ["hdr", ...]} (any number of panes, each a channel of the editor's view; the robot's sensors
             the page shows, which are rendered while it shows them) and {"type": "probe", "frame", "x", "y"}."""
@@ -1510,9 +1505,6 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                                     except KeyError:  # already replaced by a newer frame
                                         break
                                     ws.send(frame_id.to_bytes(4, "big") + bytes([code]) + img, opcode=0x2)
-                            grid = session.depth_grid(frame_id)
-                            if grid is not None:  # the page's motion warp (pane byte 2)
-                                ws.send(frame_id.to_bytes(4, "big") + bytes([2]) + grid, opcode=0x2)
                             with session.cv:
                                 session.screens.append((time.time(), 1000.0 * (time.perf_counter() - shown)))
                 except (ConnectionError, OSError, ValueError):
@@ -1633,7 +1625,7 @@ def main() -> int:
     session.nir_available = bool(info.get("nir"))
     session.modes = list(info.get("modes") or ["polar"])
     session.mode_bands = dict(info.get("mode_bands") or {m: (["rgb", "nir"] if m == "polar" else ["rgb"]) for m in session.modes})
-    session.polarization = "polar" in session.modes
+    session.polarization = "rgb" not in session.modes   # off by default: unpolarized RGB+NIR, one scene, fast
     from .robot_view import RobotSession
     robot = RobotSession(sim._client.url, args.rig_calibration, config=args.robot)  # the robot a page puts into the scene it shows
     session.attach_robot(robot)

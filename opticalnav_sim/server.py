@@ -1134,6 +1134,7 @@ class Look:
     split: bool = False              # the active pass as one path_nocaustics "split" path, not a passive and a flash path
     nir_range: tuple = (0.5, 1.0)    # pseudo near-infrared reflectance mapped onto this (rgb2nir low, high): 0.5..1 as is
     flash_offset: tuple = (0.0, 0.0, 0.0)  # the flash moved this far (m): right, up, forward of the level view
+    unpolarized: bool = False        # a polarized scene rendered without polarization (path_nocaustics unpolarized)
 
     def light_level(self, light_class: str) -> float:
         """Indoor emitter radiance factor for a light class in this band (scenes without bandscale lights)."""
@@ -1512,18 +1513,19 @@ class Resident:
         self.rr_depth = 0  # Russian roulette's first depth, set per launch (Look.rr_depth); 0: Mitsuba's 5
         self.caustics = True  # the passive and own passes keep caustics, set per launch (Look.caustics)
         self.split = False  # the active pass on one path (Look.split), set per launch
+        self.unpolarized = False  # Look.unpolarized: the passes' integrators without Mueller matrices, set per camera
 
     def integrator(self, name: str, sky: float | None = None):
         """path_nocaustics in an assist mode (or, for "own", as plain path: caustics kept, every emitter),
         with ``sky`` (default: daylight's near-infrared share) on the sky seen by a dual render's
         near-infrared slot. Without bandscale lights, "own" is the scene's own integrator (None)."""
         if name == "own" and not self.band_keys and not self.max_depth and not self.rr_depth and self.caustics \
-                and not self.hidden:
+                and not self.hidden and not self.unpolarized:
             return None
         sky = self.sky_nir if sky is None else float(sky)
         # the flash's near-specular cut (Look.flash_pdf); split cuts the flash's paths with it too
         pdf = float(self.flash_pdf) if name in ("flash", "split") else None
-        key = (name, sky, pdf, self.max_depth, self.rr_depth, self.caustics)
+        key = (name, sky, pdf, self.max_depth, self.rr_depth, self.caustics, self.unpolarized)
         if key not in self.integrators:
             spec = dict(self.depth["passive" if name == "split" else name])
             if name == "split":  # one path long enough for both passes
@@ -1548,6 +1550,8 @@ class Resident:
                 inner["rr_depth"] = int(self.rr_depth)
             if pdf is not None:
                 inner["specular_pdf_threshold"] = pdf
+            if self.unpolarized:   # the light's intensity alone: the unpolarized variant's speed on this scene
+                inner["unpolarized"] = True
             if self.mode != "rgb" or self.rgbn:   # (unpolarized RGBN: the stokes wrapper writes the lanes, NIR among them)
                 inner = {"type": "stokes", "integrator": inner}
                 if spec["reference_axis"] is not None:
@@ -1568,6 +1572,8 @@ class Resident:
             tail += ("no_caustics",)
         if pass_name == "active" and self.split:
             tail += ("split",)
+        if self.unpolarized:
+            tail += ("unpolarized",)
         return (int(spp), int(width), int(height), pass_name) + tail
 
     def pass_integrators(self, pass_name: str, sky: float | None = None) -> tuple:
@@ -1637,6 +1643,7 @@ class Resident:
                     look: Look = Look()) -> dict:
         """Write the camera, the assist shapes and the Look into the scene, unless already there."""
         mi = self.mi
+        self.unpolarized = bool(look.unpolarized) and self.mode == "polar"   # integrators and recording keys (see integrator)
         pose = (np.asarray(c2w, dtype=np.float64).tobytes(), int(width), int(height), float(hfov_deg), follow, look)
         if pose == self.pose:
             return {"traverse_s": 0.0, "update_s": 0.0}
@@ -2344,6 +2351,21 @@ class Renderer:
         # an older plugin lacks ``hidden_specular``: such lights then show in reflections and through glass
         Resident.hidden_specular = self.has_hidden and self._has_plugin(
             {"type": "path_nocaustics", "hidden": HIDDEN_LIGHT_PREFIX, "hidden_specular": HIDDEN_SPEC_PREFIX})
+        # path_nocaustics's "unpolarized" (2026-11-26): the rgb mode renders the polarized RGBN scene without Mueller
+        # matrices (S0 per lane, 5.5 ms against 67 ms a 512x384 16 spp CS02 frame, the cuda_rgbn variant's own 5.4 ms):
+        # one scene in memory for both modes, one load, recordings of one scene
+        self.shared_rgb = False
+        if "polar" in self.variant_of and "_rgbn_polarized" in self.variant_of["polar"] and self.has_nocaustics:
+            prev = mi.variant()
+            mi.set_variant(self.variant_of["polar"])
+            try:
+                probe = mi.load_dict({"type": "path_nocaustics", "unpolarized": True})
+                self.shared_rgb = "unpolarized = true" in str(probe)
+            except Exception:  # noqa: BLE001 - an older plugin: the rgb mode keeps its own scene
+                self.shared_rgb = False
+            mi.set_variant(prev)
+            if self.shared_rgb and "rgb" in self.variant_of:
+                self.variant_of["rgb"] = self.variant_of["polar"]
         self.freeze = hasattr(dr, "freeze") if freeze == "auto" else freeze == "on"
         self.preloading: list[list[str]] = []  # [scan, variant, mode] of --preload loads not done yet (main)
         # environment maps a view may ask for by name (file stem): <pack>/envmaps unless --envmaps says otherwise
@@ -2544,6 +2566,10 @@ class Renderer:
         return [name for name, v in self.meta[scan]["variants"].items()
                 if self.has_nocaustics or not v.get("flash_xml")]
 
+    def scene_mode(self, mode: str) -> str:
+        """The mode whose resident scene renders ``mode``: the rgb mode on the polarized scene when shared_rgb."""
+        return "polar" if mode == "rgb" and self.shared_rgb else mode
+
     def _on_main(self, mode: str, fn, *args):
         def job():
             if self.mi.variant() != self.variant_of[mode]:
@@ -2552,6 +2578,7 @@ class Renderer:
         return self.executor.submit(job).result()
 
     def preload(self, scan: str, variant: str, mode: str = "polar") -> float:
+        mode = self.scene_mode(mode)
         return self._on_main(mode, lambda: self._resident(self.plan(scan, variant, mode)[0], variant).load_s)
 
     def plan(self, scan: str, variant: str, mode: str) -> tuple[tuple, tuple[str, ...], bool, frozenset]:
@@ -2858,8 +2885,9 @@ class Renderer:
             return self._cycles_start(key, cams, started - submitted)
         if self.mi.variant() != self.variant_of[mode]:
             self.mi.set_variant(self.variant_of[mode])
+        unpolarized = mode == "rgb" and self.shared_rgb   # the polarized scene, its integrators without Mueller matrices
         with ACTIVITY.doing("rendering"):
-            rkey, passes, follow, hidden = self.plan(scan, variant, mode)
+            rkey, passes, follow, hidden = self.plan(scan, variant, self.scene_mode(mode))
             if placed:  # a scene with these bodies in it is another resident scene (their meshes load with it)
                 rkey = rkey + (tuple((b, name, mkey) for b, name, mkey, _ in placed),)
             resident = self._resident(rkey, variant)
@@ -2885,11 +2913,11 @@ class Renderer:
                 # serves all three), else the dual sensor
                 looks = {2: Look(hidden, lights, env, env_scale, env_rot, band=2, nir=nir, **flash, groups=groups, flash_scale=flash_scale,
                                flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
-                               split=split, nir_range=nir_range, rr_depth=rr_depth)}
+                               split=split, nir_range=nir_range, rr_depth=rr_depth, unpolarized=unpolarized)}
             else:  # one band per render
                 looks = {b: Look(hidden, lights, env, env_scale, env_rot, band=b, nir=nir, **flash, groups=groups, flash_scale=flash_scale,
                                flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
-                               split=split, nir_range=nir_range, rr_depth=rr_depth)
+                               split=split, nir_range=nir_range, rr_depth=rr_depth, unpolarized=unpolarized)
                          for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
             if renderer == "raster":  # the rasterized preview (raster.py): drawn here, one image a view
                 return self._raster_start(key, resident, cams, next(iter(looks.values())), follow, started - submitted,
@@ -3231,6 +3259,7 @@ def make_handler(renderer: Renderer, token: str | None = None):
                         "mitsuba_version": getattr(getattr(renderer, "mi", None), "__version__", None),
                         "modes": renderer.variant_of, "path_nocaustics": renderer.has_nocaustics,
                         "mode_bands": {m: mode_bands(v, bool(renderer.has_rgb2nir)) for m, v in renderer.variant_of.items()},
+                        "shared_rgb": getattr(renderer, "shared_rgb", False),   # the rgb mode renders the polarized scene unpolarized
                         "envmaps": sorted(renderer.envmaps), "nir": renderer.has_rgb2nir,
                         "active_split": getattr(renderer, "has_split", False),
                         "nir_defaults": NIR_DEFAULTS,
@@ -3557,7 +3586,7 @@ def main() -> int:
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"[serve] http://{args.host}:{args.port}  modes={renderer.variant_of}  scans={len(renderer.meta)}  "
+    print(f"[serve] http://{args.host}:{args.port}  modes={renderer.variant_of}  shared_rgb={renderer.shared_rgb}  scans={len(renderer.meta)}  "
           f"path_nocaustics={renderer.has_nocaustics}  freeze={renderer.freeze}  "
           f"kernel_history={renderer.kernel_history}  ser={renderer.ser}", flush=True)
     if not args.no_compact:

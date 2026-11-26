@@ -1075,16 +1075,17 @@ index bc145f5..2f73110 100644
                  /// Note: this assumes that sensor used sample_rgb_spectrum() to generate 'ray.wavelengths'
 diff --git a/src/integrators/path_nocaustics.cpp b/src/integrators/path_nocaustics.cpp
 new file mode 100755
-index 0000000..cf7c8cf
+index 0000000..d666365
 --- /dev/null
 +++ b/src/integrators/path_nocaustics.cpp
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,712 @@
 +#include <mitsuba/core/ray.h>
 +#include <mitsuba/core/properties.h>
 +#include <mitsuba/core/string.h>
 +#include <mitsuba/render/bsdf.h>
 +#include <mitsuba/render/emitter.h>
 +#include <mitsuba/render/integrator.h>
++#include <mitsuba/render/mueller.h>
 +#include <mitsuba/render/records.h>
 +
 +NAMESPACE_BEGIN(mitsuba)
@@ -1172,6 +1173,7 @@ index 0000000..cf7c8cf
 +        m_specular_pdf_threshold = props.get<ScalarFloat>("specular_pdf_threshold", 20.f);
 +        m_caustics = props.get<bool>("caustics", false);
 +        m_sky_nir = props.get<ScalarFloat>("sky_nir", 1.f);
++        m_unpolarized = props.get<bool>("unpolarized", false);
 +        m_assist = std::string(props.get<std::string_view>("assist", ""));
 +        m_hidden = std::string(props.get<std::string_view>("hidden", ""));
 +        m_hidden_spec = std::string(props.get<std::string_view>("hidden_specular", ""));
@@ -1190,22 +1192,59 @@ index 0000000..cf7c8cf
 +            Throw("path_nocaustics: 'assist_mode' %s needs an 'assist' shape id prefix", mode);
 +    }
 +
++    /* 'unpolarized' (a polarized variant): the path carries the light's intensity alone (UnpolarizedSpectrum: R, G, B
++       and the near-infrared lane), each BSDF and emitter value its Mueller matrix's (0, 0) entry, no basis rotations,
++       as the unpolarized variant of the same colours would render it. Dr.Jit leaves the outputs of the BSDF and
++       emitter calls that nothing reads out of the kernel, so the other fifteen entries are not computed. The result
++       is a depolarizer: S0 alone, S1 to S3 zero. One scene in memory renders polarized and unpolarized cameras. */
 +    std::pair<Spectrum, Bool> sample(const Scene *scene,
 +                                     Sampler *sampler,
 +                                     const RayDifferential3f &ray_,
-+                                     const Medium * /* medium */,
-+                                     Float * /* aovs */,
++                                     const Medium *medium,
++                                     Float *aovs,
 +                                     Bool active) const override {
++        if constexpr (is_polarized_v<Spectrum>) {
++            if (m_unpolarized) {
++                auto [value, valid] = sample_impl<UnpolarizedSpectrum>(scene, sampler, ray_, medium, aovs, active);
++                return { mueller::depolarizer(value), valid };
++            }
++        }
++        return sample_impl<Spectrum>(scene, sampler, ray_, medium, aovs, active);
++    }
++
++    /// The value of a BSDF or an emitter as a path of type ``S`` carries it (the whole Mueller matrix, or its (0, 0) entry)
++    template <typename S> S lift(const Spectrum &x) const {
++        if constexpr (std::is_same_v<S, Spectrum>)
++            return x;
++        else
++            return unpolarized_spectrum(x);
++    }
++
++    /// A BSDF value in the world frame, for a path of type ``S`` (a Mueller matrix rotated to the world's Stokes basis)
++    template <typename S> S world_bsdf(const SurfaceInteraction3f &si, const Spectrum &x, const Vector3f &wo_local) const {
++        if constexpr (std::is_same_v<S, Spectrum>)
++            return si.to_world_mueller(x, wo_local, si.wi);
++        else
++            return unpolarized_spectrum(x);
++    }
++
++    template <typename S>
++    std::pair<S, Bool> sample_impl(const Scene *scene,
++                                   Sampler *sampler,
++                                   const RayDifferential3f &ray_,
++                                   const Medium * /* medium */,
++                                   Float * /* aovs */,
++                                   Bool active) const {
 +        MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
 +
 +        if (unlikely(m_max_depth == 0))
-+            return { 0.f, false };
++            return { dr::zeros<S>(), false };
 +
 +        // --------------------- Configure loop state ----------------------
 +
 +        Ray3f ray                     = Ray3f(ray_);
-+        Spectrum throughput           = 1.f;
-+        Spectrum result               = 0.f;
++        S throughput                  = 1.f;
++        S result                      = 0.f;
 +        Float eta                     = 1.f;
 +        PreliminaryIntersection3f pi  = dr::zeros<PreliminaryIntersection3f>();
 +        UInt32 depth                  = 0;
@@ -1252,7 +1291,7 @@ index 0000000..cf7c8cf
 +           the flash seen in a mirror), as 'only' counts it (its own pdf for MIS; dropped through a near-specular
 +           bounce after a rough one, whatever 'caustics' says), then the ray goes on through the shape as
 +           'exclude' has it. Called right after each intersection, before the loop state moves on. */
-+        auto assist_hits = [&](Ray3f &ray, PreliminaryIntersection3f &pi, Spectrum &result, const Spectrum &throughput,
++        auto assist_hits = [&](Ray3f &ray, PreliminaryIntersection3f &pi, S &result, const S &throughput,
 +                               const Interaction3f &prev_si, Float prev_bsdf_pdf, Bool prev_bsdf_delta,
 +                               Bool prev_caustic, Mask active) {
 +            for (size_t i = 0; i < assist_shapes.size(); ++i) {
@@ -1265,7 +1304,7 @@ index 0000000..cf7c8cf
 +                                          assist_emitter->pdf_direction(prev_si, ds, hit && !prev_bsdf_delta));
 +                Mask counted = hit && (si.emitter(scene) == EmitterPtr(assist_emitter)) &&
 +                               (prev_bsdf_pdf > 0.f) && !prev_caustic;
-+                Spectrum light = assist_emitter->eval(si, counted) * mis_weight(prev_bsdf_pdf, em_pdf);
++                S light = lift<S>(assist_emitter->eval(si, counted)) * mis_weight(prev_bsdf_pdf, em_pdf);
 +                dr::masked(result, counted) = spec_fma(throughput, light, result);
 +                Ray3f next = si.spawn_ray(ray.d);
 +                PreliminaryIntersection3f pi_next =
@@ -1363,8 +1402,8 @@ index 0000000..cf7c8cf
 +        struct LoopState {
 +            Ray3f ray;
 +            PreliminaryIntersection3f pi;
-+            Spectrum throughput;
-+            Spectrum result;
++            S throughput;
++            S result;
 +            Float eta;
 +            UInt32 depth;
 +            Mask valid_ray;
@@ -1480,7 +1519,7 @@ index 0000000..cf7c8cf
 +                // the environment: daylight's near-infrared share in the near-infrared lane (RGBN) or slot
 +                ls.result = spec_fma(
 +                    ls.throughput,
-+                    sky_nir(ds.emitter->eval(si, hit_active) * mis_bsdf, !si.is_valid(), ls.ray.time),
++                    sky_nir(lift<S>(ds.emitter->eval(si, hit_active)) * mis_bsdf, !si.is_valid(), ls.ray.time),
 +                    ls.result);
 +            }
 +
@@ -1501,15 +1540,16 @@ index 0000000..cf7c8cf
 +            Mask active_em = active_next && has_flag(bsdf->flags(), BSDFFlags::Smooth);
 +
 +            DirectionSample3f ds = dr::zeros<DirectionSample3f>();
-+            Spectrum em_weight = dr::zeros<Spectrum>();
++            S em_weight = dr::zeros<S>();
 +            Vector3f wo = dr::zeros<Vector3f>();
 +
 +            if (dr::any_or<true>(active_em)) {
 +                // Sample the emitter
 +                if (m_assist_mode == AssistMode::Only) {
 +                    // as Scene::sample_emitter_direction would with the assist emitter as its only one
-+                    std::tie(ds, em_weight) = assist_emitter->sample_direction(
-+                        si, ls.sampler->next_2d(), active_em);
++                    auto [ds_a, w_a] = assist_emitter->sample_direction(si, ls.sampler->next_2d(), active_em);
++                    ds = ds_a;
++                    em_weight = lift<S>(w_a);
 +                    active_em &= (ds.pdf != 0.f);
 +                    if (dr::any_or<true>(active_em)) {
 +                        Mask occluded = scene->ray_test(si.spawn_ray_to(ds.p), active_em);
@@ -1518,8 +1558,10 @@ index 0000000..cf7c8cf
 +                    }
 +                } else {
 +                    // with hidden shapes in the scene the visibility test is ours (shadow_blocked)
-+                    std::tie(ds, em_weight) = scene->sample_emitter_direction(
++                    auto [ds_s, w_s] = scene->sample_emitter_direction(
 +                        si, ls.sampler->next_2d(), hidden_shapes.empty(), active_em);
++                    ds = ds_s;
++                    em_weight = lift<S>(w_s);
 +                    if (m_assist_mode == AssistMode::Exclude || m_assist_mode == AssistMode::Split)
 +                        active_em &= ds.emitter != EmitterPtr(assist_emitter);
 +                    if (!hidden_shapes.empty()) {
@@ -1539,7 +1581,7 @@ index 0000000..cf7c8cf
 +                   with AD to enable light source optimization. */
 +                if (dr::grad_enabled(si.p)) {
 +                    ds.d = dr::normalize(ds.p - si.p);
-+                    Spectrum em_val = scene->eval_emitter_direction(si, ds, active_em);
++                    S em_val = lift<S>(scene->eval_emitter_direction(si, ds, active_em));
 +                    em_weight = dr::select(ds.pdf != 0, em_val / ds.pdf, 0);
 +                }
 +
@@ -1551,7 +1593,7 @@ index 0000000..cf7c8cf
 +            Float sample_1 = ls.sampler->next_1d();
 +            Point2f sample_2 = ls.sampler->next_2d();
 +
-+            auto [bsdf_val, bsdf_pdf, bsdf_sample, bsdf_weight]
++            auto [bsdf_val_m, bsdf_pdf, bsdf_sample, bsdf_weight_m]
 +                = bsdf->eval_pdf_sample(bsdf_ctx, si, wo, sample_1, sample_2);
 +
 +            // --------------- Emitter sampling contribution ----------------
@@ -1561,7 +1603,7 @@ index 0000000..cf7c8cf
 +                active_em &= !(ls.rough_seen && (bsdf_pdf > m_specular_pdf_threshold));
 +
 +            if (dr::any_or<true>(active_em)) {
-+                bsdf_val = si.to_world_mueller(bsdf_val, -wo, si.wi);
++                S bsdf_val = world_bsdf<S>(si, bsdf_val_m, -wo);
 +
 +                // Compute the MIS weight
 +                Float mis_em =
@@ -1578,15 +1620,16 @@ index 0000000..cf7c8cf
 +                // as 'only' samples it: the assist emitter alone, its own pdf, its shadow ray, and the flash rule
 +                // (no light through a near-specular lobe after a rough bounce, whatever 'caustics' says)
 +                Mask active_f = active_next && has_flag(bsdf->flags(), BSDFFlags::Smooth);
-+                auto [ds_f, em_f] = assist_emitter->sample_direction(si, ls.sampler->next_2d(), active_f);
++                auto [ds_f, em_f_m] = assist_emitter->sample_direction(si, ls.sampler->next_2d(), active_f);
++                S em_f = lift<S>(em_f_m);
 +                active_f &= (ds_f.pdf != 0.f);
 +                if (dr::any_or<true>(active_f)) {
 +                    Mask occluded = scene->ray_test(si.spawn_ray_to(ds_f.p), active_f);
 +                    active_f &= !occluded;
 +                    Vector3f wo_f = si.to_local(ds_f.d);
-+                    auto [val_f, pdf_f] = bsdf->eval_pdf(bsdf_ctx, si, wo_f, active_f);
++                    auto [val_f_m, pdf_f] = bsdf->eval_pdf(bsdf_ctx, si, wo_f, active_f);
 +                    active_f &= !(ls.rough_seen && (pdf_f > m_specular_pdf_threshold));
-+                    val_f = si.to_world_mueller(val_f, -wo_f, si.wi);
++                    S val_f = world_bsdf<S>(si, val_f_m, -wo_f);
 +                    Float mis_f = dr::select(ds_f.delta, 1.f, mis_weight(ds_f.pdf, pdf_f));
 +                    ls.result[active_f] = spec_fma(ls.throughput, val_f * em_f * mis_f, ls.result);
 +                }
@@ -1594,7 +1637,7 @@ index 0000000..cf7c8cf
 +
 +            // ---------------------- BSDF sampling ----------------------
 +
-+            bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi);
++            S bsdf_weight = world_bsdf<S>(si, bsdf_weight_m, -bsdf_sample.wo);
 +
 +            ls.ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
 +
@@ -1609,7 +1652,7 @@ index 0000000..cf7c8cf
 +                // Recompute 'wo' to propagate derivatives to cosine term
 +                Vector3f wo_2 = si.to_local(ls.ray.d);
 +                auto [bsdf_val_2, bsdf_pdf_2] = bsdf->eval_pdf(bsdf_ctx, si, wo_2, ls.active);
-+                bsdf_weight[bsdf_pdf_2 > 0.f] = bsdf_val_2 / dr::detach(bsdf_pdf_2);
++                bsdf_weight[bsdf_pdf_2 > 0.f] = lift<S>(bsdf_val_2) / dr::detach(bsdf_pdf_2);
 +            }
 +
 +            // ------ Update loop variables based on current interaction ------
@@ -1683,11 +1726,12 @@ index 0000000..cf7c8cf
 +            "  specular_pdf_threshold = %f,\n"
 +            "  caustics = %s,\n"
 +            "  assist = \"%s\" (%s),\n"
-+            "  hidden = \"%s\"\n"
++            "  hidden = \"%s\",\n"
++            "  unpolarized = %s\n"
 +            "]", m_max_depth, m_rr_depth, m_specular_pdf_threshold, m_caustics,
 +            m_assist, m_assist_mode == AssistMode::Only ? "only"
 +                      : m_assist_mode == AssistMode::Exclude ? "exclude"
-+                      : m_assist_mode == AssistMode::Split ? "split" : "all", m_hidden);
++                      : m_assist_mode == AssistMode::Split ? "split" : "all", m_hidden, m_unpolarized);
 +    }
 +
 +    /**
@@ -1695,13 +1739,13 @@ index 0000000..cf7c8cf
 +     * variants on the near-infrared lane, otherwise on rays of a dual render's near-infrared slot (time
 +     * 0.5 or more).
 +     */
-+    Spectrum sky_nir(const Spectrum &value, Mask sky, Float time) const {
++    template <typename S> S sky_nir(const S &value, Mask sky, Float time) const {
 +        if (m_sky_nir == 1.f)
 +            return value;
 +        if constexpr (is_rgbn_v<Spectrum>) {
 +            UnpolarizedSpectrum f(1.f, 1.f, 1.f, dr::select(sky, m_sky_nir, 1.f));
-+            Spectrum out = value;
-+            if constexpr (is_polarized_v<Spectrum>) {
++            S out = value;
++            if constexpr (is_polarized_v<S>) {
 +                for (size_t i = 0; i < 4; ++i)
 +                    for (size_t j = 0; j < 4; ++j)
 +                        out.entry(i, j) *= f;
@@ -1726,9 +1770,8 @@ index 0000000..cf7c8cf
 +     * \brief Perform a Mueller matrix multiplication in polarized modes, and a
 +     * fused multiply-add otherwise.
 +     */
-+    Spectrum spec_fma(const Spectrum &a, const Spectrum &b,
-+                      const Spectrum &c) const {
-+        if constexpr (is_polarized_v<Spectrum>)
++    template <typename S> S spec_fma(const S &a, const S &b, const S &c) const {
++        if constexpr (is_polarized_v<S>)
 +            return a * b + c;
 +        else
 +            return dr::fmadd(a, b, c);
@@ -1737,6 +1780,7 @@ index 0000000..cf7c8cf
 +    ScalarFloat m_specular_pdf_threshold;
 +    bool m_caustics;
 +    ScalarFloat m_sky_nir;
++    bool m_unpolarized;
 +    std::string m_assist;
 +    std::string m_hidden;
 +    std::string m_hidden_spec;

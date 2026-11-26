@@ -24,7 +24,8 @@ PROBE_MAX = 32768
 PROBE_RAYS = 256
 PROBE_BOUNCES = 2     # indirect bounces baked
 PROBE_OCT = 8         # side of a probe's octahedral distance map
-PROBE_CHUNK = 512     # probes traced and lit at a time
+PROBE_CHUNK = 8192    # probes traced and lit at a time (2 M rays): each Mitsuba ray_intersect call is traced again
+                      # (about a second on a 400-shape scene), so few big calls: PH40's 30,000 probes took 384 s at 512
 PASS_THROUGH = 3      # glass or invisible shapes a ray goes through at most
 INSIDE = 0.25         # a probe whose rays hit this share of back faces or more is inside a wall or an object
 SH_BAND = (math.pi, 2 * math.pi / 3, math.pi / 4)  # cosine lobe per SH band: radiance to irradiance

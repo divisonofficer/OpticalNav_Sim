@@ -10,6 +10,8 @@ on through the render server, with the editor's lighting:
     GET  /api/robot/frame/<sensor>.jpg     that sensor's latest image (through its sensor model and ISP)
     GET  /api/robot/map.png                the ground map around the robot: friction (red slippery .. green grippy), obstacles
     GET  /api/robot/configs                the registered robots and rigs (hw.config), and the ones in use
+    GET  /api/robot/preview.png?config=&rig=   a configuration's picture (hw.preview; made once, cached)
+    GET  /api/robot/tree?config=&rig=      a configuration's parts as a tree (hw.tree); a spawned robot's is in the state
     POST /api/robot/config   {"config", "rig"}   another robot, or another rig on it ("none": no rig); a robot that stands
                                            in the scene is exchanged where it stands
     GET  /api/robot/rig?name=              a rig's file, as text
@@ -27,6 +29,7 @@ on through the render server, with the editor's lighting:
                              (robot_record.py: every frame at full quality) and write an MP4; "cancel" drops it
     GET  /api/robot/recording/<name>.mp4   a finished recording (state["recording"]["file"] names it)
     POST /api/robot/control  {"mode", "linear", "steering_deg", "angular"}    held for 0.5 s (the chassis's own timeout)
+    POST /api/robot/sensor_settings {"name", "pass_spp", "target_spp", "accumulate", "scale"}   one sensor's render settings
 """
 from __future__ import annotations
 
@@ -92,8 +95,12 @@ class RobotSession:
         self.viewers = None              # () -> the sensors some page shows now (the viewer sets it): rendered while shown
         self.world = None
         self.robot = None
+        self.tree: dict | None = None     # the spawned robot as a tree (hw.tree.robot_tree)
         self.sensors: dict = {}          # sensor name -> actor (its spec a hw.sensing.Sensor)
         self.enabled: set = set()        # the sensors switched on by a call (POST /api/robot/sensors): rendered whoever watches
+        self.modes: list = ["polar"]     # the render server's modes (the viewer sets them): "rgb" is unpolarized RGB+NIR
+        self.polar_policy = "split"      # the viewer's: "off" all unpolarized, "split" by each camera's model, "unified" all polarized
+        self.settings: dict = {}         # sensor name -> its own render settings (sensor_settings): pass spp, target, accumulate, scale
         self.frames: dict = {}           # name -> {"jpeg", "seq", "spp", "exposure_ms", "gain_db", "size", "seconds"}
         self.message, self.error = "", ""
         self.scene = ""
@@ -272,6 +279,7 @@ class RobotSession:
 
     def _put(self, run: int, world, x: float, y: float, yaw_deg: float) -> None:
         from .hw import config as robot_config
+        from .hw.tree import robot_tree
         cfg = self.config
         x, y = self._free_spot(world, robot_config.base_spec(cfg), x, y, yaw_deg)
         start = world.on_floor(x, y, yaw_deg)
@@ -285,6 +293,7 @@ class RobotSession:
             if self.run_id != run:
                 return
             self.world, self.robot, self.sensors, self.start_pose = world, robot, dict(built.sensors), start
+            self.tree = robot_tree(built)
             self.calibrated = built.calibrated
             self._bodies = bodies
             self.pose_seq += 1
@@ -386,25 +395,81 @@ class RobotSession:
             time.sleep(max(0.0, world.dt * 0.5 - (time.monotonic() - now)))
 
     def _sensor_view(self, view: dict, template: dict | None, polarized: bool = False) -> tuple[dict, str]:
-        """A sensor's view with the editor's look, and that look as a key (a still image is of one look).
-        ``polarized``: the sensor measures polarization, so its view is a polarized render whatever the editor's is;
-        any other sensor takes the editor's mode (unpolarized RGB when polarization is off there: the same resident
-        scene as the editor's view, and several times faster)."""
+        """A sensor's view with the editor's look, and that look as a key (a still image is of one look). Its mode: see
+        camera_mode."""
         if template is not None and template.get("scan") == self.scene:
             for k in LOOK:
                 if k in template:
                     view[k] = template[k]
-            if not polarized and template.get("mode") in ("polar", "rgb"):
-                view["mode"] = template["mode"]
+        view["mode"] = self.camera_mode(polarized)
         view["bands"] = "rgb"
         if view.get("renderer") != "depth":
             view["renderer"], view["depth"] = "path", False
         return view, json.dumps({k: view.get(k) for k in (*LOOK, "mode")}, sort_keys=True, default=str)
 
-    def sense(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None):
+    def camera_mode(self, polarized: bool) -> str:
+        """The render server mode of a camera (``polarized``: its model measures polarization), as the viewer's global
+        setting says: "off" every camera unpolarized (the server's rgb mode, RGB+NIR without Mueller matrices), "unified"
+        every one polarized (one scene on the GPU), "split" each by its model (two scenes, written the same look). A
+        server without the unpolarized mode renders all polarized."""
+        if "rgb" not in self.modes:
+            return "polar"
+        return "rgb" if self.polar_policy == "off" else "polar" if self.polar_policy == "unified" or polarized else "rgb"
+
+    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale")
+
+    def sensor_settings(self, name: str, mode: str | None = None) -> dict:
+        """A sensor's render settings: ``pass_spp`` (a frame while moving: one denoised pass), ``target_spp`` (at rest:
+        passes of ``pass_spp`` up to this, fireflies held back, denoised), ``accumulate`` (False: at rest as while moving),
+        ``scale`` (a camera's share of its sensor's resolution, its model's ``render_scale`` by default). Unpolarized, a
+        pass costs a fifth: four times the samples at rest by default."""
+        with self.lock:
+            actor = self.sensors.get(name)
+            if actor is None:
+                raise ValueError(f"no sensor {name!r} on this robot")
+            return self._settings_of(name, actor, mode)
+
+    def _settings_of(self, name: str, actor, mode: str | None) -> dict:   # (under the lock)
+        spec = actor.spec
+        default = {"pass_spp": 16, "target_spp": (1024 if mode == "rgb" and not spec.polarized else 256), "accumulate": True,
+                   "scale": float(spec.render_scale) if hasattr(spec, "render_scale") else None}
+        return {**default, **self.settings.get(name, {})}
+
+    def set_sensor_settings(self, name: str, changes: dict) -> dict:
+        """Change some of a sensor's render settings (sensor_settings); the rest stay."""
+        unknown = set(changes) - set(self.SETTING_KEYS)
+        if unknown:
+            raise ValueError(f"unknown sensor settings {sorted(unknown)} (known: {', '.join(self.SETTING_KEYS)})")
+        with self.lock:
+            actor = self.sensors.get(name)
+            if actor is None:
+                raise ValueError(f"no sensor {name!r} on this robot")
+            own = self.settings.setdefault(name, {})
+            if "pass_spp" in changes:
+                own["pass_spp"] = int(changes["pass_spp"])
+                if not 1 <= own["pass_spp"] <= 256:
+                    raise ValueError("pass_spp: 1 to 256")
+            if "target_spp" in changes:
+                own["target_spp"] = int(changes["target_spp"])
+                if not 1 <= own["target_spp"] <= 8192:
+                    raise ValueError("target_spp: 1 to 8192")
+            if "accumulate" in changes:
+                own["accumulate"] = bool(changes["accumulate"])
+            if "scale" in changes:
+                if not hasattr(actor.spec, "render_scale"):
+                    raise ValueError(f"{name} has no render scale (its resolution is its model's)")
+                scale = float(changes["scale"])
+                if not 0.0 < scale <= 1.0:
+                    raise ValueError("scale: a share of the sensor's resolution, 0 < scale <= 1")
+                own["scale"] = actor.spec.render_scale = scale
+            self.pose_seq += 1   # rendered again as asked
+            return self._settings_of(name, actor, None)
+
+    def sense(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None, passes: int = 8):
         """A measurement of a sensor now, with the editor's look: ``(Reading, spp, look)``, or None when ``before(look)``
         says it is not needed. ``settled``: a clean one (eight passes of ``spp``, fireflies held back, denoised), else
-        one denoised pass. A sensor of geometry alone is one exact render either way. ``client``: the calling thread's own."""
+        one denoised pass. A sensor of geometry alone is one exact render either way. ``client``: the calling thread's own.
+        ``passes``: of ``spp`` each, at rest."""
         with self.lock:   # the poses of this moment
             world, actor = self.world, self.sensors[name]
             spec = actor.spec
@@ -415,10 +480,10 @@ class RobotSession:
             return None
         client = client or world.client
         if spec.lit and settled:
-            outs = [clean_render(client, v, 8) for v in views]
+            outs = [clean_render(client, v, passes) for v in views]
         else:
             outs = client.render(views, "float32")
-        return spec.read(world, actor, request, outs), (spp * (8 if settled else 1) if spec.lit else 0), look
+        return spec.read(world, actor, request, outs), (spp * (passes if settled else 1) if spec.lit else 0), look
 
     def _run(self, run: int, scene: str, build) -> None:
         try:
@@ -467,12 +532,15 @@ class RobotSession:
                 if spec.rate_hz and t0 - have.get("at", 0.0) < 1.0 / spec.rate_hz:   # not due yet
                     time.sleep(0.01)
                     continue
-                mode = (template or {}).get("mode")
-                # standing still: eight passes, fireflies held back, then the denoiser (clean_render). Unpolarized a pass
-                # costs a fifth and has more outliers: four times the samples
-                spp = (128 if mode == "rgb" and not spec.polarized else 32) if settled else 16
+                mode = self.camera_mode(bool(spec.polarized))
+                # this sensor's own settings (sensor_settings): moving, one denoised pass of pass_spp; at rest, passes of
+                # pass_spp up to target_spp, fireflies held back, then the denoiser (clean_render)
+                own = self.sensor_settings(name, mode)
+                settled = settled and own["accumulate"]
+                spp = int(own["pass_spp"])
+                passes = max(1, min(64, int(own["target_spp"]) // spp))
                 done = self.sense(name, settled, spp, template, lambda look: not (
-                    settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at), client)
+                    settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at), client, passes)
                 if done is None:
                     time.sleep(0.03)
                     continue
@@ -565,12 +633,16 @@ class RobotSession:
                    "error": self.error, "map": self.map_info, "sim_rate": round(self.sim_rate, 1),
                    "calibrated": self.calibrated, "config": self.config.summary(),
                    "recording": {k: v for k, v in self.recording.items() if k != "cancel"},
+                   # a robot's sensors exist once it stands in the scene (the viewer's camera list shows them then)
                    "sensors": [{**listed, "enabled": listed["name"] in rendering,
+                                "polarized": bool(getattr(self.sensors[listed["name"]].spec, "polarized", False)) if listed["name"] in self.sensors else False, "settings": self._settings_of(listed["name"], self.sensors[listed["name"]], None)
+                                if listed["name"] in self.sensors else {},
                                 **{k: v for k, v in self.frames.get(listed["name"], {}).items() if k not in ("jpeg", "look", "at")}}
-                               for listed in self.config.sensors()]}
+                               for listed in self.config.sensors()] if self.robot is not None else []}
             robot = self.robot
             if robot is None:
                 return out
+            out["tree"] = self.tree   # base, wheels, mounts, parts, cameras (hw.tree)
             st, p, spec = robot.state, robot.pose, robot.spec
             drives = isinstance(spec, Drive)
             twist = lambda t: [round(t.vx, 3), round(t.vy, 3), round(t.wz, 3)]  # noqa: E731
@@ -602,6 +674,15 @@ def get(handler, robot: RobotSession, parts: list, query: dict) -> None:
         from .hw import config as robot_config
         return handler._json(200, {"configs": robot_config.available(), "rigs": robot_config.available_rigs(),
                                    "current": robot.config.name, "current_rig": robot.config.rig})
+    if tail == ["preview.png"]:   # ?config=&rig=: the robot list's picture of a configuration with a rig (hw.preview)
+        from .hw import preview
+        rig = query.get("rig") or None
+        png = preview.robot_png(query.get("config") or robot.config.name, "none" if rig == "none" else rig)
+        return handler._send(200, png, "image/png", {"Cache-Control": "max-age=300"})
+    if tail == ["tree"]:          # ?config=&rig=: a configuration's tree before it is spawned (hw.tree)
+        from .hw.tree import config_tree
+        rig = query.get("rig") or None
+        return handler._json(200, config_tree(query.get("config") or robot.config.name, rig))
     if tail == ["rig"]:
         from .hw import config as robot_config
         file = robot_config.rig_files().get(str(query.get("name") or ""))
@@ -640,6 +721,9 @@ def post(handler, robot: RobotSession, parts: list, body: dict) -> None:
     session = getattr(handler, "viewer_session", None)
     if tail == ["control"]:
         return handler._json(200, robot.command(body))
+    if tail == ["sensor_settings"]:   # {"name", "pass_spp"?, "target_spp"?, "accumulate"?, "scale"?}: one sensor's render settings
+        changes = {k: v for k, v in body.items() if k != "name"}
+        return handler._json(200, {"name": body.get("name"), "settings": robot.set_sensor_settings(str(body.get("name") or ""), changes)})
     if tail == ["sensors"]:
         robot.set_sensors({str(k): bool(v) for k, v in body.items()})
     elif tail == ["spawn"] and session is not None:

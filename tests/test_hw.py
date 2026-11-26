@@ -739,18 +739,21 @@ def test_robot_routes_sensors_and_commands():
     session = robot_view.RobotSession("http://127.0.0.1:1", calibration="")
     st = session.state()
     assert not st["running"] and not st["spawned"] and "robot" not in st
-    assert [(s["name"], s["enabled"]) for s in st["sensors"]] == [("hdr", False), ("12bit", False)]
+    # a robot's sensors are listed once it stands in a scene; the configuration names them before that
+    assert st["sensors"] == [] and [s["name"] for s in st["config"]["sensors"]] == ["hdr", "12bit"]
+    on = lambda: [n in session.rendering() for n in ("hdr", "12bit")]  # noqa: E731
+    assert on() == [False, False]
     session.set_sensors({"hdr": True})
-    assert [s["enabled"] for s in session.state()["sensors"]] == [True, False]
+    assert on() == [True, False]
     with pytest.raises(ValueError):
         session.set_sensors({"lidar": True})
     # a sensor renders while a page shows it (the viewer says which) or a call switched it on; no other does
     session.viewers = lambda: {"12bit"}
-    assert session.rendering() == {"hdr", "12bit"} and [s["enabled"] for s in session.state()["sensors"]] == [True, True]
+    assert session.rendering() == {"hdr", "12bit"} and on() == [True, True]
     session.set_sensors({"hdr": False})
     assert session.rendering() == {"12bit"}
     session.viewers = lambda: set()
-    assert session.rendering() == set() and [s["enabled"] for s in session.state()["sensors"]] == [False, False]
+    assert session.rendering() == set() and on() == [False, False]
     session.viewers = None
     session.set_sensors({"hdr": True})
     assert session.bodies("scene") == [] and session.pose2d() is None      # nothing spawned: nothing to draw
@@ -768,10 +771,21 @@ def test_robot_routes_sensors_and_commands():
                                       {"scan": "scene", "variant": "perturbed", "lighting": "all", "bands": "both", "renderer": "raster", "width": 9})
     assert view["variant"] == "perturbed" and view["lighting"] == "all" and view["bands"] == "rgb" and view["renderer"] == "path"
     assert "width" not in view and view["depth"] is False and "perturbed" in look
-    # polarization off in the editor: a plain camera renders unpolarized too (one resident scene), a polarization camera does not
-    plain, _ = session._sensor_view({"scan": "scene", "mode": "polar"}, {"scan": "scene", "mode": "rgb"})
-    polar, _ = session._sensor_view({"scan": "scene", "mode": "polar"}, {"scan": "scene", "mode": "rgb"}, polarized=True)
-    assert plain["mode"] == "rgb" and polar["mode"] == "polar"
+    # each camera its own mode, whatever the editor's: a plain camera unpolarized where the server can, a polarization
+    # camera polarized; a server without the unpolarized mode renders both polarized
+    session.modes = ["polar", "rgb"]
+    for editor in ("polar", "rgb"):
+        plain, _ = session._sensor_view({"scan": "scene", "mode": "polar"}, {"scan": "scene", "mode": editor})
+        polar, _ = session._sensor_view({"scan": "scene", "mode": "rgb"}, {"scan": "scene", "mode": editor}, polarized=True)
+        assert plain["mode"] == "rgb" and polar["mode"] == "polar"
+    # the viewer's global polarization setting: off, every camera unpolarized; unified, every one polarized (one scene)
+    session.polar_policy = "off"
+    assert [session.camera_mode(p) for p in (False, True)] == ["rgb", "rgb"]
+    session.polar_policy = "unified"
+    assert [session.camera_mode(p) for p in (False, True)] == ["polar", "polar"]
+    session.polar_policy = "split"
+    session.modes = ["polar"]
+    assert session._sensor_view({"scan": "scene"}, {"scan": "scene", "mode": "polar"})[0]["mode"] == "polar"
     other, _ = session._sensor_view({"scan": "scene", "variant": "base"}, {"scan": "elsewhere", "variant": "perturbed"})
     assert other["variant"] == "base"                                      # the editor shows another scene: not its look
 
@@ -787,16 +801,18 @@ def test_robot_routes_sensors_and_commands():
     robot_view.get(h, session, ["api", "robot", "frame", "hdr.jpg"], {})
     assert h.sent[0] == 404
     robot_view.get(h, session, ["api", "robot", "state"], {})
-    assert h.sent[0] == 200 and h.sent[1]["sensors"][0]["enabled"]
+    assert h.sent[0] == 200 and h.sent[1]["sensors"] == [] and "hdr" in session.rendering()
     robot_view.post(h, session, ["api", "robot", "control"], {"mode": "spin", "angular": 1.0})
     assert h.sent == (200, {"ok": True})
     robot_view.post(h, session, ["api", "robot", "sensors"], {"hdr": False, "12bit": True})
-    assert [s["enabled"] for s in h.sent[1]["sensors"]] == [False, True]
+    assert h.sent[0] == 200 and session.rendering() == {"12bit"}
     robot_view.post(h, session, ["api", "robot", "spawn"], {})             # no viewer behind this handler
     assert h.sent[0] == 404
     here = Path(robot_view.__file__).parent
     page = (here / "gui.html").read_text()                                 # one viewer: the robot is a tab and panes of it
-    assert 'id="robot-sensors"' in page and 'draggable="true"' in page and 'id="robot-spawn"' in page and "/api/robot/" in page
+    # the cameras (the editor's and the robot's) in one list; a robot added from a list of pictures; its parts as a tree
+    assert 'id="cam-list"' in page and 'draggable="true"' in page and 'id="robot-add"' in page and 'id="robot-tree"' in page \
+        and "/api/robot/preview.png" in page and "/api/robot/" in page
     assert 'id="subs"' in page and 'id="sub-add"' in page and 'id="pane-b"' not in page   # sub viewers: any number, opened and closed
     assert not (here / "robot.html").exists()
 
@@ -1310,7 +1326,7 @@ def test_robot_session_exchanges_robots_and_keeps_rigs(tmp_path, monkeypatch):
     session.use(rig="hdr_12bit_frame")
     assert session.state()["config"]["name"] == "ranger_mini" and session.state()["config"]["rig"] == "hdr_12bit_frame"
     session.use("turtlebot4")
-    assert [s["name"] for s in session.state()["sensors"]] == ["lidar", "depth", "oak_rgb"]
+    assert [s["name"] for s in session.state()["config"]["sensors"]] == ["lidar", "depth", "oak_rgb"]
     session.command({"mode": "drive", "forward": 1, "speed": 0.2})
     assert session.control[0] == hw.Twist(0.2, 0.0, 0.0)
     with pytest.raises(FileNotFoundError):
@@ -1345,3 +1361,43 @@ def test_a_light_wheel_with_a_strong_drive_is_stable():
             world.tick()
         t = r.base.state.twist
         assert np.allclose([t.vx, t.vy, t.wz], want, atol=0.01) and np.abs(r.base.state.slip).max() < 0.005
+
+
+def test_robot_tree_and_preview():
+    """A configuration as a tree of its hardware (base, wheels, mounts, parts, cameras) and its picture, without a server."""
+    from opticalnav_sim.hw import preview, tree
+    t = tree.config_tree("ranger_mini", "hdr_12bit_mast")
+    kids = {c["id"]: c for c in t["children"]}
+    assert t["kind"] == "base" and [w["kind"] for w in kids["base/wheels"]["children"]] == ["wheel"] * 4
+    mast = kids["base@deck"]["children"][0]
+    assert kids["base@deck"]["kind"] == "mount" and mast["kind"] == "mast" and mast["rig"]
+    cams = mast["children"][0]["children"]
+    assert [(c["sensor"], c["kind"]) for c in cams] == [("hdr", "camera"), ("12bit", "camera")]
+    t = tree.config_tree("turtlebot4", "none")
+    assert [w["label"] for w in t["children"][0]["children"]] == ["왼쪽", "오른쪽"]
+    ids = {n["id"] for c in t["children"] for n in [c, *c["children"]]}
+    assert {"lidar", "depth", "oak_rgb"} <= ids and not any(n.startswith("frame") for n in ids)
+    png = preview.render(hw.config.spawn(hw.World(), "turtlebot4", rig="hdr_12bit_frame"), size=(80, 60))
+    from PIL import Image
+    import io
+    im = np.asarray(Image.open(io.BytesIO(png)))
+    assert im.shape == (60, 80, 3) and (np.abs(im.astype(int) - preview.BACKGROUND).sum(-1) > 30).mean() > 0.05   # something drawn
+
+
+def test_sensor_render_settings_are_each_cameras_own():
+    """A robot camera's own pass and target spp, accumulation and resolution share (the viewer's camera tab sets them)."""
+    from opticalnav_sim import robot_view
+    session = robot_view.RobotSession("http://127.0.0.1:1", calibration="")
+    robot = hw.config.spawn(hw.World(), "ranger_mini", rig="hdr_12bit_mast")
+    session.sensors = dict(robot.sensors)
+    s = session.sensor_settings("hdr", "polar")
+    assert (s["pass_spp"], s["target_spp"], s["accumulate"]) == (16, 256, True) and 0 < s["scale"] <= 1
+    assert session.sensor_settings("hdr", "rgb")["target_spp"] == 1024        # unpolarized: a pass costs less
+    s = session.set_sensor_settings("hdr", {"pass_spp": 64, "accumulate": False, "scale": 0.5})
+    assert (s["pass_spp"], s["accumulate"], s["scale"]) == (64, False, 0.5) and robot.sensors["hdr"].spec.render_scale == 0.5
+    assert session.sensor_settings("12bit", "polar")["pass_spp"] == 16       # the other camera keeps its own
+    for bad in ({"pass_spp": 0}, {"scale": 1.5}, {"spp": 4}):
+        with pytest.raises(ValueError):
+            session.set_sensor_settings("hdr", bad)
+    with pytest.raises(ValueError):
+        session.set_sensor_settings("nope", {"pass_spp": 8})
