@@ -71,7 +71,7 @@ RULES = {
     "piece_m": 0.15,            # a part word on something smaller than this: a piece of whatever it touches most
     "flat_m": 0.003,           # thinner than this: a decal, a wear mark, a sheet (no body to push)
     "small_m": 0.05,            # nothing longer than this: a detail (a screw, a connector) left fixed ...
-    "light_kg": 0.05,           # ... nor lighter than this without a movable word (a glowing trace before a display)
+    "light_kg": 0.05,           # ... nor lighter than this (a glowing trace before a display, a case's loose handle)
     "reach_m": 0.4,           # a movable object whose bottom is this close to the floor: the robot's body can meet it
     "hull_vertices": 64,
 }
@@ -1082,7 +1082,7 @@ def classify(f: dict, rules: dict = RULES) -> tuple[bool, float, str]:
         return False, 0.9, f"large: {sx:.2f} x {sz:.2f} m, {sy:.2f} m tall, footprint {fp:.2f} m2"
     if min(sx, sy, sz) < rules["flat_m"]:
         return False, 0.8, f"flat ({min(sx, sy, sz) * 1000:.1f} mm): a decal, a mark or a sheet, nothing to push"
-    if side < rules["small_m"] or (mass < rules["light_kg"] and cls != "movable"):
+    if side < rules["small_m"] or mass < rules["light_kg"]:
         return False, 0.7, f"tiny ({side * 100:.1f} cm, {mass * 1000:.0f} g): a detail, not a body worth simulating"
     if f["holds_up"]:
         return False, 0.85, f"holds up {', '.join(f['holds_up'][:3])}"
