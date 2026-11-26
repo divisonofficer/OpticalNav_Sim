@@ -2579,25 +2579,34 @@ class Renderer:
             if scan in self.merge_checked or os.environ.get("OPTICALNAV_SIM_MERGE", "1") == "0":
                 return
             self.merge_checked.add(scan)
-            tool = Path(__file__).resolve().parents[1] / "tools" / "merge_meshes.py"
-            if not tool.is_file() or scan not in self.pack_of:
+            tools = Path(__file__).resolve().parents[1] / "tools"
+            if not (tools / "merge_meshes.py").is_file() or scan not in self.pack_of:
                 return
             started = time.monotonic()
-            with ACTIVITY.doing(f"merging meshes of {scan}"):
-                try:
-                    done = subprocess.run([sys.executable, str(tool), "--pack", str(self.pack_of[scan]), "--scene", scan,
-                                           "--if-needed"], capture_output=True, text=True, timeout=3600)
-                except subprocess.TimeoutExpired:
-                    print(f"[merge] {scan}: no answer in an hour, served as it is", flush=True)
+            changed = False
+            # first which objects a robot could push (tools/physics_tag.py: physics.json), then the merge, which keeps
+            # those apart as one body each (physics.keep: the reachable ones by default)
+            for tool, what in (("physics_tag.py", "finding movable objects in"), ("merge_meshes.py", "merging meshes of")):
+                if not (tools / tool).is_file():
+                    continue
+                with ACTIVITY.doing(f"{what} {scan}"):
+                    try:
+                        done = subprocess.run([sys.executable, str(tools / tool), "--pack", str(self.pack_of[scan]),
+                                               "--scene", scan, "--if-needed"], capture_output=True, text=True, timeout=3600)
+                    except subprocess.TimeoutExpired:
+                        print(f"[merge] {scan}: {tool} gave no answer in an hour, served as it is", flush=True)
+                        return
+                said = (done.stdout or "").strip()
+                if done.returncode:
+                    print(f"[merge] {scan}: {tool} failed (exit {done.returncode}), served as it is: "
+                          f"{(done.stderr or said)[-800:]}", flush=True)
                     return
-            said = (done.stdout or "").strip()
-            if done.returncode:
-                print(f"[merge] {scan} failed (exit {done.returncode}), served as it is: {(done.stderr or said)[-800:]}",
-                      flush=True)
-                return
-            if "nothing to do" not in said:
+                if "nothing to do" not in said:
+                    changed = True
+                    print(f"[merge] {said[-400:]}", flush=True)
+            if changed:
                 self.reload_meta(scan)
-                print(f"[merge] {said[-400:]} ({time.monotonic() - started:.0f} s)", flush=True)
+                print(f"[merge] {scan} ready in {time.monotonic() - started:.0f} s", flush=True)
 
     def reload_meta(self, scan: str) -> None:
         """Read a scene's scene.json again (after compact_on_start rewrote it); its plans go with the old one."""

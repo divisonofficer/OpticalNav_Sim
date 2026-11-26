@@ -245,6 +245,12 @@ aside dl > div { display: contents; }
 .keys { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; font-size: 12.5px; color: var(--muted); }
 kbd { font: 11.5px var(--mono); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: 3px; padding: 0 5px; }
 .hint { font-size: 12px; color: var(--muted); margin: 0; }
+.phys-list { list-style: none; margin: 4px 0 8px; padding: 0; max-height: 260px; overflow-y: auto; font-size: 12px; }
+.phys-list li { display: flex; gap: 6px; align-items: baseline; padding: 2px 0; border-bottom: 1px solid var(--line, rgba(127,127,127,0.15)); }
+.phys-list li .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.phys-list li .kg { color: var(--muted); font-variant-numeric: tabular-nums; }
+.phys-list li .tag { font-size: 11px; padding: 0 4px; border-radius: 3px; background: rgba(240,150,60,0.22); color: #f0a050; }
+.phys-list li.far .tag { background: rgba(127,127,127,0.18); color: var(--muted); }
 .hint:empty { display: none; }
 .ptabs { display: flex; gap: 2px; background: var(--panel-2); border-radius: 8px; padding: 3px; }
 .ptabs button { flex: 1 1 auto; font: 12.5px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 6px; padding: 6px 4px; cursor: pointer; white-space: nowrap; }
@@ -494,6 +500,10 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <section class="ppanel" role="tabpanel" id="p-scene" aria-labelledby="t-scene" hidden>
         <dl id="scene-stats"><div><dt>씬</dt><dd>불러오는 중…</dd></div></dl>
         <p class="hint">렌더 서버에 올라간 씬 기준, 5초마다 갱신. GPU는 장치 전체 사용량(다른 프로세스 포함).</p>
+        <h3 class="sub">움직이는 물체</h3>
+        <dl id="phys-stats"><div><dt>판별</dt><dd>—</dd></div></dl>
+        <ul id="phys-list" class="phys-list"></ul>
+        <p class="hint">씬을 처음 열 때 라벨·크기·질량·받침으로 자동 판별합니다(tools/physics_tag.py). 로봇이 닿는 높이의 물체는 따로 둬서 물리로 움직일 수 있게 하고, 지도에 주황으로 표시합니다. 바꾸려면 scene.json의 physics 설정(dynamic 규칙, keep 범위)을 씁니다.</p>
       </section>
       <section class="ppanel" role="tabpanel" id="p-robot" aria-labelledby="t-robot" hidden>
         <div id="robot-empty">
@@ -802,6 +812,7 @@ function renderMonitor() {
   const prog = act.progress || null;
   const cyc = S.render_mode === "cycles";
   const scene = what.startsWith("preparing Cycles") ? ["warn", `Cycles GPU 준비 ${secs}`, "Blender가 씬을 연 뒤 첫 렌더로 GPU를 준비합니다(커널 컴파일과 장면 업로드). 커널은 씬이 쓰는 기능 조합마다 처음 한 번 몇 분 걸리고 이후 캐시됩니다"]
+    : what.startsWith("finding movable objects") ? ["warn", `움직이는 물체 판별 ${secs}`, "씬을 처음 열 때 라벨·크기·질량·받침으로 로봇이 밀 수 있는 물체를 찾습니다(씬마다 한 번)"]
     : what.startsWith("merging meshes") ? ["warn", `메시 병합 ${secs}`, "씬을 처음 열 때 같은 재질의 고정 메시를 하나로 합칩니다(씬마다 한 번, 움직일 물체로 지정된 것은 따로 둡니다)"]
     : what.startsWith("loading") && what.endsWith("in Blender") ? ["warn", `.blend 여는 중 ${secs}`, "Blender가 씬 파일을 읽습니다"]
     : what.startsWith("loading") ? ["warn", `로드 중 ${prog && prog.files && prog.stage === "files" ? `${prog.files[0]}/${prog.files[1]}` : secs}`, progressText(prog) || "보통 1–2분"]
@@ -1059,6 +1070,7 @@ function apply(st) {
     poseKey = key;
     drawCandidates(); renderReadout();
     loadGraph(S.scene).then(drawMap).catch(() => {});
+    loadPhysics();
   }
   if (S.has_frame) {
     $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
@@ -1270,6 +1282,7 @@ function drawMap() {
   g.fillStyle = css("--accent");
   for (const cand of S.candidates.slice(0, 9)) { const [px, py] = T.to(cand.x, cand.y); g.beginPath(); g.arc(px, py, 2.5 * dpr, 0, 7); g.fill(); }
   g.beginPath(); g.arc(cx, cy, 5 * dpr, 0, 7); g.fill();
+  drawMovables(g, T, dpr);
   drawRobot(g, T, dpr);
 }
 
@@ -1941,8 +1954,39 @@ function showTab(name) {
 }
 document.querySelectorAll(".ptabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 const GROUP_NAMES = { fixture: "실내 조명", fill: "전역(소프트박스)", lamp: "꺼진 램프" };
+// the scene's movable objects (physics.json via /api/physics): the scene tab's list and the map's footprints
+let PHYS = null, PHYS_SCENE = null;
+async function loadPhysics() {
+  if (!S || !S.scene) return;
+  if (PHYS_SCENE === S.scene && PHYS && PHYS.available) { renderPhysics(); return; }
+  try { PHYS = await api(`/api/physics?scene=${encodeURIComponent(S.scene)}`); PHYS_SCENE = S.scene; } catch (e) { PHYS = null; }
+  renderPhysics(); drawMap();
+}
+function renderPhysics() {
+  const box = $("phys-stats"), list = $("phys-list");
+  if (!box) return;
+  if (!PHYS || !PHYS.available) {
+    box.innerHTML = `<div><dt>판별</dt><dd>아직 없음 (씬을 처음 열 때 만듭니다)</dd></div>`; list.innerHTML = ""; return;
+  }
+  const c = PHYS.counts || {}, keep = { reachable: "로봇이 닿는 것만", movable: "움직이는 것 전부", none: "없음" }[PHYS.keep] || PHYS.keep || "—";
+  box.innerHTML = [["물체", `${c.objects ?? "—"} (고정 ${c.fixed ?? "—"})`], ["움직임", `${c.movable ?? 0}개 · 로봇이 닿는 높이 ${c.robot_reachable ?? 0}개`],
+    ["따로 둔 것", `${PHYS.kept}개 (${keep})`]].map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("");
+  list.innerHTML = PHYS.objects.map((o) => `<li class="${o.reachable ? "" : "far"}" title="${esc(o.reason || "")}">` +
+    `<span class="tag">${o.reachable ? "닿음" : "위쪽"}</span><span class="nm">${esc(o.label)}</span>` +
+    `<span class="kg">${o.mass_kg != null ? `${o.mass_kg.toFixed(1)} kg` : ""}</span></li>`).join("");
+}
+function drawMovables(g, T, dpr) {
+  if (!PHYS || !PHYS.available || PHYS_SCENE !== (S && S.scene)) return;
+  for (const o of PHYS.objects) {
+    const [x0, y0, x1, y1] = o.footprint, [ax, ay] = T.to(x0, y1), [bx, by] = T.to(x1, y0);
+    g.beginPath(); g.rect(Math.min(ax, bx), Math.min(ay, by), Math.max(2 * dpr, Math.abs(bx - ax)), Math.max(2 * dpr, Math.abs(by - ay)));
+    g.fillStyle = o.reachable ? "rgba(240,150,60,0.35)" : "rgba(240,150,60,0.10)"; g.fill();
+    g.strokeStyle = o.reachable ? "#f0a050" : "rgba(240,160,80,0.35)"; g.lineWidth = (o.reachable ? 1.5 : 1) * dpr; g.stroke();
+  }
+}
 async function loadSceneStats() {
   if (!S || !S.scene || panelTab !== "scene") return;
+  loadPhysics();
   let st;
   try { st = await api(`/api/scene_stats?scene=${encodeURIComponent(S.scene)}`); } catch (e) { $("scene-stats").innerHTML = `<div><dt>오류</dt><dd>${e.message}</dd></div>`; return; }
   const n = (v) => v == null ? "—" : Number(v).toLocaleString("ko-KR");

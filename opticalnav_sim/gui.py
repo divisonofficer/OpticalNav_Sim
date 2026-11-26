@@ -195,6 +195,12 @@ def room_map_r2r(data: dict) -> dict:
     return {"rooms": rooms, "connections": links}
 
 
+def short_label(label: str, scene: str) -> str:
+    """An object's label without the scene's prefix (``CS02_r008_round stool seat`` -> ``round stool seat``)."""
+    tail = scene.split("_")[-1]
+    return re.sub(rf"^{re.escape(tail)}_(r\d{{3}}_)?", "", str(label)).replace("_", " ")
+
+
 def jpeg(img: np.ndarray, quality: int = 90) -> bytes:
     from PIL import Image
 
@@ -1296,6 +1302,36 @@ class Session:
             out["image"] = {"url": f"/api/mapimage?scene={scene}", "bounds": bird["bounds"]}
         return out
 
+    def physics(self, scene: str) -> dict:
+        """What tools/physics_tag.py decided for a scene (physics.json), as the page shows it: counts, the scope kept
+        apart for the physics step, and each movable object (label, mass, reachable by the robot, kept apart, reason,
+        its footprint on the map). ``{"available": False}`` before the scene was first opened."""
+        path = self.scene_dir(scene) / "physics.json"
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return {"available": False}
+        cache = getattr(self, "_physics_cache", {})
+        if cache.get(scene, (None,))[0] != stamp:
+            data = json.loads(path.read_text())
+            merge = data.get("merge") or {}
+            kept = {k for k, v in (merge.get("objects") or {}).items() if v.get("kept")}
+            objects = []
+            for o in data.get("objects", []):
+                if not o.get("movable"):
+                    continue
+                (x0, y0, _), (x1, y1, _) = o["bbox"]
+                objects.append({"id": o["id"], "label": short_label(o.get("label") or o["id"], scene),
+                                "keyword": o.get("keyword"), "mass_kg": o.get("mass_kg"),
+                                "reachable": bool(o.get("robot_reachable")), "kept": o["id"] in kept,
+                                "confidence": o.get("confidence"), "reason": o.get("reason"),
+                                "footprint": [round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3)]})
+            objects.sort(key=lambda o: (not o["reachable"], -(o["mass_kg"] or 0.0)))
+            cache[scene] = (stamp, {"available": True, "counts": data.get("counts", {}), "keep": merge.get("keep"),
+                                    "kept": len(kept), "objects": objects})
+            self._physics_cache = cache
+        return cache[scene][1]
+
     def birdeye(self, scene: str) -> dict | None:
         """scene.json's ``map`` (tools/blend_to_pack.py): the bird's-eye image and its bounds [x0, y0, x1, y1] in the map's R2R frame."""
         with contextlib.suppress(Exception):
@@ -1461,6 +1497,8 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                     if pic is None:
                         return self._json(404, {"error": "no picture yet"})
                     return self._send(200, pic[0], pic[1], {"Cache-Control": "max-age=60"})
+                if parts == ["api", "physics"]:  # the scene's movable objects (tools/physics_tag.py physics.json), for the page
+                    return self._json(200, session.physics(q["scene"]))
                 if parts == ["api", "scene_stats"]:  # the scene tab: asks the render server each time
                     return self._json(200, session.sim._client.stats(q["scene"]))
                 if parts == ["api", "graph"]:
