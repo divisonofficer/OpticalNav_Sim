@@ -2397,6 +2397,8 @@ class Renderer:
         self.cache: OrderedDict[tuple, Resident] = OrderedDict()
         self.body_models: dict[str, dict] = {}  # name -> bodies.build_model (POST /v1/bodies)
         self.plans: dict[tuple[str, str, str], tuple] = {}
+        self.merge_checked: set[str] = set()   # scans merge_if_needed has looked at in this process
+        self.merge_lock = threading.Lock()
         self.denoisers: dict[tuple[str, int, int], object] = {}
         # path_nocaustics with camera-assist modes (an older build of the plugin has none: active variants
         # that need it are hidden, and one-pass active variants keep a resident scene of their own)
@@ -2562,6 +2564,41 @@ class Renderer:
             print("[mitsuba] resident scenes freed", flush=True)
         return had
 
+    def merge_if_needed(self, scan: str) -> None:
+        """The first time a scene is opened in this process: its static meshes of one material merged into one
+        (tools/merge_meshes.py --if-needed, a subprocess: its Mitsuba runs scalar_rgb, which must not switch this
+        process's variant), then its scene.json read again. Thousands of shapes in a scene file left the loaded meshes
+        with registry ids in the thousands, and with a robot (instances) in the scene every frozen replay rebuilt call
+        tables that long (REF_CS02: 4964 shapes -> 215, a replay 16.5 -> 8.6 ms, the load 0.8 -> 0.1 s). A scene already
+        merged costs a text scan (~2 s with the interpreter's start); a failure serves the scene as it is.
+        OPTICALNAV_SIM_MERGE=0 turns it off."""
+        import subprocess
+        import sys
+
+        with self.merge_lock:
+            if scan in self.merge_checked or os.environ.get("OPTICALNAV_SIM_MERGE", "1") == "0":
+                return
+            self.merge_checked.add(scan)
+            tool = Path(__file__).resolve().parents[1] / "tools" / "merge_meshes.py"
+            if not tool.is_file() or scan not in self.pack_of:
+                return
+            started = time.time()
+            with ACTIVITY.doing(f"merging meshes of {scan}"):
+                try:
+                    done = subprocess.run([sys.executable, str(tool), "--pack", str(self.pack_of[scan]), "--scene", scan,
+                                           "--if-needed"], capture_output=True, text=True, timeout=3600)
+                except subprocess.TimeoutExpired:
+                    print(f"[merge] {scan}: no answer in an hour, served as it is", flush=True)
+                    return
+            said = (done.stdout or "").strip()
+            if done.returncode:
+                print(f"[merge] {scan} failed (exit {done.returncode}), served as it is: {(done.stderr or said)[-800:]}",
+                      flush=True)
+                return
+            if "nothing to do" not in said:
+                self.reload_meta(scan)
+                print(f"[merge] {said[-400:]} ({time.time() - started:.0f} s)", flush=True)
+
     def reload_meta(self, scan: str) -> None:
         """Read a scene's scene.json again (after compact_on_start rewrote it); its plans go with the old one."""
         self.meta[scan] = json.loads((self.scene_dir(scan) / "scene.json").read_text())
@@ -2654,6 +2691,7 @@ class Renderer:
         key = (scan, variant, mode)
         if key in self.plans:
             return self.plans[key]
+        self.merge_if_needed(scan)   # before anything reads the scene's files (the variants' shapes, its scene.json)
         variants = self.meta[scan]["variants"]
         spec = variants[variant]
         if spec.get("flash_xml") and not self.has_nocaustics:

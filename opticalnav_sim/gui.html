@@ -802,6 +802,7 @@ function renderMonitor() {
   const prog = act.progress || null;
   const cyc = S.render_mode === "cycles";
   const scene = what.startsWith("preparing Cycles") ? ["warn", `Cycles GPU 준비 ${secs}`, "Blender가 씬을 연 뒤 첫 렌더로 GPU를 준비합니다(커널 컴파일과 장면 업로드). 커널은 씬이 쓰는 기능 조합마다 처음 한 번 몇 분 걸리고 이후 캐시됩니다"]
+    : what.startsWith("merging meshes") ? ["warn", `메시 병합 ${secs}`, "씬을 처음 열 때 같은 재질의 고정 메시를 하나로 합칩니다(씬마다 한 번, 움직일 물체로 지정된 것은 따로 둡니다)"]
     : what.startsWith("loading") && what.endsWith("in Blender") ? ["warn", `.blend 여는 중 ${secs}`, "Blender가 씬 파일을 읽습니다"]
     : what.startsWith("loading") ? ["warn", `로드 중 ${prog && prog.files && prog.stage === "files" ? `${prog.files[0]}/${prog.files[1]}` : secs}`, progressText(prog) || "보통 1–2분"]
     : ready.scene ? ["ok", `${short} · ${S.variant}`, "렌더 서버 GPU에 올라가 있음"]
