@@ -19,13 +19,15 @@ are the ones the path tracer sees.
 * Lights: each emitter as a point at its centroid carrying its power (radiance x area; one-sided when flat),
   with a cube shadow map (SHADOW a side) made the first time it is lit and kept until the geometry changes,
   filtered into soft shadows as wide as the light (PCSS; a CUDA kernel, raster_kernels);
-  the camera flash as a one-sided light behind the camera, without shadows; the windows that see the sky as
-  lights of the sky's mean radiance. Metal-rough shading: Lambert under GGX (Smith, Schlick) with each pixel's
-  roughness (Mitsuba's ``alpha``, textured or not) and metallic weight (the ``blendbsdf`` of plastic and
-  conductor). Indirect light comes from a grid of light probes baked with Mitsuba's ray tracing when the
+  the camera flash as a one-sided light behind the camera, its shadows from one map along the view drawn each
+  frame (_flash_shadow); the windows that see the sky as lights of the sky's mean radiance. Metal-rough
+  shading: Lambert under GGX (Smith, Schlick) with each pixel's roughness (Mitsuba's ``alpha``, textured or
+  not) and metallic weight (the ``blendbsdf`` of plastic and conductor). Indirect light comes from a grid of light probes baked with Mitsuba's ray tracing when the
   lights or the geometry change (raster_gi), diffuse and specular (Karis' analytic environment BRDF),
-  darkened in corners and crevices by screen-space ambient occlusion; without them, a flat ambient term (a
-  share of the frame's mean direct irradiance plus some of the sky).
+  darkened where things touch by screen-space ambient occlusion reaching half the probes' spacing (what is
+  larger they hold themselves); without them, a flat ambient term (a share of the frame's mean direct
+  irradiance plus some of the sky) under the full, squared occlusion. Glass reflects the probes' light about
+  its mirror direction (the flat term without them). The sky is read bilinearly, as Mitsuba's envmap.
 * Polarization, one reflection deep, with Mitsuba's own Mueller matrices: a light's GGX reflection is the
   Fresnel reflection (mueller::specular_reflection, complex for a conductor) in the plane of the microfacet,
   of unpolarized light or of the flash's (polarized_area, linear in its canonical basis); a pplastic's diffuse
@@ -82,10 +84,14 @@ MIRROR_OFFSET = 0.005  # m: a mirror's reflected view starts this far in front o
 MIN_ALPHA = 0.04       # GGX alpha floor: a mirror's highlight from a point light would be a single pixel
 SOFT_SEARCH, SOFT_TAPS = 8, 12  # soft shadows: taps looking for what casts, then taps filtering (see _visibility)
 SOFT_MAX = 0.3          # m: the widest penumbra
+FLASH_SHADOW = 1024     # the camera flash's shadow map side (see _flash_shadow)
+FLASH_MARGIN = 10.0     # deg: the flash's map reaches this far past the view's corners
+FLASH_PAST_CAMERA = 0.05  # m: nothing nearer the flash than the camera and this casts the flash's shadow
 AO_SAMPLES = 12         # ambient occlusion: points tried in the hemisphere over a pixel (see _occlusion)
 AO_RADIUS = 0.5         # m: how far around a point counts as its surroundings
 AO_BIAS = 0.03          # m: nearer than this in front of a sample does not occlude it
-AO_POWER = 2.0          # the occlusion squared: the ambient term stands for all indirect light, darker in corners
+AO_POWER = 2.0          # without probes, the occlusion squared: the flat ambient term stands for all indirect light
+AO_PROBE_SHARE = 0.5    # with probes: the occlusion's reach, this share of their spacing (see _shade)
 PROBES_ON = True        # light probes (raster_gi) for indirect light; False: the flat ambient term
 PROFILE = bool(__import__("os").environ.get("OPTICALNAV_RASTER_PROFILE"))
 COLOR_SLOTS = ("diffuse_reflectance", "specular_reflectance", "reflectance")
@@ -708,6 +714,68 @@ class RasterScene:
         slope = ((1 - cos * cos).sqrt() / cos).clamp_max(10.0)  # tan of the angle from the normal
         return ma, stored, stored * 1.02 + 0.04 + ma * slope * (2.0 / SHADOW)
 
+    def _flash_shadow(self, pos, axis, up, eye, hfov_deg: float, aspect: float):
+        """The camera flash's shadow map: from the flash (``pos``, behind the camera, shining along ``axis``) the
+        depth along its axis to the nearest caster (inf where nothing is), over a square that reaches the view's
+        corners and FLASH_MARGIN past them (the flash may sit off the camera's axis); None if nothing is in it.
+        Drawn every frame, as it moves with the camera: one view's rasterization more. Nothing between the flash
+        and the camera casts (the camera's own housing would darken the whole view; the real flash is a
+        rectangle about it); the lights' bodies do, the flash not being one of them."""
+        z = axis / axis.norm().clamp_min(1e-12)
+        xa = torch.cross(z, up, dim=0)
+        if float(xa.norm()) < 1e-6:  # up along the axis: any across it
+            xa = torch.cross(z, torch.tensor([0.0, 0.0, 1.0] if abs(float(z[2])) < 0.9 else [1.0, 0.0, 0.0],
+                                             device=self.dev), dim=0)
+        xa = xa / xa.norm()
+        ya = torch.cross(xa, z, dim=0)
+        w2l = torch.eye(4, device=self.dev)
+        w2l[:3, :3] = torch.stack([xa, ya, -z])  # looking down its -z, as the camera's view matrix does
+        w2l[:3, 3] = -(w2l[:3, :3] @ pos)
+        corner = math.tan(math.radians(float(hfov_deg)) / 2.0) * math.sqrt(1.0 + 1.0 / float(aspect) ** 2)
+        tan_half = math.tan(min(math.atan(corner) + math.radians(FLASH_MARGIN), math.radians(80.0)))
+        n, f = max(SHADOW_NEAR, float((eye - pos) @ z) + FLASH_PAST_CAMERA), SHADOW_FAR
+        proj = torch.tensor([[1 / tan_half, 0, 0, 0], [0, 1 / tan_half, 0, 0],
+                             [0, 0, -(f + n) / (f - n), -2 * f * n / (f - n)], [0, 0, -1, 0]],
+                            device=self.dev, dtype=torch.float32)
+        mvp = proj @ w2l
+        tris, _ = self._in_view(mvp)
+        if tris.shape[0] == 0:
+            return None
+        rast, _ = drt.rasterize(self.ctx, (self.pos_h @ mvp.T)[None].contiguous(), tris.contiguous(),
+                                (FLASH_SHADOW, FLASH_SHADOW))
+        depth = 2 * f * n / ((f + n) - rast[0, :, :, 2] * (f - n))
+        depth = torch.where(rast[0, :, :, 3] > 0, depth, math.inf).reshape(-1)
+        return SimpleNamespace(mvp=mvp, depth=depth, tan_half=tan_half, near=n, pos=pos)
+
+    def _flash_visibility(self, fs, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        """How much of the flash points ``x`` (P x 3, normals ``n``) see by its map (P, 0 to 1): the four texels
+        about each point's place in it, each lit or not, blended bilinearly (an edge one texel soft). The margin
+        grows as the flash grazes the surface, as _cube_test's does. Outside the map: lit."""
+        if fs is None:
+            return torch.ones(x.shape[0], device=self.dev)
+        S = FLASH_SHADOW
+        c = x @ fs.mvp[:, :3].T + fs.mvp[:, 3]
+        w = c[:, 3]  # the depth along the flash's axis
+        wc = w.clamp_min(1e-6)
+        u = (c[:, 0] / wc + 1) * (0.5 * S) - 0.5
+        v = (c[:, 1] / wc + 1) * (0.5 * S) - 0.5
+        inside = (w > fs.near) & (u > -0.5) & (u < S - 0.5) & (v > -0.5) & (v < S - 0.5)
+        d = x - fs.pos
+        cos = ((d * n).sum(1).abs() / d.norm(dim=1).clamp_min(1e-9)).clamp(0.05, 1.0)
+        slope = ((1 - cos * cos).sqrt() / cos).clamp_max(10.0)
+        limit_add = 0.02 + w * slope * (2.0 * fs.tan_half / S)  # a texel's depth across the surface
+        u0, v0 = u.floor(), v.floor()
+        fu, fv = u - u0, v - v0
+        lit = torch.zeros_like(w)
+        for dy in (0, 1):
+            for dx in (0, 1):
+                col = (u0.long() + dx).clamp(0, S - 1)
+                row = (v0.long() + dy).clamp(0, S - 1)
+                stored = fs.depth[row * S + col]
+                weight = (fu if dx else 1 - fu) * (fv if dy else 1 - fv)
+                lit = lit + weight * (w <= stored * 1.01 + limit_add).float()
+        return torch.where(inside, lit, 1.0)
+
     # --- shading ---
     def _sample(self, layer: torch.Tensor, uv: torch.Tensor, duv: torch.Tensor) -> torch.Tensor:
         """Trilinear, repeating lookups (P x 3, linear) of textures ``layer`` (P, >= 0) at ``uv`` (P x 2): the
@@ -878,7 +946,20 @@ class RasterScene:
         u = u - torch.floor(u)
         v = torch.acos(d[:, 1].clamp(-1, 1)) / math.pi
         h, w = env.shape[:2]
-        rgb = env[(v * h).long().clamp(0, h - 1), (u * w).long().clamp(0, w - 1)] * float(look.env_scale)
+        # bilinear, as Mitsuba's envmap reads its bitmap: across, texel centres and the longitude wrapping round
+        # (the last column blends into the first); down, the first and last rows on the poles. Nearest texels
+        # showed the map's pixels as blocks in the sky and in the probes' light
+        x = u * w - 0.5
+        x0 = torch.floor(x)
+        fx = (x - x0)[:, None]
+        c0 = x0.long() % w
+        c1 = (c0 + 1) % w
+        y = v * max(h - 1, 0)
+        r0 = torch.floor(y).long().clamp(0, max(h - 2, 0))
+        fy = (y - r0.float()).clamp(0, 1)[:, None]
+        r1 = (r0 + 1).clamp_max(h - 1)
+        rgb = ((env[r0, c0] * (1 - fx) + env[r0, c1] * fx) * (1 - fy)
+               + (env[r1, c0] * (1 - fx) + env[r1, c1] * fx) * fy) * float(look.env_scale)
         nir = rgb @ torch.tensor(LUMA, device=self.dev) * float(dict(look.nir).get("daylight", 0.0))
         return torch.cat([rgb, nir[:, None]], dim=1)
 
@@ -895,10 +976,11 @@ class RasterScene:
         return d / d.norm(dim=1, keepdim=True)
 
     def render(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, look, follow: bool,
-               aa: str = "off") -> tuple:
+               aa: str = "edge") -> tuple:
         """One view: ([S0, S1, S2, S3], depth): Stokes images H x W x 4 (R, G, B, near-infrared lanes; None for
         zero) and the depth H x W along the view axis (0 where nothing is), numpy float32. ``aa``: "off" (one
-        sample a pixel), "edge" (nvdiffrast's antialias: silhouettes blended by their coverage) or "ssaa2"
+        sample a pixel), "edge" (the default: nvdiffrast's antialias, silhouettes blended by their coverage,
+        nearly free) or "ssaa2"
         (2 x 2 samples a pixel, averaged: also textures, highlights and shadow edges; four times the shading)."""
         if aa not in AA_MODES:
             raise ValueError(f"raster antialiasing is one of {AA_MODES}")
@@ -928,7 +1010,7 @@ class RasterScene:
         proj = self._projection(hfov_deg, width, height)
         surf = self._rasterize(m, proj, width, height)
         tick("rasterize")
-        frame = self._frame_lights(look, follow, c2w, m)
+        frame = self._frame_lights(look, follow, c2w, m, hfov_deg, width / height)
         tick("lights of the frame")
         stokes, spec_pol, ambient = self._shade(surf, look, frame)
         P_all = width * height
@@ -950,9 +1032,11 @@ class RasterScene:
             front = (gid > 0) & ((surf.tid <= 0) | (gz < surf.rast[0, :, :, 2].reshape(-1)))
             g = torch.nonzero(front)[:, 0]
             if g.numel():
-                film[g] = self._through_glass(film[g], -dirs[g], self._glass_normal(gid[g].long() - 1, rg, g, dirs[g]),
-                                              frame.up, (ambient + math.pi * sky_mean)[None] / math.pi)
                 w_inv = 2 * FAR * NEAR / ((FAR + NEAR) - gz[g] * (FAR - NEAR))
+                normal = self._glass_normal(gid[g].long() - 1, rg, g, dirs[g])
+                reflected = self._glass_reflected(frame, ambient, sky_mean, surf.eye, surf.forward, dirs[g], w_inv,
+                                                  normal)
+                film[g] = self._through_glass(film[g], -dirs[g], normal, frame.up, reflected)
                 depth[g] = w_inv
         tick("sky, glass")
         film = film.view(1, height, width, 12)
@@ -1039,11 +1123,12 @@ class RasterScene:
         per = ("hit", "x", "n", "n_geo", "uv", "duv", "corners", "pa", "pb", "pc", "shape", "mat", "view")
         return SimpleNamespace(**{k: (v[sel] if k in per else v) for k, v in vars(surf).items()})
 
-    def _frame_lights(self, look, follow: bool, c2w, m: torch.Tensor):
+    def _frame_lights(self, look, follow: bool, c2w, m: torch.Tensor, hfov_deg: float = 90.0, aspect: float = 1.0):
         """The lights of a frame: each light's radiance per lane at the Look's levels, those lit (with shadow
-        maps made), the light probes baked for them, the camera flash, and the rows the shading takes (position,
-        normal, how they emit: 0 one-sided, 1 both ways, 2 every way, a lamp's shade; power per lane; the squared
-        size added to the squared distance; polarized or not, and the frame of a polarized one)."""
+        maps made), the light probes baked for them, the camera flash (with its shadow map over the view,
+        ``hfov_deg`` wide, ``aspect`` width / height), and the rows the shading takes (position, normal, how
+        they emit: 0 one-sided, 1 both ways, 2 every way, a lamp's shade; power per lane; the squared size added
+        to the squared distance; polarized or not, and the frame of a polarized one)."""
         dev = self.dev
         levels = look.uniforms()
         L = self.l_pos.shape[0]
@@ -1070,7 +1155,7 @@ class RasterScene:
         r = self.resident
         flash = None
         if follow and r.flash is not None and r.k_flash_radiance is not None and (look.flash_rgb or look.flash_nir):
-            # the camera flash: one-sided, facing the view, no shadows (it sits behind the camera)
+            # the camera flash: one-sided, facing the view, its shadows from one map along the view (_flash_shadow)
             le = np.resize(r.radiance[r.k_flash_radiance][1].astype(np.float32), 3)
             from .server import flash_matrix, level_offset
             size = [float(v) * float(look.flash_scale) for v in r.flash["size_world"]]
@@ -1092,6 +1177,7 @@ class RasterScene:
             flash = SimpleNamespace(pos=f(pos)[0], s=f(fm[:3, 0])[0], t=f(fm[:3, 1])[0], n=f(fm[:3, 2])[0],
                                     radiance=power[0] / (area * float(look.flash_scale) ** 2), polarized=polarized,
                                     frame=f(frame)[0])
+            flash.shadow = self._flash_shadow(flash.pos, flash.n, m[:3, 1], m[:3, 3], hfov_deg, aspect)
         axis = (getattr(r, "depth", None) or {}).get("own", {}).get("reference_axis")
         up = torch.as_tensor(axis, device=dev, dtype=torch.float32) if axis is not None else m[:3, 1].contiguous()
         return SimpleNamespace(lanes_t=lanes_t, active=active, idx=idx, probes=probes, up=up, flash=flash,
@@ -1109,7 +1195,13 @@ class RasterScene:
         # a turn per pixel, tiled over 4 x 4 pixels, for the taps of soft shadows and ambient occlusion
         bayer = torch.tensor([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5], device=dev, dtype=torch.float32)
         angle = bayer[(hit // surf.width % 4) * 4 + hit % surf.width % 4] * (2 * math.pi / 16)
-        ao = self._occlusion(x, n_geo, hit, angle, surf.zbuf, surf.mvp, surf.eye, surf.forward, surf.width, surf.height)
+        # the probes' light already holds what a room's walls and furniture shade, at their spacing and up: with
+        # them, the occlusion reaches only a share of that spacing (contact shadows under and between things,
+        # which the probes are too far apart to see) and darkens once; without them, it is the only occlusion
+        probes = frame.probes
+        radius = AO_RADIUS if probes is None else min(AO_RADIUS, AO_PROBE_SHARE * float(probes.step))
+        ao = self._occlusion(x, n_geo, hit, angle, surf.zbuf, surf.mvp, surf.eye, surf.forward, surf.width,
+                             surf.height, radius)
         tick("occlusion")
         lid = self.shape_light[surf.shape]
         emission = torch.where((lid >= 0)[:, None], frame.lanes_t[lid.clamp_min(0)], 0.0)
@@ -1124,8 +1216,10 @@ class RasterScene:
             for first in range(0, P, PIXEL_CHUNK):  # lights x pixels at a time: a 2x2 frame would hold gigabytes
                 sl = slice(first, min(P, first + PIXEL_CHUNK))
                 vis = torch.ones((pos.shape[0], sl.stop - sl.start), device=dev)
-                if frame.active:  # the lights with cube maps come first (the flash, last, casts no shadow)
+                if frame.active:  # the lights with cube maps come first
                     vis[:len(frame.active)] = self._visibility(frame.idx, lit[sl], n_geo[sl], angle[sl])
+                if frame.flash is not None:  # the flash, last, by its own map
+                    vis[-1] = self._flash_visibility(frame.flash.shadow, lit[sl], n_geo[sl])
                 if kernels is not None:  # polarized: Mitsuba's Mueller matrices of each reflection (raster_kernels)
                     o = kernels.shade_lights(x[sl].contiguous(), n[sl].contiguous(), n_geo[sl].contiguous(),
                                              view[sl].contiguous(), a2[0, sl].contiguous(), spec_pol[sl].contiguous(),
@@ -1137,10 +1231,10 @@ class RasterScene:
         tick("lights")
         sky_mean = self._sky_mean(look)
         ambient = AMBIENT_DIRECT * diffuse.mean(0) + AMBIENT_SKY * math.pi * sky_mean  # glass's reflection; no probes
-        occluded = (ao ** AO_POWER)[:, None]
-        if frame.probes is not None:  # the probes' irradiance about the normal, and about the mirror direction
+        occluded = (ao if probes is not None else ao ** AO_POWER)[:, None]
+        if probes is not None:  # the probes' irradiance about the normal, and about the mirror direction
             mirror = 2 * (n * view).sum(1, keepdim=True) * n - view
-            irr, irr_mirror = frame.probes.irradiance(x, n, mirror, n_geo)
+            irr, irr_mirror = probes.irradiance(x, n, mirror, n_geo)
             shade, gloss = irr * occluded, irr_mirror * occluded
         else:
             shade = gloss = ambient[None] * occluded
@@ -1280,22 +1374,24 @@ class RasterScene:
         self.probes.bake(key, light_rows, lambda d: self._sky(d, look), look.nir_range)
         return self.probes
 
-    def _occlusion(self, x, n, hit, angle, depth, mvp, eye, forward, width, height) -> torch.Tensor:
+    def _occlusion(self, x, n, hit, angle, depth, mvp, eye, forward, width, height,
+                   radius: float = AO_RADIUS) -> torch.Tensor:
         """Screen-space ambient occlusion (P, 1 open to 0 shut): of AO_SAMPLES points in the hemisphere over each
         hit point (normal ``n``, turned by ``angle``), the share that something nearer the camera hides, within
-        AO_RADIUS. The tiled turn is then averaged out over 4 x 4 pixels, not across an edge in depth (``depth``,
-        H*W along the view axis, inf where nothing is). A CUDA kernel (raster_kernels), else the same in torch."""
+        ``radius`` (an occluder much farther in front counts less). The tiled turn is then averaged out over 4 x 4
+        pixels, not across an edge in depth (``depth``, H*W along the view axis, inf where nothing is). A CUDA
+        kernel (raster_kernels), else the same in torch."""
         kernels = raster_kernels.kernels()
         if kernels is not None:
             return kernels.occlusion(x.contiguous(), n.contiguous(), hit, angle.contiguous(), depth,
                                      mvp.contiguous(), eye.contiguous(), forward.contiguous(), self.ao_kernel,
-                                     width, height, AO_RADIUS, AO_BIAS, NEAR)
+                                     width, height, float(radius), AO_BIAS, NEAR)
         t, b = _frame(n, angle)
         k = self.ao_kernel
         z0 = depth[hit]
         hidden = torch.zeros(x.shape[0], device=self.dev)
         for kx, ky, kz in k.tolist():
-            s = x + AO_RADIUS * (kx * t + ky * b + kz * n)
+            s = x + radius * (kx * t + ky * b + kz * n)
             c = s @ mvp[:, :3].T + mvp[:, 3]
             wc = c[:, 3].clamp_min(1e-6)
             col = ((c[:, 0] / wc + 1) * (0.5 * width)).long()
@@ -1303,7 +1399,7 @@ class RasterScene:
             inside = (c[:, 3] > NEAR) & (col >= 0) & (col < width) & (row >= 0) & (row < height)
             scene = depth[(row.clamp(0, height - 1) * width + col.clamp(0, width - 1))]
             sz = ((s - eye) * forward).sum(1)
-            near = (AO_RADIUS / (z0 - scene).abs().clamp_min(1e-6)).clamp_max(1.0)  # far in front: another object
+            near = (radius / (z0 - scene).abs().clamp_min(1e-6)).clamp_max(1.0)  # far in front: another object
             hidden = hidden + torch.where(inside & (scene < sz - AO_BIAS), near, 0.0)
         ao = torch.ones(height * width, device=self.dev)
         ao[hit] = 1 - hidden / AO_SAMPLES
@@ -1343,6 +1439,22 @@ class RasterScene:
         q1 = B * s0 + A * p1 + rb * reflected
         q2 = C * p2
         return torch.cat([q0, cn * q1 - sn * q2, sn * q1 + cn * q2], dim=1)  # and back
+
+    @staticmethod
+    def _glass_reflected(frame, ambient, sky_mean, eye, forward, d, depth, normal) -> torch.Tensor:
+        """The unpolarized radiance a pane of glass reflects toward the camera, before its Fresnel (P x 4, or
+        1 x 4): with light probes, their irradiance about the mirror direction over pi, as an opaque surface's
+        glossy light has it (the room or the street the pane faces, not one colour everywhere); without them,
+        the flat ambient term and the sky's mean. The pane's points are the camera rays (``d``, P x 3) at their
+        ``depth`` along the view axis (``forward``)."""
+        if frame.probes is None:
+            return (ambient + math.pi * sky_mean)[None] / math.pi
+        x = eye + d * (depth / (d @ forward).clamp_min(1e-6))[:, None]
+        out = -d
+        n = torch.where((normal * out).sum(1, keepdim=True) < 0, -normal, normal)  # the camera's side of the pane
+        mirror = 2 * (n * out).sum(1, keepdim=True) * n - out
+        _, irr_mirror = frame.probes.irradiance(x, n, mirror, n)
+        return (irr_mirror / math.pi).contiguous()
 
     def _glass_normal(self, tri: torch.Tensor, rg, pix, dirs) -> torch.Tensor:
         corners = self.tri_g[tri].long()
