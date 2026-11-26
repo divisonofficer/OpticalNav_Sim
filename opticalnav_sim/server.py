@@ -121,6 +121,27 @@ SPP_CHUNK = {"polar": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK", "64"
 PASS_PHASE = {"active": "lights + flash", "passive": "lights only", "own": "render", "flash": "flash only", "split": "lights + flash"}
 
 
+def despeckle(img: np.ndarray, ratio: float = 4.0) -> np.ndarray:
+    """A pixel ``ratio`` times brighter than the brightest of its eight neighbours (a firefly: one path that found a
+    small bright light through a glossy bounce) scaled down to that neighbour. A single pass has them on every wall;
+    the OptiX denoiser keeps them as detail. Edges and highlights are left alone: a neighbour is about as bright."""
+    lum = img.mean(axis=-1) if img.ndim == 3 else img
+    pad = np.pad(lum, 1, mode="edge")
+    h, w = lum.shape
+    near = np.zeros_like(lum)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            if dy == 1 and dx == 1:
+                continue
+            np.maximum(near, pad[dy:dy + h, dx:dx + w], out=near)
+    hot = lum > ratio * near + 1e-6
+    if not hot.any():
+        return img
+    out = img.copy()
+    scale = np.where(hot, near / np.maximum(lum, 1e-12), 1.0)
+    return out * (scale[..., None] if img.ndim == 3 else scale)
+
+
 def trim_host_memory() -> None:
     """Hand freed host memory back to the system. Compiling a render's kernels leaves gigabytes in the C library's
     arenas (a 75-mesh outdoor scene: 16.4 GB resident after its first frame, 3.3 GB after a trim), and the next scene's
@@ -1803,6 +1824,15 @@ class Resident:
             self.scene.parameters_changed([])
         return time.perf_counter() - t0
 
+    def park_bodies(self) -> None:
+        """Every body link (and lamp) back where a load puts it, far below the scene: out of sight and out of the light,
+        while the scene stays loaded for the next view that places them."""
+        far = np.eye(4)
+        far[1, 3] = -1000.0
+        lamp = np.diag([0.001, 0.001, 0.001, 1.0])
+        lamp[1, 3] = -1000.0
+        self.set_bodies({sid: (lamp if "__light" in sid else far) for sid in self.body_shapes})
+
     def _camera_only(self, ps) -> None:
         """A sensor's new to_world, evaluated in place, without the sensor's parameters_changed (see _set_camera)."""
         import drjit as dr
@@ -2704,7 +2734,9 @@ class Renderer:
             return Resident(*args, **kwargs)
 
     def _denoise(self, mode: str, img: np.ndarray) -> np.ndarray:
-        """OptiX AI denoiser on one non-negative HxWx3 radiance image (runs on the mode's worker)."""
+        """OptiX AI denoiser on one non-negative HxWx3 radiance image (runs on the mode's worker), lone fireflies
+        brought down to their neighbours first (despeckle): the denoiser keeps an isolated bright pixel as a feature."""
+        img = despeckle(np.clip(np.nan_to_num(img), 0.0, None))
         h, w = img.shape[:2]
         key = (mode, w, h)
         if key not in self.denoisers:
@@ -2725,6 +2757,7 @@ class Renderer:
         and denoises the running mean, rather than averaging denoised passes, which keeps only what every
         pass's denoiser agreed on and smears detail. Both bands in one call: one trip to the main thread."""
         mode = "polar" if "s0" in arrays or "nir_s0" in arrays else "rgb"
+        mode = self.scene_mode(mode) if hasattr(self, "scene_mode") else mode
         mode = mode if mode in self.variant_of else next(iter(self.variant_of))
 
         def job():
@@ -2738,6 +2771,9 @@ class Renderer:
                 out.update({f"nir_s{k}": v[..., 0] for k, v in enumerate(self._denoise_stokes(mode, *grey))})
             if "radiance" in arrays:
                 out["radiance"] = self._denoise(mode, np.asarray(arrays["radiance"], dtype=np.float32))
+            if "nir" in arrays:  # an unpolarized near-infrared intensity (HxW): one run, as three equal channels
+                grey = np.repeat(np.asarray(arrays["nir"], dtype=np.float32)[..., None], 3, axis=2)
+                out["nir"] = self._denoise(mode, grey)[..., 0]
             return out
         return self._on_main(mode, job)
 
@@ -2888,12 +2924,21 @@ class Renderer:
         unpolarized = mode == "rgb" and self.shared_rgb   # the polarized scene, its integrators without Mueller matrices
         with ACTIVITY.doing("rendering"):
             rkey, passes, follow, hidden = self.plan(scan, variant, self.scene_mode(mode))
+            parked = False
             if placed:  # a scene with these bodies in it is another resident scene (their meshes load with it)
                 rkey = rkey + (tuple((b, name, mkey) for b, name, mkey, _ in placed),)
+            else:
+                # no bodies asked for (a robot taken away, the raster preview): the scene already loaded with bodies
+                # serves, its bodies parked below the scene, instead of loading the place again without them
+                with_bodies = next((k for k in reversed(self.cache) if k[:4] == rkey and len(k) > 4), None)
+                if with_bodies is not None:
+                    rkey, parked = with_bodies, True
             resident = self._resident(rkey, variant)
             if placed:
                 resident.set_bodies({sid: np.frombuffer(m, dtype=np.float64).reshape(4, 4)
                                      for _, _, _, poses in placed for sid, m in poses})
+            elif parked:
+                resident.park_bodies()
             # lighting mode (and the lamps added to dark lamps, when asked for): the light groups it leaves out
             # are removed from the scene (hidden), not just dimmed
             groups = LIGHTING[lighting] + (("lamp",) if lamps else ())
@@ -3500,7 +3545,9 @@ def main() -> int:
     ap.add_argument("--modes", default="polar",
                     help="render modes this process serves: polar, rgb or polar,rgb. Two Mitsuba variants in one "
                          "process crashed on the OptiX 7 build, so run one server per mode there")
-    ap.add_argument("--max-resident", type=int, default=2, help="scene/variant/mode triples kept loaded")
+    ap.add_argument("--max-resident", type=int, default=1,
+                    help="scenes kept loaded (1: the one shown; a frozen replay walks every loaded scene's shapes, so a "
+                         "second one made every CS02 frame 74 ms of CPU instead of 6)")
     ap.add_argument("--preload", action="append", default=[], help="SCAN[:VARIANT[:MODE]] to load at start (repeatable)")
     ap.add_argument("--ser", choices=["on", "off"], default="on",
                     help="shader execution reordering. On: the fast way, for a GPU no other CUDA job is busy on. Off: for a "

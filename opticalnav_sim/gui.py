@@ -812,10 +812,16 @@ class Session:
                 gen, seed = self.gen, self.issued
                 spp = self._next_pass_spp()
                 view = dict(self.view, spp=spp)
+                # with the denoiser on, a new camera's first pass comes back denoised by the server in the same
+                # request (one denoiser run beside the render, no second trip queued behind the next passes): what a
+                # moving camera shows. It is for the screen only; the passes after it are accumulated raw, as before.
+                display = seed == 0 and self.sim.denoise and view.get("renderer", "path") == "path"
+                if display:
+                    view["denoise"] = True
                 self.issued += 1
-                self.spp_issued += spp
+                self.spp_issued += 0 if display else spp
                 self.inflight += 1
-            self._pool.submit(self._pass, gen, view, seed)
+            self._pool.submit(self._pass, gen, view, seed, display)
 
     def _client(self) -> RenderClient:
         client = getattr(self._local, "client", None)
@@ -825,7 +831,7 @@ class Session:
                                           if isinstance(main, RenderClient) else main)
         return client
 
-    def _pass(self, gen: int, view: dict, seed: int) -> None:
+    def _pass(self, gen: int, view: dict, seed: int, display: bool = False) -> None:
         """A pass thread: ask the render server for one pass and add it to the running sums. Nothing else: the mean,
         the denoiser, the polarization images and the JPEGs are the publisher's (_publisher), so a pass that comes
         back never waits for a picture to be made, and the next one is already on its way."""
@@ -855,7 +861,15 @@ class Session:
             out = dict(out, nir_s0=np.asarray(out["nir"], dtype=np.float32))
         wall = time.perf_counter() - started  # the render request's round trip
         job = {"gen": gen, "view": view, "depth": out.get("depth"), "started": started, "wall": wall, "timing": timing,
-               "server_s": server_s, "one": None}
+               "server_s": server_s, "one": None, "denoised": False}
+        if display:   # denoised by the server: shown as it is, never added to the sums
+            job.update(one={k: np.asarray(out[k], dtype=np.float32) for k in ACCUMULATED if k in out}, denoised=True)
+            with self.cv:
+                self.inflight -= 1
+                if gen >= self.frame_meta.get("frame_gen", -1) and (self._job is None or self._job["gen"] <= gen):
+                    self._job = job
+                self.cv.notify_all()
+            return
         with self.cv:
             self.inflight -= 1
             self.cv.notify_all()   # the render loop sends the next pass now
@@ -921,22 +935,34 @@ class Session:
                     mean = robust_mean(self.acc, self.acc_n)
                 else:
                     mean = {k: self.acc[k].sum(axis=0) / self.spp_done for k in ACCUMULATED if k in self.acc}
+        unpolarized = "s1" not in mean and "nir_s1" not in mean
         if "s0" in mean and "s1" not in mean:   # an unpolarized render
             mean["s1"] = mean["s2"] = np.zeros_like(mean["s0"])
         if "nir_s0" in mean and "nir_s1" not in mean:
             mean["nir_s1"] = mean["nir_s2"] = np.zeros_like(mean["nir_s0"])
         nir = [mean.get(f"nir_s{k}") for k in range(3)]
-        if self.sim.denoise:
+        if self.sim.denoise and not job.get("denoised"):
             # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
             # denoised 16 spp passes keeps just what every pass's denoiser agreed on, and smears detail).
             # Both bands in one request: one trip, queued once behind the render server's passes.
-            images = {k: mean[k] for k in ("s0", "s1", "s2") if k in mean}
-            if nir[0] is not None:
-                images.update({f"nir_s{k}": nir[k] for k in range(3)})
+            # Unpolarized (S1 = S2 = 0): the intensities alone, one denoiser run a band, not the four polarizer
+            # images a Stokes triple needs (eight runs with the near-infrared band: ~80 ms of a 512 x 384 frame)
+            if unpolarized:
+                images = {"radiance": mean["s0"]} if "s0" in mean else {}
+                if nir[0] is not None:
+                    images["nir"] = nir[0]
+            else:
+                images = {k: mean[k] for k in ("s0", "s1", "s2") if k in mean}
+                if nir[0] is not None:
+                    images.update({f"nir_s{k}": nir[k] for k in range(3)})
             try:
                 den = self._client().denoise(images)
+                if "radiance" in den:
+                    mean["s0"] = den["radiance"]
                 mean.update({k: den[k] for k in ("s0", "s1", "s2") if k in den})
-                if nir[0] is not None:
+                if "nir" in den:
+                    nir = [den["nir"], nir[1], nir[2]]
+                elif nir[0] is not None and "nir_s0" in den:
                     nir = [den[f"nir_s{k}"] for k in range(3)]
             except (ConnectionError, OSError, RuntimeError):
                 pass  # show the raw mean rather than nothing

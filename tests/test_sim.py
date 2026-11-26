@@ -1393,3 +1393,15 @@ def test_one_server_with_shader_reordering_per_gpu(tmp_path):
     assert server.ser_lock("1", tmp_path) is not None
     first.close()                                          # the first server ended
     assert server.ser_lock("0", tmp_path) is not None
+
+
+def test_despeckle_lowers_lone_fireflies_and_keeps_bright_regions():
+    """Before the denoiser: a pixel far above all its neighbours goes down to them; a bright patch stays."""
+    from opticalnav_sim.server import despeckle
+    img = np.full((40, 50, 3), 0.1, np.float32)
+    img[10, 10] = 50.0               # a firefly
+    img[20:26, 30:36] = 5.0          # a lamp seen directly
+    out = despeckle(img)
+    assert np.allclose(out[10, 10], 0.1) and np.allclose(out[22, 32], 5.0) and np.allclose(out[0, 0], 0.1)
+    grey = img[..., 0].copy()
+    assert np.isclose(despeckle(grey)[10, 10], 0.1)
