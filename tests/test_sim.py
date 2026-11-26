@@ -906,6 +906,20 @@ def test_filmic_curve_is_monotonic_and_deeper_in_the_shadows():
     assert tonemap.curve("filmic") is tonemap.filmic and tonemap.curve("reinhard") is tonemap.reinhard
 
 
+def test_tone_curve_table_is_within_one_step_of_the_curve():
+    from opticalnav_sim import tonemap
+
+    rng = np.random.default_rng(0)
+    img = rng.lognormal(-1.5, 2.0, (64, 80, 3)).astype(np.float32)
+    img[0, 0, 0], img[0, 1, 0] = np.nan, -1.0
+    for name in ("filmic", "reinhard"):
+        for exposure, white in ((3.0, 4.0), (0.2, 1.0), (50.0, 8.0)):
+            exact, fast = tonemap.curve(name)(img, exposure, white), tonemap.fast(name, img, exposure, white)
+            assert fast.dtype == np.uint8 and fast.shape == img.shape
+            assert np.abs(exact.astype(int) - fast.astype(int)).max() <= 1
+            assert fast[0, 0, 0] == 0 and fast[0, 1, 0] == 0   # NaN and negative: black
+
+
 def test_gray_textures_become_one_channel_except_normal_maps_and_colour(tmp_path):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
     from PIL import Image

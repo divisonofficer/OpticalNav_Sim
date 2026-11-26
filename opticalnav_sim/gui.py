@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import statistics
 import sys
 import threading
 import time
@@ -98,6 +99,10 @@ CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  #
 # the largest pass: a polarized path carries Mueller matrices (its wavefront memory, and a long pass delays a move);
 # without polarization a pass of 256 samples is the server's own chunk (server.SPP_CHUNK)
 MAX_PASS_SPP = {"polar": 64, "rgb": 256}
+# A camera's passes after its first wait until it has not moved for this long (s). A held key or a drag sends a move
+# about every 20 ms, before a second pass of the camera could come back: sent at once, it was thrown away (two in five
+# of the render server's passes, turning), and it held a slot the next camera's first pass then waited for.
+STILL_S = 0.06
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
 PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
 _OLD_PANES = {"rgb": ("rgb", "img"), "dolp": ("rgb", "dolp"), "aolp": ("rgb", "aolp"), "s1": ("rgb", "s1"),
@@ -232,6 +237,8 @@ class Session:
         self.issued = self.inflight = self.passes = 0
         self.spp_issued = self.spp_done = 0  # samples in the passes sent / accumulated (a pass has 1, 1, 2, 4, ... pass_spp)
         self.published = 0                # passes in the newest published frame of this gen
+        self.wasted = 0                   # passes that came back for a camera already left and were not shown
+        self.sent = 0                     # passes sent to the render server (with wasted: the share thrown away)
         self.acc: dict[str, np.ndarray] = {}  # per key, FIREFLY_BUCKETS sums of passes (see robust_mean)
         self.acc_n = [0] * FIREFLY_BUCKETS     # passes in each of them
         self.robust = bool(robust)             # fireflies held back (robust_mean), else the plain mean
@@ -811,13 +818,17 @@ class Session:
             return True
         if self.view.get("renderer") == "raster":  # noiseless: one image is the frame
             return False
+        if time.time() - self.gen_started < STILL_S:   # still moving, maybe: the slot waits for the next camera (_loop)
+            return False
         return self.auto and self.spp_issued < self.target_spp
 
     def _loop(self) -> None:
         while True:
             with self.cv:
                 while not self._wants_pass():
-                    self.cv.wait()
+                    # a camera that has not moved for STILL_S gets its next passes then: wake for it
+                    still = STILL_S - (time.time() - self.gen_started)
+                    self.cv.wait(still + 0.002 if self.view is not None and self.issued and 0 < still <= STILL_S else None)
                 gen, seed = self.gen, self.issued
                 spp = self._next_pass_spp()
                 view = dict(self.view, spp=spp)
@@ -827,6 +838,7 @@ class Session:
                 display = seed == 0 and self.sim.denoise and view.get("renderer", "path") == "path"
                 if display:
                     view["denoise"] = True
+                self.sent += 1
                 self.issued += 1
                 self.spp_issued += 0 if display else spp
                 self.inflight += 1
@@ -886,6 +898,7 @@ class Session:
             # the camera moved on while this pass rendered: while moving, still show it if it is newer than what the
             # page has (a game shows the last finished frame), but never accumulate it
             if not current and (seed != 0 or gen <= self.frame_meta.get("frame_gen", -1)):
+                self.wasted += 1
                 return
         added = False
         if current:
@@ -1045,14 +1058,7 @@ class Session:
         sim = self.sim
         with self.cv:
             now = time.time()
-            # frames shown in the last 5 s (2 s jumped with every slow pass); the time split as medians over them
-            recent = [t for t in self.arrivals if now - t <= 5.0]
-            fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 2 and recent[-1] > recent[0] else 0.0
-            split = [s for t, s in self.timings if now - t <= 5.0] or [s for _, s in list(self.timings)[-1:]]
-            timing = {k: round(float(np.median([s[k] for s in split])), 1) for k in (split[0] if split else {})}
-            screens = [ms for t, ms in self.screens if now - t <= 5.0]
-            if screens:  # per page: JPEGs (polarization, tone), the socket writes
-                timing["screen_ms"] = round(float(np.median(screens)), 1)
+            arrivals, timings, screens = list(self.arrivals), list(self.timings), list(self.screens)
             waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error and self.render_on
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             conv = ((self.renderer or {}).get("converting") or {}).get(self.opening["id"]) if self.opening else None  # the converter's own progress
@@ -1075,7 +1081,8 @@ class Session:
                    "width": sim.width, "height": sim.height, **self.pose, **self.frame_meta,
                    "done": spp_now >= self.target_spp or (not self.auto and spp_now > 0)
                            or (sim.renderer == "raster" and spp_now > 0),
-                   "stale": waiting, "fps": round(fps, 1), "in_flight": self.inflight, "timing": timing}
+                   "stale": waiting, "in_flight": self.inflight,
+                   "passes_sent": self.sent, "passes_wasted": self.wasted}
             waited = now - self.gen_started if waiting else 0.0
             info = self.renderer or {}
             out["renderer"] = {"reachable": info.get("reachable"), "activity": self._renderer_status(),
@@ -1084,6 +1091,17 @@ class Session:
             # the scene the render server holds, or is still preloading (a page opened during --preload waits for it)
             resident = info.get("resident") or info.get("preloading") or []
             out["default_scene"] = resident[0][0] if resident else None
+        # frames shown in the last 5 s (2 s jumped with every slow pass); the time split as medians over them. Outside
+        # the lock, without numpy: a page is sent this on every input and every frame (numpy's median on these few
+        # numbers, under the lock the passes and the publisher take, was a tenth of the viewer's time while moving)
+        recent = [t for t in arrivals if now - t <= 5.0]
+        out["fps"] = round((len(recent) - 1) / (recent[-1] - recent[0]), 1) if len(recent) > 2 and recent[-1] > recent[0] else 0.0
+        split = [sp for t, sp in timings if now - t <= 5.0] or [sp for _, sp in timings[-1:]]
+        timing = {k: round(float(statistics.median([sp[k] for sp in split])), 1) for k in (split[0] if split else {})}
+        shown = [ms for t, ms in screens if now - t <= 5.0]
+        if shown:  # per page: JPEGs (polarization, tone), the socket writes
+            timing["screen_ms"] = round(float(statistics.median(shown)), 1)
+        out["timing"] = timing
         server = {"busy": waiting, "what": "render", "waiting": 0, "elapsed_s": round(waited, 1)}
         if waiting and waited > 1.0:
             server["renderer"] = out["renderer"]["activity"]
@@ -1220,7 +1238,7 @@ class Session:
                 return jpeg(self._tonemapped(frame, band, float(ev.get(band, 0.0))))
             grey = np.repeat(frame["s0"][..., "rgb".index(band), None], 3, axis=2)
             tone = self._tone(frame["scan"], frame["variant"], frame["s0"])
-            return jpeg(tonemap.curve(self.tone_curve)(grey, tone["exposure"] * 2.0 ** float(ev.get("rgb", 0.0)), tone["white"]))
+            return jpeg(tonemap.fast(self.tone_curve, grey, tone["exposure"] * 2.0 ** float(ev.get("rgb", 0.0)), tone["white"]))
         derived = self._polarization(frame, "luma" if band == "rgb" else band)
         return jpeg(channel_image(dict(frame, derived=derived), view, scale))
 
@@ -1231,7 +1249,7 @@ class Session:
         else:
             radiance, key = np.repeat(frame["nir_grey"][..., None], 3, axis=2), (frame["scan"], frame["variant"] + "|nir")
         tone = self._tone(key[0], key[1], radiance, own_frame=band == "nir")
-        return tonemap.curve(self.tone_curve)(radiance, tone["exposure"] * 2.0 ** ev, tone["white"])
+        return tonemap.fast(self.tone_curve, radiance, tone["exposure"] * 2.0 ** ev, tone["white"])
 
     def refit_tone(self) -> None:
         """Fit both bands' tone to the frame on screen now (instead of the dataset frames, or the band's first

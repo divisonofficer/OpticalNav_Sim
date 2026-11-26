@@ -829,8 +829,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     if (m.type === "state") apply(m.state);
     else if (m.type === "ack") {
-      const done = acks.get(m.id);
-      acks.delete(m.id);
+      const done = acks.get(m.id);   // it takes itself out of acks
       if (done) done(m.error);
     } else if (m.type === "probe") showProbe(m);
   };
@@ -855,8 +854,11 @@ function send(path, body, what) {
   const id = nextId++;
   pending++;
   return new Promise((resolve) => {
+    // once only: a send that failed was answered at once and stayed in acks, and the socket closing answered it
+    // again, leaving pending at -1 (truthy: every later move was held back)
     acks.set(id, (error) => {
-      pending--;
+      if (!acks.delete(id)) return;
+      pending = Math.max(0, pending - 1);
       if (error) showError(`${what} 실패: ${error}`);
       resolve();
       pumpLook();
@@ -899,11 +901,14 @@ let mouselook = null;
 const lookAcc = { yaw: 0, pitch: 0 };
 function pumpLook() { pumpMotion(); }
 
-// held keys move continuously, like a game: velocity x elapsed time is summed and sent about 25 times a
-// second, whatever the key repeat rate, so the camera moves at the set speed; the server keeps rendering
+// held keys move continuously, like a game: velocity x elapsed time is summed every display frame (rAF) and sent,
+// whatever the key repeat rate, so the camera moves at the set speed; the server keeps rendering
 // the newest camera and the page draws every frame that finishes
 const held = new Set();
-let MOTION_MS = 16;  // the most often a move is sent (ms); each move is a new camera, and so at most one frame
+// The most often a move is sent (ms); each move is a new camera, and so at most one frame. Under a display frame, so
+// the display's rate (rAF) and the answer to the last move set the pace: 16 ms missed every other frame of a 60 Hz
+// display by a hair and held a turn to ~45 pictures a second; at 8 ms the render server keeps up with ~85 moves a second
+let MOTION_MS = 8;
 const motion = { forward: 0, right: 0, up: 0, yaw_deg: 0, pitch_deg: 0 };
 let lastTick = performance.now(), lastSent = 0;
 const MOVE_KEYS = { w: ["forward", 1], s: ["forward", -1], a: ["right", -1], d: ["right", 1], q: ["up", -1], e: ["up", 1],
@@ -928,7 +933,7 @@ function motionTick(now) {
 function pumpMotion() {
   const big = Math.abs(motion.forward) + Math.abs(motion.right) + Math.abs(motion.up) > 1e-3 ||
     Math.abs(motion.yaw_deg) + Math.abs(motion.pitch_deg) > 0.05;
-  // about 25 updates a second; the server renders the newest camera and shows each finished frame
+  // one move a display frame at most, the last one answered; the server renders the newest camera and shows each finished frame
   if (!big || pending || !S || performance.now() - lastSent < MOTION_MS) return;
   const o = { ...motion };
   for (const k of Object.keys(motion)) motion[k] = 0;
