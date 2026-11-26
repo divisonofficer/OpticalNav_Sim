@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1165,6 +1166,8 @@ def main() -> int:
                     help="instances of shapegroups kept, the nearest to the .blend's cameras first (default 300: the server's RAM grows "
                          "with them during Dr.Jit's recording; 999 tree instances were an out-of-memory kill)")
     ap.add_argument("--no-map", action="store_true", help="skip the bird's-eye map render (10 to 30 s on the CPU)")
+    ap.add_argument("--no-merge", action="store_true",
+                    help="leave every object a shape of its own (tools/merge_meshes.py merges static meshes of one material)")
     ap.add_argument("--link-blend", action="store_true",
                     help="development: scene.json points at the source .blend instead of a packed copy (seconds, not minutes, for a big one)")
     ap.add_argument("--sky-rotation", type=float, default=270.0,
@@ -1199,12 +1202,31 @@ def main() -> int:
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
                LD_LIBRARY_PATH=f"{cb.DRIVER_DIRS}:{cb.BLENDER.parent / 'lib'}:{cb.lib_dir()}")
     t0 = time.time()
-    for stale in ("base.xml", "convert_report.json"):
-        (out / stale).unlink(missing_ok=True)  # a failed run must not look like the last one's
-    for old_asset in (out / "assets").glob("*"):
-        old_asset.unlink()  # content-addressed names: what this run does not write is not wanted
-    (out / "map" / "birdeye.png").unlink(missing_ok=True)
-    (out / "sky" / "world.exr").unlink(missing_ok=True)
+    if not Path(blend).is_file():  # before anything of the last conversion is touched
+        print(f"{blend}: no such .blend file")
+        return 1
+    # The last conversion's outputs are set aside, not deleted: a run that fails (a .blend gone missing, Blender failing)
+    # puts them back, so the scene keeps working as it was. A successful run drops them. (Deleted up front, a failed
+    # reconversion of REF_CS02 left the scene without its XML, meshes and sky.)
+    previous = out / ".previous"
+    if previous.exists():
+        shutil.rmtree(previous)
+    previous.mkdir()
+    kept = [p for p in ("base.xml", "convert_report.json", "merged_meshes.json", "assets", "map/birdeye.png", "sky/world.exr")
+            if (out / p).exists()]
+    for p in kept:  # content-addressed asset names: what this run does not write is not wanted
+        (previous / p).parent.mkdir(parents=True, exist_ok=True)
+        (out / p).rename(previous / p)
+    (out / "assets").mkdir(exist_ok=True)
+
+    def restore() -> None:
+        for p in kept:
+            if (out / p).is_dir():
+                shutil.rmtree(out / p)
+            elif (out / p).exists():
+                (out / p).unlink()
+            (previous / p).rename(out / p)
+        shutil.rmtree(previous)
     proc = subprocess.Popen([str(cb.BLENDER), "-b", "--python-exit-code", "1", "--python", str(Path(__file__).resolve())], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     tail: list[str] = []
@@ -1215,7 +1237,10 @@ def main() -> int:
     proc.wait()
     if proc.returncode or not (out / "base.xml").is_file():
         print("".join(tail)[-2500:])
+        restore()
+        print(f"{scene_id}: conversion failed, the previous one is back in place", flush=True)
         return 1
+    shutil.rmtree(previous)
     print("[progress] 0.88 텍스처 정리", flush=True)
     postprocess_assets(out / "assets", args.max_texture)
     # scene.json: the template's, with this scene's ids
@@ -1224,7 +1249,8 @@ def main() -> int:
     meta["scan"] = scene_id
     meta["variants"] = {"base": {**meta["variants"]["base"], "xml": "base.xml", "protocol": "blend_direct_v1"}}
     meta["converter"] = {"tool": "blend_to_pack", "source": str(blend), "seconds": round(time.time() - t0, 1), "report": report}
-    for k in ("flat_colors", "flat_normalmaps", "gray_textures", "asset_compaction", "emissive_parts", "staged", "spawn_before", "blend", "sky"):
+    for k in ("flat_colors", "flat_normalmaps", "gray_textures", "asset_compaction", "emissive_parts", "staged", "spawn_before", "blend", "sky",
+              "mesh_merge"):
         meta.pop(k, None)
     if report.get("sky"):
         meta["sky"] = {"file": report["sky"], "gain": 1.0, "rotation_deg": args.sky_rotation}
@@ -1255,6 +1281,17 @@ def main() -> int:
     conn = pack / "connectivity"
     if own_template and (conn / f"{args.scene}_connectivity.json").is_file():
         (conn / f"{scene_id}_connectivity.json").write_text((conn / f"{args.scene}_connectivity.json").read_text().replace(args.scene, scene_id))
+    if not args.no_merge:
+        # Static meshes of one material become one mesh (tools/merge_meshes.py): thousands of shapes in the file left the
+        # loaded meshes with registry ids in the thousands, and with a robot (instances) in the scene every frozen replay
+        # rebuilt call tables that long (CS02: 4964 shapes -> 215, a replay 16.5 -> 8.6 ms). Objects marked dynamic stay
+        # apart; merged_meshes.json gives every object back. A failure leaves the scene as converted.
+        print("[progress] 0.97 메시 병합", flush=True)
+        merged = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "merge_meshes.py"), "--pack", str(pack),
+                                 "--scene", scene_id], capture_output=True, text=True)
+        print((merged.stdout or "").strip()[-400:] or f"merge_meshes: exit {merged.returncode}", flush=True)
+        if merged.returncode:
+            print(f"[blend_to_pack] mesh merging failed, the scene stays unmerged:\n{merged.stderr[-1500:]}", flush=True)
     print(f"{scene_id}: done in {time.time() - t0:.0f} s -> {out}")
     return 0
 
