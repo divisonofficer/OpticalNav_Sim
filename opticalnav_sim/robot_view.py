@@ -636,8 +636,16 @@ class RobotSession:
                 time.sleep(0.03)
                 return
             actor, request, outs, shown_spp, look = got
+            t1 = time.monotonic()
+            used = client or (self.world.client if self.world is not None else None)
+            server = dict(getattr(used, "last_timing", {}) or {})
             reading = self._read(name, actor, request, outs, own.get("isp") is not False)
             jpeg = _jpeg(reading.picture)
+            # where the frame's time went (ms): the render's round trip and the server's part of it, the reading
+            timing = {"trip_ms": round(1000 * (t1 - t0), 1), "read_ms": round(1000 * (time.monotonic() - t1), 1),
+                      "server_ms": round(1000 * float(getattr(used, "last_render_seconds", 0.0) or 0.0), 1),
+                      **{k[:-2] + "_ms": round(1000 * float(v), 1) for k, v in server.items()
+                         if k.endswith("_s") and isinstance(v, (int, float)) and v}}
         except Exception as exc:  # noqa: BLE001 - the render server went away (a restart): say so, try again
             self._failed(run, exc)
             return
@@ -646,7 +654,8 @@ class RobotSession:
                 return
             self.frames[name] = {"jpeg": jpeg, "seq": self.frames.get(name, {}).get("seq", 0) + 1,
                                  "spp": shown_spp, "still": settled, "look": look, "pose_seq": seq_at, "at": t0,
-                                 "modality": reading.modality, "info": reading.info, "seconds": round(time.monotonic() - t0, 3)}
+                                 "modality": reading.modality, "info": reading.info, "seconds": round(time.monotonic() - t0, 3),
+                                 "timing": timing}
             self.error = ""
             if self.message.startswith("로봇이 든 씬"):
                 self.message = ""
