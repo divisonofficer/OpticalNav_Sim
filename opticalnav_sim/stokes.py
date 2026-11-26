@@ -27,6 +27,8 @@ def rgbn_intensity(image: np.ndarray, band: int) -> np.ndarray:
     """An RGBN Stokes film's intensity alone (what an unpolarized frame needs): band 0 the film's R, G, B (a view, no
     copy), band 1 the near-infrared lane of S0 in all three channels. rgbn_band builds the whole Stokes layout:
     19-20 channels copied, 52% of a render request's thread while a camera moved (and the interpreter lock held)."""
+    if image.shape[2] == 4:   # already cut to R, G, B, NIR on the GPU (server.Resident.intensity_lanes)
+        return image[:, :, :3] if band == 0 else np.repeat(image[:, :, 3:4], 3, axis=2)
     off = {19: 3, 20: 4}[image.shape[2]]
     if band == 0:
         return image[:, :, :3]

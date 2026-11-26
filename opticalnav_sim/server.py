@@ -1824,6 +1824,15 @@ class Resident:
             self.scene.parameters_changed([])
         return time.perf_counter() - t0
 
+    def intensity_lanes(self, img):
+        """An RGBN Stokes film (a Dr.Jit tensor, 19 or 20 channels) cut down on the GPU to R, G, B and the near-infrared
+        lane of S0 before it is read back: an unpolarized frame needs nothing else (15 MB -> 3 MB at 512 x 384)."""
+        import drjit as dr
+        if not hasattr(img, "shape") or len(img.shape) != 3 or img.shape[2] not in (19, 20):
+            return img
+        off = img.shape[2] - 16
+        return dr.concat([img[:, :, 0:3], img[:, :, off + 3:off + 4]], axis=2)
+
     def park_bodies(self) -> None:
         """Every body link (and lamp) back where a load puts it, far below the scene: out of sight and out of the light,
         while the scene stays loaded for the next view that places them."""
@@ -2166,8 +2175,12 @@ class Resident:
         follows a single camera, so those views still render one at a time.
         """
         follow = (self.k_flash is not None) if follow is None else bool(follow and self.k_flash is not None)
-        if len(cams) == 1 or follow or look.band == 2:
-            return [self.render(c, width, height, hfov_deg, spp, seed, pass_name, follow, look) for c in cams]
+        fovs = [float(f) for f in (hfov_deg if isinstance(hfov_deg, (list, tuple)) else [hfov_deg] * len(cams))]
+        # one at a time: a single view; the flash, which follows one camera; two bands through the dual sensor (an
+        # RGBN variant holds both in one render, so it batches)
+        if len(cams) == 1 or follow or (look.band == 2 and not self.rgbn):
+            return [self.render(c, width, height, f, spp, seed, pass_name, follow, look) for c, f in zip(cams, fovs)]
+        hfov_deg = fovs[0]
         if not self.parked or look != self.look:  # the batch sensor sees the scene as set here
             self._set_camera(cams[0], width, height, hfov_deg, False, look)
         mi, k = self.mi, len(cams)
@@ -2176,12 +2189,12 @@ class Resident:
         for c in cams:
             origin, target, up = frames.lookat(c)
             looks.append(mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up))
-        key = (k, int(width), int(height), round(float(hfov_deg), 6))
+        key = (k, int(width), int(height), tuple(round(f, 6) for f in fovs))
         if key not in self.batch_sensors:
             spec = {"type": "batch", "film": {"type": "hdrfilm", "width": k * int(width), "height": int(height)},
                     "sampler": {"type": "independent", "sample_count": 1}}
-            for i, look in enumerate(looks):
-                spec[f"slot{i}"] = {"type": "perspective", "fov": float(hfov_deg), "fov_axis": "x", "to_world": look}
+            for i, look in enumerate(looks):   # each slot its own lens (field of view)
+                spec[f"slot{i}"] = {"type": "perspective", "fov": fovs[i], "fov_axis": "x", "to_world": look}
             self.batch_sensors[key] = mi.load_dict(spec)
         sensor = self.batch_sensors[key]
         p = mi.traverse(sensor)
@@ -2210,9 +2223,11 @@ class Resident:
                     lambda scene, sn, sd, n=int(spp), it=integrator:
                     mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
                     backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
+                self.frozen_args[fkey] = (self.scene, sensor)   # what _absorb replays it with, as the others
                 self._prepare_inputs(sensor, integrator)
                 self._settle(self.frozen[fkey], self.scene, sensor)
-            img = np.array(self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed))))
+            img = self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed)))
+            img = np.array(self.intensity_lanes(img) if self.unpolarized and self.rgbn else img)
         w = int(width)
         return [img[:, i * w:(i + 1) * w] for i in range(k)]
 
@@ -2909,8 +2924,9 @@ class Renderer:
                 renderer, raster_aa, placed)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
-    def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False):
-        """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined)."""
+    def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False, hfovs: list | None = None):
+        """Main-thread half one: queue the views on the GPU. Returns the second half (see submit_pipelined).
+        ``hfovs``: each camera's field of view (several cameras in one batch call); default the key's."""
         started = time.perf_counter()
         scan, variant, mode, width, height, hfov, spp, seed, denoise, (lights, env, env_scale, env_rot, bands,
                                                                         flash_band, nir, lighting, mirrors, lamps,
@@ -2979,14 +2995,17 @@ class Renderer:
                                for p in run] for b, look in looks.items()}
                 if len(run) > 1:  # added on the GPU, read back once
                     handles = {b: [self._sum_handles(hs)] for b, hs in handles.items()}
+                if unpolarized and resident.rgbn:  # S0 is all an unpolarized frame reads: 4 of the film's 19 channels
+                    handles = {b: [(resident.intensity_lanes(img), bd) for img, bd in hs] for b, hs in handles.items()}
                 if self.readback is not None:  # each image copied out behind its own kernels (readback.py)
                     handles = {b: [(img if isinstance(img, np.ndarray) else self.readback.start(img), bd)
                                    for img, bd in hs] for b, hs in handles.items()}
             else:  # batch sensor: completes here
-                batch = {b: [resident.render_many(cams, width, height, hfov, spp, seed, p, follow, look)
+                batch = {b: [resident.render_many(cams, width, height, hfovs or hfov, spp, seed, p, follow, look)
                              for p in passes] for b, look in looks.items()}
             # each view's depth (Resident.depth_image), queued behind its passes: the scene as they rendered it
-            depths = [resident.depth_image(c, width, height, hfov) for c in cams] if depth else None
+            depths = [resident.depth_image(c, width, height, (hfovs or [hfov] * len(cams))[n])
+                      for n, c in enumerate(cams)] if depth else None
             if depths is not None:
                 self.dr.eval(*depths)
                 if self.readback is not None and len(cams) == 1:
@@ -3209,15 +3228,19 @@ class Renderer:
         render call (see Resident.render_many). Timing sums over calls."""
         checked = [self._check(v) for v in views]
         results, total = [], {}
+
+        def batchable(key):   # the key without the field of view: path-traced views of different lenses share a call
+            return key[:5] + (None,) + key[6:] if key[9][18] == "path" else key
         i = 0
         while i < len(checked):
             key = checked[i][0]
             j = i + 1
-            while j < len(checked) and checked[j][0] == key:
+            while j < len(checked) and batchable(checked[j][0]) == batchable(key):
                 j += 1
+            hfovs = [k[5] for k, _ in checked[i:j]]
             done = self.executor.submit_pipelined(self._start, key, [c for _, c in checked[i:j]],
                                                   time.perf_counter(),
-                                                  any(bool(v.get("depth")) for v in views[i:j])).result()
+                                                  any(bool(v.get("depth")) for v in views[i:j]), hfovs).result()
             outs, kernels, render_s, denoise_s = done() if callable(done) else done  # (see _start: assemble)
             t0 = time.perf_counter()
             results.extend(self._finish(key[2], out, dtype, bool(views[i + n].get("preview", True)),
