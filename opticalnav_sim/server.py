@@ -179,6 +179,20 @@ HIDDEN_SPEC_PREFIX = "light_hidden_spec_"
 ASSIST_SHAPE = re.compile(r'\s*<shape type="rectangle" id="camera_assist_[a-z]+">.*?</shape>', re.S)
 SENSOR_BLOCK = re.compile(r"\s*<sensor\b.*?</sensor>", re.S)
 COMMENT = re.compile(r"\s*<!--.*?-->", re.S)
+# The film's reconstruction filter. The scenes' hdrfilm names none: Mitsuba's default Gaussian spreads each sample over
+# its neighbours, and noise came out correlated pixel to pixel (0.37 at one pixel's distance). The OptiX denoiser takes
+# that for texture once the noise is small: 16 spp denoised well, 64 spp hardly, 256 spp not at all. A box filter keeps
+# each sample in its pixel. OPTICALNAV_SIM_RFILTER=gaussian renders as the dataset's exports did.
+RFILTER = os.environ.get("OPTICALNAV_SIM_RFILTER", "box")
+FILM_OPEN = re.compile(r'(<film type="hdrfilm"[^>]*>)(.*?)(</film>)', re.S)
+
+
+def film_filter(text: str) -> str:
+    """The scene text with RFILTER as every hdrfilm's reconstruction filter (a film naming its own keeps it)."""
+    if RFILTER == "gaussian":
+        return text
+    return FILM_OPEN.sub(lambda m: m.group(0) if "<rfilter" in m.group(2)
+                         else f'{m.group(1)}{m.group(2)}<rfilter type="{RFILTER}" />{m.group(3)}', text)
 TOP_ELEMENT = re.compile(r'\n  <(shape|bsdf|texture)\b([^>]*?)(?:/>|>.*?\n  </\1>)', re.S)
 
 
@@ -1413,6 +1427,7 @@ class Resident:
         mi.Thread.thread().file_resolver().prepend(str(xml.parent))  # assets are relative to the XML
         self.name = f"{xml.parent.name}/{xml.name}" + (f"+{flash_xml.name}" if flash_xml is not None else "")
         self.score = progress.scene_score(text)  # sizes the recording-time estimate before any history
+        text = film_filter(text)
         with progress.watch_load(mi, text, self.name):
             self.scene = mi.load_string(text)
         # OPTICALNAV_UNIFORM_EMITTERS=1: Mitsuba's default, every emitter picked as often (for comparisons)
@@ -1628,7 +1643,7 @@ class Resident:
             slot = {"type": "perspective", "fov": fov, "fov_axis": "x"}
             self.dual_sensors[key] = mi.load_dict({
                 "type": "batch", "slot_time": True, "slot0": dict(slot), "slot1": dict(slot),
-                "film": {"type": "hdrfilm", "width": 2 * wm, "height": int(height)},
+                "film": {"type": "hdrfilm", "width": 2 * wm, "height": int(height), "rfilter": {"type": RFILTER}},
                 "sampler": {"type": "independent", "sample_count": 1}})
             # Every frozen render sees this sensor (registry), and its first render filled two things that
             # start empty: the slot of each ray last sampled (m_last_index) and the film's storage. That
@@ -2191,7 +2206,8 @@ class Resident:
             looks.append(mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up))
         key = (k, int(width), int(height), tuple(round(f, 6) for f in fovs))
         if key not in self.batch_sensors:
-            spec = {"type": "batch", "film": {"type": "hdrfilm", "width": k * int(width), "height": int(height)},
+            spec = {"type": "batch", "film": {"type": "hdrfilm", "width": k * int(width), "height": int(height),
+                                               "rfilter": {"type": RFILTER}},
                     "sampler": {"type": "independent", "sample_count": 1}}
             for i, look in enumerate(looks):   # each slot its own lens (field of view)
                 spec[f"slot{i}"] = {"type": "perspective", "fov": fovs[i], "fov_axis": "x", "to_world": look}

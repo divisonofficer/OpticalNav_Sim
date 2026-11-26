@@ -544,7 +544,15 @@ The first frame for each spp and resolution records the freeze once per pass: ab
 
 Without freeze, renders are split into passes to bound GPU memory: at most 64 spp in polar mode (`OPTICALNAV_SIM_SPP_CHUNK`) and 256 spp in rgb mode (`OPTICALNAV_SIM_SPP_CHUNK_RGB`). Each pass is traced again, so frame time grows with the number of passes.
 
-At 128 spp and above, the OptiX denoiser changes frames by only about 0.5% and does not lower the error against the dataset. The noise left at those spp is small and texture-like.
+The render server's film uses a box reconstruction filter (`OPTICALNAV_SIM_RFILTER`, default `box`; the scenes' `hdrfilm` names none, and Mitsuba's default is a Gaussian). With the Gaussian, each sample was spread over its neighbours and the noise was correlated from pixel to pixel (0.37 at one pixel), which the OptiX denoiser took for texture once it was small. That is why the denoiser used to change frames at 128 spp and above by only about 0.5%. Measured on CS02 at 512 x 384 (relative Laplacian on a plain wall), the denoised noise against the raw:
+
+| spp | Gaussian: raw → denoised | box: raw → denoised |
+|---|---|---|
+| 16 | 0.53 → 0.016 | 1.34 → 0.002 |
+| 64 | 0.30 → 0.19 | 0.76 → 0.005 |
+| 256 | 0.165 → 0.164 | 0.43 → 0.013 |
+
+The box film's raw noise is larger because nothing blurs it, and its correlation is 0.002. `OPTICALNAV_SIM_RFILTER=gaussian` renders as the dataset's exports did.
 
 To measure a build, run `tools/benchmark_modes.py`. It sweeps mode, spp and denoiser over the scene's dataset reference views. For each setting it reports steady-state fps with a render / denoise / post-processing breakdown, and S0 error against the 1024-spp dataset frame.
 
