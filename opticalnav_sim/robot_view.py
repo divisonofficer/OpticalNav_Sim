@@ -55,13 +55,13 @@ LOOK = ("variant", "lights", "env", "flash_band", "nir", "lighting", "lamps", "f
         "rr_depth", "caustics", "nir_range", "active_split", "mirrors")
 
 
-def clean_render(client, view: dict, passes: int = 8, abort=None) -> dict | None:
+def clean_render(client, view: dict, passes: int = 8, abort=None, denoise: bool = True) -> dict | None:
     """A view rendered as ``passes`` passes of ``view["spp"]`` samples, their mean with fireflies held back
     (gui.robust_mean: a pass's pixel far above the others' median is scaled down), then denoised: the server's
     answer as one render would give it (``s0``.. or ``radiance``). The denoiser alone leaves a firefly as a white
     speck; the mean alone leaves the grain. For a camera standing still, and for recordings. ``abort()`` true between
     passes: given up, None (the robot moved off: 64 passes of 16 spp are seconds the camera would show nothing new)."""
-    from .gui import robust_mean
+    from .gui import DENOISE_MIN_SPP, robust_mean
     outs = []
     for i in range(passes):
         if abort is not None and abort():
@@ -71,11 +71,12 @@ def clean_render(client, view: dict, passes: int = 8, abort=None) -> dict | None
     spp = float(view["spp"])
     acc = {("s0" if k == "radiance" else k): np.stack([np.asarray(o[k], dtype=np.float32) for o in outs]) * spp for k in keys}
     mean = robust_mean(acc, [spp] * passes)
-    try:
-        den = client.denoise({k: mean[k] for k in ("s0", "s1", "s2") if k in mean})
-        mean.update({k: den[k] for k in den if k in mean})
-    except (ConnectionError, OSError, RuntimeError):
-        pass   # the mean as it is rather than nothing
+    if denoise and spp * passes >= DENOISE_MIN_SPP:   # fewer samples: the mean as it is (the denoiser makes blotches of it)
+        try:
+            den = client.denoise({k: mean[k] for k in ("s0", "s1", "s2") if k in mean})
+            mean.update({k: den[k] for k in den if k in mean})
+        except (ConnectionError, OSError, RuntimeError):
+            pass   # the mean as it is rather than nothing
     out = dict(outs[-1])
     for k in keys:
         out[k] = mean["s0" if k == "radiance" else k]
@@ -424,10 +425,10 @@ class RobotSession:
             return "polar"
         return "rgb" if self.polar_policy == "off" else "polar" if self.polar_policy == "unified" or polarized else "rgb"
 
-    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale", "isp")
+    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale", "isp", "denoise")
 
     def sensor_settings(self, name: str, mode: str | None = None) -> dict:
-        """A sensor's render settings: ``pass_spp`` (a frame while moving: one denoised pass), ``target_spp`` (at rest:
+        """A sensor's render settings: ``pass_spp`` (a frame while moving: one pass, denoised from 64 spp), ``target_spp`` (at rest:
         passes of ``pass_spp`` up to this, fireflies held back, denoised), ``accumulate`` (False: at rest as while moving),
         ``scale`` (a camera's share of its sensor's resolution, its model's ``render_scale`` by default). Unpolarized, a
         pass costs a fifth: four times the samples at rest by default."""
@@ -442,7 +443,9 @@ class RobotSession:
         default = {"pass_spp": 16, "target_spp": (1024 if mode == "rgb" and not spec.polarized else 256), "accumulate": True,
                    "scale": float(spec.render_scale) if hasattr(spec, "render_scale") else None,
                    # a camera's sensor model and ISP (False: the render itself, lens distortion and a tone alone)
-                   "isp": True if getattr(spec, "kind", None) == "camera" else None}
+                   "isp": True if getattr(spec, "kind", None) == "camera" else None,
+                   # the denoiser on this camera's pictures (from DENOISE_MIN_SPP samples on); geometry sensors have none
+                   "denoise": True if spec.lit else None}
         return {**default, **self.settings.get(name, {})}
 
     def set_sensor_settings(self, name: str, changes: dict) -> dict:
@@ -465,6 +468,10 @@ class RobotSession:
                     raise ValueError("target_spp: 1 to 8192")
             if "accumulate" in changes:
                 own["accumulate"] = bool(changes["accumulate"])
+            if "denoise" in changes:
+                if not actor.spec.lit:
+                    raise ValueError(f"{name} measures geometry: nothing to denoise")
+                own["denoise"] = bool(changes["denoise"])
             if "isp" in changes:
                 if getattr(actor.spec, "kind", None) != "camera":
                     raise ValueError(f"{name} is not a camera: it has no ISP")
@@ -483,7 +490,7 @@ class RobotSession:
               isp: bool = True):
         """A measurement of a sensor now, with the editor's look: ``(Reading, spp, look)``, or None when ``before(look)``
         says it is not needed. ``settled``: a clean one (eight passes of ``spp``, fireflies held back, denoised), else
-        one denoised pass. A sensor of geometry alone is one exact render either way. ``client``: the calling thread's own.
+        one pass (denoised from 64 spp). A sensor of geometry alone is one exact render either way. ``client``: the calling thread's own.
         ``passes``: of ``spp`` each, at rest. ``isp`` False: a camera's render as it is (see picture_without_isp)."""
         got = self._render(name, settled, spp, template, before, client, passes)
         if got is None:
@@ -492,20 +499,24 @@ class RobotSession:
         return self._read(name, actor, request, outs, isp), shown, look
 
     def _render(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None, passes: int = 8,
-                abort=None):
+                abort=None, denoise: bool = True):
         """sense's first half: the render server's answer, ``(actor, request, outs, spp shown, look)`` or None (also when
-        ``abort()`` stopped a clean render)."""
+        ``abort()`` stopped a clean render). ``denoise`` False: never denoised (the camera's own switch)."""
         with self.lock:   # the poses of this moment
             world, actor = self.world, self.sensors[name]
             spec = actor.spec
-            request = spec.request(world, actor, spp=spp, denoise=bool(spec.lit and not settled), preview=False)
+            from .gui import DENOISE_MIN_SPP
+            # moving: one pass, denoised only when it has the samples for it (DENOISE_MIN_SPP)
+            request = spec.request(world, actor, spp=spp,
+                                   denoise=bool(denoise and spec.lit and not settled and spp >= DENOISE_MIN_SPP),
+                                   preview=False)
             looks = [self._sensor_view(v, template, spec.polarized) for v in request["views"]]
         views, look = [v for v, _ in looks], looks[0][1]
         if before is not None and not before(look):
             return None
         client = client or world.client
         if spec.lit and settled:
-            outs = [clean_render(client, v, passes, abort) for v in views]
+            outs = [clean_render(client, v, passes, abort, denoise) for v in views]
             if any(o is None for o in outs):
                 return None
         else:
@@ -623,7 +634,7 @@ class RobotSession:
                     return
                 spec, seq_at, have = self.sensors[name].spec, self.pose_seq, self.frames.get(name, {})
             mode = self.camera_mode(bool(spec.polarized))
-            # this sensor's own settings (sensor_settings): moving, one denoised pass of pass_spp; at rest, passes of
+            # this sensor's own settings (sensor_settings): moving, one pass of pass_spp (denoised from 64 spp); at rest, passes of
             # pass_spp up to target_spp, fireflies held back, then the denoiser (clean_render)
             own = self.sensor_settings(name, mode)
             settled = settled and own["accumulate"]
@@ -631,7 +642,8 @@ class RobotSession:
             passes = max(1, min(64, int(own["target_spp"]) // spp))
             got = self._render(name, settled, spp, template, lambda look: not (
                 settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at), client, passes,
-                abort=lambda: self.pose_seq != seq_at)   # moved on: a moving frame now, not the rest of this clean one
+                abort=lambda: self.pose_seq != seq_at,   # moved on: a moving frame now, not the rest of this clean one
+                denoise=own.get("denoise") is not False)
             if got is None:
                 time.sleep(0.03)
                 return

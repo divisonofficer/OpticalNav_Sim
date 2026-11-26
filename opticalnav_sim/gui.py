@@ -103,6 +103,10 @@ MAX_PASS_SPP = {"polar": 64, "rgb": 256}
 # about every 20 ms, before a second pass of the camera could come back: sent at once, it was thrown away (two in five
 # of the render server's passes, turning), and it held a slot the next camera's first pass then waited for.
 STILL_S = 0.06
+# The denoiser runs on a picture of at least this many samples. With the film's box filter (server.RFILTER) a 16 or 32 spp
+# picture denoised into blotches (the noise left is coarse and the network smooths it into flat patches); from 64 spp
+# on it is clean. Below, the raw mean is shown (fireflies held back).
+DENOISE_MIN_SPP = 64
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
 PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
 _OLD_PANES = {"rgb": ("rgb", "img"), "dolp": ("rgb", "dolp"), "aolp": ("rgb", "aolp"), "s1": ("rgb", "s1"),
@@ -835,7 +839,7 @@ class Session:
                 # with the denoiser on, a new camera's first pass comes back denoised by the server in the same
                 # request (one denoiser run beside the render, no second trip queued behind the next passes): what a
                 # moving camera shows. It is for the screen only; the passes after it are accumulated raw, as before.
-                display = seed == 0 and self.sim.denoise and view.get("renderer", "path") == "path"
+                display = seed == 0 and self.sim.denoise and view.get("renderer", "path") == "path" and spp >= DENOISE_MIN_SPP
                 if display:
                     view["denoise"] = True
                 self.sent += 1
@@ -963,7 +967,7 @@ class Session:
         if "nir_s0" in mean and "nir_s1" not in mean:
             mean["nir_s1"] = mean["nir_s2"] = np.zeros_like(mean["nir_s0"])
         nir = [mean.get(f"nir_s{k}") for k in range(3)]
-        if self.sim.denoise and not job.get("denoised"):
+        if self.sim.denoise and not job.get("denoised") and spp_shown >= DENOISE_MIN_SPP:
             # passes are rendered and accumulated raw; only the mean on screen is denoised (averaging
             # denoised 16 spp passes keeps just what every pass's denoiser agreed on, and smears detail).
             # Both bands in one request: one trip, queued once behind the render server's passes.

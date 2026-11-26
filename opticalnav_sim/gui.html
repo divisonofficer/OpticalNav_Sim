@@ -441,10 +441,11 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
           <h3 class="sub">이 카메라의 렌더</h3>
           <div class="toggles">
             <label class="tg" for="sc-auto" title="멈춰 있으면 목표 spp까지 패스를 쌓고(흰 점은 눌러 두고) 디노이저를 겁니다. 끄면 멈춰 있어도 움직일 때처럼 한 패스"><input type="checkbox" class="sw" id="sc-auto" checked> 멈추면 누적</label>
+            <label class="tg" for="sc-denoise" title="이 카메라의 영상에 OptiX 디노이저를 겁니다(한 장이 64 spp 이상일 때만: 그 아래에서는 얼룩이 생겨 걸지 않습니다)"><input type="checkbox" class="sw" id="sc-denoise" checked> 디노이저</label>
             <label class="tg" for="sc-isp" title="켜면 렌더가 이 카메라의 센서 모델(자동 노출, 노이즈, 모자이크, 비트 깊이)과 ISP(디모자이크, 화이트 밸런스, 톤)를 거쳐 카메라가 내놓을 영상이 됩니다. 끄면 렌즈 왜곡만 입힌 렌더를 톤만 맞춰 보여 줍니다(빠름)"><input type="checkbox" class="sw" id="sc-isp" checked> 센서·ISP</label>
           </div>
           <div class="fields one">
-            <label class="f" for="sc-pass" title="움직이는 동안 한 프레임의 샘플 수(한 패스, 디노이저)"><span>패스 spp</span><select id="sc-pass" class="as-slider"></select></label>
+            <label class="f" for="sc-pass" title="움직이는 동안 한 프레임의 샘플 수(한 패스. 64 spp 이상이면 디노이저)"><span>패스 spp</span><select id="sc-pass" class="as-slider"></select></label>
             <label class="f" for="sc-target" title="멈춰 있을 때 이 샘플 수까지 패스를 쌓습니다"><span>목표 spp</span><select id="sc-target" class="as-slider"></select></label>
             <label class="f" for="sc-scale" title="센서 해상도에 대한 렌더 해상도의 비율. 화면에는 센서 해상도로 늘려 보여 줍니다. 해상도마다 처음 한 번 freeze를 기록합니다"><span>해상도</span><select id="sc-scale" class="as-slider"><option value="0.25">25%</option><option value="0.5">50%</option><option value="0.75">75%</option><option value="1">100%</option></select></label>
           </div>
@@ -455,7 +456,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <div class="toggles">
           <label class="tg" for="editor-render" hidden title="에디터 뷰의 렌더 켜기/끄기. 끄면 에디터 카메라는 더 렌더하지 않고 마지막 화면이 남습니다(카메라를 움직이면 그 화면을 새 시점 쪽으로 옮겨 보여 주기만 합니다). GPU를 로봇 센서 뷰어에만 쓰고 싶을 때 끕니다. 에디터 창 머리의 눈 버튼과 같습니다."><input type="checkbox" class="sw" id="editor-render" checked> 에디터 뷰 렌더</label>
           <label class="tg mitsuba-only" for="auto" title="멈춰 있으면 목표 spp까지 패스를 쌓습니다 (Space)"><input type="checkbox" class="sw" id="auto" checked> 멈추면 누적</label>
-          <label class="tg noisy-only" for="denoise" title="누적한 평균에 OptiX 디노이저를 겁니다"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
+          <label class="tg noisy-only" for="denoise" title="누적한 평균이 64 spp 이상이 되면 OptiX 디노이저를 겁니다(그 아래에서는 얼룩이 생겨 걸지 않습니다)"><input type="checkbox" class="sw" id="denoise"> 디노이저</label>
         </div>
         <div class="fields one">
           <label class="f mitsuba-only" for="pass" title="한 번의 렌더에 쓰는 샘플 수. 움직일 때는 한 패스만 보여 줍니다."><span>패스 spp</span><select id="pass" class="as-slider"></select></label>
@@ -2125,6 +2126,7 @@ $("sc-target").addEventListener("change", () => setSensorSetting({ target_spp: N
 $("sc-scale").addEventListener("change", () => setSensorSetting({ scale: Number($("sc-scale").value) }));
 $("sc-auto").addEventListener("change", () => setSensorSetting({ accumulate: $("sc-auto").checked }));
 $("sc-isp").addEventListener("change", () => setSensorSetting({ isp: $("sc-isp").checked }));
+$("sc-denoise").addEventListener("change", () => setSensorSetting({ denoise: $("sc-denoise").checked }));
 $("robot-add").addEventListener("click", openRobots);
 $("robot-swap").addEventListener("click", openRobots);
 $("robots-close").addEventListener("click", closeRobots);
@@ -2214,7 +2216,8 @@ function renderCams() {
     if (v != null && document.activeElement !== $(id)) { const opt = [...$(id).options].find((o) => Number(o.value) === Number(v)); if (opt) $(id).value = opt.value; }
   if (document.activeElement !== $("sc-auto")) $("sc-auto").checked = st.accumulate !== false;
   if (document.activeElement !== $("sc-isp")) $("sc-isp").checked = st.isp !== false;
-  for (const id of ["sc-pass", "sc-target", "sc-auto", "sc-isp"]) $(id).disabled = !lit;
+  if (document.activeElement !== $("sc-denoise")) $("sc-denoise").checked = st.denoise !== false;
+  for (const id of ["sc-pass", "sc-target", "sc-auto", "sc-isp", "sc-denoise"]) $(id).disabled = !lit;
   $("sc-scale").disabled = st.scale == null;
   $("sc-note").textContent = lit ? "" : "깊이·LiDAR는 빛 없이 한 번에 정확히 재므로 spp가 없습니다.";
   syncSliders();

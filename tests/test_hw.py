@@ -1403,6 +1403,9 @@ def test_sensor_render_settings_are_each_cameras_own():
         session.set_sensor_settings("nope", {"pass_spp": 8})
     assert session.sensor_settings("12bit", "polar")["isp"] is True             # a camera's sensor model and ISP: on
     assert session.set_sensor_settings("12bit", {"isp": False})["isp"] is False
+    assert session.sensor_settings("hdr", "polar")["denoise"] is True              # each camera's own denoiser switch
+    assert session.set_sensor_settings("hdr", {"denoise": False})["denoise"] is False
+    assert session.sensor_settings("12bit", "polar")["denoise"] is True
 
 
 def test_camera_without_isp_is_its_render_through_the_lens():
