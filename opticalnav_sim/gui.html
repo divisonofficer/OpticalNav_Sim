@@ -61,6 +61,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 #gallery .gcard.cur { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 #gallery .gimg { aspect-ratio: 4 / 3; background: linear-gradient(135deg, var(--panel-3), var(--panel)); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 26px; font-weight: 600; overflow: hidden; }
 #gallery .gimg { position: relative; }
+.tabs button:disabled { opacity: 0.35; cursor: not-allowed; }
 #gallery .gimg img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; }
 #gallery .gimg img.ok { opacity: 1; }   /* a lazy image must be laid out (not display: none) to load: see-through until it has */
 #gallery .gname { padding: 7px 9px 3px; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -650,11 +651,11 @@ function buildTabs(root = document) {
       b.type = "button"; b.textContent = label; b.dataset.value = value;
       b.addEventListener("click", () => {
         if (kind === "aov") pick[pane].aov = value;
-        else { pick[pane][kind] = value; pick[pane].aov = null; }
+        else { pick[pane][kind] = value; pick[pane].aov = null; if (kind === "band") delete pick[pane].wanted; }
         try { localStorage.setItem("opticalnav-panes", JSON.stringify({ a: pick.a })); } catch (e) { /* not remembered */ }
         saveLayout();
         // a near-infrared pane needs the near-infrared band: turn it on alongside the visible one
-        if (pick[pane].band === "nir" && S && S.nir_available && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
+        if (pick[pane].band === "nir" && nirHere() && S.bands === "rgb") configure({ bands: "both" }, "근적외선 켜기");
         syncTabs(pane); paneTitle(pane); showImages(); renderLegends();
       });
       box.appendChild(b);
@@ -1238,8 +1239,27 @@ function renderMirrors() {
   $("mdensity-v").textContent = $("mdensity").value;
   $("mdensity").disabled = $("mglass").disabled = !(m || pool);
 }
+// the near-infrared band where the current render mode has it (the server's bands_here: cuda_rgb renders RGB only)
+function nirHere() { return !!(S && S.nir_available && (S.bands_here || ["rgb", "nir"]).includes("nir")); }
+// band controls only for what this mode renders: the band select's options, the panes' NIR buttons (a pane that showed
+// NIR shows RGB meanwhile, its choice kept for when the band is back)
+function syncBandAvailability() {
+  const nir = nirHere(), why = S.polarization === false ? "편광 없는 모드에서는 이 렌더 서버가 NIR을 렌더하지 못합니다 (cuda_rgbn 변형 필요)" : "이 렌더 서버에는 NIR 대역이 없습니다";
+  for (const sel of [$("bands"), $("flashband")])
+    for (const o of sel.options) { o.disabled = o.value !== "rgb" && !nir; o.title = o.disabled ? why : ""; }
+  document.querySelectorAll('.tabs[data-kind="band"] button[data-value="nir"]').forEach((b) => { b.disabled = !nir; b.title = nir ? "" : why; });
+  for (const pane of Object.keys(pick)) {
+    const p = pick[pane];
+    let changed = false;
+    if (!p) continue;
+    if (!nir && p.band === "nir") { p.band = "rgb"; p.wanted = "nir"; changed = true; }
+    else if (nir && p.wanted) { p.band = p.wanted; delete p.wanted; changed = true; }
+    if (changed && $(`title-${pane}`)) { syncTabs(pane); paneTitle(pane); showImages(); }
+  }
+}
 function renderBands() {
   const ok = !!S.nir_available;
+  syncBandAvailability();
   $("bands").closest("label").hidden = !ok;
   $("flashband").closest("label").hidden = !ok || !variantsHere().includes("active_polar");
   if (document.activeElement !== $("bands") && $("bands").value !== S.bands) $("bands").value = S.bands || "rgb";

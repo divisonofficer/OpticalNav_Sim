@@ -266,6 +266,7 @@ class Session:
         self.cam_now = (0.0, 0.0, 1.5, 0.0, 0.0)  # the editor camera: x, y, height, heading, elevation (set by every move)
         self.rec_busy = False             # a recording renders (robot_record): it moves the camera itself
         self.modes: list[str] = ["polar"]  # the render server's modes (main sets them): "rgb" is the unpolarized one
+        self.mode_bands: dict = {"polar": ["rgb", "nir"], "rgb": ["rgb"]}  # the bands each mode renders (the server says)
         self.follow: tuple | None = None  # the camera rides with the robot: its place in the robot's frame (set_follow)
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(self.depth, thread_name_prefix="pass")
@@ -660,10 +661,17 @@ class Session:
             self.sim.setCameraOffset(*(float(v) for v in settings["camera_offset"]))
             restart = True
         if "bands" in settings:
-            self.sim.setBands(str(settings["bands"]))
+            want = str(settings["bands"])
+            if want != "rgb" and "nir" not in self.bands_here():
+                raise ValueError("this render mode has no near-infrared band" + ("" if self.polarization else ": switch polarization on"))
+            self.sim.setBands(want)
             restart = True
         if "flash_band" in settings:
             self.sim.setFlashBand(str(settings["flash_band"]))
+            restart = True
+        if "nir" not in self.bands_here() and (self.sim.bands != "rgb" or self.sim.flash_band != "rgb"):
+            self.sim.setBands("rgb")         # a mode without the near-infrared band (cuda_rgb): RGB alone
+            self.sim.setFlashBand("rgb")
             restart = True
         if {"env", "env_scale", "env_rotate_deg"} & set(settings):
             env = dict(self.sim.env)
@@ -710,8 +718,7 @@ class Session:
         c2w = self._camera(st)
         st.camera_to_world = c2w
         scene, variant = sim._split(st.scanId)
-        # polarization off: the path tracer's plain RGB variant (the preview rasteriser and Cycles have their own modes)
-        mode = "polar" if self.polarization or sim.renderer != "path" or "rgb" not in self.modes else "rgb"
+        mode = self.render_mode_now()
         view = {"scan": scene, "variant": variant, "camera_to_world": c2w, "width": sim.width, "height": sim.height,
                 "hfov_deg": sim._hfov_deg(sim.width, sim.height), "spp": self.pass_spp, "mode": mode,
                 "denoise": False, "preview": False, "s3": False, "depth": True, "lights": sim.lights, "env": dict(sim.env),
@@ -759,6 +766,17 @@ class Session:
             self.pose = pose
             self.version += 1
             self.cv.notify_all()
+
+    def render_mode_now(self) -> str:
+        """The render server mode a frame asks for: polarization off is the path tracer's unpolarized variant (the preview
+        rasteriser and Cycles have their own modes)."""
+        return "polar" if self.polarization or self.sim.renderer != "path" or "rgb" not in self.modes else "rgb"
+
+    def bands_here(self) -> list:
+        """The bands the current mode renders ("rgb", and "nir" where it can)."""
+        if not self.nir_available:
+            return ["rgb"]
+        return list(self.mode_bands.get(self.render_mode_now(), ["rgb"]))
 
     def _next_pass_spp(self) -> int:
         """Samples of the next pass: the first is ``pass_spp``, each later one doubles what has been issued (the
@@ -1003,7 +1021,7 @@ class Session:
                    "scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "max_pass_spp": MAX_PASS_SPP, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
-                   "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,
+                   "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available, "bands_here": self.bands_here(),
                    "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                    "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
@@ -1614,6 +1632,7 @@ def main() -> int:
     session.server_info = {k: info.get(k) for k in ("mitsuba_version", "mitsuba_variant", "cycles")}
     session.nir_available = bool(info.get("nir"))
     session.modes = list(info.get("modes") or ["polar"])
+    session.mode_bands = dict(info.get("mode_bands") or {m: (["rgb", "nir"] if m == "polar" else ["rgb"]) for m in session.modes})
     session.polarization = "polar" in session.modes
     from .robot_view import RobotSession
     robot = RobotSession(sim._client.url, args.rig_calibration, config=args.robot)  # the robot a page puts into the scene it shows

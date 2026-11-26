@@ -57,6 +57,20 @@ so both MIS strategies drop the same set of paths.
      emitter sample each bounce, and never caustics). Its expected value is the
      sum of an ``exclude`` and an ``only`` render, at the cost of one path and
      an extra shadow ray per bounce instead of two paths.
+ * - hidden
+   - |string|
+   - Shapes whose id starts with ``hidden`` are invisible to the camera: a camera
+     ray passes through them (at most two along one ray) and goes on. They still
+     light the scene and show in reflections, like a Blender light with camera
+     visibility off: a room's fill light without a white panel on the ceiling.
+     (Default: none)
+ * - hidden_specular
+   - |string|
+   - Shapes whose id starts with this are lights seen only by diffuse bounces (Blender's light with camera, glossy and
+     transmission visibility off): invisible to the camera, and to a ray whose last bounce was not diffuse (a mirror or
+     metal reflection, glass transmission, a rough glossy bounce), front and back. They still light the scene (the
+     emitter sample of a diffuse or glossy surface). Handled like ``hidden`` otherwise (a hidden prefix of its own is
+     not needed). (Default: none)
  * - sky_nir
    - |float|
    - Factor on light from the environment emitter in the near-infrared: its lane in RGBN variants,
@@ -78,6 +92,8 @@ public:
         m_caustics = props.get<bool>("caustics", false);
         m_sky_nir = props.get<ScalarFloat>("sky_nir", 1.f);
         m_assist = std::string(props.get<std::string_view>("assist", ""));
+        m_hidden = std::string(props.get<std::string_view>("hidden", ""));
+        m_hidden_spec = std::string(props.get<std::string_view>("hidden_specular", ""));
         std::string mode(props.get<std::string_view>("assist_mode", "all"));
         if (mode == "all")
             m_assist_mode = AssistMode::All;
@@ -178,6 +194,74 @@ public:
             }
         };
 
+        /* 'hidden': a light that is only a light, as Blender's camera visibility off, and not an object in the
+           room. Camera rays go on through these shapes (at most two along a ray: a megakernel takes every step).
+           A later ray (a bounce) goes on through the back of one: its emission is one-sided and the shape stays
+           out of the way of what lies behind it (a ceiling patch above a softbox kept in its shadow: a dark blob).
+           Shadow rays ignore them as well (``shadow_blocked``). Hitting the front still counts the emission. */
+        std::vector<const Shape *> hidden_shapes, spec_shapes;  // spec_shapes (hidden_specular) are in both
+        for (const auto &shape : scene->shapes()) {
+            bool spec = !m_hidden_spec.empty() && string::starts_with(shape->id(), m_hidden_spec);
+            if (spec || (!m_hidden.empty() && string::starts_with(shape->id(), m_hidden)))
+                hidden_shapes.push_back(shape.get());
+            if (spec)
+                spec_shapes.push_back(shape.get());
+        }
+        auto is_spec_hidden = [&spec_shapes](const ShapePtr &shape) {
+            Mask hit = false;
+            for (const Shape *s : spec_shapes)
+                hit |= (shape == ShapePtr(s));
+            return hit;
+        };
+        auto is_hidden = [&hidden_shapes](const ShapePtr &shape) {
+            Mask hit = false;
+            for (const Shape *s : hidden_shapes)
+                hit |= (shape == ShapePtr(s));
+            return hit;
+        };
+        /* ``nondiffuse``: lanes whose last bounce was not diffuse; hidden_specular shapes are skipped there from the
+           front as well (a ray from the camera is such a lane too: it has no bounce). */
+        auto skip_hidden = [&](Ray3f &ray, PreliminaryIntersection3f &pi, Mask active, bool back_only,
+                               Mask nondiffuse) {
+            for (size_t i = 0; i < std::min(hidden_shapes.size(), (size_t) 2); ++i) {
+                Mask hit = active && pi.is_valid() && is_hidden(pi.shape);
+                if (dr::none_or<false>(hit))
+                    break;
+                SurfaceInteraction3f si = pi.compute_surface_interaction(ray, +RayFlags::Minimal, hit);
+                if (back_only) {
+                    Mask spec_front = nondiffuse && !spec_shapes.empty() && is_spec_hidden(pi.shape);
+                    hit &= (dr::dot(si.n, ray.d) > 0.f) || spec_front;
+                }
+                if (dr::none_or<false>(hit))
+                    break;
+                Ray3f next = si.spawn_ray(ray.d);
+                PreliminaryIntersection3f pi_next =
+                    scene->ray_intersect_preliminary(next, false, false, 0, 0, hit);
+                dr::masked(ray, hit) = next;
+                dr::masked(pi, hit) = pi_next;
+            }
+        };
+        /* A shadow ray's blockers other than hidden shapes: the segment from ``si`` to the emitter sample, stepped
+           through the hidden shapes it meets (three at most; one still in the way then blocks). */
+        auto shadow_blocked = [&](const SurfaceInteraction3f &si, const DirectionSample3f &ds, Mask active) {
+            Ray3f sray = si.spawn_ray_to(ds.p);
+            Mask blocked = scene->ray_test(sray, active);
+            Mask pending = blocked && active;
+            for (int k = 0; k < 3 && dr::any_or<true>(pending); ++k) {
+                PreliminaryIntersection3f pi = scene->ray_intersect_preliminary(sray, false, false, 0, 0, pending);
+                Mask hid = pending && pi.is_valid() && is_hidden(pi.shape);
+                if (dr::none_or<false>(hid))
+                    break;
+                SurfaceInteraction3f hsi = pi.compute_surface_interaction(sray, +RayFlags::Minimal, hid);
+                Ray3f next = hsi.spawn_ray_to(ds.p);
+                dr::masked(sray, hid) = next;
+                Mask still = scene->ray_test(sray, hid);
+                dr::masked(blocked, hid) = still;
+                pending = hid && still;
+            }
+            return blocked;
+        };
+
         // If m_hide_emitters == false, the environment emitter will be visible
         // ('only' ignores every emitter but the assist one, the environment included)
         Mask valid_ray = !m_hide_emitters && (scene->environment() != nullptr) &&
@@ -206,6 +290,7 @@ public:
             Interaction3f prev_si;
             Float prev_bsdf_pdf;
             Bool prev_bsdf_delta;
+            Bool prev_nondiffuse;
             Bool rough_seen;
             Bool prev_caustic;
             Bool active;
@@ -213,7 +298,7 @@ public:
 
             DRJIT_STRUCT(LoopState, ray, pi, throughput, result, eta, depth, \
                 valid_ray, prev_si, prev_bsdf_pdf, prev_bsdf_delta,
-                rough_seen, prev_caustic, active, sampler)
+                prev_nondiffuse, rough_seen, prev_caustic, active, sampler)
         } ls = {
             ray,
             pi,
@@ -225,6 +310,7 @@ public:
             prev_si,
             prev_bsdf_pdf,
             prev_bsdf_delta,
+            /* prev_nondiffuse = */ Bool(false),
             /* rough_seen   = */ Bool(false),
             /* prev_caustic = */ Bool(false),
             active,
@@ -238,6 +324,8 @@ public:
                                                  /* reorder_hint = */ 0,
                                                  /* reorder_hint_bits = */ 0,
                                                  ls.active);
+        if (!hidden_shapes.empty())
+            skip_hidden(ls.ray, ls.pi, ls.active, false, Mask(true));
         if (m_assist_mode == AssistMode::Exclude)
             skip_assist(ls.ray, ls.pi, ls.active);
         else if (m_assist_mode == AssistMode::Split)
@@ -270,7 +358,8 @@ public:
 
         dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
             [](const LoopState& ls) { return ls.active; },
-            [this, scene, bsdf_ctx, &skip_assist, &assist_hits, assist_emitter](LoopState& ls) {
+            [this, scene, bsdf_ctx, &skip_assist, &assist_hits, assist_emitter, &hidden_shapes,
+             &skip_hidden, &shadow_blocked](LoopState& ls) {
 
             /* dr::while_loop implicitly masks all code in the loop using the
                'active' flag, so there is no need to pass it to every function */
@@ -347,10 +436,19 @@ public:
                         dr::masked(ds.pdf, occluded) = 0.f;
                     }
                 } else {
+                    // with hidden shapes in the scene the visibility test is ours (shadow_blocked)
                     std::tie(ds, em_weight) = scene->sample_emitter_direction(
-                        si, ls.sampler->next_2d(), true, active_em);
+                        si, ls.sampler->next_2d(), hidden_shapes.empty(), active_em);
                     if (m_assist_mode == AssistMode::Exclude || m_assist_mode == AssistMode::Split)
                         active_em &= ds.emitter != EmitterPtr(assist_emitter);
+                    if (!hidden_shapes.empty()) {
+                        Mask sampled = active_em && (ds.pdf != 0.f);
+                        if (dr::any_or<true>(sampled)) {
+                            Mask occluded = shadow_blocked(si, ds, sampled);
+                            dr::masked(em_weight, occluded) = 0.f;
+                            dr::masked(ds.pdf, occluded) = 0.f;
+                        }
+                    }
                     if (m_sky_nir != 1.f && scene->environment() != nullptr)
                         em_weight = sky_nir(em_weight, ds.emitter == EmitterPtr(scene->environment()), si.time);
                 }
@@ -444,6 +542,8 @@ public:
             ls.prev_si = Interaction3f(si);
             ls.prev_bsdf_pdf = bsdf_sample.pdf;
             ls.prev_bsdf_delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
+            ls.prev_nondiffuse = !(has_flag(bsdf_sample.sampled_type, BSDFFlags::DiffuseReflection) ||
+                                   has_flag(bsdf_sample.sampled_type, BSDFFlags::DiffuseTransmission));
 
             Mask near_specular =
                 has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta) ||
@@ -477,6 +577,8 @@ public:
                                                      /* reorder_hint = */ 0,
                                                      /* reorder_hint_bits = */ 0,
                                                      ls.active);
+            if (!hidden_shapes.empty())
+                skip_hidden(ls.ray, ls.pi, ls.active, true, ls.prev_nondiffuse);
             if (m_assist_mode == AssistMode::Exclude)
                 skip_assist(ls.ray, ls.pi, ls.active);
             else if (m_assist_mode == AssistMode::Split)
@@ -499,11 +601,12 @@ public:
             "  rr_depth = %u,\n"
             "  specular_pdf_threshold = %f,\n"
             "  caustics = %s,\n"
-            "  assist = \"%s\" (%s)\n"
+            "  assist = \"%s\" (%s),\n"
+            "  hidden = \"%s\"\n"
             "]", m_max_depth, m_rr_depth, m_specular_pdf_threshold, m_caustics,
             m_assist, m_assist_mode == AssistMode::Only ? "only"
                       : m_assist_mode == AssistMode::Exclude ? "exclude"
-                      : m_assist_mode == AssistMode::Split ? "split" : "all");
+                      : m_assist_mode == AssistMode::Split ? "split" : "all", m_hidden);
     }
 
     /**
@@ -554,6 +657,8 @@ public:
     bool m_caustics;
     ScalarFloat m_sky_nir;
     std::string m_assist;
+    std::string m_hidden;
+    std::string m_hidden_spec;
     AssistMode m_assist_mode;
 
     MI_DECLARE_CLASS(PathNoCausticsIntegrator)

@@ -97,7 +97,15 @@ RAW_ARRAYS_TYPE = "application/x-opticalnav-arrays"
 # polar: cuda_rgbn_polarized first (R, G, B and near-infrared lanes in one path, each with its own Mueller
 # matrix: both bands in one render); --variant cuda_rgb_polarized keeps the dual-sensor render instead
 MODE_VARIANTS = {"polar": ("cuda_rgbn_polarized", "cuda_rgb_polarized", "cuda_ad_rgb_polarized"),
-                 "rgb": ("cuda_rgb", "cuda_ad_rgb")}
+                 "rgb": ("cuda_rgbn", "cuda_rgb", "cuda_ad_rgb")}
+# rgb: cuda_rgbn first (R, G, B and near-infrared lanes, no Mueller matrices: the stokes integrator writes S0 per lane and
+# zero S1-S3, the polarized RGBN layout), else cuda_rgb, which renders RGB only
+
+
+def mode_bands(variant: str, nir_plugin: bool) -> list:
+    """The bands a mode's variant renders: an RGBN variant both lanes in one path, a polarized RGB one the near-infrared
+    band through its second sensor; plain cuda_rgb RGB only (its band switch failed in the frozen recording)."""
+    return ["rgb", "nir"] if nir_plugin and ("_rgbn" in variant or "polarized" in variant) else ["rgb"]
 # Without dr.freeze, high spp is rendered in passes of at most this many samples (wavefront memory);
 # a polarized path carries Mueller matrices, so its passes are smaller.
 # What a frozen render takes as input. "scene": the whole scene, so Dr.Jit walks every texture and mesh
@@ -1333,7 +1341,7 @@ class Resident:
             text, self.upgraded_flash = flash_scene_text(text, flash), True
         elif upgrade_flash and flash is not None and flash_xml is None:
             text, self.upgraded_flash = upgrade_flash_text(text, float(flash.get("polarizer_angle_deg") or 0.0))
-        if mode == "rgb":
+        if mode == "rgb" and "_rgbn" not in mi.variant():   # an RGBN variant keeps the stokes wrapper: its AOVs hold the NIR lane
             text = rgb_scene_text(text)
         base_dir = xml.parent  # dark lamps' shades glow (group "lamp", dark by default)
 
@@ -1540,7 +1548,7 @@ class Resident:
                 inner["rr_depth"] = int(self.rr_depth)
             if pdf is not None:
                 inner["specular_pdf_threshold"] = pdf
-            if self.mode != "rgb":
+            if self.mode != "rgb" or self.rgbn:   # (unpolarized RGBN: the stokes wrapper writes the lanes, NIR among them)
                 inner = {"type": "stokes", "integrator": inner}
                 if spec["reference_axis"] is not None:
                     inner["reference_axis"] = self.mi.ScalarVector3f(*spec["reference_axis"])
@@ -3222,6 +3230,7 @@ def make_handler(renderer: Renderer, token: str | None = None):
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,
                         "mitsuba_version": getattr(getattr(renderer, "mi", None), "__version__", None),
                         "modes": renderer.variant_of, "path_nocaustics": renderer.has_nocaustics,
+                        "mode_bands": {m: mode_bands(v, bool(renderer.has_rgb2nir)) for m, v in renderer.variant_of.items()},
                         "envmaps": sorted(renderer.envmaps), "nir": renderer.has_rgb2nir,
                         "active_split": getattr(renderer, "has_split", False),
                         "nir_defaults": NIR_DEFAULTS,

@@ -291,7 +291,7 @@ export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 
 ### 2. Mitsuba 3
 
-**Variants.** `polar` mode uses `cuda_rgbn_polarized` when the build has it (see below), else `cuda_rgb_polarized` (the server falls back to `cuda_ad_rgb_polarized`, which renders the same images but needs more GPU memory). `--variant cuda_rgb_polarized` keeps the two-slot render on a build that has both. `rgb` mode needs `cuda_rgb` or `cuda_ad_rgb`. A PyPI `mitsuba` wheel ships a fixed set of variants; check `mi.variants()`, and build from source when the RGB polarized variants are missing.
+**Variants.** `polar` mode uses `cuda_rgbn_polarized` when the build has it (see below), else `cuda_rgb_polarized` (the server falls back to `cuda_ad_rgb_polarized`, which renders the same images but needs more GPU memory). `--variant cuda_rgb_polarized` keeps the two-slot render on a build that has both. `rgb` mode uses `cuda_rgbn` when the build has it (R, G, B and near-infrared lanes without Mueller matrices: RGB+NIR without polarization, about as fast as plain RGB), else `cuda_rgb` or `cuda_ad_rgb`, which render RGB only (the viewer then greys out its NIR controls). A PyPI `mitsuba` wheel ships a fixed set of variants; check `mi.variants()`, and build from source when the RGB polarized variants are missing.
 
 **Real-time rendering** needs `dr.freeze` (Dr.Jit ≥ 1.0 with Mitsuba ≥ 3.6; this code also passes `auto_opaque`, present in Dr.Jit 1.2). Without it every frame re-traces the scene, about 50 s per polar frame.
 
@@ -300,13 +300,15 @@ export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 **Mitsuba 3.9.1 with `cuda_rgbn_polarized` (recommended).** `mitsuba/mitsuba-3.9.1-opticalnav.patch` carries everything above onto upstream v3.9.1 (Dr.Jit 1.5), plus:
 * **`cuda_rgbn_polarized`.** Its spectrum is `MuellerMatrix<Color<Float, 4>>`: R, G, B and a near-infrared lane travel one path, each with its own Mueller matrix, so one render holds both bands. Reflectances get their near-infrared lane from `rgb2nir` (pseudo NIR), lights from `bandscale` (per-class levels), the sky from `path_nocaustics` `sky_nir`, and named conductors (`Ag`, `Al`, …) from their spectral eta/k averaged over 800–900 nm; any other colour's lane is its luminance. `stokes` writes `S0.R, S0.G, S0.B, S0.N`, … On a Device 1 apartment it matched the two-slot render within noise (means ≤ 0.2% apart in all six Stokes images).
 * **Moving one small shape rebuilds only its acceleration structure.** Before, every write to the flash's `to_world` rebuilt the GAS of every mesh in the scene (~40 ms a frame on Device 1).
+* **`cuda_rgbn`** (2026-11-26): the same lanes without polarization, `Color<Float, 4>`. `stokes` accepts it and writes `S0.R … S0.N` with S1 to S3 zero (the polarized RGBN layout, read the same way); the film keeps R, G, B. Checked against `cuda_rgbn_polarized` on a diffuse sphere: equal S0 lanes.
+* `path_nocaustics` `hidden` and `hidden_specular`: lights a camera ray (and, for `hidden_specular`, a non-diffuse bounce) passes through, Blender's light visibility switches.
 * Two 3.9.1 build fixes: the `batch` sensor's traversal also registers `m_last_index`, and a build without `_ad_` variants links `drjit-extra`.
 
 ```bash
 git clone --recursive --branch v3.9.1 https://github.com/mitsuba-renderer/mitsuba3 mitsuba3-3.9.1
 cd mitsuba3-3.9.1 && git apply <opticalnav_sim>/mitsuba/mitsuba-3.9.1-opticalnav.patch
 mkdir build && cd build && cmake -GNinja .. -DPython_EXECUTABLE=/usr/bin/python3.10
-# in build/mitsuba.conf: "enabled": ["scalar_rgb", "cuda_rgb", "cuda_rgb_polarized", "cuda_rgbn_polarized"]
+# in build/mitsuba.conf: "enabled": ["scalar_rgb", "cuda_rgb", "cuda_rgb_polarized", "cuda_rgbn_polarized", "cuda_rgbn"]
 cmake . && ninja
 ```
 
@@ -371,7 +373,7 @@ CUDA_VISIBLE_DEVICES=0 timeout 6h /usr/bin/python3.10 -u -m opticalnav_sim.serve
     --preload infinigen_apartment_natural_v1_20268504:base:polar
 ```
 
-* The start line should read `modes={'polar': 'cuda_rgbn_polarized', 'rgb': 'cuda_rgb'} … freeze=True` (or `cuda_rgb_polarized` on a build without the RGBN variant).
+* The start line should read `modes={'polar': 'cuda_rgbn_polarized', 'rgb': 'cuda_rgbn'} … freeze=True` (or `cuda_rgb_polarized` on a build without the RGBN variant).
 * **Expect waits.** Loading a scene takes about 100 s (`--preload`, or the first request for it). The first frame of each spp and resolution records the freeze, about 25 s on the 3.9.1 RGBN build (light on and off together), 90–100 s per pass on the 3.7.1 build. Later frames replay in tens of milliseconds. With `--max-resident 1`, every scene switch pays the load and the recordings again. A variant switch within a scene does not reload (see *One resident scene for all three variants*); `base` and `perturbed` share their recordings. `GET /v1/status` (and the viewer's status bar) says which of these is running.
 * **GPU memory.** Use `--max-resident 1` when the GPU is shared. Freeze recordings failed twice when the card was nearly full, and a server whose recording failed fails every later render until it restarts.
 * **Shared machines.** Start servers under `timeout` so a forgotten one does not hold the GPU. Bind beyond localhost only with a token (`--host 0.0.0.0 --token …`). On WSL2, other machines reach the port only after Windows forwards it (`netsh interface portproxy add v4tov4 listenport=18780 connectaddress=<WSL IP> connectport=18780` and a firewall rule).
