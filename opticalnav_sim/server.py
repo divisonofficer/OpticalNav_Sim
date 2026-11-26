@@ -3019,7 +3019,8 @@ class Renderer:
                         for want in ((0, 1) if b == 2 else (b,)):
                             if want == 0 and bands == "nir" or want == 1 and bands == "rgb":
                                 continue
-                            bands_out[want] = [[stokes.rgbn_band(v, want) for v in vs] for vs in views]
+                            split = stokes.rgbn_intensity if mode == "rgb" else stokes.rgbn_band   # (rgb: S0 is all it reads)
+                            bands_out[want] = [[split(v, want) for v in vs] for vs in views]
                 elif 2 in per_band:  # dual: visible slot left, near-infrared right, margins cropped
                     wm, m = int(width) + 2 * DUAL_MARGIN, DUAL_MARGIN
                     bands_out = dict(per_band)
@@ -3147,7 +3148,7 @@ class Renderer:
             if 1 in per_band:  # near-infrared: the luminance of the band's (grey-material) render
                 passes = [views[i] for views in per_band[1]]
                 if mode == "rgb":
-                    rad = sum(p[:, :, :3] for p in passes)
+                    rad = passes[0][:, :, :3] if len(passes) == 1 else sum(p[:, :, :3] for p in passes)
                     out["nir"] = (self._denoise(mode, rad) if denoise else rad) @ LUMA
                 else:
                     split = [stokes.split_channels(p)[1:] for p in passes]
@@ -3160,7 +3161,8 @@ class Renderer:
                 continue
             passes = [views[i] for views in per_band[0]]
             if mode == "rgb":
-                out["radiance"] = sum(p[:, :, :3] for p in passes)
+                # one pass: its R, G, B as they are (the reply's dtype conversion makes the one copy); several: summed
+                out["radiance"] = passes[0][:, :, :3] if len(passes) == 1 else sum(p[:, :, :3] for p in passes)
                 if denoise:
                     out["radiance"] = self._denoise(mode, out["radiance"])
             else:

@@ -23,6 +23,16 @@ def split_channels(image: np.ndarray) -> tuple[np.ndarray, ...]:
     return (rgb,) + tuple(np.asarray(image[:, :, off + 3 * k:off + 3 * k + 3], dtype=np.float32) for k in range(4))
 
 
+def rgbn_intensity(image: np.ndarray, band: int) -> np.ndarray:
+    """An RGBN Stokes film's intensity alone (what an unpolarized frame needs): band 0 the film's R, G, B (a view, no
+    copy), band 1 the near-infrared lane of S0 in all three channels. rgbn_band builds the whole Stokes layout:
+    19-20 channels copied, 52% of a render request's thread while a camera moved (and the interpreter lock held)."""
+    off = {19: 3, 20: 4}[image.shape[2]]
+    if band == 0:
+        return image[:, :, :3]
+    return np.repeat(image[:, :, off + 3:off + 4], 3, axis=2)
+
+
 def rgbn_band(image: np.ndarray, band: int) -> np.ndarray:
     """An RGBN Stokes film (cuda_rgbn_polarized: 19 or 20 channels, R, G, B[, A] then S0..S3 as R, G, B, N)
     in the RGB layout split_channels reads: band 0 its R, G, B lanes; band 1 its near-infrared lane in all
