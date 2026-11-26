@@ -117,9 +117,15 @@ def scene_surfaces(scene_dir, xml: str = "base.xml") -> list[dict]:
     shape's 4x4 in the world (None: as the mesh lies), ``file`` the mesh of a "ply" or "obj" (None for a "rectangle" or
     "cube"). Roughness is Blender's (the square root of the BSDF's alpha); metallic is the conductor's share of the BSDF.
     Where a texture gives one, ``roughness_map`` and ``metallic_map`` name it (``build`` reads the maps of what a robot
-    can stand on: their mean)."""
+    can stand on: their mean).
+
+    A scene merged by tools/merge_meshes.py is read as it was before (merged_meshes.original_text: every object in its own
+    file, in its place): where coplanar surfaces meet, the later one in the file names the cell, and read merged, 26 cells of
+    CS02's floor at the walls' feet went from the epoxy floor to the wall paint."""
+    from .merged_meshes import original_text
+
     scene_dir = Path(scene_dir)
-    root = ET.parse(scene_dir / xml, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))).getroot()
+    root = ET.fromstring(original_text(scene_dir, xml), parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
     shared = {b.get("id"): b for b in root.iter("bsdf") if b.get("id")}
 
     def read(shape, meta: str | None, matrix) -> dict | None:
