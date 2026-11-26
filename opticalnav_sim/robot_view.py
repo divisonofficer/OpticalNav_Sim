@@ -253,19 +253,17 @@ class RobotSession:
         folder = Path(str(world.meta.get("scene_dir") or ""))
         if not (folder / "base.xml").is_file():
             raise FileNotFoundError(f"이 씬의 파일이 뷰어가 도는 기계에 없습니다 ({folder}): 지면 지도를 만들 수 없습니다")
-        try:
-            probe = groundmap.build(folder, eye[2] - 0.05, top=0.0, cell=0.25, below=40.0,
-                                    bounds=(eye[0] - 1.5, eye[1] - 1.5, eye[0] + 1.5, eye[1] + 1.5))
-            seen = probe.heights[probe.material >= 0]
-        except ValueError:
-            seen = ()
-        if not len(seen):
+        ahead_x, ahead_y = math.sin(heading), math.cos(heading)
+        probe = groundmap.floor_probe(folder, eye, (8.0 * ahead_x, 8.0 * ahead_y))
+        floor_z = groundmap.floor_under(probe, eye[0], eye[1]) if probe is not None else None
+        if floor_z is None:
             raise ValueError("카메라 아래에 바닥이 없습니다: 바닥 위로 옮긴 뒤 다시 스폰하세요")
-        floor_z = float(np.median(seen))
         # where the camera looks at the floor, between 1.5 and 8 m ahead (2.5 m when it looks level or up)
         ahead = (eye[2] - floor_z) / math.tan(-elevation) if elevation < -0.05 else 2.5
         ahead = min(max(ahead, 1.5), 8.0)
-        x, y = eye[0] + ahead * math.sin(heading), eye[1] + ahead * math.cos(heading)
+        x, y = eye[0] + ahead * ahead_x, eye[1] + ahead * ahead_y
+        there = groundmap.floor_under(probe, x, y, near=floor_z)   # (sloping ground)
+        floor_z = floor_z if there is None else there
         yaw_deg = math.degrees(hw.transform.yaw_from_heading(heading))
         self._say("지면 지도 만드는 중: 높이·장애물·마찰 (씬 파일의 재질에서, 처음 한 번)")
         gm = world.load_ground(floor_z=floor_z, center=(x, y), top=self._headroom())

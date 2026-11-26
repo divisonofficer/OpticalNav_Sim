@@ -101,9 +101,10 @@ class SimWorld(World):
                                     "(tools/build_ground_map.py) and load it with groundmap.GroundMap.load(...).ground()")
         spawn = (self.meta.get("spawn") or [{"position": [0.0, 0.0, 1.5]}])[0]["position"]
         if floor_z is None:
-            probe = groundmap.build(folder, spawn[2] - 1.5, top=0.5, cell=0.25, below=1.0,
-                                    bounds=(spawn[0] - 2, spawn[1] - 2, spawn[0] + 2, spawn[1] + 2))
-            floor_z = float(np.nanmedian(np.where(probe.material >= 0, probe.heights, np.nan)))
+            probe = groundmap.floor_probe(folder, spawn)
+            floor_z = groundmap.floor_under(probe, spawn[0], spawn[1]) if probe is not None else None
+            if floor_z is None:
+                raise ValueError(f"no floor under the first start pose of {self.scene} ({spawn})")
         whole = (self.meta.get("map") or {}).get("bounds")
         bounds = None
         if center is not None:
@@ -118,7 +119,7 @@ class SimWorld(World):
         gm = None
         if saved.is_file() and not rebuild:
             gm = groundmap.GroundMap.load(saved)
-            fits = gm.cell == cell and abs(gm.top - top) < 1e-6
+            fits = gm.cell == cell and abs(gm.top - top) < 1e-6 and gm.meta.get("reader") == groundmap.READER
             if center is None:
                 fits = fits and abs(gm.floor_z - floor_z) <= 0.02 and gm.meta.get("around") == around and not gm.meta.get("center")
             else:   # a map made for another place does while it holds this one with room to drive (or to the scene's edge)

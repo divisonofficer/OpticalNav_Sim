@@ -66,6 +66,11 @@ class Activity:
             with self.lock:
                 self.what, self.since = prev
 
+    def rename(self, what: str) -> None:
+        """The same wait, now at another step (its elapsed time starts again)."""
+        with self.lock:
+            self.what, self.since = what, time.time()
+
     def snapshot(self) -> dict:
         with self.lock:
             out = {"what": self.what, "elapsed_s": round(time.time() - self.since, 1) if self.since else 0.0}
@@ -102,6 +107,21 @@ MODE_VARIANTS = {"polar": ("cuda_rgbn_polarized", "cuda_rgb_polarized", "cuda_ad
 FREEZE_INPUT = os.environ.get("OPTICALNAV_SIM_FREEZE_INPUT", "scene")
 SPP_CHUNK = {"polar": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK", "64"))),
              "rgb": max(1, int(os.environ.get("OPTICALNAV_SIM_SPP_CHUNK_RGB", "256")))}
+
+
+# what a recording of each pass is, for the progress the viewer shows ("step k of n: ...")
+PASS_PHASE = {"active": "lights + flash", "passive": "lights only", "own": "render", "flash": "flash only", "split": "lights + flash"}
+
+
+def trim_host_memory() -> None:
+    """Hand freed host memory back to the system. Compiling a render's kernels leaves gigabytes in the C library's
+    arenas (a 75-mesh outdoor scene: 16.4 GB resident after its first frame, 3.3 GB after a trim), and the next scene's
+    compilation came on top: the kernel killed the server at 20.7 GB on a 24 GB machine."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):   # not glibc
+        pass
 
 
 def rgb_scene_text(text: str) -> str:
@@ -1911,10 +1931,17 @@ class Resident:
             # record. The flash's place and the hidden shapes are scene data, not part of a recording.
             names = ("active", "passive") if "flash" in self.depth and pass_name != "own" else ()
             names += (pass_name,) if pass_name not in names else ()  # a pass asked for alone ("flash")
-            for name in names:
-                self._prepare_inputs(dual if dual is not None else self.sensor, self.pass_integrators(name, sky)[0])
-                self._record(spp, int(width), int(height), name, dual, sky)
-            self._absorb([self._key(spp, width, height, n, dual, sky) for n in names])
+            # one wait to the viewer: each pass's recording, then settling (progress.FREEZE.job: "step k of n")
+            progress.FREEZE.job_begin(len(names) + 1)
+            try:
+                for name in names:
+                    progress.FREEZE.job_step(PASS_PHASE.get(name, name))
+                    self._prepare_inputs(dual if dual is not None else self.sensor, self.pass_integrators(name, sky)[0])
+                    self._record(spp, int(width), int(height), name, dual, sky)
+                progress.FREEZE.job_step("settle")
+                self._absorb([self._key(spp, width, height, n, dual, sky) for n in names])
+            finally:
+                progress.FREEZE.job_end()
             t2 = time.perf_counter()
         # a replay whose inputs changed layout records again: report it like a recording (see progress.py)
         progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=1, remember=False,
@@ -2083,7 +2110,7 @@ class Resident:
         for _ in range(2):
             progress.FREEZE.next_call()
             dr.eval(frozen(*args, dr.opaque(self.mi.UInt32, 0)))
-
+            trim_host_memory()
 
     def render_many(self, cams: list, width: int, height: int, hfov_deg: float, spp: int, seed: int,
                     pass_name: str = "own", follow: bool | None = None, look: Look = Look()) -> list:
@@ -2407,16 +2434,19 @@ class Renderer:
             raise ValueError(f"{scan} has no .blend (tools/attach_blend.py)")
         if self.cycles_gpu == "exclusive":
             self.free_mitsuba()
+        def stage(name: str) -> None:   # the .blend is open; Cycles prepares its GPU kernels for this scene's features
+            ACTIVITY.rename(f"preparing Cycles kernels for {scan}")
         with ACTIVITY.doing(f"loading {scan} in Blender"):
             try:
-                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device)
+                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device, on_stage=stage)
             except cycles_backend.CyclesError as exc:
                 if not cycles_backend.is_oom(exc):
                     raise
                 self.free_mitsuba()  # the GPU is full: hand the Mitsuba scenes' memory back and try again
-                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device)
+                ACTIVITY.rename(f"loading {scan} in Blender")
+                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device, on_stage=stage)
         self.cycles = (scan, worker)
-        print(f"[cycles] {scan}: {blend[0].name} loaded in {worker.load_s:.0f}s {worker.info}", flush=True)
+        print(f"[cycles] {scan}: {blend[0].name} ready in {worker.load_s:.0f}s (GPU kernels {worker.info.get('warm_s')}s) {worker.info}", flush=True)
         return worker
 
     def free_cycles(self) -> bool:
@@ -2595,6 +2625,7 @@ class Renderer:
             # loads, or the old scene's memory and the new one's add up (28 of 32.6 GB on Device 1 while a
             # variant switch loaded, with another process holding 8.8 GB) and freeze recordings fail
             self.dr.flush_malloc_cache()
+            trim_host_memory()
         base = self.scene_dir(scan)  # XML asset paths are relative to this directory
         # the flash of the active variant this scene file carries (or, two-pass, takes from flash_xml)
         flash = next((v["flash"] for v in self.meta[scan]["variants"].values()

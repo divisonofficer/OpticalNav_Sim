@@ -60,7 +60,9 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 #gallery .gcard:hover, #gallery .gcard:focus-visible { border-color: var(--accent); outline: none; }
 #gallery .gcard.cur { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 #gallery .gimg { aspect-ratio: 4 / 3; background: linear-gradient(135deg, var(--panel-3), var(--panel)); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 26px; font-weight: 600; overflow: hidden; }
-#gallery .gimg img { width: 100%; height: 100%; object-fit: cover; display: block; }
+#gallery .gimg { position: relative; }
+#gallery .gimg img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; }
+#gallery .gimg img.ok { opacity: 1; }   /* a lazy image must be laid out (not display: none) to load: see-through until it has */
 #gallery .gname { padding: 7px 9px 3px; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #gallery .gtags { padding: 0 9px 8px; display: flex; gap: 5px; font-size: 10.5px; color: var(--muted); }
 #gallery .gtag { border: 1px solid var(--rule); border-radius: 4px; padding: 0 5px; }
@@ -548,7 +550,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const PASS = [1, 2, 4, 8, 16, 32, 64];
+const PASS = [1, 2, 4, 8, 16, 32, 64, 128, 256];   // up to the server's max_pass_spp of the mode (polarized 64, plain 256)
 const TARGET = [64, 128, 256, 512, 1024, 2048, 4096];
 // a pane shows one band (RGB: the colour image and the dataset's luminance polarization; R, G, B, NIR: that
 // band's own Stokes vector) in one view; the server takes "<band>.<view>"
@@ -596,6 +598,15 @@ function fillScenes(current) {
     }
     sel.appendChild(group);
   }
+}
+// what another page or a script set shows here too: the pass sizes this mode allows, and both values
+function syncSppSelects() {
+  const top = (S.max_pass_spp || {})[S.polarization === false ? "rgb" : "polar"] || 64;
+  const passes = PASS.filter((v) => v <= top);
+  if ($("pass").options.length !== passes.length) fillSelect($("pass"), passes, S.pass_spp);
+  if (document.activeElement !== $("pass") && $("pass").value !== String(S.pass_spp)) $("pass").value = String(S.pass_spp);
+  if (!$("target").options.length) fillSelect($("target"), TARGET, S.target_spp);
+  if (document.activeElement !== $("target") && $("target").value !== String(S.target_spp)) $("target").value = String(S.target_spp);
 }
 function fillSelect(sel, values, current) {
   sel.innerHTML = "";
@@ -685,8 +696,7 @@ async function boot() {
   const scenes = Object.keys(S.scans).sort();
   const first = S.scene || S.default_scene || scenes[0];  // prefer the scene the render server already holds
   fillScenes(first);
-  fillSelect($("pass"), PASS, S.pass_spp);
-  fillSelect($("target"), TARGET, S.target_spp);
+  syncSppSelects();
   makeSliders();
   $("denoise").checked = S.denoise;
   $("auto").checked = S.auto;
@@ -719,11 +729,14 @@ function renderMonitor() {
   const server = r.reachable === true ? ["ok", "응답함"] : r.reachable === false ? ["bad", "응답 없음"] : ["", "확인 중"];
   const short = (S.scene || "").replace("infinigen_apartment_natural_v1_", "…").replace("infinigen_apartment_", "…");
   const prog = act.progress || null;
-  const scene = what.startsWith("loading") ? ["warn", `로드 중 ${prog && prog.files && prog.stage === "files" ? `${prog.files[0]}/${prog.files[1]}` : secs}`, progressText(prog) || "보통 1–2분"]
+  const cyc = S.render_mode === "cycles";
+  const scene = what.startsWith("preparing Cycles") ? ["warn", `Cycles GPU 준비 ${secs}`, "Blender가 씬을 연 뒤 첫 렌더로 GPU를 준비합니다(커널 컴파일과 장면 업로드). 커널은 씬이 쓰는 기능 조합마다 처음 한 번 몇 분 걸리고 이후 캐시됩니다"]
+    : what.startsWith("loading") && what.endsWith("in Blender") ? ["warn", `.blend 여는 중 ${secs}`, "Blender가 씬 파일을 읽습니다"]
+    : what.startsWith("loading") ? ["warn", `로드 중 ${prog && prog.files && prog.stage === "files" ? `${prog.files[0]}/${prog.files[1]}` : secs}`, progressText(prog) || "보통 1–2분"]
     : ready.scene ? ["ok", `${short} · ${S.variant}`, "렌더 서버 GPU에 올라가 있음"]
     : ready.scene === false ? ["", "아직 안 올라감", "첫 렌더 때 올립니다 (1–2분)"] : ["", "—"];
   const res = `${S.pass_spp} spp ${S.width}×${S.height}`;
-  const freeze = (what.startsWith("recording") || (prog && prog.kernels)) ? ["warn", `기록 중 ${prog && prog.percent != null ? `${prog.percent}%` : secs}`, progressText(prog) || `${res}, 설정마다 처음 한 번 약 150 s`]
+  const freeze = cyc ? ["", "Cycles: 해당 없음", "freeze는 Mitsuba 렌더의 기록입니다"] : (what.startsWith("recording") || (prog && prog.kernels)) ? ["warn", `기록 중 ${prog && prog.overall != null ? `${prog.step}/${prog.steps} · ${prog.overall}%` : prog && prog.percent != null ? `${prog.percent}%` : secs}`, progressText(prog) || `${res}, 설정마다 처음 한 번 약 150 s`]
     : ready.freeze ? ["ok", `${res} 준비`, "기록된 커널을 재생합니다"]
     : ready.freeze === false ? ["", "아직 기록 안 됨", `${res}: 첫 렌더 때 기록 (약 150 s)`]
     : r.freeze_available === false ? ["", "꺼짐", "freeze 없이 매번 트레이싱합니다 (느림)"] : ["", "—"];
@@ -1045,7 +1058,13 @@ function progressText(p) {
     return p.stage === "optix" ? `OptiX 가속 구조 만드는 중 (파일 ${p.files[1]}개 읽음)`
       : `파일 ${p.files[0]}/${p.files[1]}${pct}`;
   }
-  const stage = p.stage === "codegen" ? `코드 생성 (커널 ${p.kernels[0]}/${p.kernels[1]})` : "트레이싱";
+  const stage = p.stage === "codegen" ? `코드 생성 (커널 ${p.kernels[0]}/${p.kernels[1]})` : p.stage === "replay" ? "재생" : "트레이싱";
+  if (p.steps) {  // one wait made of several recordings (the server's progress.FREEZE.job): the step and one percentage for all
+    const phase = { "lights + flash": "조명+플래시 패스 기록", "lights only": "조명만 패스 기록", render: "렌더 기록", "flash only": "플래시 패스 기록",
+      settle: "값 바꿀 때 멈추지 않게 미리 재기록" }[p.phase] || p.phase;
+    const call = p.calls > 1 ? ` (호출 ${Math.max(1, p.call)}/${p.calls})` : "";
+    return `단계 ${p.step}/${p.steps} · ${phase}${call} · ${stage}${p.overall != null ? ` · 전체 ${p.overall}%` : ""}`;
+  }
   const call = p.calls > 1 ? `기록 ${Math.max(1, p.call)}/${p.calls} · ` : "다시 기록 · ";
   return `${call}${stage}${pct}${left}`;
 }
@@ -1053,6 +1072,7 @@ function rendererText(r) {
   if (!r) return "";
   if (r.error) return "렌더 서버에 연결할 수 없습니다 (다시 띄우는 중일 수 있습니다)";
   const t = `${(r.elapsed_s || 0).toFixed(0)} s`, p = progressText(r.progress);
+  if (r.what.startsWith("preparing Cycles")) return `렌더 서버: Cycles GPU 준비 중 ${t} (커널 컴파일·장면 업로드; 커널은 기능 조합마다 처음 한 번 몇 분)`;
   if (r.what.startsWith("loading")) return `렌더 서버: 씬 로드 중 ${t} (${p || r.what.split(" ").slice(1).join(" · ")})`;
   if (r.what.startsWith("recording")) return `렌더 서버: freeze 기록 중 ${t} (${r.what.replace("recording ", "")}${p ? ` · ${p}` : ""})`;
   if (r.what && p) return `렌더 서버: freeze ${t} (${p}; 입력 구조가 바뀌어 다시 기록합니다)`;
@@ -1142,6 +1162,7 @@ function apply(st) {
     $("progress").style.width = S.render_mode === "raster" ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
+  syncSppSelects();
   syncSliders();
   rigSync();
   if ($("auto").checked !== S.auto) $("auto").checked = S.auto;
@@ -1543,10 +1564,14 @@ function renderGallery() {
     const grid = document.createElement("div"); grid.className = "ggrid"; body.appendChild(grid);
     for (const c of list.sort((a, b) => a.id.localeCompare(b.id))) {
       const btn = document.createElement("button"); btn.type = "button"; btn.className = "gcard" + (c.id === S.scene ? " cur" : "");
-      const img = document.createElement("div"); img.className = "gimg"; img.textContent = sceneLabel(c.id).slice(0, 2).toUpperCase();
-      const pic = new Image(); pic.loading = "lazy"; pic.alt = "";
-      pic.onload = () => { img.textContent = ""; img.appendChild(pic); };
-      pic.src = `/api/thumb?scene=${encodeURIComponent(c.id)}`;
+      // the picture sits in the card from the start (a lazy image outside the page never loads); the initials until it has
+      const img = document.createElement("div"); img.className = "gimg";
+      const initials = document.createElement("span"); initials.textContent = sceneLabel(c.id).slice(0, 2).toUpperCase();
+      const pic = document.createElement("img"); pic.loading = "lazy"; pic.alt = "";
+      pic.onload = () => { pic.classList.add("ok"); };
+      pic.onerror = () => { pic.remove(); };
+      pic.src = `/api/thumb?scene=${encodeURIComponent(c.id)}${c.id === S.scene ? `&t=${S.frame_id || 0}` : ""}`;
+      img.append(initials, pic);
       const name = document.createElement("div"); name.className = "gname"; name.textContent = sceneLabel(c.id); name.title = c.id;
       const tags = document.createElement("div"); tags.className = "gtags";
       if (c.id.startsWith("blend_") || c.todo) { const t = document.createElement("span"); t.className = "gtag blend"; t.textContent = ".blend"; tags.appendChild(t); }

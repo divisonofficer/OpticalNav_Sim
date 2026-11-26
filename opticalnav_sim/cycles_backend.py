@@ -76,7 +76,7 @@ def lib_dir(blender: Path = BLENDER) -> Path:
 class CyclesWorker:
     """One Blender process rendering one ``.blend``; ``render`` is serialised by a lock."""
 
-    def __init__(self, blend: Path, origin_offset, device: str = "OPTIX", blender: Path = BLENDER):
+    def __init__(self, blend: Path, origin_offset, device: str = "OPTIX", blender: Path = BLENDER, on_stage=None):
         self.blend, self.origin_offset, self.device = Path(blend), tuple(origin_offset), device
         self.lock = threading.Lock()
         self.load_s = 0.0
@@ -95,6 +95,10 @@ class CyclesWorker:
         os.close(reply_w)
         self._cmd, self._reply = os.fdopen(self._cmd_w, "w"), os.fdopen(self._reply_r, "r")
         self.info = self._read()
+        while "stage" in self.info:   # the worker says where it is before "ready": "kernels" (the GPU kernels, minutes the first time)
+            if on_stage is not None:
+                on_stage(self.info["stage"])
+            self.info = self._read()
         self.load_s = time.perf_counter() - t0
 
     def _read(self) -> dict:

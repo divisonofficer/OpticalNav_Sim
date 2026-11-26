@@ -95,6 +95,9 @@ def robust_mean(acc: dict[str, np.ndarray], counts) -> dict[str, np.ndarray]:
 
 
 CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  # the older pane names
+# the largest pass: a polarized path carries Mueller matrices (its wavefront memory, and a long pass delays a move);
+# without polarization a pass of 256 samples is the server's own chunk (server.SPP_CHUNK)
+MAX_PASS_SPP = {"polar": 64, "rgb": 256}
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
 PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
 _OLD_PANES = {"rgb": ("rgb", "img"), "dolp": ("rgb", "dolp"), "aolp": ("rgb", "aolp"), "s1": ("rgb", "s1"),
@@ -648,6 +651,7 @@ class Session:
             if want and "polar" not in self.modes:
                 raise ValueError("the render server has no polarized mode: start it with --modes polar,rgb")
             self.polarization = want
+            self.pass_spp = min(self.pass_spp, MAX_PASS_SPP["polar" if want else "rgb"])   # a polarized pass carries Mueller matrices
             restart = True
         if "caustics" in settings:  # MatterSim.setCaustics
             self.sim.setCaustics(bool(settings["caustics"]))
@@ -670,7 +674,11 @@ class Session:
                                     float(settings.get("env_rotate_deg", env["rotate_deg"])))
             restart = True
         if "pass_spp" in settings:
-            self.pass_spp = int(settings["pass_spp"])
+            want = int(settings["pass_spp"])
+            top = MAX_PASS_SPP["polar" if self.polarization else "rgb"]
+            if not 1 <= want <= top:
+                raise ValueError(f"pass_spp {want}: 1 to {top} {'with' if self.polarization else 'without'} polarization")
+            self.pass_spp = want
             restart = True
         if settings.get("refit_tone"):  # display only: nothing renders again
             self.refit_tone()
@@ -992,7 +1000,7 @@ class Session:
             out = {"opening": ({**self.opening, "elapsed_s": round(time.time() - self.opening["t0"], 1),
                                 "fraction": conv.get("fraction") if conv else None, "stage": conv.get("stage") if conv else None}
                                if self.opening else None),
-                   "scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "target_spp": self.target_spp, "auto": self.auto,
+                   "scans": self.scans, "blends": [b for b in getattr(self, "blends", []) if not b["ready"]], "pass_spp": self.pass_spp, "max_pass_spp": MAX_PASS_SPP, "target_spp": self.target_spp, "auto": self.auto,
                    "denoise": sim.denoise, "variant": sim.variant, "started": self.started,
                    "lights": sim.lights, "env": sim.env, "envmaps": self.envmaps,
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available,

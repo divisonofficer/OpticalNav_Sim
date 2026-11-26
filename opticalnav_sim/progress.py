@@ -57,6 +57,7 @@ class FreezeProgress:
             self.history = {}
         self.key = None
         self.hooked = False
+        self.job: dict | None = None   # several recordings in a row that are one wait to the viewer (job_begin)
         self._reset()
 
     def _reset(self) -> None:
@@ -79,6 +80,21 @@ class FreezeProgress:
             self._reset()
             self.key, self.calls, self.remember, self.score = key, calls, remember, int(score)
             self.started = self.stage_since = time.time()
+
+    # --- a wait made of several recordings (a scene's first frame: its passes, then settling), shown as one ---
+    def job_begin(self, steps: int) -> None:
+        with self.lock:
+            self.job = {"step": 0, "steps": max(1, int(steps)), "phase": "", "since": time.time()}
+
+    def job_step(self, phase: str) -> None:
+        with self.lock:
+            if self.job is not None:
+                self.job["step"] = min(self.job["steps"], self.job["step"] + 1)
+                self.job["phase"] = phase
+
+    def job_end(self) -> None:
+        with self.lock:
+            self.job = None
 
     def next_call(self) -> None:
         with self.lock:
@@ -128,8 +144,14 @@ class FreezeProgress:
 
     def snapshot(self) -> dict | None:
         with self.lock:
+            job = dict(self.job) if self.job is not None else None
             if self.key is None or (not self.remember and not self.recorded):
-                return None  # a plain replay: nothing to report
+                if job is None or not job["step"]:
+                    return None  # a plain replay: nothing to report
+                # between the recordings of one wait (a replay that records nothing): the wait goes on
+                return {"stage": "replay", "call": 0, "calls": 0, "kernels": [0, 0], "elapsed_s": round(time.time() - job["since"], 1),
+                        "step": job["step"], "steps": job["steps"], "phase": job["phase"],
+                        "overall": int(100 * (job["step"] - 1) / job["steps"])}
             now = time.time()
             out = {"stage": self.stage or "tracing", "call": self.call, "calls": self.calls,
                    "kernels": list(self.kernels), "elapsed_s": round(now - self.started, 1),
@@ -148,6 +170,9 @@ class FreezeProgress:
                 done = (now - self.started) / expected
                 out["percent"] = int(min(99, 100 * done))
                 out["eta_s"] = round(max(0.0, expected - (now - self.started)), 1)
+            if job is not None and job["step"]:   # this recording is step k of n: one bar for all of them
+                out.update(step=job["step"], steps=job["steps"], phase=job["phase"])
+                out["overall"] = int(min(99, 100 * (job["step"] - 1 + out.get("percent", 0) / 100.0) / job["steps"]))
             return out
 
 

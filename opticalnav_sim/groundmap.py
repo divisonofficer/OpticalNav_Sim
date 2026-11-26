@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,50 +70,134 @@ def material_friction(name: str, roughness: float | None = None, metallic: float
     return mu, why
 
 
-_SHAPE = re.compile(r'<!--opticalnav-obj:(\{.*?\})-->\s*<shape type="(\w+)" id="([^"]*)">(.*?)</shape>', re.S)
+READER = 2   # how scene files are read; a saved map of another reading is built again (hw.sim.SimWorld.load_ground)
+
+# Mitsuba's own shapes as meshes: (vertices, triangles)
+_RECTANGLE = (np.array([[-1.0, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]]), np.array([[0, 1, 2], [0, 2, 3]]))
+_CUBE = (np.array([[x, y, z] for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)]),
+         np.array([[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5], [0, 4, 5], [0, 5, 1], [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4],
+                   [1, 5, 7], [1, 7, 3]]))
+_PRIMITIVES = {"rectangle": _RECTANGLE, "cube": _CUBE}
+
+
+def _to_world(shape) -> np.ndarray | None:
+    """A shape's ``to_world`` as a 4x4 (Mitsuba applies the listed steps in order); None: none."""
+    tf = next((t for t in shape.findall("transform") if t.get("name") == "to_world"), None)
+    if tf is None:
+        return None
+    m = np.eye(4)
+    for step in tf:
+        if not isinstance(step.tag, str):
+            continue
+        a = np.eye(4)
+        v = [float(x) for x in re.split(r"[\s,]+", (step.get("value") or "").strip()) if x]
+        if step.tag == "translate":
+            a[:3, 3] = v if len(v) == 3 else [float(step.get(k, 0.0)) for k in "xyz"]
+        elif step.tag == "scale":
+            a[[0, 1, 2], [0, 1, 2]] = v if len(v) == 3 else v * 3 if len(v) == 1 else [float(step.get(k, 1.0)) for k in "xyz"]
+        elif step.tag == "rotate":
+            k = np.array(v if len(v) == 3 else [float(step.get(c, 0.0)) for c in "xyz"])
+            k = k / np.linalg.norm(k)
+            t = math.radians(float(step.get("angle")))
+            cross = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+            a[:3, :3] = np.eye(3) + math.sin(t) * cross + (1.0 - math.cos(t)) * (cross @ cross)
+        elif step.tag == "matrix":
+            a = np.array(v).reshape((4, 4) if len(v) == 16 else (3, 3))
+            if a.shape == (3, 3):
+                a = np.block([[a, np.zeros((3, 1))], [np.zeros((1, 3)), np.ones((1, 1))]])
+        else:
+            raise ValueError(f"shape {shape.get('id')!r}: a to_world step <{step.tag}> is not read here")
+        m = a @ m
+    return m
 
 
 def scene_surfaces(scene_dir, xml: str = "base.xml") -> list[dict]:
-    """The scene's mesh shapes with what its file says of their surface: ``{"id", "material", "file", "roughness",
-    "metallic", "emitter", "transmissive"}``. Roughness is Blender's (the square root of the BSDF's alpha; a
-    texture's mean); metallic is the conductor's share of the BSDF."""
+    """The scene's mesh shapes with what its file says of their surface: ``{"id", "material", "file", "kind", "matrix",
+    "roughness", "metallic", "emitter", "transmissive"}``, instances of a shape group written out. ``matrix`` is the
+    shape's 4x4 in the world (None: as the mesh lies), ``file`` the mesh of a "ply" or "obj" (None for a "rectangle" or
+    "cube"). Roughness is Blender's (the square root of the BSDF's alpha); metallic is the conductor's share of the BSDF.
+    Where a texture gives one, ``roughness_map`` and ``metallic_map`` name it (``build`` reads the maps of what a robot
+    can stand on: their mean)."""
     scene_dir = Path(scene_dir)
-    text = (scene_dir / xml).read_text()
-    out = []
-    for meta, kind, sid, body in _SHAPE.findall(text):
-        if kind not in ("ply", "obj"):
-            continue
-        file = re.search(r'<string name="filename" value="([^"]+)"', body)
-        if file is None:
-            continue
-        try:
-            material = json.loads(meta).get("material") or sid
-        except json.JSONDecodeError:
-            material = sid
-        rough = None
-        alpha = re.search(r'<float name="alpha" value="([-\d.eE+]+)"', body)
-        if alpha is not None:
-            rough = math.sqrt(max(float(alpha.group(1)), 0.0))
-        else:
-            tex = re.search(r'<texture[^>]*name="alpha"[^>]*>.*?<string name="filename" value="([^"]+)"', body, re.S)
-            if tex is not None:
-                rough = _texture_mean_sqrt(scene_dir / tex.group(1))
-        weight = re.search(r'<bsdf type="blendbsdf">\s*<float name="weight" value="([-\d.eE+]+)"', body)
-        metallic = float(weight.group(1)) if weight is not None and "roughconductor" in body else \
-            1.0 if ('type="roughconductor"' in body or 'type="conductor"' in body) else 0.0
-        out.append({"id": sid, "material": str(material), "file": file.group(1), "roughness": rough, "metallic": metallic,
-                    "emitter": "<emitter" in body, "transmissive": 'dielectric"' in body and "pplastic" not in body})
+    root = ET.parse(scene_dir / xml, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))).getroot()
+    shared = {b.get("id"): b for b in root.iter("bsdf") if b.get("id")}
+
+    def read(shape, meta: str | None, matrix) -> dict | None:
+        kind, sid = shape.get("type"), shape.get("id") or ""
+        if kind not in ("ply", "obj", "rectangle", "cube"):
+            return None
+        file = shape.find("string[@name='filename']")
+        if kind in ("ply", "obj") and file is None:
+            return None
+        material = sid
+        if meta is not None:
+            try:
+                material = json.loads(meta).get("material") or sid
+            except json.JSONDecodeError:
+                pass
+        bsdfs = [b for b in shape.findall("bsdf")] + [shared[r.get("id")] for r in shape.findall("ref") if r.get("id") in shared]
+        parts = [b for top in bsdfs for b in top.iter("bsdf")]
+        types = {b.get("type") for b in parts}
+        rough = rough_map = metal_map = None
+        alpha = next((a for b in parts for a in b if a.get("name") == "alpha"), None)
+        if alpha is not None and alpha.tag == "float":
+            rough = math.sqrt(max(float(alpha.get("value")), 0.0))
+        elif alpha is not None and alpha.tag == "texture" and alpha.find("string[@name='filename']") is not None:
+            rough_map = alpha.find("string[@name='filename']").get("value")
+        weight = next((w for b in parts if b.get("type") == "blendbsdf" for w in b if w.get("name") == "weight"), None)
+        if weight is not None and weight.tag != "float":
+            image = weight.find("string[@name='filename']")
+            metal_map, weight = image.get("value") if image is not None else None, None
+        conductor = bool(types & {"roughconductor", "conductor"})
+        metallic = float(weight.get("value")) if weight is not None and conductor else \
+            0.0 if "blendbsdf" in types else 1.0 if conductor else 0.0
+        return {"id": sid, "material": str(material), "file": None if kind in _PRIMITIVES else file.get("value"), "kind": kind,
+                "matrix": matrix, "roughness": rough, "metallic": metallic, "roughness_map": rough_map,
+                "metallic_map": metal_map if conductor else None, "emitter": shape.find("emitter") is not None,
+                "transmissive": any(t and t.endswith("dielectric") for t in types)}
+
+    def walk(parent):
+        """(shape, the metadata comment before it) of an element's own shapes."""
+        meta = None
+        for el in parent:
+            if el.tag is ET.Comment:
+                text = (el.text or "").strip()
+                meta = text[len("opticalnav-obj:"):] if text.startswith("opticalnav-obj:") else meta
+            elif el.tag == "shape":
+                yield el, meta
+                meta = None
+            else:
+                meta = None
+
+    out, groups = [], {}
+    for shape, meta in walk(root):
+        if shape.get("type") == "shapegroup":
+            groups[shape.get("id")] = [r for r in (read(c, m or meta, _to_world(c)) for c, m in walk(shape)) if r is not None]
+    for shape, meta in walk(root):
+        if shape.get("type") == "instance":
+            ref = shape.find("ref")
+            inner = shape.find("shape")
+            at = _to_world(shape)
+            members = groups.get(ref.get("id"), []) if ref is not None else \
+                [r for r in (read(c, m or meta, _to_world(c)) for c, m in walk(inner)) if r is not None] if inner is not None else []
+            for k in members:
+                m = at if k["matrix"] is None else k["matrix"] if at is None else at @ k["matrix"]
+                out.append({**k, "matrix": m})
+        elif shape.get("type") != "shapegroup":
+            r = read(shape, meta, _to_world(shape))
+            if r is not None:
+                out.append(r)
     return out
 
 
-def _texture_mean_sqrt(path: Path) -> float | None:
+def _texture_mean(path: Path, power: float = 1.0) -> float | None:
     try:
         from PIL import Image
         a = np.asarray(Image.open(path))
     except Exception:  # noqa: BLE001 - a map that does not open says nothing
         return None
     top = 65535.0 if a.dtype == np.uint16 or a.max() > 255 else 255.0 if a.dtype.kind in "ui" else 1.0
-    return float(np.sqrt(np.clip(a.astype(np.float64) / top, 0.0, 1.0)).mean())
+    return float((np.clip(a.astype(np.float64) / top, 0.0, 1.0) ** power).mean())
 
 
 def read_ply(path) -> tuple[np.ndarray, np.ndarray]:
@@ -199,7 +284,7 @@ def _vertex_extent(scene_dir: Path, surfaces: list, lo: float, hi: float, cache:
     x0 = y0 = math.inf
     x1 = y1 = -math.inf
     for s in surfaces:
-        mesh = _mesh(scene_dir / s["file"], cache)
+        mesh = _surface_mesh(scene_dir, s, cache)
         if mesh is None:
             continue
         v = mesh[0]
@@ -212,13 +297,46 @@ def _vertex_extent(scene_dir: Path, surfaces: list, lo: float, hi: float, cache:
     return x0, y0, x1, y1
 
 
+_EXTENTS: dict = {}   # mesh file -> the 8 corners of its vertices' box: the second map of a scene reads only what is near
+
+
 def _mesh(file: Path, cache: dict):
     if file not in cache:
         try:
             cache[file] = read_ply(file)
         except (OSError, ValueError):
             cache[file] = None
+        v = cache[file][0] if cache[file] is not None else np.zeros((0, 3))
+        _EXTENTS[file] = np.array([[x, y, z] for x in (v[:, 0].min(), v[:, 0].max()) for y in (v[:, 1].min(), v[:, 1].max())
+                                   for z in (v[:, 2].min(), v[:, 2].max())]) if len(v) else None
     return cache[file]
+
+
+def _surface_mesh(scene_dir: Path, s: dict, cache: dict, lo: float = -math.inf, hi: float = math.inf, bounds=None):
+    """(vertices in the world, Mitsuba axes; triangles) of a surface; None: not readable, empty, or wholly outside the
+    height band and the ``bounds``."""
+    m = s["matrix"]
+
+    def placed(v):
+        return v if m is None else v @ m[:3, :3].T + m[:3, 3]
+    if s["kind"] in _PRIMITIVES:
+        v, f = _PRIMITIVES[s["kind"]]
+        return placed(v), f
+    file = scene_dir / s["file"]
+    if file in _EXTENTS:
+        box = _EXTENTS[file]
+        if box is None:
+            return None
+        c = placed(box)
+        if c[:, 1].max() < lo or c[:, 1].min() > hi:
+            return None
+        if bounds is not None and (c[:, 0].max() < bounds[0] or c[:, 0].min() > bounds[2]
+                                   or -c[:, 2].min() < bounds[1] or -c[:, 2].max() > bounds[3]):
+            return None
+    mesh = _mesh(file, cache)
+    if mesh is None or not len(mesh[1]):
+        return None
+    return placed(mesh[0]), mesh[1]
 
 
 POINTS_AT_ONCE = 2_000_000   # samples held at a time: a scene of any size is binned in pieces of this many
@@ -272,8 +390,8 @@ def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bound
     for n, s in enumerate(surfaces):
         if progress is not None and n % 200 == 0:
             progress(n / max(len(surfaces), 1))
-        mesh = _mesh(scene_dir / s["file"], cache)
-        if mesh is None or not len(mesh[1]):
+        mesh = _surface_mesh(scene_dir, s, cache, lo, hi, (x0, y0, x1, y1))
+        if mesh is None:
             continue
         v, f = mesh
         tri = v[f]                                            # M x 3 x 3, Mitsuba axes
@@ -310,12 +428,56 @@ def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bound
         raise ValueError(f"{scene_dir}: nothing between {lo:.2f} and {hi:.2f} m within the bounds")
     heights[np.isinf(heights)] = np.nan
     friction = {}
+    stood = {int(k) for k in np.unique(material)}
+    groups: dict = {n: [] for n in names}
+    for s in surfaces:
+        groups[s["material"]].append(s)
+
+    def value(s: dict, what: str, power: float):
+        file = s[what + "_map"]
+        if file is None or index[s["material"]] not in stood:
+            return s[what]
+        if (file, power) not in maps:
+            maps[file, power] = _texture_mean(scene_dir / file, power)
+        return s[what] if maps[file, power] is None else maps[file, power]
+    maps: dict = {}
     for name in names:
-        group = [s for s in surfaces if s["material"] == name]
-        rough = [s["roughness"] for s in group if s["roughness"] is not None]
+        rough = [v for v in (value(s, "roughness", 0.5) for s in groups[name]) if v is not None]
         r = float(np.mean(rough)) if rough else None
-        m = float(np.mean([s["metallic"] for s in group]))
+        m = float(np.mean([value(s, "metallic", 1.0) for s in groups[name]]))
         mu, why = material_friction(name, r, m)
         friction[name] = {"mu": mu, "why": why, "roughness": None if r is None else round(r, 3), "metallic": round(m, 3)}
     return GroundMap(heights.reshape(rows, cols), material.reshape(rows, cols).astype(np.int64), names, friction, (x0, y0), float(cell),
-                     float(floor_z), float(top), {"scene": scene_dir.name, "xml": xml, "samples": int(samples), "shapes": len(surfaces)})
+                     float(floor_z), float(top), {"scene": scene_dir.name, "xml": xml, "samples": int(samples), "shapes": len(surfaces), "reader": READER})
+
+
+def floor_under(gm: GroundMap, x: float, y: float, near: float | None = None) -> float | None:
+    """The floor at (x, y) by a map seen from the camera's height (``floor_probe``): the low end of what lies within
+    0.4 m, and where that is furniture (a table under the camera), a level lower by up to 1.3 m that fills a good part
+    of the 3 m around. A drop of a storey beside a balcony is not it. ``near``: only surfaces within 0.6 m of it."""
+    i, j = np.indices(gm.heights.shape)
+    d = np.hypot(gm.origin[0] + j * gm.cell - x, gm.origin[1] + i * gm.cell - y)
+    stand = (gm.material >= 0) & ~np.isnan(gm.heights)
+    if near is not None:
+        stand &= np.abs(gm.heights - near) <= 0.6
+    z = gm.heights[stand & (d <= 0.4)]
+    around = gm.heights[stand & (d <= 1.5)]
+    if not len(around):
+        return None
+    start = float(np.percentile(z, 20)) if len(z) else float(np.median(around))
+    bins = np.round(around / 0.05).astype(int)
+    for level in np.unique(bins):              # lowest first
+        at = around[np.abs(bins - level) <= 1]
+        if start - 1.3 <= level * 0.05 < start - 0.25 and len(at) >= 0.15 * len(around):
+            return float(np.median(at))
+    return start
+
+
+def floor_probe(scene_dir, eye, reach=(0.0, 0.0)) -> GroundMap | None:
+    """What lies under a camera at ``eye`` (x, y, height), up to ``reach`` (dx, dy) from it, seen from its height."""
+    x, y = sorted((eye[0], eye[0] + reach[0])), sorted((eye[1], eye[1] + reach[1]))
+    try:
+        return build(scene_dir, eye[2] - 0.05, top=0.0, cell=0.1, below=40.0,
+                     bounds=(x[0] - 1.5, y[0] - 1.5, x[1] + 1.5, y[1] + 1.5))
+    except ValueError:
+        return None

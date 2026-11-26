@@ -658,6 +658,46 @@ def _quad(x0, x1, y0, y1, z):
     return [[x0, z, -y0], [x1, z, -y0], [x1, z, -y1], [x0, z, -y1]], [[0, 1, 2], [0, 2, 3]]
 
 
+def test_scene_files_of_every_pack_are_read_transforms_primitives_and_instances(tmp_path):
+    (tmp_path / "assets").mkdir()
+    v, f = bodies.box((0.4, 1.0, 0.4))
+    bodies.write_ply(tmp_path / "assets" / "box.ply", np.asarray(v, np.float32), np.asarray(f, np.int32))
+    bsdf = '<bsdf type="twosided"><bsdf type="pplastic"><float name="alpha" value="0.25" /></bsdf></bsdf>'
+    mesh = '<string name="filename" value="assets/box.ply" />'
+    (tmp_path / "base.xml").write_text(f"""<scene version="3.0.0">
+      <shape type="rectangle" id="hall_tile"><transform name="to_world"><scale x="5" y="5" /><rotate x="1" angle="-90" />
+        <translate x="0" y="0.1" z="0" /></transform>{bsdf}</shape>
+      <shape type="ply" id="crate">{mesh}<transform name="to_world"><translate x="2" y="0.6" z="-1" /></transform>{bsdf}</shape>
+      <shape type="cube" id="block"><transform name="to_world"><scale value="0.25" /><translate value="-2, 0.35, 0" /></transform>{bsdf}</shape>
+      <shape type="shapegroup" id="posts"><shape type="ply" id="post">{mesh}{bsdf}</shape></shape>
+      <shape type="instance" id="i"><ref id="posts" /><transform name="to_world">
+        <matrix value="1 0 0 -3  0 1 0 0.6  0 0 1 -2  0 0 0 1" /></transform></shape>
+      <shape type="rectangle" id="lamp"><transform name="to_world"><translate x="0" y="0.5" z="0" /></transform><emitter type="area" /></shape>
+    </scene>""")
+    ids = [s["id"] for s in groundmap.scene_surfaces(tmp_path)]
+    assert ids == ["hall_tile", "crate", "block", "post", "lamp"]    # (the group itself is drawn nowhere)
+    for again in (False, True):                                     # the second time only the meshes near are read
+        gm = groundmap.build(tmp_path, floor_z=0.1, top=1.4, cell=0.05, bounds=(-4.0, -4.0, 4.0, 4.0))
+        at = lambda x, y: float(gm.heights[int(round((y - gm.origin[1]) / 0.05)), int(round((x - gm.origin[0]) / 0.05))])
+        assert at(0.0, 0.0) == pytest.approx(0.1, abs=1e-6)          # the lamp is not in the way
+        assert at(2.0, 1.0) == pytest.approx(1.1, abs=1e-4) and at(-2.0, 0.0) == pytest.approx(0.6, abs=1e-4)
+        assert at(-3.0, 2.0) == pytest.approx(1.1, abs=1e-4)
+    assert gm.ground().material_at(0.0, 0.0) == "hall_tile"
+
+
+def test_the_floor_under_a_camera_is_not_the_furniture_around_it(tmp_path):
+    def floor(folder, eye, *shapes):
+        _write_scene(folder, [("f", "hall_tile", 0.25, *_quad(-6, 6, -6, 6, 0.02)), *shapes])
+        return groundmap.floor_under(groundmap.floor_probe(folder, eye), eye[0], eye[1])
+    shelves = ("s", "wood", 0.25, *_quad(0.5, 6, -6, 6, 1.4))         # most of the 3 m around is a shelf's top
+    assert floor(tmp_path / "a", (0.0, 0.0, 1.5), shelves, ("t", "wood", 0.25, *_quad(-6, -0.6, -6, 6, 1.4))) == pytest.approx(0.02)
+    table = ("t", "wood", 0.25, *_quad(-0.8, 0.8, -0.5, 0.5, 0.75))   # the camera above a table
+    assert floor(tmp_path / "b", (0.0, 0.0, 1.6), table) == pytest.approx(0.02)
+    balcony = ("b", "wood", 0.25, *_quad(-6, 0.6, -6, 6, 3.0))        # a storey down beside it is another floor
+    assert floor(tmp_path / "c", (0.0, 0.0, 4.5), balcony) == pytest.approx(3.0)
+    assert groundmap.floor_probe(tmp_path / "c", (50.0, 50.0, 1.5)) is None
+
+
 def test_ground_map_from_scene_files_gives_heights_obstacles_and_friction(tmp_path):
     box_v, box_f = bodies.box((0.4, 1.0, 0.4))                      # Mitsuba axes: 0.4 wide, 1.0 tall, 0.4 deep
     box_v = box_v + np.array([3.0, 0.5, 0.0])                       # a crate standing on the floor at x = 3, y = 0

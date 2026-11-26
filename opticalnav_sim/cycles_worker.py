@@ -79,13 +79,18 @@ def main() -> None:
     cmd, reply = os.fdopen(cmd_fd, "r"), os.fdopen(reply_fd, "w")
     device = os.environ.get("OPTICALNAV_CYCLES_DEVICE", "OPTIX")
     setup(device)
-    # the first GPU render compiles the kernels for this card (minutes, once; Blender caches them): done before "ready"
+    t_open = time.perf_counter()
+    # the first GPU render compiles the kernels for this card and for the features this scene uses (minutes, once per
+    # feature set; OptiX caches them): done before "ready", and said first, so the wait is not shown as loading the .blend
+    reply.write(json.dumps({"stage": "kernels"}) + "\n")
+    reply.flush()
     render({"width": 32, "height": 24, "hfov_deg": 60.0, "spp": 1, "seed": 0,
             "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1.5, 0, 0, 0, 1],
             "out": os.path.join("/dev/shm" if os.path.isdir("/dev/shm") else "/tmp", f"opticalnav_cycles_warm_{os.getpid()}.exr")})
     os.unlink(os.path.join("/dev/shm" if os.path.isdir("/dev/shm") else "/tmp", f"opticalnav_cycles_warm_{os.getpid()}.exr"))
     reply.write(json.dumps({"ok": True, "ready": True, "device": device, "scene": bpy.data.filepath,
-                            "objects": len(bpy.data.objects), "lights": sum(o.type == "LIGHT" for o in bpy.data.objects)}) + "\n")
+                            "objects": len(bpy.data.objects), "lights": sum(o.type == "LIGHT" for o in bpy.data.objects),
+                            "warm_s": round(time.perf_counter() - t_open, 1)}) + "\n")
     reply.flush()
     for line in cmd:
         req = json.loads(line)
