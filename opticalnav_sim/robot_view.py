@@ -46,6 +46,8 @@ from pathlib import Path
 import numpy as np
 
 CONTROL_TIMEOUT_S = 0.5      # the Ranger's CAN command timeout: no command for this long stops it
+# sensors measured at once (_measure): their renders side by side on the server, their readings beside
+MEASURE_WORKERS = max(1, int(os.environ.get("OPTICALNAV_ROBOT_MEASURE_WORKERS", "3")))
 DEFAULT_CONFIG = "ranger_mini"
 # what a sensor's view takes from the editor's: the scene as it is lit and dressed there (and so the same resident
 # scene on the render server: another variant or lighting would not load a second one, but these keep one picture)
@@ -53,13 +55,18 @@ LOOK = ("variant", "lights", "env", "flash_band", "nir", "lighting", "lamps", "f
         "rr_depth", "caustics", "nir_range", "active_split", "mirrors")
 
 
-def clean_render(client, view: dict, passes: int = 8) -> dict:
+def clean_render(client, view: dict, passes: int = 8, abort=None) -> dict | None:
     """A view rendered as ``passes`` passes of ``view["spp"]`` samples, their mean with fireflies held back
     (gui.robust_mean: a pass's pixel far above the others' median is scaled down), then denoised: the server's
     answer as one render would give it (``s0``.. or ``radiance``). The denoiser alone leaves a firefly as a white
-    speck; the mean alone leaves the grain. For a camera standing still, and for recordings."""
+    speck; the mean alone leaves the grain. For a camera standing still, and for recordings. ``abort()`` true between
+    passes: given up, None (the robot moved off: 64 passes of 16 spp are seconds the camera would show nothing new)."""
     from .gui import robust_mean
-    outs = [client.render([dict(view, seed=int(view.get("seed", 0)) * 1000 + i, denoise=False)], "float32")[0] for i in range(passes)]
+    outs = []
+    for i in range(passes):
+        if abort is not None and abort():
+            return None
+        outs.append(client.render([dict(view, seed=int(view.get("seed", 0)) * 1000 + i, denoise=False)], "float32")[0])
     keys = [k for k in ("s0", "s1", "s2", "radiance") if k in outs[0]]
     spp = float(view["spp"])
     acc = {("s0" if k == "radiance" else k): np.stack([np.asarray(o[k], dtype=np.float32) for o in outs]) * spp for k in keys}
@@ -102,6 +109,7 @@ class RobotSession:
         self.polar_policy = "split"      # the viewer's: "off" all unpolarized, "split" by each camera's model, "unified" all polarized
         self.settings: dict = {}         # sensor name -> its own render settings (sensor_settings): pass spp, target, accumulate, scale
         self.frames: dict = {}           # name -> {"jpeg", "seq", "spp", "exposure_ms", "gain_db", "size", "seconds"}
+        self._tones: dict = {}           # camera name -> its display tone with the ISP off (exposure, white), followed slowly
         self.message, self.error = "", ""
         self.scene = ""
         self.run_id = 0                  # a spawn's threads stop when it moves on
@@ -416,7 +424,7 @@ class RobotSession:
             return "polar"
         return "rgb" if self.polar_policy == "off" else "polar" if self.polar_policy == "unified" or polarized else "rgb"
 
-    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale")
+    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale", "isp")
 
     def sensor_settings(self, name: str, mode: str | None = None) -> dict:
         """A sensor's render settings: ``pass_spp`` (a frame while moving: one denoised pass), ``target_spp`` (at rest:
@@ -432,7 +440,9 @@ class RobotSession:
     def _settings_of(self, name: str, actor, mode: str | None) -> dict:   # (under the lock)
         spec = actor.spec
         default = {"pass_spp": 16, "target_spp": (1024 if mode == "rgb" and not spec.polarized else 256), "accumulate": True,
-                   "scale": float(spec.render_scale) if hasattr(spec, "render_scale") else None}
+                   "scale": float(spec.render_scale) if hasattr(spec, "render_scale") else None,
+                   # a camera's sensor model and ISP (False: the render itself, lens distortion and a tone alone)
+                   "isp": True if getattr(spec, "kind", None) == "camera" else None}
         return {**default, **self.settings.get(name, {})}
 
     def set_sensor_settings(self, name: str, changes: dict) -> dict:
@@ -455,6 +465,10 @@ class RobotSession:
                     raise ValueError("target_spp: 1 to 8192")
             if "accumulate" in changes:
                 own["accumulate"] = bool(changes["accumulate"])
+            if "isp" in changes:
+                if getattr(actor.spec, "kind", None) != "camera":
+                    raise ValueError(f"{name} is not a camera: it has no ISP")
+                own["isp"] = bool(changes["isp"])
             if "scale" in changes:
                 if not hasattr(actor.spec, "render_scale"):
                     raise ValueError(f"{name} has no render scale (its resolution is its model's)")
@@ -465,11 +479,22 @@ class RobotSession:
             self.pose_seq += 1   # rendered again as asked
             return self._settings_of(name, actor, None)
 
-    def sense(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None, passes: int = 8):
+    def sense(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None, passes: int = 8,
+              isp: bool = True):
         """A measurement of a sensor now, with the editor's look: ``(Reading, spp, look)``, or None when ``before(look)``
         says it is not needed. ``settled``: a clean one (eight passes of ``spp``, fireflies held back, denoised), else
         one denoised pass. A sensor of geometry alone is one exact render either way. ``client``: the calling thread's own.
-        ``passes``: of ``spp`` each, at rest."""
+        ``passes``: of ``spp`` each, at rest. ``isp`` False: a camera's render as it is (see picture_without_isp)."""
+        got = self._render(name, settled, spp, template, before, client, passes)
+        if got is None:
+            return None
+        actor, request, outs, shown, look = got
+        return self._read(name, actor, request, outs, isp), shown, look
+
+    def _render(self, name: str, settled: bool, spp: int, template: dict | None, before=None, client=None, passes: int = 8,
+                abort=None):
+        """sense's first half: the render server's answer, ``(actor, request, outs, spp shown, look)`` or None (also when
+        ``abort()`` stopped a clean render)."""
         with self.lock:   # the poses of this moment
             world, actor = self.world, self.sensors[name]
             spec = actor.spec
@@ -480,10 +505,41 @@ class RobotSession:
             return None
         client = client or world.client
         if spec.lit and settled:
-            outs = [clean_render(client, v, passes) for v in views]
+            outs = [clean_render(client, v, passes, abort) for v in views]
+            if any(o is None for o in outs):
+                return None
         else:
             outs = client.render(views, "float32")
-        return spec.read(world, actor, request, outs), (spp * (passes if settled else 1) if spec.lit else 0), look
+        return actor, request, outs, (spp * (passes if settled else 1) if spec.lit else 0), look
+
+    def _read(self, name: str, actor, request: dict, outs: list, isp: bool = True):
+        """sense's second half: the sensor's reading of the render (its model, a camera's ISP), or with ``isp`` off a
+        camera's render as it is."""
+        spec = actor.spec
+        if not isp and getattr(spec, "kind", None) == "camera":
+            return self.picture_without_isp(name, actor, request, outs[0])
+        return spec.read(self.world, actor, request, outs)
+
+    def picture_without_isp(self, name: str, actor, request: dict, out: dict):
+        """A camera's render with its lens's distortion and a display tone alone: no exposure, noise, mosaic or ISP (a
+        few ms, against tens for the sensor model and ISP). The tone follows the image slowly, so a turn does not flicker."""
+        from . import tonemap
+        from .hw.sensing import Reading
+        frame = self.world.frame(request, out, ("s0",))
+        s0 = np.asarray(frame.s0, dtype=np.float32)
+        # the scene's log-average luminance at middle grey, as the ISP's auto exposure does (a percentile at white, as
+        # the editor's scene tone does, made a camera facing a plain wall a white sheet)
+        lum = np.maximum(s0[::4, ::4] @ tonemap.LUMA, 1e-6)
+        exposure = 0.18 / max(float(np.exp(np.mean(np.log(lum)))), 1e-9)
+        now = {"exposure": exposure, "white": max(1.0, float(np.percentile(lum, 99.9)) * exposure)}
+        with self.lock:
+            last = self._tones.get(name)
+            tone = now if last is None else {k: math.exp(0.7 * math.log(last[k]) + 0.3 * math.log(now[k])) for k in now}
+            self._tones[name] = tone
+        picture = tonemap.fast("filmic", s0, tone["exposure"], tone["white"])
+        return Reading(actor.name, actor.spec.modality, frame.time, frame.pose, {"frame": frame}, picture,
+                       {"model": actor.spec.model, "format": "센서·ISP 꺼짐 (렌더 그대로)",
+                        "size": f"{picture.shape[1]}x{picture.shape[0]}"})
 
     def _run(self, run: int, scene: str, build) -> None:
         try:
@@ -503,63 +559,104 @@ class RobotSession:
         self._measure(run, True)
 
     def _measure(self, run: int, lit: bool) -> None:
-        """Measure the sensors that are shown, in turn: the cameras (``lit``) or those of geometry alone."""
-        from .client import RenderClient
-        client = RenderClient(self.server_url) if self.client is None and not lit else None
+        """Measure the sensors that are shown: the cameras (``lit``) or those of geometry alone.
+
+        Each sensor's measurement (its render, then its reading: the sensor model and ISP, 25 to 90 ms a camera at
+        preview sizes) runs on a worker of its own, so the sensors' renders are on the render server side by side (it
+        overlaps one's readback and the other's tracing) and a reading never holds up another sensor's render. A sensor
+        has at most one measurement under way: its frames stay in order and its auto exposure sees them one by one.
+        Done one after another on this thread, two cameras made ~4 frames a second each while turning; see README."""
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+        from concurrent.futures import wait as wait_any
+        pool = ThreadPoolExecutor(MEASURE_WORKERS, thread_name_prefix="robot-measure" if lit else "robot-measure-geometry")
+        local = threading.local()
+        under_way: dict = {}   # sensor name -> the future of its measurement
         turn = 0
-        while self._alive(run):
-            if self.replaying:          # the recording renders the sensors itself
-                time.sleep(0.05)
-                continue
-            wanted = self.rendering()   # a sensor nobody shows is not rendered
+
+        def client():   # one connection per worker: requests travel side by side
+            from .client import RenderClient
+            if self.client is not None:
+                return None   # the world's own (in-process) client
+            if getattr(local, "client", None) is None:
+                local.client = RenderClient(self.server_url)
+            return local.client
+        try:
+            while self._alive(run):
+                if self.replaying:          # the recording renders the sensors itself
+                    time.sleep(0.05)
+                    continue
+                wanted = self.rendering()   # a sensor nobody shows is not rendered
+                with self.lock:
+                    order = [n for n, a in self.sensors.items() if n in wanted and a.spec.lit == lit]
+                for n in [n for n, f in under_way.items() if f.done()]:
+                    under_way.pop(n)
+                free = [n for n in order if n not in under_way]
+                if not free or len(under_way) >= MEASURE_WORKERS:
+                    if under_way:
+                        wait_any(list(under_way.values()), timeout=0.1, return_when=FIRST_COMPLETED)
+                    else:
+                        time.sleep(0.05)
+                    continue
+                name = free[turn % len(free)]
+                turn += 1
+                with self.lock:
+                    if self.run_id != run:
+                        return
+                    spec, have = self.sensors[name].spec, self.frames.get(name, {})
+                if spec.rate_hz and time.monotonic() - have.get("at", 0.0) < 1.0 / spec.rate_hz:   # not due yet
+                    time.sleep(0.01 / len(free))
+                    continue
+                under_way[name] = pool.submit(lambda n=name: self._measure_one(run, n, client()))
+        finally:
+            pool.shutdown(wait=False)
+
+    def _measure_one(self, run: int, name: str, client) -> None:
+        """A worker of _measure: one measurement of a sensor, then it is the sensor's frame."""
+        template = self.view_source() if self.view_source is not None else None
+        # standing still for a while: more samples, once per camera (a clean image to look at); moving: few
+        # samples, denoised on the server
+        settled = time.monotonic() - self.moved_at > 0.6
+        try:
+            t0 = time.monotonic()
             with self.lock:
-                order = [n for n, a in self.sensors.items() if n in wanted and a.spec.lit == lit]
-            if not order:
-                time.sleep(0.05)
-                continue
-            name = order[turn % len(order)]
-            turn += 1
-            template = self.view_source() if self.view_source is not None else None
-            # standing still for a while: more samples, once per camera (a clean image to look at); moving: few
-            # samples, denoised on the server
-            settled = time.monotonic() - self.moved_at > 0.6
-            try:
-                t0 = time.monotonic()
-                with self.lock:
-                    if self.run_id != run:
-                        return
-                    spec, seq_at, have = self.sensors[name].spec, self.pose_seq, self.frames.get(name, {})
-                if spec.rate_hz and t0 - have.get("at", 0.0) < 1.0 / spec.rate_hz:   # not due yet
-                    time.sleep(0.01)
-                    continue
-                mode = self.camera_mode(bool(spec.polarized))
-                # this sensor's own settings (sensor_settings): moving, one denoised pass of pass_spp; at rest, passes of
-                # pass_spp up to target_spp, fireflies held back, then the denoiser (clean_render)
-                own = self.sensor_settings(name, mode)
-                settled = settled and own["accumulate"]
-                spp = int(own["pass_spp"])
-                passes = max(1, min(64, int(own["target_spp"]) // spp))
-                done = self.sense(name, settled, spp, template, lambda look: not (
-                    settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at), client, passes)
-                if done is None:
-                    time.sleep(0.03)
-                    continue
-                reading, shown_spp, look = done
-                with self.lock:
-                    if self.run_id != run:
-                        return
-                    self.frames[name] = {"jpeg": _jpeg(reading.picture), "seq": self.frames.get(name, {}).get("seq", 0) + 1,
-                                         "spp": shown_spp, "still": settled, "look": look, "pose_seq": seq_at, "at": t0,
-                                         "modality": reading.modality, "info": reading.info, "seconds": round(time.monotonic() - t0, 3)}
-                    self.error = ""
-                    if self.message.startswith("로봇이 든 씬"):
-                        self.message = ""
-            except Exception as exc:  # noqa: BLE001 - the render server went away (a restart): say so, try again
-                with self.lock:
-                    if self.run_id == run:
-                        self.error = f"{type(exc).__name__}: {str(exc)[:200]}"
-                self.reregister()
-                time.sleep(2.0)
+                if self.run_id != run or name not in self.sensors:
+                    return
+                spec, seq_at, have = self.sensors[name].spec, self.pose_seq, self.frames.get(name, {})
+            mode = self.camera_mode(bool(spec.polarized))
+            # this sensor's own settings (sensor_settings): moving, one denoised pass of pass_spp; at rest, passes of
+            # pass_spp up to target_spp, fireflies held back, then the denoiser (clean_render)
+            own = self.sensor_settings(name, mode)
+            settled = settled and own["accumulate"]
+            spp = int(own["pass_spp"])
+            passes = max(1, min(64, int(own["target_spp"]) // spp))
+            got = self._render(name, settled, spp, template, lambda look: not (
+                settled and have.get("still") and have.get("look") == look and have.get("pose_seq") == seq_at), client, passes,
+                abort=lambda: self.pose_seq != seq_at)   # moved on: a moving frame now, not the rest of this clean one
+            if got is None:
+                time.sleep(0.03)
+                return
+            actor, request, outs, shown_spp, look = got
+            reading = self._read(name, actor, request, outs, own.get("isp") is not False)
+            jpeg = _jpeg(reading.picture)
+        except Exception as exc:  # noqa: BLE001 - the render server went away (a restart): say so, try again
+            self._failed(run, exc)
+            return
+        with self.lock:
+            if self.run_id != run or name not in self.sensors:
+                return
+            self.frames[name] = {"jpeg": jpeg, "seq": self.frames.get(name, {}).get("seq", 0) + 1,
+                                 "spp": shown_spp, "still": settled, "look": look, "pose_seq": seq_at, "at": t0,
+                                 "modality": reading.modality, "info": reading.info, "seconds": round(time.monotonic() - t0, 3)}
+            self.error = ""
+            if self.message.startswith("로봇이 든 씬"):
+                self.message = ""
+
+    def _failed(self, run: int, exc: Exception) -> None:
+        with self.lock:
+            if self.run_id == run:
+                self.error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        self.reregister()
+        time.sleep(2.0)
 
     # --- the viewer's calls ---------------------------------------------------------------------------------------
     def rendering(self) -> set:

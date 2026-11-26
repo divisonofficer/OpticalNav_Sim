@@ -144,6 +144,28 @@ def _cv2():
     return _CV2[0]
 
 
+_TABLES: dict = {}
+
+
+def _table(map_x: np.ndarray, map_y: np.ndarray, h: int, w: int) -> tuple:
+    """The four source pixels (flat indices) and bilinear weights of every output pixel, made once per lens map and
+    image size: a camera's map is fixed (RenderPlan), and the floors, clips and weights were most of a remap's time."""
+    key = (id(map_x), id(map_y), h, w)
+    hit = _TABLES.get(key)
+    if hit is not None and hit[0] is map_x and hit[1] is map_y:
+        return hit[2]
+    x, y = np.clip(map_x, 0.0, w - 1.0), np.clip(map_y, 0.0, h - 1.0)
+    x0, y0 = np.minimum(np.floor(x).astype(np.int64), w - 2), np.minimum(np.floor(y).astype(np.int64), h - 2)
+    fx, fy = (x - x0).astype(np.float32), (y - y0).astype(np.float32)
+    i00 = (y0 * w + x0).ravel()
+    idx = (i00, i00 + 1, i00 + w, i00 + w + 1)
+    wts = tuple(a.ravel() for a in ((1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy))
+    if len(_TABLES) > 32:   # cameras and sizes in use: a handful
+        _TABLES.clear()
+    _TABLES[key] = (map_x, map_y, (idx, wts, map_x.shape))
+    return _TABLES[key][2]
+
+
 def remap(image: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
     """Bilinear resampling of ``image`` (H x W or H x W x C) at (map_x, map_y); the edge is repeated outside."""
     img = np.asarray(image)
@@ -151,6 +173,17 @@ def remap(image: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray
         # the same resampling, several times faster (it interpolates in 1/32 pixel steps: 5e-4 of a step's contrast)
         return _cv2().remap(img, map_x, map_y, _cv2().INTER_LINEAR, borderMode=_cv2().BORDER_REPLICATE)
     h, w = img.shape[:2]
+    if h >= 2 and w >= 2:
+        # the sampling table of this lens (cached), then four gathers: a 792 x 514 render to 720 x 464 RGB in ~5 ms
+        # instead of ~17 (the viewer's Python has no working OpenCV: built against a newer numpy)
+        idx, wts, shape = _table(map_x, map_y, h, w)
+        flat = img.reshape(h * w, -1)
+        out = None
+        for i, wt in zip(idx, wts):
+            part = flat[i] * wt[:, None]
+            out = part if out is None else out + part
+        out = out.reshape(shape + img.shape[2:])
+        return out.astype(img.dtype if img.dtype.kind == "f" else np.float32, copy=False)
     x, y = np.clip(map_x, 0.0, w - 1.0), np.clip(map_y, 0.0, h - 1.0)
     x0, y0 = np.minimum(np.floor(x).astype(np.int64), w - 2), np.minimum(np.floor(y).astype(np.int64), h - 2)
     fx, fy = (x - x0).astype(np.float32), (y - y0).astype(np.float32)

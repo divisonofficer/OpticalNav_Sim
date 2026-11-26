@@ -1401,3 +1401,32 @@ def test_sensor_render_settings_are_each_cameras_own():
             session.set_sensor_settings("hdr", bad)
     with pytest.raises(ValueError):
         session.set_sensor_settings("nope", {"pass_spp": 8})
+    assert session.sensor_settings("12bit", "polar")["isp"] is True             # a camera's sensor model and ISP: on
+    assert session.set_sensor_settings("12bit", {"isp": False})["isp"] is False
+
+
+def test_camera_without_isp_is_its_render_through_the_lens():
+    """ISP off: the render with the lens's distortion and a display tone, no sensor model; the same size as with it."""
+    from opticalnav_sim import robot_view
+    from opticalnav_sim.hw.sim import SimWorld
+
+    class Stub:
+        last_timing = {}
+
+        def register_body(self, *a, **k):
+            return {}
+
+        def meta(self, *a):
+            return {}
+    world = SimWorld(scene="", spp=16, client=Stub())
+    robot = hw.config.spawn(world, "ranger_mini", rig="hdr_12bit_mast")
+    session = robot_view.RobotSession("http://127.0.0.1:1", calibration="")
+    session.world, session.sensors = world, dict(robot.sensors)
+    actor = robot.sensors["12bit"]
+    request = actor.spec.request(world, actor, spp=16, scale=0.25)
+    v = request["views"][0]
+    out = {"radiance": np.random.default_rng(0).lognormal(-1.0, 1.0, (v["height"], v["width"], 3)).astype(np.float32)}
+    off = session._read("12bit", actor, request, [out], isp=False)
+    on = session._read("12bit", actor, request, [out], isp=True)
+    assert off.picture.dtype == np.uint8 and off.picture.shape == on.picture.shape
+    assert "ISP" in off.info["format"] and 30 < off.picture.mean() < 225

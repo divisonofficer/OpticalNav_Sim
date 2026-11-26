@@ -223,7 +223,8 @@ def expose(frame, spec, exposure_s: float | None = None, gain_db: float = 0.0, n
             return np.minimum(mean_e + dark, full_well)
         got = rng.poisson((mean_e + dark) * n).astype(np.float64) / n
         got = np.minimum(got, full_well)
-        return got + rng.normal(0.0, read_noise / math.sqrt(n), mean_e.shape)
+        # float32 draws: the same normal, in less time (the HDR camera reads three wells a frame)
+        return got + rng.standard_normal(mean_e.shape, dtype=np.float32) * np.float32(read_noise / math.sqrt(n))
 
     full = float(2 ** sensor.bit_depth - 1)
     black = round(sensor.black_level * full)

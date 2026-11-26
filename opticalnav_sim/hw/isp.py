@@ -33,6 +33,11 @@ class Isp:
 
 def _filter(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """Correlation with a small kernel, the edge mirrored (so a mosaic's phase carries over the border)."""
+    try:   # SciPy when present: the same numbers (mode "mirror" is np.pad's "reflect"), ~4x faster
+        from scipy.ndimage import correlate
+        return correlate(np.asarray(img, dtype=np.float64), np.asarray(kernel, dtype=np.float64), mode="mirror")
+    except ImportError:
+        pass
     r = kernel.shape[0] // 2
     pad = np.pad(img, r, mode="reflect")
     out = np.zeros_like(img, dtype=np.float64)
@@ -81,8 +86,10 @@ def demosaic(values: np.ndarray, cfa: str = "RGGB", method: str = "malvar") -> n
 
 
 def srgb(linear: np.ndarray) -> np.ndarray:
-    a = np.clip(linear, 0.0, 1.0)
-    return np.where(a <= 0.0031308, 12.92 * a, 1.055 * np.power(a, 1.0 / 2.4) - 0.055)
+    # in float32: a third of the time of float64 (the power is most of it), and the 8-bit image it becomes is the same
+    # but for a value on a rounding edge
+    a = np.clip(np.asarray(linear, dtype=np.float32), 0.0, 1.0)
+    return np.where(a <= 0.0031308, np.float32(12.92) * a, np.float32(1.055) * np.power(a, np.float32(1.0 / 2.4)) - np.float32(0.055))
 
 
 def linear_rgb(raw: Raw, config: Isp | None = None) -> np.ndarray:
