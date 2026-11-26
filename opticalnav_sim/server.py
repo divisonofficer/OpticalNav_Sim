@@ -1734,7 +1734,7 @@ class Resident:
         return z
 
     def raster_views(self, cams: list, width: int, height: int, hfov_deg: float, follow: bool, look: Look,
-                     aa: str = "off") -> tuple:
+                     aa: str = "edge") -> tuple:
         """The rasterized preview (raster.py) of each camera, with the scene as ``look`` has it (written into the
         scene as a launch would, so the path tracer and the preview always show the same state). Returns
         (each view's Stokes images [S0..S3] in R, G, B and near-infrared lanes, depths, timing parts)."""
@@ -2844,7 +2844,7 @@ class Renderer:
             raise ValueError(f"{scan} has no .blend for the Cycles backend (tools/attach_blend.py)")
         if renderer == "cycles" and bands == "nir":
             raise ValueError("the Cycles backend renders RGB only")
-        raster_aa = str(view.get("raster_aa", "off"))  # the preview's antialiasing (raster.AA_MODES)
+        raster_aa = str(view.get("raster_aa", "edge"))  # the preview's antialiasing (raster.AA_MODES; edge: nearly free)
         if raster_aa not in ("off", "edge", "ssaa2"):
             raise ValueError("raster_aa must be 'off', 'edge' or 'ssaa2'")
         # bodies: [{"id", "model" (POST /v1/bodies), "links": {link: object-to-world 4x4}}]. Which bodies a view
@@ -3040,7 +3040,7 @@ class Renderer:
         return lambda: lambda: ([{"depth": z} for z in maps], kernels, render_s, 0.0)
 
     def _raster_start(self, key: tuple, resident, cams: list, look, follow: bool, queue_s: float, bands: str,
-                      depth: bool, aa: str = "off"):
+                      depth: bool, aa: str = "edge"):
         """_start for the rasterized preview: the views drawn and read back here, handed on in the path tracer's
         bands (RGB Stokes images, near-infrared ones) without its film split."""
         if not resident.rgbn:

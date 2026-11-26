@@ -1098,7 +1098,7 @@ function renderSky() {
   if (document.activeElement !== $("maxdepth")) $("maxdepth").value = String(S.max_depth || 0);
   if (document.activeElement !== $("rrdepth")) $("rrdepth").value = String(S.rr_depth || 0);
   const raster = S.render_mode === "raster";  // (S.renderer: the render server's state)
-  if (document.activeElement !== $("rasteraa")) $("rasteraa").value = S.raster_aa || "off";
+  if (document.activeElement !== $("rasteraa")) $("rasteraa").value = S.raster_aa || "edge";
   document.body.classList.toggle("raster", raster);
   document.body.classList.toggle("cycles", S.render_mode === "cycles");
   const blends = ((S.server_info || {}).cycles || {}).scans || [];  // scenes whose pack carries a .blend
