@@ -249,6 +249,16 @@ class SimWorld(World):
     def expose(self, camera: Actor, request: dict, out: dict, exposure_s: float | None = None, gain_db: float | None = None,
                noise: bool = True, binning: bool = False) -> tuple:
         """``capture``'s second half: the server's answer to ``request`` through the camera's sensor."""
+        frame, light, exposure_s, gain_db, covered = self.meter(camera, request, out, exposure_s, gain_db, binning)
+        return sensor_model.expose(frame, camera.spec, exposure_s, gain_db, noise, seed=self.seed,
+                                   pixels_per_sample=covered, light=light), frame
+
+    def meter(self, camera: Actor, request: dict, out: dict, exposure_s: float | None = None, gain_db: float | None = None,
+              binning: bool = False) -> tuple:
+        """``expose``'s first half, the one with state: the lens's image of the render, the light on each well, and the
+        setting this frame is taken with (the auto exposure moves on, so frames come here one by one, in order).
+        ``(frame, light, exposure_s, gain_db, pixels_per_sample)``: what ``hw.sensor.expose`` takes, a pure function
+        of them and a seed (hw.offload runs it in another process)."""
         polar = camera.spec.sensor.cfa.startswith("polar_")
         frame = self.frame(request, out, ("s0", "s1", "s2") if polar else ("s0",))
         light = sensor_model.irradiance(frame, camera.spec)   # once: the meter and the sensor both read it
@@ -256,5 +266,4 @@ class SimWorld(World):
             exposure_s, auto_gain = camera.state.exposure.next(frame, camera.spec, light)
             gain_db = auto_gain if gain_db is None else gain_db
         covered = (camera.spec.sensor.width / frame.intrinsics.width) ** 2 if binning else 1.0
-        return sensor_model.expose(frame, camera.spec, exposure_s, gain_db or 0.0, noise, seed=self.seed,
-                                   pixels_per_sample=covered, light=light), frame
+        return frame, light, exposure_s, gain_db or 0.0, covered
