@@ -20,8 +20,10 @@ What merges: a top-level ``ply`` or ``obj`` shape that
     perturbation_pool.json, room_map.json, ...), no ``metadata`` value of another shape's note (a light's fixture_id);
   * is the same, byte for byte with its note, in every scene file of the directory (base.xml, perturbed.xml,
     glassmirror.xml, active_polar*.xml): a variant stays "base plus extra shapes" for server.extra_shapes;
-  * may not move (physics): its note has no ``"dynamic": true``, and neither scene.json's ``physics.dynamic`` regexes nor
-    ``--keep`` match its id or its label (re.search; the label is the Blender object, so one regex keeps all its parts);
+  * may not move (physics): it is not in physics.json's ``movable_parts`` (tools/physics_tag.py: the objects a robot could
+    push, decided from the scene; kept reason ``dynamic``), its note has no ``"dynamic": true``, and neither scene.json's
+    ``physics.dynamic`` regexes nor ``--keep`` match its id or its label (re.search; the label is the Blender object, so one
+    regex keeps all its parts);
   * carries only a filename, a to_world, its BSDF (inline or a <ref>) and face_normals / flip_normals, and its mesh has no
     attribute beyond positions, normals and UVs.
 Shapes merge when everything apart from the file and the transform is the same: the BSDF text, face_normals, flip_normals and
@@ -34,9 +36,10 @@ loader renormalises). face_normals and flip_normals stay properties of the merge
 Undo and physics. ``merged_meshes.json`` (scene dir; scene.json's ``mesh_merge.manifest``) keeps, per merged shape, its file,
 key and material, and per part its id, note, file, exact text in the scene file, vertex and face range in the merged mesh and
 bounding box. ``--unmerge`` puts the original files back byte for byte (a scene file edited since gets every part back in place
-of its merged shape). To let an object move, add it to scene.json ``"physics": {"dynamic": [regex, ...]}`` (or its note's
-``"dynamic": true``) and run again: a merged scene is first unmerged, then merged with the new plan (``--if-needed``: only when
-the plan changed). The manifest names the original meshes, so tools/compact_assets.py keeps them (it keeps what any JSON names).
+of its merged shape). To let an object move, tag the scene (tools/physics_tag.py writes physics.json) or add it to scene.json
+``"physics": {"dynamic": [regex, ...]}`` (or its note's ``"dynamic": true``) and run again: a merged scene is first unmerged,
+then merged with the new plan (``--if-needed``: only when the plan changed, so a new physics.json is noticed). The
+manifest names the original meshes, so tools/compact_assets.py keeps them (it keeps what any JSON names).
 opticalnav_sim.merged_meshes.original_text gives a reader the scene object by object (groundmap.scene_surfaces reads it so).
 
 Like compact_assets: files are never written in place (pack assets are hard links), the scene's lock is held, scene.json
@@ -63,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compact_assets import SceneBusy, scene_lock  # noqa: E402
 from opticalnav_sim import bodies as body_models, server  # noqa: E402
 from opticalnav_sim.merged_meshes import MANIFEST, VERSION, read_manifest, restore_text, sha1_text  # noqa: E402
+from opticalnav_sim.physics_objects import PHYSICS  # noqa: E402
 
 MERGED_PREFIX = "merged_"
 MERGED_FILE = re.compile(r"merged_[0-9a-f]{20}\.ply$")
@@ -160,16 +164,26 @@ def _strings(obj, out: set) -> None:
 
 
 def json_strings(scene_dir: Path) -> set[str]:
-    """Every key and string value of the scene dir's JSON files but this tool's manifest: an id among them is looked up."""
+    """Every key and string value of the scene dir's JSON files but this tool's manifest and physics.json (it names every
+    shape, fixed or not; its ``movable_parts`` are read by ``physics_movable``): an id among them is looked up."""
     out: set[str] = set()
     for f in scene_dir.rglob("*.json"):
-        if f.name == MANIFEST and f.parent == scene_dir:
+        if f.name in (MANIFEST, PHYSICS) and f.parent == scene_dir:
             continue
         try:
             _strings(json.loads(f.read_text()), out)
         except (OSError, ValueError):
             continue
     return out
+
+
+def physics_movable(scene_dir: Path) -> set[str]:
+    """The shapes tools/physics_tag.py found movable (physics.json ``movable_parts``): each stays a shape of its own."""
+    try:
+        data = json.loads((scene_dir / PHYSICS).read_text())
+    except (OSError, ValueError):
+        return set()
+    return {str(s) for s in data.get("movable_parts") or []} if isinstance(data, dict) else set()
 
 
 def rest_of(inner: str) -> str:
@@ -220,6 +234,7 @@ def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> di
         lamp_ids |= {sid for sid in shape_m if sid == o["id"] or sid.startswith(o["id"] + "__part_")}
     lamp_ids |= {L["id"] for L in list(paired.values()) + list(orphans)}
     physics = [re.compile(r) for r in ((meta or {}).get("physics") or {}).get("dynamic") or []]
+    movable = physics_movable(scene_dir)
     keep_rx = [re.compile(r) for r in keep]
 
     def matches(rxs, s) -> bool:
@@ -244,6 +259,8 @@ def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> di
             reason = "lamp"
         elif note.get("dynamic"):
             reason = "dynamic_note"
+        elif sid in movable:
+            reason = "dynamic"
         elif matches(physics, s):
             reason = "physics_list"
         elif matches(keep_rx, s):

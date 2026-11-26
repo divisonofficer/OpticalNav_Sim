@@ -755,15 +755,34 @@ def run_inside(cfg: dict) -> None:
         used_ids.add(sid)
         return sid
 
-    def note(obj_id: str, label: str, material_name: str, center: list, size: list, base_h: float, emission) -> str:
+    def note(obj_id: str, label: str, material_name: str, center: list, size: list, base_h: float, emission,
+             tree: tuple = (None, None)) -> str:
         n = {"id": obj_id, "type": "landmark", "label": label, "placement": "point", "material": san(material_name or "default"),
              "source_ref": None, "is_emitter": emission is not None, "emitter_radiance": emission, "emitter_intensity": 1.0,
              "emitter_shape": None, "emitter_polarized": False, "emitter_polarizer_angle_deg": 0.0, "emitter_pattern": None,
              "geometry": {"type": "point", "center": center, "start": None, "end": None, "height_m": None, "thickness_m": None,
                           "size_m": size, "base_height_m": base_h, "yaw_deg": 0.0, "pitch_deg": 0.0, "roll_deg": 0.0, "scale": None},
              "nav": {"blocks": True, "hazard_type": None, "include_hazard_mask": False, "goal_candidate": False,
-                     "instruction_candidate": False}}
+                     "instruction_candidate": False},
+             "object": tree[0], "collection": tree[1]}
         return json.dumps(n, separators=(",", ":"))
+
+    def root_of(ob):
+        """The top of an object's parent chain (Blender's own hierarchy: a stool's seat, stem and spokes under its empty)."""
+        seen = set()
+        while ob.parent is not None and ob.name not in seen:
+            seen.add(ob.name)
+            ob = ob.parent
+        return ob
+
+    def hierarchy(inst, ob) -> tuple:
+        """(object, collection) of a drawn instance: ``object`` the root of its parent chain, for a collection instance (or a
+        particle / vertex instance) the root of the empty or mesh that instances it, so every part of one placed asset
+        names the same object; ``collection`` the first collection the object is in (not the scene's master collection).
+        tools/physics_tag.py groups parts into objects by them."""
+        src = inst.parent.original if inst.is_instance and inst.parent is not None else ob
+        coll = next((c.name for c in ob.users_collection if c != scene.collection), None)
+        return root_of(src).name, coll
 
     view_layer = bpy.context.view_layer
     # a big mesh drawn three or more times (linked duplicates, a tree instanced on the vertices of a ground: PH37's two tree meshes of
@@ -826,6 +845,7 @@ def run_inside(cfg: dict) -> None:
             flip = np.linalg.det(W3) < 0
             nmat = np.linalg.inv(W3).T
             slots = [s.material for s in o.material_slots] or [None]
+            tree = hierarchy(inst, o)
             report["objects"] += 1
             parts = sorted(set(tmat.tolist()))
             key = mesh_key(ev, o)
@@ -916,7 +936,7 @@ def run_inside(cfg: dict) -> None:
                 lo, hi = u[:, :3].min(0), u[:, :3].max(0)
                 note_xml = note(sid, o.name, mat.name if mat else "default", [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
                                 [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]),
-                                emission[1] if emission else None)
+                                emission[1] if emission else None, tree)
                 emit = f'    <emitter type="area">\n{emission[0]}    </emitter>\n' if emission else ""
                 shapes_xml.append(f'\n  <!--opticalnav-obj:{note_xml}-->\n  <shape type="ply" id="{sid}">\n'
                                   f'    <string name="filename" value="{path}" />\n{bsdf}{emit}  </shape>')
@@ -931,7 +951,7 @@ def run_inside(cfg: dict) -> None:
                         pos3 = gu[:, :3] + sgn * 0.0005 * nn
                         pth = write_ply(pos3, sgn * gu[:, 3:6], gu[:, 6:8], np.ascontiguousarray(gt if sgn > 0 else gt[:, ::-1]))
                         note3 = note(sid3, o.name, mat.name, [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
-                                     [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), grad)
+                                     [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), grad, tree)
                         shapes_xml.append(f'\n  <!--opticalnav-obj:{note3}-->\n  <shape type="ply" id="{sid3}">\n'
                                           f'    <string name="filename" value="{pth}" />\n{dark}{gem}  </shape>')
                 elif emission and float((hi - lo).min()) < 0.03:
@@ -944,7 +964,7 @@ def run_inside(cfg: dict) -> None:
                     nback /= max(np.linalg.norm(nback), 1e-9)
                     path2 = write_ply(u[:, :3] + 0.0005 * nback, -u[:, 3:6], u[:, 6:8], np.ascontiguousarray(tris[:, ::-1]))
                     note2 = note(sid2, o.name, mat.name if mat else "default", [float((lo[0] + hi[0]) / 2), float((lo[2] + hi[2]) / 2)],
-                                 [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), emission[1])
+                                 [float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])], float(lo[1]), emission[1], tree)
                     shapes_xml.append(f'\n  <!--opticalnav-obj:{note2}-->\n  <shape type="ply" id="{sid2}">\n'
                                       f'    <string name="filename" value="{path2}" />\n{bsdf}{emit}  </shape>')
                     report["two_sided_emitters"] = report.get("two_sided_emitters", 0) + 1
@@ -1168,6 +1188,8 @@ def main() -> int:
     ap.add_argument("--no-map", action="store_true", help="skip the bird's-eye map render (10 to 30 s on the CPU)")
     ap.add_argument("--no-merge", action="store_true",
                     help="leave every object a shape of its own (tools/merge_meshes.py merges static meshes of one material)")
+    ap.add_argument("--no-physics", action="store_true",
+                    help="do not decide which objects are movable (tools/physics_tag.py writes physics.json; the merge keeps them apart)")
     ap.add_argument("--link-blend", action="store_true",
                     help="development: scene.json points at the source .blend instead of a packed copy (seconds, not minutes, for a big one)")
     ap.add_argument("--sky-rotation", type=float, default=270.0,
@@ -1212,7 +1234,7 @@ def main() -> int:
     if previous.exists():
         shutil.rmtree(previous)
     previous.mkdir()
-    kept = [p for p in ("base.xml", "convert_report.json", "merged_meshes.json", "assets", "map/birdeye.png", "sky/world.exr")
+    kept = [p for p in ("base.xml", "convert_report.json", "merged_meshes.json", "physics.json", "assets", "map/birdeye.png", "sky/world.exr")
             if (out / p).exists()]
     for p in kept:  # content-addressed asset names: what this run does not write is not wanted
         (previous / p).parent.mkdir(parents=True, exist_ok=True)
@@ -1281,6 +1303,15 @@ def main() -> int:
     conn = pack / "connectivity"
     if own_template and (conn / f"{args.scene}_connectivity.json").is_file():
         (conn / f"{scene_id}_connectivity.json").write_text((conn / f"{args.scene}_connectivity.json").read_text().replace(args.scene, scene_id))
+    if not args.no_physics:
+        # Which objects a robot could push (tools/physics_tag.py -> physics.json), before the merge so it keeps them apart
+        # the first time. A failure leaves the scene without physics.json: every object static, as before.
+        print("[progress] 0.95 움직이는 물체", flush=True)
+        tagged = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "physics_tag.py"), "--pack", str(pack),
+                                 "--scene", scene_id], capture_output=True, text=True)
+        print((tagged.stdout or "").strip()[-400:] or f"physics_tag: exit {tagged.returncode}", flush=True)
+        if tagged.returncode:
+            print(f"[blend_to_pack] physics tagging failed, every object stays static:\n{tagged.stderr[-1500:]}", flush=True)
     if not args.no_merge:
         # Static meshes of one material become one mesh (tools/merge_meshes.py): thousands of shapes in the file left the
         # loaded meshes with registry ids in the thousands, and with a robot (instances) in the scene every frozen replay
