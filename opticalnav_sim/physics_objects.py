@@ -41,7 +41,7 @@ from pathlib import Path
 import numpy as np
 
 from .groundmap import _PRIMITIVES, _to_world, material_friction, read_ply
-from .merged_meshes import original_text, read_manifest
+from .merged_meshes import is_merged, original_text, read_manifest
 
 VERSION = 1
 PHYSICS = "physics.json"
@@ -100,6 +100,7 @@ MOVABLE = set("""chair chairs stool stools cart carts trolley trolleys dolly box
 suitcase luggage bin bins bucket buckets basket baskets cone cones bag bags trashbag backpack ball balls bottle bottles can
 cans jar jars pot pots vase vases cup cups mug mugs plate plates bowl bowls toolbox tool tools spool driver screwdriver wrench
 hammer pliers monitor keyboard mouse laptop phone book books binder binders magazine folder pillow cushion toy toys pallet
+aframe
 barrel drum tote container canister jerrycan extinguisher bike bicycle scooter fan printer speaker sanitizer kettle
 microwave pcb instrument oscilloscope multimeter meter stack foodbox cupstack caliper""".split())
 MODIFIERS = set("""bench wall floor table desk counter shelf window door office kitchen cafe coffee storage garden bar back
@@ -237,7 +238,7 @@ def _obj(path: Path):
 
 def _merged_slices(scene_dir: Path, text: str) -> dict:
     """part id -> (merged file, vertex range, face range) for the merged shapes the current scene file holds."""
-    manifest = read_manifest(scene_dir) if 'id="merged_' in text else None
+    manifest = read_manifest(scene_dir) if is_merged(text) else None
     out = {}
     for g in (manifest or {}).get("merged", []):
         if g["xml"] in text:
@@ -982,7 +983,7 @@ def floor_under(body: Body, parts: list, ground: list[int], rules: dict) -> floa
 
 def wall_contact(body: Body, parts: list, walls: list[int], own: set, rules: dict) -> dict:
     """Which structure (or large parts) the object touches: {"wall": [labels], "ceiling": [labels]}. A wall is a face
-    within 45 degrees of vertical; a ceiling a horizontal face at the object's top."""
+    within 45 degrees of vertical; a ceiling a horizontal face of structure (only) at the object's top."""
     tol = rules["contact_m"]
     out = {"wall": set(), "ceiling": set()}
     w_lo, w_hi = _boxes(parts, walls)
@@ -1003,7 +1004,10 @@ def wall_contact(body: Body, parts: list, walls: list[int], own: set, rules: dic
         side = tri[ny < 0.7]
         if len(side) and near(v, side, tol).any():
             out["wall"].add(p["label"])
-        # a ceiling: a horizontal face at or over the object's top (not the table top a flat thing lies on)
+        # a ceiling: a horizontal face of structure at or over the object's top (not the table top a flat thing lies on,
+        # not a large shelf board or awning over it: a case in a rack and an A-frame sign under a canopy are free)
+        if not p["structure"]:
+            continue
         top = tri[(ny >= 0.7) & (tri[:, :, 1].min(1) >= body.hi[1] - tol)
                   & (tri[:, :, 1].min(1) > body.lo[1] + 0.5 * (body.hi[1] - body.lo[1]))]
         if len(top) and near(v[v[:, 1] >= body.hi[1] - tol], top, tol).any():

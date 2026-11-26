@@ -194,30 +194,77 @@ def _mitsuba():
         pytest.skip(f"no scalar_rgb Mitsuba: {exc}")
 
 
-def test_merge_keeps_movable_objects_apart_and_merges_again_when_physics_changes(tmp_path):
+def shape_ids(scene: Path) -> set:
+    return {s["id"] for s in mm.top_shapes((scene / "base.xml").read_text())}
+
+
+def merged_of(scene: Path) -> dict:
+    """Merged shape id -> (its physics object, its part ids)."""
+    return {g["id"]: (g.get("object"), [p["id"] for p in g["parts"]]) for g in mm.read_manifest(scene)["merged"]}
+
+
+def set_keep(scene: Path, scope: str) -> None:
+    meta = json.loads((scene / "scene.json").read_text())
+    meta["physics"] = {"keep": scope}
+    (scene / "scene.json").write_text(json.dumps(meta))
+
+
+def test_merge_makes_one_body_per_kept_object_and_follows_the_scope(tmp_path):
     _mitsuba()
     scene = room(tmp_path)
+    original = (scene / "base.xml").read_bytes()
     physics_tag.tag_scene(scene)
     data = json.loads((scene / po.PHYSICS).read_text())
-    movable = set(data["movable_parts"])
-    assert {"stool_seat", "stool_leg", "cup", "crate_a", "crate_b"} <= movable
+    obj = by_part(data)
+    reach = {o["id"] for o in data["objects"] if o["movable"] and o["robot_reachable"]}
+    assert {obj["crate_a"]["id"], obj["stool_seat"]["id"]} <= reach and obj["cup"]["id"] not in reach
+    # keep "reachable" (the default): the crate's two pine shapes become one body mesh; the cup (on the table, out of
+    # the robot's reach) merges with the oak table like any static shape
     summary = mm.merge_scene(scene)
-    assert summary["kept"]["dynamic"] == len(movable)
-    merged_ids = {p["id"] for g in mm.read_manifest(scene)["merged"] for p in g["parts"]}
-    assert merged_ids and not (merged_ids & movable)                  # the table, the shelf ... merged; movable ones not
-    shapes = {s["id"] for s in mm.top_shapes((scene / "base.xml").read_text())}
-    assert movable <= shapes
-    assert not mm.needs_merging(scene)
-    # the scene tagged again from its merged files: the same objects and decisions (geometry from the merged slices)
+    merged = merged_of(scene)
+    crate = obj["crate_a"]["id"]
+    assert merged[f"dyn_{crate}_1"] == (crate, ["crate_a", "crate_a_lid"])
+    static = [m for m, (o, parts) in merged.items() if o is None and "cup" in parts]
+    assert static and static[0].startswith("merged_")
+    assert summary["kept"]["dynamic_single"] >= 3                       # crate_b, the stool's fabric and chrome parts
+    record = json.loads((scene / po.PHYSICS).read_text())["merge"]
+    assert record["keep"] == "reachable"
+    assert record["objects"][crate] == {"kept": True, "shapes": [f"dyn_{crate}_1"]}
+    assert record["objects"][obj["stool_seat"]["id"]] == {"kept": True, "shapes": ["stool_seat", "stool_leg"]}
+    assert record["objects"][obj["cup"]["id"]] == {"kept": False, "shapes": static}
+    assert set(record["objects"][crate]["shapes"]) <= shape_ids(scene)
+    assert not mm.needs_merging(scene) and not physics_tag.needs_tagging(scene)
+    # read from the merged files (dyn_ shapes too), the scene gives the same objects
     again = po.analyse(scene)
     assert again["movable_parts"] == data["movable_parts"]
     assert [o["mass_kg"] for o in again["objects"]] == pytest.approx([o["mass_kg"] for o in data["objects"]])
-    assert not physics_tag.needs_tagging(scene)
-    # physics.json changes (the cup is fixed now): the merge plan changes, the scene is unmerged and merged anew
-    data["movable_parts"] = [p for p in data["movable_parts"] if p != "cup"]
+    # tagged again, physics.json keeps what the merge recorded
+    physics_tag.tag_scene(scene)
+    assert json.loads((scene / po.PHYSICS).read_text())["merge"] == record
+    # keep "movable": the cup is a body of its own too (one shape: left alone), merged anew
+    set_keep(scene, "movable")
+    assert mm.needs_merging(scene)
+    mm.merge_scene(scene)
+    assert "cup" in shape_ids(scene) and not any("cup" in parts for _, parts in merged_of(scene).values())
+    assert json.loads((scene / po.PHYSICS).read_text())["merge"]["objects"][obj["cup"]["id"]]["kept"]
+    # physics.json changes (the cup is fixed now): merged with the table again
+    data = json.loads((scene / po.PHYSICS).read_text())
+    for o in data["objects"]:
+        if "cup" in o["parts"]:
+            o["movable"] = False
     (scene / po.PHYSICS).write_text(json.dumps(data))
     assert mm.needs_merging(scene)
     mm.merge_scene(scene)
-    merged_ids = {p["id"] for g in mm.read_manifest(scene)["merged"] for p in g["parts"]}
-    assert "cup" in merged_ids and "cup" not in {s["id"] for s in mm.top_shapes((scene / "base.xml").read_text())}
+    assert "cup" not in shape_ids(scene)
+    # keep "none": every object static, the crate's shapes in the pine mesh of the scene with the other crate
+    set_keep(scene, "none")
+    assert mm.needs_merging(scene)
+    mm.merge_scene(scene)
+    assert not any(m.startswith("dyn_") for m in merged_of(scene))
+    pine = [parts for m, (o, parts) in merged_of(scene).items() if "crate_a" in parts]
+    assert pine and set(pine[0]) == {"crate_a", "crate_a_lid", "crate_b"}
     assert not mm.needs_merging(scene)
+    # and back, byte for byte
+    mm.unmerge_scene(scene)
+    assert (scene / "base.xml").read_bytes() == original
+    assert "merge" not in json.loads((scene / po.PHYSICS).read_text())

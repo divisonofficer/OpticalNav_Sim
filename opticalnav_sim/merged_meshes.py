@@ -14,6 +14,7 @@ from pathlib import Path
 
 MANIFEST = "merged_meshes.json"
 VERSION = 1
+DYN_PREFIX = "dyn_"   # the merged meshes of one movable object (tools/merge_meshes.py, physics.json)
 
 
 def sha1_text(text: str) -> str:
@@ -54,9 +55,14 @@ def restore_text(text: str, manifest: dict, name: str) -> tuple[str, bool]:
     return text, False
 
 
+def is_merged(text: str) -> bool:
+    """Whether a scene file holds merged shapes (static ``merged_`` ones or a movable object's ``dyn_`` ones)."""
+    return 'id="merged_' in text or f'id="{DYN_PREFIX}' in text
+
+
 def original_text(scene_dir, xml: str = "base.xml") -> str:
     """The scene file ``xml`` as it was before the merge (as it is, when the scene has no manifest)."""
     scene_dir = Path(scene_dir)
     text = (scene_dir / xml).read_text()
-    manifest = read_manifest(scene_dir) if 'id="merged_' in text else None
+    manifest = read_manifest(scene_dir) if is_merged(text) else None
     return text if manifest is None else restore_text(text, manifest, xml)[0]

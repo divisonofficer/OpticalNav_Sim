@@ -7,8 +7,10 @@ opticalnav_sim/physics_objects.py does the work (read the scene object by object
 them, classify them by rules, a convex hull for each movable one); this tool runs it over a pack's scenes and writes the
 result. physics.json carries the rules and thresholds it used, per object its part (shape) ids, label, ``movable``,
 ``robot_reachable``, confidence, the reason, mass, centre of mass, box, support, and for a movable one a pose, a hull and a
-friction, plus ``movable`` (object ids) and ``movable_parts`` (shape ids): tools/merge_meshes.py keeps every shape of
-``movable_parts`` apart (kept reason ``dynamic``), so a physics engine can move them as bodies the way the robot's are.
+friction, plus ``movable`` (object ids) and ``movable_parts`` (shape ids). tools/merge_meshes.py makes the movable
+objects its scope keeps (``keep`` here or scene.json ``physics.keep``: "reachable", the default, "movable" or "none") one
+body each, ``dyn_<object>_<n>`` meshes merged per material, and records under ``merge`` which shapes hold each movable
+object, so a physics engine can move them as bodies the way the robot's are.
 
 Order: tag, then merge. A merged scene is tagged from its manifest (the parts as they were, merged_meshes.original_text);
 merge_meshes.needs_merging sees a changed physics.json (its plan changes) and the merge unmerges and merges again. From
@@ -79,6 +81,11 @@ def tag_scene(scene_dir, xml: str = "base.xml", dry_run: bool = False, show: boo
     scene_dir = Path(scene_dir)
     with scene_lock(scene_dir):
         result = physics_objects.analyse(scene_dir, xml)
+        # what is not the analysis carries over: the scope a person set ("keep") and what the last merge recorded
+        # ("merge": a new movable list changes the merge plan, and that merge writes it again)
+        for key in ("keep", "merge"):
+            if key in (read_physics(scene_dir) or {}):
+                result[key] = read_physics(scene_dir)[key]
         if not dry_run:
             result["at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             _write(scene_dir / PHYSICS, json.dumps(result, separators=(",", ":")))
