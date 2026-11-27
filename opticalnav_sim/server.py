@@ -1888,7 +1888,8 @@ class Resident:
                 self.object_pose[oid] = m.tobytes()
         if changed:
             self.scene.parameters_changed([])
-        return time.perf_counter() - t0
+        self.objects_s = time.perf_counter() - t0   # in the next launch's time split (objects_s)
+        return self.objects_s
 
     def intensity_lanes(self, img):
         """An RGBN Stokes film (a Dr.Jit tensor, 19 or 20 channels) cut down on the GPU to R, G, B and the near-infrared
@@ -2076,6 +2077,7 @@ class Resident:
         if repeats > 1:
             img = img / float(repeats)
         breakdown["replay_s"] = time.perf_counter() - t2
+        breakdown["objects_s"] = self.__dict__.pop("objects_s", 0.0)   # pushed objects moved for this frame (set_objects)
         return img, breakdown
 
     def _place_shapes(self, p, hidden: frozenset) -> None:
