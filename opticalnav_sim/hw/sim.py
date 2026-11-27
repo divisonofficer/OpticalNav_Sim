@@ -119,7 +119,8 @@ class SimWorld(World):
         gm = None
         if saved.is_file() and not rebuild:
             gm = groundmap.GroundMap.load(saved)
-            fits = gm.cell == cell and abs(gm.top - top) < 1e-6 and gm.meta.get("reader") == groundmap.READER
+            fits = gm.cell == cell and abs(gm.top - top) < 1e-6 and gm.meta.get("reader") == groundmap.READER \
+                and gm.meta.get("pushed") == groundmap.pushed_key(folder)   # what the physics step moves is left out
             if center is None:
                 fits = fits and abs(gm.floor_z - floor_z) <= 0.02 and gm.meta.get("around") == around and not gm.meta.get("center")
             else:   # a map made for another place does while it holds this one with room to drive (or to the scene's edge)
@@ -192,6 +193,9 @@ class SimWorld(World):
         bodies = self.bodies()
         if bodies:
             view["bodies"] = bodies
+        objects = getattr(self, "objects_view", None)   # pushed objects (robot_view: hw.physics), as the editor sees them
+        if objects:
+            view["objects"] = objects
         return view, plan, k
 
     def request(self, camera: Actor, spp: int | None = None, scale: float | None = None, oversample: float = 1.0,

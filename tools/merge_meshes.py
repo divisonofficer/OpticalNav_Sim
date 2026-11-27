@@ -212,12 +212,13 @@ def physics_scope(scene_dir: Path, meta: dict | None) -> str:
 def physics_dynamic(scene_dir: Path, meta: dict | None) -> dict[str, str]:
     """Shape id -> its object id, for the movable objects of physics.json (tools/physics_tag.py) the scope keeps apart.
     Each such object's shapes merge among themselves only (one mesh per object and material), as ``dyn_<object>_<n>``."""
+    from opticalnav_sim.hw.physics import choose   # the physics step's own choice: the bodies it simulates
     data = read_physics(scene_dir)
     scope = physics_scope(scene_dir, meta)
     if data is None or scope == "none":
         return {}
-    return {str(p): str(o["id"]) for o in data.get("objects") or [] if o.get("movable")
-            and (scope == "movable" or o.get("robot_reachable")) for p in o.get("parts") or []}
+    # what lies on a chosen object goes with it (the carton on CS02's cart), as hw.physics makes it a body too
+    return {str(p): str(o["id"]) for o in choose(data, scope) for p in o.get("parts") or []}
 
 
 def rest_of(inner: str) -> str:

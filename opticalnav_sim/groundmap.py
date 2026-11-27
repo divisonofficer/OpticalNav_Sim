@@ -70,7 +70,24 @@ def material_friction(name: str, roughness: float | None = None, metallic: float
     return mu, why
 
 
-READER = 2   # how scene files are read; a saved map of another reading is built again (hw.sim.SimWorld.load_ground)
+READER = 3   # how scene files are read; a saved map of another reading is built again (hw.sim.SimWorld.load_ground)
+
+
+def pushed_parts(scene_dir) -> set:
+    """The shapes of the objects the physics step moves (physics.json's objects kept apart by tools/merge_meshes.py): not
+    in the ground map, which is what does not move. Counted as obstacles, CS02's cart stopped the robot ahead of contact."""
+    path = Path(scene_dir) / "physics.json"
+    if not path.is_file():
+        return set()
+    data = json.loads(path.read_text())
+    kept = {k for k, v in ((data.get("merge") or {}).get("objects") or {}).items() if v.get("kept")}
+    return {str(p) for o in data.get("objects") or [] if o["id"] in kept for p in o.get("parts") or []}
+
+
+def pushed_key(scene_dir) -> str:
+    """What a saved ground map left out for the physics step (pushed_parts), so it is built again when that changes."""
+    import hashlib
+    return hashlib.sha1("\n".join(sorted(pushed_parts(scene_dir))).encode()).hexdigest()[:12]
 
 # Mitsuba's own shapes as meshes: (vertices, triangles)
 _RECTANGLE = (np.array([[-1.0, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]]), np.array([[0, 1, 2], [0, 2, 3]]))
@@ -357,7 +374,8 @@ def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bound
     one to stand on when it faces up (within 45 degrees) and lies within ``below`` under and above the floor.
     Memory is the grids' (25 bytes a cell) plus ``POINTS_AT_ONCE`` samples, whatever the scene's size."""
     scene_dir = Path(scene_dir)
-    surfaces = [s for s in scene_surfaces(scene_dir, xml) if not s["emitter"]]
+    pushed = pushed_parts(scene_dir)   # moved by the physics step: not obstacles of the map
+    surfaces = [s for s in scene_surfaces(scene_dir, xml) if not s["emitter"] and s["id"] not in pushed]
     names = sorted({s["material"] for s in surfaces})
     index = {n: i for i, n in enumerate(names)}
     lo, hi = float(floor_z) - below, float(floor_z) + float(top)
@@ -454,7 +472,8 @@ def build(scene_dir, floor_z: float, top: float = 1.4, cell: float = 0.05, bound
         mu, why = material_friction(name, r, m)
         friction[name] = {"mu": mu, "why": why, "roughness": None if r is None else round(r, 3), "metallic": round(m, 3)}
     return GroundMap(heights.reshape(rows, cols), material.reshape(rows, cols).astype(np.int64), names, friction, (x0, y0), float(cell),
-                     float(floor_z), float(top), {"scene": scene_dir.name, "xml": xml, "samples": int(samples), "shapes": len(surfaces), "reader": READER})
+                     float(floor_z), float(top), {"scene": scene_dir.name, "xml": xml, "samples": int(samples), "shapes": len(surfaces), "reader": READER,
+                      "pushed": pushed_key(scene_dir)})
 
 
 def floor_under(gm: GroundMap, x: float, y: float, near: float | None = None) -> float | None:

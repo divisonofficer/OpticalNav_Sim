@@ -46,6 +46,7 @@ from pathlib import Path
 import numpy as np
 
 CONTROL_TIMEOUT_S = 0.5      # the Ranger's CAN command timeout: no command for this long stops it
+PUSH_LAG_M = 0.05            # the robot's body in the physics this far behind its drive: it is stuck pushing (stop there)
 # sensors measured at once (_measure): their renders side by side on the server, their readings beside
 MEASURE_WORKERS = max(1, int(os.environ.get("OPTICALNAV_ROBOT_MEASURE_WORKERS", "3")))
 DEFAULT_CONFIG = "ranger_mini"
@@ -128,6 +129,8 @@ class RobotSession:
         self.replaying = False           # a recording renders: the robot's real time and its live sensors hold
         self.recording: dict = {"phase": "idle"}   # logging / rendering / encoding / done / error, with its numbers
         self._bodies: list = []          # the robot's links as the render server's view field, as of pose_seq
+        self.push = None                 # hw.physics.PushWorld of the robot's scene: what the robot pushes (built at spawn)
+        self.pushed: dict = {}           # physics object id -> its pose change (4x4 list), the render server's "objects" field
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
     def use(self, config=None, rig=None) -> None:
@@ -192,6 +195,7 @@ class RobotSession:
             self.running = False
             self.world = self.robot = None
             self.sensors, self.frames, self._bodies, self.control = {}, {}, [], None
+            self.push, self.pushed = None, {}   # the objects back where the scene has them (the next view names none)
             self.message = ""
             if had:
                 self.pose_seq += 1
@@ -348,6 +352,48 @@ class RobotSession:
                              "materials": {m: v for m, v in sorted(gm.friction.items(), key=lambda kv: kv[1]["mu"])}}
 
     # --- the loops ------------------------------------------------------------------------------------------------
+    def _physics(self, run: int, world) -> None:
+        """Build the scene's push world (hw.physics: the movable objects of physics.json as free bodies, the robot as the
+        pusher; ~3 s on CS02) beside the drive, which runs meanwhile; from then on each tick of _simulate steps it."""
+        try:
+            from .hw.physics import PushWorld
+            folder = Path(str(world.meta.get("scene_dir") or ""))
+            if not (folder / "physics.json").is_file():
+                return   # no movable objects decided for this scene (tools/physics_tag.py runs when it is opened)
+            with self.lock:
+                spec = self.robot.spec if self.robot is not None else None
+            if spec is None or not hasattr(spec, "footprint"):
+                return
+            height = float(getattr(spec, "size", (0.0, 0.0, 0.3))[2]) + 0.1   # the body over its wheels
+            push = PushWorld.from_scene(folder, np.asarray(spec.footprint())[:, :2], height)
+        except Exception as exc:  # noqa: BLE001 - the robot drives without it
+            print(f"[physics] {type(exc).__name__}: {exc}", flush=True)
+            return
+        with self.lock:
+            if self.run_id == run:
+                self.push, self.pushed = push, {}
+                self.push_rest = {oid: np.asarray(m) for oid, m in push.world_poses().items()}
+
+    def _pushed_report(self) -> dict:   # (under the lock)
+        """What the robot has pushed (hw.physics): each moved object's distance from where the scene has it and its
+        turn, and the objects it touches now."""
+        if self.push is None:
+            return {"ready": False, "touching": [], "objects": {}}
+        rest, now, out = self.push_rest, self.push.world_poses(), {}
+        for oid, m in now.items():
+            m = np.asarray(m)
+            moved = float(np.hypot(*(m[:2, 3] - rest[oid][:2, 3])))
+            turned = math.degrees(math.atan2(m[1, 0], m[0, 0]) - math.atan2(rest[oid][1, 0], rest[oid][0, 0]))
+            turned = (turned + 180.0) % 360.0 - 180.0
+            if moved > 0.01 or abs(turned) > 1.0:
+                out[oid] = {"moved_m": round(moved, 3), "turned_deg": round(turned, 1)}
+        return {"ready": True, "touching": sorted(self.push.contacts()), "objects": out}
+
+    def objects(self, scene: str) -> dict:
+        """The pushed objects of ``scene`` as the render server's view field: object id -> pose change (4x4)."""
+        with self.lock:
+            return dict(self.pushed) if self.robot is not None and scene == self.scene else {}
+
     def _simulate(self, run: int) -> None:
         """The robot's own time: the command (or none: the chassis stops 0.5 s after the last one), a tick of the
         world every ``dt`` of real time, the trail. Never waits for an image."""
@@ -371,6 +417,7 @@ class RobotSession:
                     if self.run_id != run:
                         return
                     control = self.control
+                    before = robot.pose   # where it stood: back to it when what it pushes will not give way
                     if drives:
                         robot.spec.apply(robot.state, hw.Twist() if control is None or now - control[1] > CONTROL_TIMEOUT_S else control[0])
                     for _ in range(steps):
@@ -383,6 +430,19 @@ class RobotSession:
                                 break
                     last += steps * world.dt if steps < 20 else (now - last)
                     ticks += steps
+                    if self.push is not None:   # what the robot pushes (hw.physics), drawn by the render server
+                        moved = self.push.step(robot.pose, steps * world.dt)
+                        if drives and self.push.lag > PUSH_LAG_M:
+                            # pushing something that does not give way (a cart jammed against a rack): the drive model
+                            # knows nothing of it and drove on, the robot's body in the physics stayed; it stays too,
+                            # as against a wall (Drive.settle), instead of driving through the object
+                            robot.pose = before
+                            robot.spec.stop(robot.state)
+                            robot.state.collided = True
+                        if moved:
+                            self.pushed.update({oid: np.asarray(m, dtype=np.float64).tolist() for oid, m in moved.items()})
+                            world.objects_view = dict(self.pushed)
+                            self.pose_seq += 1
                     p, t = robot.pose, robot.state.twist if drives else hw.Twist()
                     if abs(t.vx) + abs(t.vy) + abs(t.wz) > 1e-3:
                         self.moved_at = now
@@ -573,6 +633,7 @@ class RobotSession:
         if pool is not None:   # its workers start while the scene with the robot loads (the readings go here till then)
             pool.start()
         self.moved_at = time.monotonic()
+        threading.Thread(target=self._physics, args=(run, world), name="robot-physics-build", daemon=True).start()
         threading.Thread(target=self._simulate, args=(run,), name="robot-sim", daemon=True).start()
         # two loops: a depth camera or a LiDAR does not wait for the cameras' light
         threading.Thread(target=self._measure, args=(run, False), name="robot-geometry", daemon=True).start()
@@ -784,6 +845,8 @@ class RobotSession:
                 "footprint": [[round(p.xyz[0] + c * fx - s * fy, 3), round(p.xyz[1] + s * fx + c * fy, 3)] for fx, fy in foot],
                 "material": self.world.ground.material_at(p.xyz[0], p.xyz[1]) if self.world is not None else None}
             out["trail"], out["odometry_trail"] = self.trail[-1500:], self.odo_trail[-1500:]
+            # what the robot has pushed (hw.physics): each object's move since the scene file, and what it touches now
+            out["pushed"] = self._pushed_report()
             return out
 
     def frame(self, name: str) -> bytes | None:

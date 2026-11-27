@@ -761,6 +761,9 @@ class Session:
             bodies = self.robot.bodies(scene) if sim.renderer == "path" else []   # the preview rasteriser draws none
             if bodies:
                 view["bodies"] = bodies
+            pushed = self.robot.objects(scene) if sim.renderer == "path" and hasattr(self.robot, "objects") else {}   # hw.physics
+            if pushed:
+                view["objects"] = pushed
         pos = st._free_position or (st.location.x, st.location.y)
         self.cam_now = (*self.free_pose(), float(st.heading), float(st.elevation))
         if not self.trail or self.trail[-1] != (pos[0], pos[1]):
