@@ -231,7 +231,8 @@ class RobotSession:
         c, s = math.cos(math.radians(self.start_pose.rpy_deg[2])), math.sin(math.radians(self.start_pose.rpy_deg[2]))
         cam, follow = self.editor_pose() if self.editor_pose is not None else ((0.0, 0.0, 1.5, 0.0, 0.0), None)
         return {"t": self.world.time, "pose": robot.pose, "state": snap, "cam": cam, "follow": follow,
-                "odometry_xy": (self.start_pose.xyz[0] + c * o[0] - s * o[1], self.start_pose.xyz[1] + s * o[0] + c * o[1])}
+                "odometry_xy": (self.start_pose.xyz[0] + c * o[0] - s * o[1], self.start_pose.xyz[1] + s * o[0] + c * o[1]),
+                "pushed": {k: [list(r) for r in v] for k, v in self.pushed.items()}}   # what it had pushed (hw.physics)
 
     def restore(self, entry: dict) -> None:
         """Put the robot back as an entry of a log has it (its pose and its base's state: the wheels' angles too)."""
@@ -239,6 +240,9 @@ class RobotSession:
         robot.pose = entry["pose"]
         for k, v in entry["state"].items():
             setattr(robot.state, k, v.copy() if isinstance(v, np.ndarray) else v)
+        if "pushed" in entry:   # the objects as they stood at that moment, in every view rendered now
+            self.pushed = dict(entry["pushed"])
+            self.world.objects_view = dict(self.pushed)
 
     def _alive(self, run: int) -> bool:
         return self.running and self.run_id == run
