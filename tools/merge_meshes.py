@@ -75,6 +75,11 @@ from opticalnav_sim.merged_meshes import DYN_PREFIX, MANIFEST, VERSION, read_man
 from opticalnav_sim.physics_objects import PHYSICS  # noqa: E402
 
 MERGED_PREFIX = "merged_"
+# A vertex attribute on every movable object's mesh. Mitsuba's loader merges all top-level meshes of one BSDF into one
+# (MergeShape) unless a mesh has attributes: with it, an object's mesh stays a mesh of its own under its dyn_ id, which
+# the render server moves by rewriting its vertices (and rebuilding its small acceleration structure) as physics
+# pushes the object. Without it, 40 of CS02's 60 kept shapes were swallowed by larger meshes of their material.
+BODY_ATTRIBUTE = "vertex_body"
 MERGED_FILE = re.compile(r"merged_[0-9a-f]{20}\.ply$")
 # ids the server finds shapes by (lights and their groups, the flash, the dataset's mirrors and glass walls, robot bodies)
 PROTECTED_PREFIXES = ("light_", server.HIDDEN_LIGHT_PREFIX, server.HIDDEN_SPEC_PREFIX, server.FILL_PREFIX,
@@ -315,8 +320,8 @@ def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> di
         groups.setdefault(key, []).append(sid)
     out_groups, keys = [], []
     for key, ids in groups.items():
-        if len(ids) < 2:
-            kept["dynamic_single" if key[2] else "single"] += 1
+        if len(ids) < 2 and not key[2]:   # a kept object's lone shape still becomes its dyn_ mesh (BODY_ATTRIBUTE)
+            kept["single"] += 1
             continue
         out_groups.append(ids)
         keys.append(key)
@@ -407,9 +412,10 @@ def load_arrays(scene_dir: Path, kind: str, inner: str) -> dict:
             "faces": np.array(p["faces"], np.uint32).reshape(-1, 3), "extra": extra}
 
 
-def write_merged(scene_dir: Path, arrays: list[dict], merged_inner: str) -> tuple[str, dict]:
+def write_merged(scene_dir: Path, arrays: list[dict], merged_inner: str, body: bool = False) -> tuple[str, dict]:
     """The parts as one mesh in assets/merged_<sha1>.ply (Mesh.write_ply), checked by loading it as the merged shape loads.
-    Returns (file, {"positions", "normals", "uvs", "faces"} of the merged mesh)."""
+    ``body``: a movable object's mesh, given the BODY_ATTRIBUTE vertex attribute so the scene loader leaves it a mesh of
+    its own. Returns (file, {"positions", "normals", "uvs", "faces"} of the merged mesh)."""
     import numpy as np
 
     mi = _mitsuba()
@@ -426,6 +432,8 @@ def write_merged(scene_dir: Path, arrays: list[dict], merged_inner: str) -> tupl
         if merged[key] is not None:
             p[name] = type(p[name])(np.ascontiguousarray(merged[key]).ravel())
     p.update()
+    if body:
+        mesh.add_attribute(BODY_ATTRIBUTE, 1, [0.0] * len(merged["positions"]))
     assets = scene_dir / "assets"
     tmp = assets / f".merged.{os.getpid()}.ply.tmp"
     try:
@@ -593,8 +601,8 @@ def _merge_scene(scene_dir: Path, keep, dry_run: bool) -> dict:
                 continue
             layouts.setdefault((a["normals"] is not None, a["uvs"] is not None), []).append(sid)
         for (has_n, has_uv), sub in layouts.items():
-            if len(sub) < 2:
-                kept["dynamic_single" if obj else "single"] += 1
+            if len(sub) < 2 and not obj:
+                kept["single"] += 1
                 continue
             first = shapes[sub[0]]
             if obj:     # the object's own meshes, numbered: dyn_<object>_1, _2, ... (one per material)
@@ -611,7 +619,7 @@ def _merge_scene(scene_dir: Path, keep, dry_run: bool) -> dict:
             rest = rest_of(first["inner"])
             placeholder = f'\n    <string name="filename" value="assets/merged.ply" />{rest}'
             try:
-                file, mesh = write_merged(scene_dir, [arrays[s] for s in sub], placeholder)
+                file, mesh = write_merged(scene_dir, [arrays[s] for s in sub], placeholder, body=bool(obj))
             except Exception as exc:  # noqa: BLE001 - the group stays as it was
                 print(f"  ! {mid}: {exc} (kept apart)", flush=True)
                 kept["merge_failed"] += len(sub)

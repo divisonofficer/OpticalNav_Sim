@@ -198,6 +198,11 @@ def shape_ids(scene: Path) -> set:
     return {s["id"] for s in mm.top_shapes((scene / "base.xml").read_text())}
 
 
+def mesh_files(scene: Path) -> dict:
+    """Merged shape id -> its PLY file (relative to the scene)."""
+    return {g["id"]: g["file"] for g in mm.read_manifest(scene)["merged"]}
+
+
 def merged_of(scene: Path) -> dict:
     """Merged shape id -> (its physics object, its part ids)."""
     return {g["id"]: (g.get("object"), [p["id"] for p in g["parts"]]) for g in mm.read_manifest(scene)["merged"]}
@@ -226,11 +231,17 @@ def test_merge_makes_one_body_per_kept_object_and_follows_the_scope(tmp_path):
     assert merged[f"dyn_{crate}_1"] == (crate, ["crate_a", "crate_a_lid"])
     static = [m for m, (o, parts) in merged.items() if o is None and "cup" in parts]
     assert static and static[0].startswith("merged_")
-    assert summary["kept"]["dynamic_single"] >= 3                       # crate_b, the stool's fabric and chrome parts
+    # a kept object's lone shapes become dyn_ meshes too (the stool's fabric and chrome parts), with the body attribute
+    stool = obj["stool_seat"]["id"]
+    assert merged[f"dyn_{stool}_1"][1] == ["stool_seat"] and merged[f"dyn_{stool}_2"][1] == ["stool_leg"]
+    assert "dynamic_single" not in summary["kept"]
+    import mitsuba as mi
+    body = mi.load_dict({"type": "ply", "filename": str(scene / dict(mesh_files(scene))[f"dyn_{stool}_1"])})
+    assert body.has_mesh_attributes() and "vertex_body" in mi.traverse(body).keys()
     record = json.loads((scene / po.PHYSICS).read_text())["merge"]
     assert record["keep"] == "reachable"
     assert record["objects"][crate] == {"kept": True, "shapes": [f"dyn_{crate}_1"]}
-    assert record["objects"][obj["stool_seat"]["id"]] == {"kept": True, "shapes": ["stool_seat", "stool_leg"]}
+    assert record["objects"][stool] == {"kept": True, "shapes": [f"dyn_{stool}_1", f"dyn_{stool}_2"]}
     assert record["objects"][obj["cup"]["id"]] == {"kept": False, "shapes": static}
     assert set(record["objects"][crate]["shapes"]) <= shape_ids(scene)
     assert not mm.needs_merging(scene) and not physics_tag.needs_tagging(scene)
@@ -241,11 +252,12 @@ def test_merge_makes_one_body_per_kept_object_and_follows_the_scope(tmp_path):
     # tagged again, physics.json keeps what the merge recorded
     physics_tag.tag_scene(scene)
     assert json.loads((scene / po.PHYSICS).read_text())["merge"] == record
-    # keep "movable": the cup is a body of its own too (one shape: left alone), merged anew
+    # keep "movable": the cup is a body of its own too (its own dyn_ mesh), merged anew
     set_keep(scene, "movable")
     assert mm.needs_merging(scene)
     mm.merge_scene(scene)
-    assert "cup" in shape_ids(scene) and not any("cup" in parts for _, parts in merged_of(scene).values())
+    cups = [m for m, (o, parts) in merged_of(scene).items() if parts == ["cup"]]
+    assert cups and cups[0].startswith("dyn_")
     assert json.loads((scene / po.PHYSICS).read_text())["merge"]["objects"][obj["cup"]["id"]]["kept"]
     # physics.json changes (the cup is fixed now): merged with the table again
     data = json.loads((scene / po.PHYSICS).read_text())

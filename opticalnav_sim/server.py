@@ -1839,6 +1839,57 @@ class Resident:
             self.scene.parameters_changed([])
         return time.perf_counter() - t0
 
+    # simulator frame (x = X, y = -Z, z = Y of the scene files) <- Mitsuba's (Y up): a physics pose change into the scene's
+    SIM_FROM_MI = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+
+    def set_objects(self, poses: dict, shapes_of: dict) -> float:
+        """Move pushed objects: physics object id -> the change of its pose since the scene file (simulator frame, 4x4).
+        Each of its dyn_ meshes (a mesh of its own: tools/merge_meshes.py BODY_ATTRIBUTE) gets its loaded vertices and
+        normals moved by it, written through the mesh's own parameters; then the scene rebuilds just those meshes'
+        acceleration structures (the selective GAS rebuild the flash uses, _write_assist). An object not named any
+        more goes back where the file put it. Returns the seconds it took."""
+        import drjit as dr
+
+        t0, mi = time.perf_counter(), self.mi
+        if not hasattr(self, "object_pose"):
+            self.object_pose: dict[str, bytes] = {}     # object id -> the change last written
+            self.object_rest: dict[str, tuple] = {}     # dyn_ shape id -> (its shape, positions N x 3, normals or None)
+            self.dyn_shapes = {s.id(): s for s in self.scene.shapes() if s.id().startswith("dyn_")}
+        wanted = dict(poses)
+        for oid in [o for o in self.object_pose if o not in wanted]:
+            wanted[oid] = np.eye(4)
+        changed = False
+        for oid, m in wanted.items():
+            m = np.ascontiguousarray(m, dtype=np.float64).reshape(4, 4)
+            if self.object_pose.get(oid, np.eye(4).tobytes()) == m.tobytes():
+                continue
+            mm = np.linalg.inv(self.SIM_FROM_MI) @ m @ self.SIM_FROM_MI   # the same change in the scene's frame
+            rot, move = mm[:3, :3].astype(np.float32), mm[:3, 3].astype(np.float32)
+            for sid in shapes_of.get(oid, ()):
+                shape = self.dyn_shapes.get(sid)
+                if shape is None:
+                    continue   # merged into another mesh by the loader (a scene merged before BODY_ATTRIBUTE): stays put
+                if sid not in self.object_rest:
+                    ps = mi.traverse(shape)
+                    pos = np.array(ps["vertex_positions"], dtype=np.float32).reshape(-1, 3)
+                    nrm = np.array(ps["vertex_normals"], dtype=np.float32).reshape(-1, 3) \
+                        if "vertex_normals" in ps.keys() and dr.width(ps["vertex_normals"]) else None
+                    self.object_rest[sid] = (shape, pos, nrm)
+                shape, pos, nrm = self.object_rest[sid]
+                ps = mi.traverse(shape)
+                ps["vertex_positions"] = mi.Float((pos @ rot.T + move).ravel())
+                if nrm is not None:
+                    ps["vertex_normals"] = mi.Float((nrm @ rot.T).ravel())
+                ps.update()
+                changed = True
+            if np.allclose(m, np.eye(4)):
+                self.object_pose.pop(oid, None)
+            else:
+                self.object_pose[oid] = m.tobytes()
+        if changed:
+            self.scene.parameters_changed([])
+        return time.perf_counter() - t0
+
     def intensity_lanes(self, img):
         """An RGBN Stokes film (a Dr.Jit tensor, 19 or 20 channels) cut down on the GPU to R, G, B and the near-infrared
         lane of S0 before it is read back: an unpolarized frame needs nothing else (15 MB -> 3 MB at 512 x 384)."""
@@ -2608,6 +2659,21 @@ class Renderer:
                 self.reload_meta(scan)
                 print(f"[merge] {scan} ready in {time.monotonic() - started:.0f} s", flush=True)
 
+    def object_shapes(self, scan: str) -> dict:
+        """Physics object id -> the dyn_ shapes that draw it (physics.json's merge record, tools/merge_meshes.py), for the
+        objects kept apart as bodies; read again when the file changes."""
+        path = self.scene_dir(scan) / "physics.json"
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+        cache = self.__dict__.setdefault("_object_shapes", {})
+        if cache.get(scan, (None,))[0] != stamp:
+            merge = (json.loads(path.read_text()).get("merge") or {}).get("objects") or {}
+            cache[scan] = (stamp, {oid: [s for s in v.get("shapes", []) if s.startswith("dyn_")]
+                                   for oid, v in merge.items() if v.get("kept")})
+        return cache[scan][1]
+
     def reload_meta(self, scan: str) -> None:
         """Read a scene's scene.json again (after compact_on_start rewrote it); its plans go with the old one."""
         self.meta[scan] = json.loads((self.scene_dir(scan) / "scene.json").read_text())
@@ -2984,9 +3050,20 @@ class Renderer:
             raise ValueError("body ids repeat in one view")
         if placed and renderer not in ("path", "depth"):
             raise ValueError("bodies are drawn by the path tracer only (renderer 'path', or its 'depth')")
+        # objects: {physics object id: 4x4}: a movable object pushed by the physics step (hw/physics.py), as the change of
+        # its pose since the scene file (simulator frame: x = X, y = -Z, z = Y); its dyn_ meshes are moved by it
+        moved = []
+        for oid, m in sorted(dict(view.get("objects") or {}).items()):
+            m = np.ascontiguousarray(m, dtype=np.float64).reshape(4, 4)
+            if not np.all(np.isfinite(m)):
+                raise ValueError(f"object {oid!r}: a pose that is not finite")
+            moved.append((str(oid), m.tobytes()))
+        moved = tuple(moved)
+        if moved and renderer not in ("path", "depth"):
+            raise ValueError("moved objects are drawn by the path tracer only (renderer 'path', or its 'depth')")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
                 mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth,
-                renderer, raster_aa, placed)
+                renderer, raster_aa, placed, moved)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False, hfovs: list | None = None):
@@ -2997,7 +3074,7 @@ class Renderer:
                                                                         flash_band, nir, lighting, mirrors, lamps,
                                                                         flash_scale, flash_pdf, flash_offset, max_depth,
                                                                         caustics, split, nir_range, rr_depth,
-                                                                        renderer, raster_aa, placed) = key
+                                                                        renderer, raster_aa, placed, moved) = key
         if renderer == "cycles":  # a Blender process, not a Mitsuba scene: nothing of the path tracer is loaded for it
             return self._cycles_start(key, cams, started - submitted)
         if self.mi.variant() != self.variant_of[mode]:
@@ -3020,6 +3097,8 @@ class Renderer:
                                      for _, _, _, poses in placed for sid, m in poses})
             elif parked:
                 resident.park_bodies()
+            resident.set_objects({oid: np.frombuffer(m, dtype=np.float64).reshape(4, 4) for oid, m in moved},
+                                 self.object_shapes(scan))
             # lighting mode (and the lamps added to dark lamps, when asked for): the light groups it leaves out
             # are removed from the scene (hidden), not just dimmed
             groups = LIGHTING[lighting] + (("lamp",) if lamps else ())
