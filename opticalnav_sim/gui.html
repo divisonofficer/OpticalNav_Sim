@@ -356,7 +356,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
     </section>
     <section class="card">
-      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="cycles" aria-pressed="false" title="Cycles: 장면의 .blend를 Blender Cycles로 렌더합니다(RGB만, 편광 없음). 카메라·해상도·spp는 다른 렌더러와 같고, 멈추면 패스를 쌓는 방식도 같습니다. 조명·하늘·플래시 등 Mitsuba 설정은 적용되지 않고 .blend 안의 것을 씁니다. 디노이저는 쓸 수 있습니다. 장면 폴더에 .blend가 있어야 켤 수 있습니다.">Cycles</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button></span></h2>
+      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="cycles" aria-pressed="false" title="Cycles: 장면의 .blend를 Blender Cycles로 렌더합니다(RGB만, 편광 없음). 카메라·해상도·spp는 다른 렌더러와 같고, 멈추면 패스를 쌓는 방식도 같습니다. 조명·하늘·플래시 등 Mitsuba 설정은 적용되지 않고 .blend 안의 것을 씁니다. 디노이저는 쓸 수 있습니다. 장면 폴더에 .blend가 있어야 켤 수 있습니다.">Cycles</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button><button type="button" data-engine="solid" aria-pressed="false" title="솔리드 미리보기: Blender의 Solid 뷰처럼 구조만 봅니다. 면마다 재질 색(텍스처 포함)에 카메라를 따라오는 고정 스튜디오 조명(어깨 너머 키 라이트, 반대편 보조광, 위아래 반구광)만 씁니다. 그림자, 간접광(프로브), 거울, 유리는 그리지 않아 래스터보다 빠르고, 래스터의 장면 데이터를 같이 써서 따로 준비하는 시간(프로브 굽기 등)이 없습니다. 로봇 몸체는 아직 그리지 않습니다.">솔리드</button></span></h2>
       <div class="toggles">
         <label class="tg mitsuba-only" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
         <label class="tg mitsuba-only" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
@@ -654,6 +654,9 @@ const editorPanes = () => ["a", ...SUBS.filter((x) => x.kind === "editor").map((
 // everything: the server pushes state on every change and the panes' JPEGs for every new frame; the page
 // sends inputs (answered at once, before any render) and probes.
 let ws = null, nextId = 1, pending = 0;
+// renderers whose one image is the frame (no passes to add up), and their names on the page
+const ENGINE_NAMES = { raster: "래스터", solid: "솔리드" };
+const oneImage = () => !!(S && ENGINE_NAMES[S.render_mode]);
 const acks = new Map();
 
 async function api(path, body) {
@@ -825,7 +828,7 @@ function renderMonitor() {
     : r.freeze_available === false ? ["", "꺼짐", "freeze 없이 매번 트레이싱합니다 (느림)"] : ["", "—"];
   const sv = S.server || {};
   const render = S.error ? ["bad", "실패", S.error] : sv.busy && sv.elapsed_s > 0.6 ? ["warn", `새 프레임 대기 ${sv.elapsed_s.toFixed(0)} s`]
-    : S.has_frame ? ["ok", `${(S.fps || 0).toFixed(1)} fps`, S.render_mode === "raster" ? "래스터" : `${S.frame_spp}/${S.target_spp} spp`] : ["warn", "첫 프레임 대기"];
+    : S.has_frame ? ["ok", `${(S.fps || 0).toFixed(1)} fps`, oneImage() ? ENGINE_NAMES[S.render_mode] : `${S.frame_spp}/${S.target_spp} spp`] : ["warn", "첫 프레임 대기"];
   $("monitor").innerHTML = chip(link[0], "뷰어", link[1]) + chip(server[0], "렌더 서버", server[1]) +
     chip(scene[0], "씬", scene[1], scene[2]) + chip(freeze[0], "freeze", freeze[1], freeze[2]) + chip(render[0], "렌더", render[1], render[2]);
 }
@@ -1073,8 +1076,8 @@ function apply(st) {
     loadPhysics();
   }
   if (S.has_frame) {
-    $("badge").textContent = S.render_mode === "raster" ? "래스터" : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
-    $("progress").style.width = S.render_mode === "raster" ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
+    $("badge").textContent = oneImage() ? ENGINE_NAMES[S.render_mode] : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
+    $("progress").style.width = oneImage() ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
   syncSppSelects();
@@ -1117,7 +1120,7 @@ function renderSky() {
   if (document.activeElement !== $("flashscale")) $("flashscale").value = String(S.flash_scale || 1);
   if (document.activeElement !== $("maxdepth")) $("maxdepth").value = String(S.max_depth || 0);
   if (document.activeElement !== $("rrdepth")) $("rrdepth").value = String(S.rr_depth || 0);
-  const raster = S.render_mode === "raster";  // (S.renderer: the render server's state)
+  const raster = oneImage();  // the raster preview or its Solid view (S.renderer: the render server's state)
   if (document.activeElement !== $("rasteraa")) $("rasteraa").value = S.raster_aa || "edge";
   document.body.classList.toggle("raster", raster);
   document.body.classList.toggle("cycles", S.render_mode === "cycles");
@@ -1351,7 +1354,7 @@ function renderStatus() {
   if (!S.has_frame) { $("status").innerHTML = "<span>첫 프레임을 렌더하는 중…</span>"; return; }
   const ms = (v) => (v || 0).toFixed(0);
   const t = S.timing || {};
-  $("status").innerHTML = (S.render_mode === "raster" ? `<span><b>래스터</b></span>`
+  $("status").innerHTML = (oneImage() ? `<span><b>${ENGINE_NAMES[S.render_mode]}</b></span>`
     : `<span><b>${S.frame_spp}</b>/${S.target_spp} spp</span><span>패스 <b>${S.passes}</b> × ${S.pass_spp}</span>`) +
     `<span>표시 <b>${(S.fps || 0).toFixed(1)}</b> fps</span><span title="렌더 요청을 보내고 화면에 올리기까지 (최근 5초 중앙값)">패스 <b>${ms(t.wall_ms)}</b> ms</span>` +
     `<span class="split" title="패스 시간 내역 (최근 5초 중앙값). GPU: 서버가 커널을 넣은 뒤 GPU를 기다린 시간(CPU 작업에 가려지지 않은 GPU 시간). 서버 CPU: 렌더 호출의 나머지와 분리·인코딩. 대기열: 서버의 렌더 스레드에서 다른 패스 뒤에 기다린 시간. 전송: 왕복에서 서버 시간을 뺀 나머지. 뷰어: 누적·디노이즈·편광 계산. JPEG: 패스를 받은 스레드에서 열린 페이지들의 화면 JPEG(편광 색·톤매핑)과 깊이 격자를 미리 만드는 시간(렌더와 겹쳐 돎). 화면: 페이지로 보내는 시간(미리 만든 것이 없으면 만드는 시간 포함)">` +
@@ -1553,7 +1556,7 @@ $("maxdepth").addEventListener("change", () => configure({ max_depth: Number($("
 $("rrdepth").addEventListener("change", () => configure({ rr_depth: Number($("rrdepth").value) }, "RR 시작 깊이"));
 $("rasteraa").addEventListener("change", () => configure({ raster_aa: $("rasteraa").value }, "안티에일리어싱"));
 for (const b of $("engine").querySelectorAll("button")) {
-  b.addEventListener("click", () => configure({ renderer: b.dataset.engine }, { raster: "래스터 미리보기", cycles: "Cycles 렌더" }[b.dataset.engine] || "Mitsuba 경로 추적"));
+  b.addEventListener("click", () => configure({ renderer: b.dataset.engine }, { raster: "래스터 미리보기", solid: "솔리드 미리보기", cycles: "Cycles 렌더" }[b.dataset.engine] || "Mitsuba 경로 추적"));
 }
 $("res").addEventListener("change", () => configure({ resolution: $("res").value.split("x").map(Number) }, "해상도"));
 $("bands").addEventListener("change", () => configure({ bands: $("bands").value }, "대역 변경"));

@@ -277,9 +277,10 @@ class Simulator:
         a frame for moving about; spp and the path settings do not apply. "cycles": Blender's Cycles renders the scene's
         own .blend (the pack carries it: scene.json "blend"), RGB only, with the camera, size and spp of the other
         renderers; the lights, sky, flash and polarization of the Mitsuba scene do not apply. setDenoise turns Cycles'
-        OptiX denoiser on."""
-        if name not in ("path", "raster", "cycles"):
-            raise ValueError("renderer must be 'path', 'raster' or 'cycles'")
+        OptiX denoiser on. "solid": the raster scene's structural preview (raster.RasterScene.render_solid: material
+        colours under a fixed studio light, like Blender's Solid viewport), one image a frame, the fastest to move in."""
+        if name not in ("path", "raster", "solid", "cycles"):
+            raise ValueError("renderer must be 'path', 'raster', 'solid' or 'cycles'")
         self.renderer = str(name)
 
     def setRasterAntialiasing(self, mode: str) -> None:

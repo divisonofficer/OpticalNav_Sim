@@ -65,6 +65,10 @@ SHADOW = 512       # cube shadow map side
 CHUNK = 4096       # triangles per culling chunk
 PIXEL_CHUNK = 1 << 17  # pixels lit at a time (lights x pixels x 3 floats each)
 AA_MODES = ("off", "edge", "ssaa2")
+# the Solid preview's studio light (render_solid): ambient, sky hemisphere, key and fill, of a white surface lit head-on
+# about 1; its backdrop's grey below and above the horizon
+SOLID_AMBIENT, SOLID_SKY, SOLID_KEY, SOLID_FILL = 0.1, 0.18, 0.42, 0.14
+SOLID_BACK = (0.16, 0.30)
 WINDOW_TRI = 0.05  # m^2: a glass triangle this large is part of a window pane (_windows)
 WINDOW_NEAR = 0.1  # m: a window's shadow map starts this far out (its frame and wall cast none)
 WINDOW_INSET = 0.3  # m: a window's light sits this far into the room (see _cubes)
@@ -997,6 +1001,49 @@ class RasterScene:
             import traceback
             traceback.print_exc()
             raise
+
+    def render_solid(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, look, aa: str = "edge") -> tuple:
+        """A structural preview, like Blender's Solid viewport: each surface in its material's colour (textures at the
+        mip its pixel footprint picks), lit by a fixed studio light that follows the camera (a key light over the
+        shoulder, a fill from the other side, a sky-and-ground hemisphere), no shadows, light probes, mirrors or glass.
+        Returns ([S0, None, None, None], depth) like ``render`` (no polarization; the near-infrared lane is the material's).
+        Display-referred: 1 is
+        white (the viewer shows it at a fixed tone). Nothing is built for it beyond the scene's geometry and
+        materials: the lights' structures and the probes are left for ``render``."""
+        if aa not in AA_MODES:
+            raise ValueError(f"raster antialiasing is one of {AA_MODES}")
+        k = 2 if aa == "ssaa2" else 1
+        dev = self.dev
+        w, h = int(width) * k, int(height) * k
+        m = torch.as_tensor(np.asarray(c2w, dtype=np.float64), device=dev, dtype=torch.float32)
+        surf = self._rasterize(m, self._projection(hfov_deg, w, h), w, h)
+        film = torch.zeros((w * h, 4), device=dev)   # S0 alone: R, G, B, near-infrared (read back: a third of render's)
+        depth = torch.zeros(w * h, device=dev)
+        if surf.hit.numel():
+            kd, f0, _, _, _ = self._surface(surf.mat, surf.uv, surf.duv, look.nir_range)
+            base = (kd + f0).clamp(0.0, 1.0)                     # the surface's colour: diffuse, or a metal's tint
+            right, up, back = m[:3, 0], m[:3, 1], m[:3, 2]       # camera axes (it looks along -back)
+            key = back * 0.75 + up * 0.55 - right * 0.35
+            fill = back * 0.6 - up * 0.15 + right * 0.75
+            key, fill = key / key.norm(), fill / fill.norm()
+            n = surf.n
+            sky = 0.35 + 0.65 * (0.5 + 0.5 * n[:, 1])           # the scene is Y up; a ceiling still gets some
+            light = SOLID_AMBIENT + SOLID_SKY * sky + SOLID_KEY * (n @ key).clamp_min(0.0) \
+                + SOLID_FILL * (n @ fill).clamp_min(0.0)
+            film[surf.hit, :4] = base * light[:, None]
+            depth[surf.hit] = surf.zbuf[surf.hit]
+        miss = torch.nonzero(surf.tid <= 0)[:, 0]
+        if miss.numel():   # a grey backdrop, lighter above the horizon
+            d = self._ray_dirs(m, w, h, hfov_deg)[miss]
+            film[miss, :4] = (SOLID_BACK[0] + (SOLID_BACK[1] - SOLID_BACK[0]) * (0.5 + 0.5 * d[:, 1:2])).expand(-1, 4)
+        film = film.view(1, h, w, 4)
+        if aa == "edge":
+            film = drt.antialias(film.contiguous(), surf.rast, surf.clip, surf.tri_v)
+        film, depth = film[0], depth.view(h, w)
+        if k > 1:
+            film = film.view(int(height), k, int(width), k, 4).mean(dim=(1, 3))
+            depth = depth[::k, ::k]
+        return [film.contiguous().cpu().numpy(), None, None, None], depth.contiguous().cpu().numpy()
 
     def _render(self, c2w, width, height, hfov_deg, look, follow, edge=False):
         prof = PROFILE and []

@@ -1293,6 +1293,45 @@ def shape_vertices(mi, text: str, shape_id: str) -> np.ndarray:
     return np.array(mi.traverse(shape)["vertex_positions"], dtype=np.float32).reshape(-1, 3)
 
 
+OBJECT_GROUP_PREFIX, OBJECT_INSTANCE_PREFIX = "objgrp_", "objinst_"
+# Pushed objects as instances (object_instances_text) in a scene loaded with bodies; 0: their meshes' vertices rewritten
+OBJECT_INSTANCES = os.environ.get("OPTICALNAV_OBJECT_INSTANCES", "1") != "0"
+
+
+def object_instances_text(text: str, objects: dict) -> tuple[str, dict]:
+    """``text`` with each object's dyn_ meshes (``objects``: physics object id -> shape ids) moved into a shapegroup of its
+    own and drawn through an instance, at rest where they were. Returns (text, object id -> instance id). Moving an
+    object then writes its instance's transform alone: the top-level structure is rebuilt, no mesh is (rewriting a
+    mesh's vertices cost ~0.4 ms a mesh, a GPU sync each for its bounding box, 21 ms for CS02's 14 objects, 63 meshes).
+    A shape not found stays as it is."""
+    groups, out, n = "", {}, 0
+    for oid, sids in sorted(objects.items()):
+        children = ""
+        for sid in sids:
+            m = re.search(rf'\n[ \t]*(?:<!--opticalnav-obj:[^\n]*-->\n[ \t]*)?<shape type="[a-z]+" id="{re.escape(sid)}">', text)
+            if m is None:
+                continue
+            end = text.find("</shape>", m.end())
+            if end < 0 or "<shape" in text[m.end():end]:   # a nested shape: not a plain mesh, left alone
+                continue
+            end += len("</shape>")
+            element = text[m.start():end]
+            element = re.sub(r'^\s*<!--opticalnav-obj:[^\n]*-->', "", element)   # the note stays out of the group
+            children += element
+            text = text[:m.start()] + text[end:]
+        if not children:
+            continue
+        gid, iid = f"{OBJECT_GROUP_PREFIX}{n}", f"{OBJECT_INSTANCE_PREFIX}{n}"
+        groups += (f'\n  <shape type="shapegroup" id="{gid}">{children}\n  </shape>'
+                   f'\n  <shape type="instance" id="{iid}">\n    <ref id="{gid}" />\n  </shape>')
+        out[oid] = iid
+        n += 1
+    if groups:
+        end = text.rindex("</scene>")
+        text = text[:end] + groups + "\n" + text[end:]
+    return text, out
+
+
 def locate_blocks(meshes: dict, blocks: dict) -> dict:
     """Where each vertex block sits among the scene's meshes: {name: (mesh key, first vertex, count)}.
     The loader merges meshes that share a BSDF into one mesh by appending their vertices, so a shape's
@@ -1361,7 +1400,8 @@ class Resident:
     def __init__(self, mi, xml: Path, mode: str, flash: dict | None = None, freeze: bool = False,
                  flash_xml: Path | None = None, hideable=(), envs=None, freeze_spp: int = 0, nir: bool = False,
                  pool: dict | None = None, upgrade_flash: bool = False, hidden: str = "", fill_gain: float = 1.0,
-                 blender_power: bool = False, alpha_power: float = 1.0, watt_gain: float = 1.0, bodies: str = ""):
+                 blender_power: bool = False, alpha_power: float = 1.0, watt_gain: float = 1.0, bodies: str = "",
+                 objects: dict | None = None):
         self.mi, self.mode = mi, mode
         # an RGBN variant: every render holds both bands (R, G, B lanes and the near-infrared lane)
         self.rgbn = "_rgbn" in mi.variant()
@@ -1370,6 +1410,9 @@ class Resident:
         if bodies:  # robots and their equipment (bodies.scene_xml): instances a view places (set_bodies)
             end = text.rindex("</scene>")
             text = text[:end] + bodies + text[end:]
+        # the objects a robot can push (physics.json, kept apart by tools/merge_meshes.py), each a shapegroup of its dyn_
+        # meshes and an instance: pushed, only the instance's transform is written (set_objects)
+        text, self.object_groups = object_instances_text(text, objects or {})
         self.hidden = hidden  # shape id prefix camera rays pass through (path_nocaustics "hidden"; FILL_PREFIX)
         self.upgraded_flash = False  # an old one-pass flash rendered as the current protocol (upgrade_flash_text)
         if flash is not None and flash.get("synthetic") and flash_xml is None:
@@ -1460,6 +1503,18 @@ class Resident:
         self.sensor = self.scene.sensors()[0]
         self.assist_shapes = {s.id(): s for s in self.scene.shapes() if s.id().startswith(ASSIST_PREFIX)}
         self.body_shapes = {s.id(): s for s in self.scene.shapes() if s.id().startswith(body_models.BODY_PREFIX)}
+        # physics object id -> its instance (object_instances_text), its transform written once now (evaluated: the
+        # frozen renders' input layout is the same before and after the first push)
+        by_id = {s.id(): s for s in self.scene.shapes() if s.id().startswith(OBJECT_INSTANCE_PREFIX)}
+        self.object_instances = {oid: by_id[iid] for oid, iid in self.object_groups.items() if iid in by_id}
+        if self.object_instances:
+            import drjit as dr
+            for inst in self.object_instances.values():
+                ps = mi.traverse(inst)
+                ps["to_world"] = mi.ScalarTransform4f()
+                ps.update()
+                dr.make_opaque(ps["to_world"])
+            self.scene.parameters_changed([])
         self.body_pose: dict[str, bytes] = {}  # instance id -> the matrix last written
         sensor_keys = set(mi.traverse(self.sensor).keys())
         self.ks_size = "film.size" if "film.size" in sensor_keys else None
@@ -1770,7 +1825,7 @@ class Resident:
         return z
 
     def raster_views(self, cams: list, width: int, height: int, hfov_deg: float, follow: bool, look: Look,
-                     aa: str = "edge") -> tuple:
+                     aa: str = "edge", solid: bool = False) -> tuple:
         """The rasterized preview (raster.py) of each camera, with the scene as ``look`` has it (written into the
         scene as a launch would, so the path tracer and the preview always show the same state). Returns
         (each view's Stokes images [S0..S3] in R, G, B and near-infrared lanes, depths, timing parts)."""
@@ -1790,7 +1845,8 @@ class Resident:
                 parts["raster_build_s"] += self._raster.build_s
             self._raster.sync(look.hidden)
             t2 = time.perf_counter()
-            lanes, z = self._raster.render(c2w, width, height, hfov_deg, look, follow, aa)
+            lanes, z = self._raster.render_solid(c2w, width, height, hfov_deg, look, aa) if solid else \
+                self._raster.render(c2w, width, height, hfov_deg, look, follow, aa)
             parts["scene_update_s"] += t1 - t0
             parts["raster_s"] += time.perf_counter() - t2
             views.append(lanes)
@@ -1864,6 +1920,18 @@ class Resident:
             if self.object_pose.get(oid, np.eye(4).tobytes()) == m.tobytes():
                 continue
             mm = np.linalg.inv(self.SIM_FROM_MI) @ m @ self.SIM_FROM_MI   # the same change in the scene's frame
+            inst = getattr(self, "object_instances", {}).get(oid)
+            if inst is not None:   # an instance (a scene loaded with bodies): its transform alone, no mesh rebuilt
+                ps = mi.traverse(inst)
+                ps["to_world"] = mi.ScalarTransform4f(mm.tolist())
+                ps.update()
+                dr.make_opaque(ps["to_world"])
+                changed = True
+                if np.allclose(m, np.eye(4)):
+                    self.object_pose.pop(oid, None)
+                else:
+                    self.object_pose[oid] = m.tobytes()
+                continue
             rot, move = mm[:3, :3].astype(np.float32), mm[:3, 3].astype(np.float32)
             for sid in shapes_of.get(oid, ()):
                 shape = self.dyn_shapes.get(sid)
@@ -2861,7 +2929,8 @@ class Renderer:
                 alpha_power=self.alpha_power if own and not self.direct_scene(scan) else 1.0,
                 watt_gain=math.pi if self.direct_scene(scan) else 1.0,
                 bodies=body_models.scene_xml(self.body_models, [(b, name) for b, name, _ in with_bodies[0]])
-                if with_bodies else "")
+                if with_bodies else "",
+                objects=self.object_shapes(scan) if with_bodies and OBJECT_INSTANCES else None)   # pushed: instances
         self.cache[rkey] = loaded
         return loaded
 
@@ -3020,9 +3089,10 @@ class Renderer:
                 raise ValueError("mirrors.density must be 0..100 and mirrors.glass 0..64")
         renderer = str(view.get("renderer", "path"))  # "raster": the rasterized preview (raster.py); "cycles": its .blend
         # "depth": no image, the depth alone (one ray a pixel, nothing sampled or recorded: hw.sensing's depth sensors)
-        if renderer not in ("path", "raster", "cycles", "depth"):
+        # "solid": a structural preview of the raster scene (raster.RasterScene.render_solid: material colours, a studio light)
+        if renderer not in ("path", "raster", "solid", "cycles", "depth"):
             raise ValueError("renderer must be 'path', 'raster', 'cycles' or 'depth'")
-        if renderer == "raster":   # drawn from the RGBN polar variant whatever the mode: its Stokes images, not "radiance"
+        if renderer in ("raster", "solid"):   # drawn from the RGBN polar variant whatever the mode: its Stokes images, not "radiance"
             mode = "polar"         # (an "rgb" raster request came back empty: the rgb reply keeps "radiance" alone)
         if renderer == "cycles" and self.blend_of(scan) is None:
             raise ValueError(f"{scan} has no .blend for the Cycles backend (tools/attach_blend.py)")
@@ -3126,9 +3196,9 @@ class Renderer:
                                flash_pdf=flash_pdf, flash_offset=flash_offset, max_depth=max_depth, caustics=caustics,
                                split=split, nir_range=nir_range, rr_depth=rr_depth, unpolarized=unpolarized)
                          for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
-            if renderer == "raster":  # the rasterized preview (raster.py): drawn here, one image a view
+            if renderer in ("raster", "solid"):  # the rasterized preview (raster.py): drawn here, one image a view
                 return self._raster_start(key, resident, cams, next(iter(looks.values())), follow, started - submitted,
-                                          bands, depth, raster_aa)
+                                          bands, depth, raster_aa, solid=renderer == "solid")
             if renderer == "depth":
                 return self._depth_start(resident, cams, width, height, hfov, next(iter(looks.values())), started - submitted)
             if self.kernel_history:
@@ -3251,7 +3321,7 @@ class Renderer:
         return lambda: lambda: ([{"depth": z} for z in maps], kernels, render_s, 0.0)
 
     def _raster_start(self, key: tuple, resident, cams: list, look, follow: bool, queue_s: float, bands: str,
-                      depth: bool, aa: str = "edge"):
+                      depth: bool, aa: str = "edge", solid: bool = False):
         """_start for the rasterized preview: the views drawn and read back here, handed on in the path tracer's
         bands (RGB Stokes images, near-infrared ones) without its film split."""
         if not resident.rgbn:
@@ -3259,7 +3329,7 @@ class Renderer:
         t0 = time.perf_counter()
         width, height, hfov = key[3], key[4], key[5]
         with ACTIVITY.doing("rasterizing"):
-            views, depths, parts = resident.raster_views(cams, width, height, hfov, follow, look, aa)
+            views, depths, parts = resident.raster_views(cams, width, height, hfov, follow, look, aa, solid)
         render_s = time.perf_counter() - t0
         parts.update(queue_s=queue_s, launch_s=0.0)
 
@@ -3269,7 +3339,8 @@ class Renderer:
                 outs = []
                 for lanes, z in zip(views, depths):
                     zero = np.zeros_like(lanes[0])
-                    stokes_ = [zero if v is None else v for v in lanes]  # S0..S3: R, G, B, near-infrared
+                    # S0..S3: R, G, B, near-infrared; the Solid preview has S0 alone (no polarization to send)
+                    stokes_ = [v for v in lanes[:1]] if solid else [zero if v is None else v for v in lanes]
                     out = {}
                     if bands != "nir":
                         out.update({"rgb_src": stokes_[0][..., :3], **{f"s{k}": v[..., :3] for k, v in enumerate(stokes_)}})
@@ -3364,7 +3435,7 @@ class Renderer:
                                                        percentile=0.995, blur=0.0)
             return result
         if "s0" in out:
-            result.update({k: out[k].astype(dtype) for k in stokes_keys})
+            result.update({k: out[k].astype(dtype) for k in stokes_keys if k in out})   # (S0 alone: the Solid preview)
             if preview:
                 result["rgb"] = stokes.rgb_preview(out["rgb_src"], out["s0"], out["s1"], out["s2"])
         return result

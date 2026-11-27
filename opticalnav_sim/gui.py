@@ -99,6 +99,8 @@ CHANNELS = ("rgb", "dolp", "aolp", "s1", "s2", "nir", "nir_dolp", "nir_aolp")  #
 # the largest pass: a polarized path carries Mueller matrices (its wavefront memory, and a long pass delays a move);
 # without polarization a pass of 256 samples is the server's own chunk (server.SPP_CHUNK)
 MAX_PASS_SPP = {"polar": 64, "rgb": 256}
+ONE_IMAGE = ("raster", "solid")   # renderers whose one image is the frame (no passes to add up)
+SOLID_TONE = {"exposure": 0.8, "white": 1.0}   # the Solid preview's colours are display-referred (raster.render_solid)
 # A camera's passes after its first wait until it has not moved for this long (s). A held key or a drag sends a move
 # about every 20 ms, before a second pass of the camera could come back: sent at once, it was thrown away (two in five
 # of the render server's passes, turning), and it held a slot the next camera's first pass then waited for.
@@ -829,7 +831,7 @@ class Session:
             return False
         if self.issued == 0:
             return True
-        if self.view.get("renderer") == "raster":  # noiseless: one image is the frame
+        if self.view.get("renderer") in ONE_IMAGE:  # noiseless: one image is the frame
             return False
         if time.monotonic() - self.gen_started < STILL_S:   # still moving, maybe: the slot waits for the next camera (_loop)
             return False
@@ -1010,7 +1012,7 @@ class Session:
         # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
         frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
                  "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": spp_shown, "passes": passes,
-                 "variant": view["variant"], "depth": job["depth"],
+                 "variant": view["variant"], "depth": job["depth"], "renderer": view.get("renderer", "path"),
                  "c2w": [round(float(v), 5) for v in np.asarray(view["camera_to_world"]).ravel()]}
         # Where a pass's time went (ms), for the pass this picture was made after. gpu: the server waiting for the GPU
         # after queuing the pass's kernels, the GPU time no CPU work hid (exact kernel times would need a sync per
@@ -1093,7 +1095,7 @@ class Session:
                    "hfov_deg": sim._hfov_deg(sim.width, sim.height), "vfov_deg": math.degrees(sim.vfov),
                    "width": sim.width, "height": sim.height, **self.pose, **self.frame_meta,
                    "done": spp_now >= self.target_spp or (not self.auto and spp_now > 0)
-                           or (sim.renderer == "raster" and spp_now > 0),
+                           or (sim.renderer in ONE_IMAGE and spp_now > 0),
                    "stale": waiting, "in_flight": self.inflight,
                    "passes_sent": self.sent, "passes_wasted": self.wasted}
             waited = now - self.gen_started if waiting else 0.0
@@ -1257,6 +1259,9 @@ class Session:
 
     def _tonemapped(self, frame: dict, band: str, ev: float) -> np.ndarray:
         """Extended Reinhard at the band's tone fit (see _tone), its exposure shifted by ``ev`` stops."""
+        if frame.get("renderer") == "solid":   # display-referred already: one fixed tone, whatever the scene's light
+            radiance = frame["s0"] if band == "rgb" else np.repeat(frame["nir_grey"][..., None], 3, axis=2)
+            return tonemap.fast(self.tone_curve, radiance, SOLID_TONE["exposure"] * 2.0 ** ev, SOLID_TONE["white"])
         if band == "rgb":
             radiance, key = frame["s0"], (frame["scan"], frame["variant"])
         else:
@@ -1492,7 +1497,7 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                     if "after" in q:
                         session.wait(int(q["after"]), float(q.get("wait", 2.0)))
                     st = session.status()
-                    if st.get("done") and st.get("has_frame") and st.get("frame_id") is not None and st.get("render_mode") != "raster":
+                    if st.get("done") and st.get("has_frame") and st.get("frame_id") is not None and st.get("render_mode") not in ONE_IMAGE:
                         session.maybe_thumb(st["scene"], st["frame_id"])
                     return self._json(200, st)
                 if parts == ["api", "thumb"]:  # the gallery's picture of a scene (404: the page draws initials)
