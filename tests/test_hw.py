@@ -1266,9 +1266,10 @@ def test_extends_and_broken_files(tmp_path, monkeypatch):
 
 # --- sensors other than cameras ----------------------------------------------------------------------------------------
 class _Room:
-    """A render server of an empty room, 8 x 6 m, floor at 0: exact depth along the axis, for depth views."""
-    def __init__(self):
-        self.views = []
+    """A render server of an empty room, 8 x 6 m, floor at 0: exact depth along the axis, for depth views; for LiDAR views
+    the path length, Lambertian walls of reflectance ``albedo``."""
+    def __init__(self, albedo: float = 0.8):
+        self.views, self.albedo = [], albedo
 
     def register_body(self, name, links):
         return {}
@@ -1276,7 +1277,7 @@ class _Room:
     def render(self, views, dtype="float32"):
         out = []
         for v in views:
-            assert v["renderer"] == "depth"
+            assert v["renderer"] in ("depth", "lidar")
             self.views.append(v)
             c2w = np.asarray(v["camera_to_world"])                   # dataset convention: x right, y up, looks along -z; y up world
             w, h = v["width"], v["height"]
@@ -1286,12 +1287,22 @@ class _Room:
             o = c2w[:3, 3]
             # the world's x, y, z here are Mitsuba's x, height, -y
             best = np.full(u.shape, np.inf)
+            cos = np.zeros(u.shape)
+            norm = np.linalg.norm(d, axis=-1)
             for axis, planes in ((0, (-4.0, 4.0)), (2, (-3.0, 3.0)), (1, (0.0, 3.0))):
                 for at in planes:
                     with np.errstate(divide="ignore", invalid="ignore"):
                         s = (at - o[axis]) / d[..., axis]
-                    best = np.where((s > 1e-6) & (s < best), s, best)
-            out.append({"depth": best.astype(np.float32)})
+                    nearer = (s > 1e-6) & (s < best)
+                    cos = np.where(nearer, np.abs(d[..., axis]) / norm, cos)
+                    best = np.where(nearer, s, best)
+            if v["renderer"] == "depth":
+                out.append({"depth": best.astype(np.float32)})
+            else:   # Resident.LIDAR_CHANNELS: walls of reflectance self.albedo (Lambertian), no glass or mirrors
+                rng = best * norm
+                lid = np.zeros(u.shape + (6,), np.float32)
+                lid[..., 0], lid[..., 1], lid[..., 2] = rng, self.albedo * cos, cos
+                out.append({"lidar": lid})
         return out
 
 
@@ -1509,3 +1520,93 @@ def test_camera_reading_in_a_worker_process_is_the_same_as_here():
     finally:
         pool.shutdown()
     assert offload.Pool(0).develop is not None and offload.Pool(0).off   # 0 processes: readings here
+
+
+def test_ouster_model_in_a_room():
+    """hw.ouster.OusterLidar against the room: ideal ranges on the walls, the noise of the datasheet's size, dark walls
+    dropping out far away, returns merged or split by their distance, glass and mirror returns, Ouster's reflectivity code."""
+    from opticalnav_sim.hw import ouster
+    room = _Room(albedo=0.8)
+    world = hw.SimWorld(scene="", client=room)
+    base = world.spawn(hw.drive.DifferentialDrive(), at=hw.pose2d(1.0, 0.5, 0.0, 30.0))
+    mount = Transform((0.0, 0.0, 1.0))
+    ideal = world.spawn(ouster.OusterLidar(model="OS1-64", columns=512, noise=False), attach_to=base, link="base_link", mount=mount)
+    got = world.sense(ideal)
+    assert got.modality == "lidar" and got.data["ranges"].shape == (64, 512) and room.views[-1]["renderer"] == "lidar"
+    r, el = got.data["ranges"], np.radians(got.data["elevation_deg"])
+    assert (r > 0).mean() > 0.99
+    # the beams nearest the horizon: their horizontal distance is the wall's, from the beam origin's circle
+    az = np.radians(ideal.spec.beam_azimuths() + 30.0)
+    with np.errstate(divide="ignore"):
+        wall = np.minimum(np.where(np.cos(az) > 0, 3.0 / np.cos(az), -5.0 / np.cos(az)), np.where(np.sin(az) > 0, 2.5 / np.sin(az), -3.5 / np.sin(az)))
+    mid = np.argmin(np.abs(el))
+    pts = ideal.spec.points(r)[mid]
+    o = ideal.spec.spec["origin_mm"] / 1000.0
+    assert np.abs(np.hypot(pts[:, 0], pts[:, 1]) - wall[mid] - o * 0).max() < 0.06
+    noisy = world.spawn(ouster.OusterLidar(model="OS1-64", columns=512), attach_to=base, link="base_link", mount=mount)
+    e = (world.sense(noisy).data["ranges"] - r)[(r > 0)]
+    e = e[np.abs(e) < 0.3]
+    assert 0.003 < float(e.std()) < 0.03                       # the OS1's 0.5-3 cm, with each beam's offset
+    assert np.array_equal(world.sense(noisy).data["ranges"], world.sense(noisy).data["ranges"])   # one moment, one noise
+    room.albedo = 1e-6                                           # walls that send almost nothing back: far ones drop out
+    dark = world.sense(noisy).data["ranges"]
+    assert (dark > 0).mean() < 0.5
+    room.albedo = 0.8
+    # returns: rays 0.2 m apart merge (a mixed point between them), 2 m apart they are two returns, the strongest first
+    spec = ouster.OusterLidar(model="OS1-64", columns=512)
+    rays = np.zeros((1, 1, 7, 6), np.float32)
+    rays[..., 1], rays[..., 2] = 0.8, 1.0
+    rays[0, 0, :, 0] = [5.0, 5.0, 5.0, 5.2, 5.2, 5.2, 5.2]
+    rng = np.random.default_rng(0)
+    m = spec.measure(rays, rng)
+    assert 5.02 < m["range"][0, 0] < 5.2 and m["mixed"][0, 0] and m["range2"][0, 0] == 0
+    rays[0, 0, :, 0] = [5.0, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0]
+    m = spec.measure(rays, rng)
+    assert abs(m["range"][0, 0] - 5.0) < 0.1 and abs(m["range2"][0, 0] - 7.0) < 0.1
+    # glass 2 m away, a wall behind it at 7 m: head-on the glass itself returns, far stronger than the wall (too weak a
+    # second return); 10 degrees off its normal the beam goes through to the wall
+    rays[0, 0, :, 0] = 7.0
+    rays[0, 0, :, 3], rays[0, 0, :, 4], rays[0, 0, :, 5] = 2.0, 2.0, 1.0
+    m = spec.measure(rays, rng)
+    assert abs(m["range"][0, 0] - 2.0) < 0.1 and m["specular"][0, 0]
+    rays[0, 0, :, 5] = math.cos(math.radians(10.0))
+    m = spec.measure(rays, rng)
+    assert abs(m["range"][0, 0] - 7.0) < 0.1 and not m["specular"][0, 0]
+    assert list(ouster.reflectivity_code(np.array([0.004, 0.5, 1.0, 864.0]))) == [1.0, 50.0, 100.0, 255.0]
+    with pytest.raises(ValueError):
+        ouster.OusterLidar(model="OS9")
+
+
+def test_suspension_bounces_over_a_bump_and_settles():
+    """hw.suspension: with springs the body pitches further over a 6 cm bump than the contact plane alone, its vertical
+    acceleration is felt, a 4 cm step is climbed along the wheel's arc, and on flat ground after it the body comes to rest
+    level."""
+    from opticalnav_sim.hw import robots, suspension
+    from opticalnav_sim.hw.drive import Twist
+    from opticalnav_sim.hw.ground import Ground
+    cell = 0.01
+    xs, ys = np.arange(-2.0, 9.0, cell), np.arange(-1.0, 1.0, cell)
+    X, _ = np.meshgrid(xs, ys)
+    bump = 0.06 * np.clip(1.0 - ((X - 3.0) / 0.2) ** 2, 0.0, None)
+    peaks = {}
+    for hz in (0.0, 3.0):
+        g = Ground(step=0.08)
+        g.set_height_map(bump, (xs[0], ys[0]), cell)
+        world = hw.World(ground=g, dt=0.01)
+        spec = robots.ranger_mini(suspension_hz=hz, suspension_zeta=0.15)
+        r = world.spawn(spec, at=Transform((0.0, 0.0, 0.0)))
+        pitch, acc = [], []
+        for _ in range(700):
+            spec.apply(r.state, Twist(1.0, 0.0, 0.0))
+            world.tick()
+            pitch.append(r.pose.rpy_deg[1])
+            acc.append(r.state.body.accel if r.state.body is not None else 0.0)
+        peaks[hz] = (max(abs(p) for p in pitch), max(abs(a) for a in acc))
+        if hz:
+            assert abs(r.pose.rpy_deg[1]) < 0.1 and abs(r.pose.xyz[2]) < 0.002      # at rest again, level, on the floor
+    assert peaks[3.0][0] > peaks[0.0][0] * 1.2 and peaks[3.0][1] > 3.0 and peaks[0.0][1] == 0.0
+    # a wheel meeting a 4 cm step: its ground rises along an arc of its radius, not at once
+    g = Ground(step=0.08)
+    g.set_height_map(np.where(X > 3.0, 0.04, 0.0), (xs[0], ys[0]), cell)
+    h = [suspension.rim_heights(g, np.array([[x, 0.0]]), 0.0, 0.1, samples=41)[0] for x in (2.85, 2.95, 2.98, 3.05)]
+    assert h[0] == 0.0 and 0.0 < h[1] < h[2] < 0.04 and abs(h[3] - 0.04) < 1e-9

@@ -83,6 +83,9 @@ def _depth_view(world, pose: np.ndarray, width: int, height: int, hfov_deg: floa
     bodies = world.bodies()
     if bodies:
         view["bodies"] = bodies
+    objects = getattr(world, "objects_view", None)   # pushed or held objects (hw.physics), where they are now
+    if objects:
+        view["objects"] = objects
     return view
 
 

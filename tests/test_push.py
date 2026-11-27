@@ -149,3 +149,25 @@ def test_a_jump_passes_through_until_clear(scene):
     world.step((-2.0, -0.2, 0.0, 0.0), 0.05)
     world.step((-2.0, -0.2, 0.0, 0.0), 0.05)
     assert not world._ghost
+
+
+def test_a_held_object_goes_where_it_is_held_and_falls_when_let_go(scene):
+    """PushWorld.hold: the crate put 0.3 m up and 0.2 m along every step, colliding with nothing; released, it falls back
+    to the floor."""
+    world = physics.PushWorld.from_scene(scene, FOOT, 0.4)
+    far = (-3.0, -3.0, 0.0, 0.0)                       # the robot out of the way
+    world.step(far, 0.05)
+    start = world.world_poses()["crate"].copy()
+    up = start.copy()
+    up[:3, 3] += [0.2, 0.0, 0.3]
+    world.hold("crate", up)
+    moved = world.step(far, 0.05)
+    assert "crate" in moved and np.allclose(world.world_poses()["crate"], up, atol=1e-6)
+    for _ in range(10):                                # held: it stays, no falling
+        world.step(far, 0.05)
+    assert np.allclose(world.world_poses()["crate"], up, atol=1e-6)
+    world.release("crate")
+    for _ in range(40):
+        world.step(far, 0.05)
+    now = world.world_poses()["crate"]
+    assert abs(now[2, 3] - start[2, 3]) < 0.01 and abs(now[0, 3] - up[0, 3]) < 0.05   # on the floor, where it was let go

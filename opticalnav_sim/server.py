@@ -34,6 +34,7 @@ import queue
 import re
 import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
 from concurrent.futures import Future
@@ -43,7 +44,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import bodies as body_models, frames, progress, stokes
+from . import bodies as body_models, frames, progress, solid_filters, stokes
 
 MAX_PIXELS = 2048 * 2048
 
@@ -1820,12 +1821,205 @@ class Resident:
         d = mi.Vector3f(*(r[i][0] * cx + r[i][1] * cy + r[i][2] * cz for i in range(3)))
         o = mi.Point3f(*(dr.opaque(mi.Float, float(m[i, 3])) for i in range(3)))
         pi = self.scene.ray_intersect_preliminary(mi.Ray3f(o, d), coherent=True)
-        z = dr.select(pi.is_valid(), pi.t * self._depth_inv, 0.0)
+        t = pi.t
+        valid = pi.is_valid()
+        if self.hidden:   # the room softboxes the camera sees through: a depth sensor too
+            for _ in range(2):
+                unseen = valid & self._unseen(pi.shape)
+                if not getattr(self, "_unseen_shapes", None):
+                    break
+                pi2 = self.scene.ray_intersect_preliminary(mi.Ray3f(o + d * (t + 1e-4), d), unseen)
+                valid = dr.select(unseen, pi2.is_valid(), valid)
+                t = dr.select(unseen, t + 1e-4 + pi2.t, t)
+                pi.shape = dr.select(unseen, pi2.shape, pi.shape)
+        z = dr.select(valid, t * self._depth_inv, 0.0)
         dr.schedule(z)
         return z
 
+    LIDAR_BOUNCES = 3        # a LiDAR ray follows mirrors and glass this many surfaces deep (lidar_image)
+    LIDAR_GLASS_T = 0.92     # what one glass surface lets through (Fresnel at normal incidence, n = 1.5)
+    LIDAR_MIRROR_R = 0.90    # what a smooth conductor (a mirror) gives back of a LiDAR's light
+    LIDAR_CHANNELS = ("range_m", "return", "cos", "first_m", "first_kind", "first_cos")
+    LIDAR_LAMP = 0.5         # what a lamp's glowing part (black to the path tracer: it only emits) returns (estimate)
+
+    LIDAR_MIRROR_ALPHA = 0.05   # a conductor this smooth (GGX alpha, no diffuse part) is a mirror to a LiDAR (raster.py's too)
+
+    def _mirror_like(self, bsdf) -> bool:
+        """Whether a BSDF is a conductor alone, smoother than LIDAR_MIRROR_ALPHA (a mirror made of a rough conductor of
+        tiny roughness: the path tracer draws it as a mirror, but its flags say glossy)."""
+        keys = list(self.mi.traverse(bsdf).keys())
+        if any(k.split(".")[-1] in ("diffuse_reflectance", "reflectance") or "diffuse_reflectance." in k
+               or ".reflectance." in k or k.startswith("reflectance.") for k in keys):
+            return False
+        if not any(k.split(".")[-1] in ("k", "specular_reflectance") or ".k." in k or "specular_reflectance." in k for k in keys):
+            return False
+        params = self.mi.traverse(bsdf)
+        alphas = [k for k in keys if k.split(".")[-1] in ("alpha", "alpha_u", "alpha_v")]
+        return all(np.size(params[k]) <= 4 and float(np.max(np.array(params[k]))) < self.LIDAR_MIRROR_ALPHA for k in alphas)
+
+    def _shape_table(self, name: str, pick):
+        """A Bool table by shape registry id: ``pick(shape)`` for each of the scene's shapes (built once per name)."""
+        import drjit as dr
+        mi = self.mi
+        tables = self.__dict__.setdefault("_shape_tables", {})
+        if name not in tables:
+            ids = []
+            for s in self.scene.shapes():
+                try:
+                    yes = pick(s)
+                except Exception:  # noqa: BLE001 - a BSDF the test cannot read: not picked
+                    yes = False
+                if yes:
+                    ids.append(int(dr.reinterpret_array(mi.UInt32, mi.ShapePtr(s))[0]))
+            table = np.zeros(max(ids, default=0) + 2, bool)
+            table[ids] = True
+            tables[name] = (mi.Bool(table), len(ids))
+        return tables[name]
+
+    def _in_table(self, name: str, pick, shape_ptr):
+        import drjit as dr
+        mi = self.mi
+        table, _ = self._shape_table(name, pick)
+        idx = dr.reinterpret_array(mi.UInt32, shape_ptr)
+        n = dr.width(table)
+        return dr.gather(mi.Bool, table, dr.minimum(idx, n - 1)) & (idx < n)
+
+    def _unseen_build(self) -> None:
+        import drjit as dr
+        mi = self.mi
+        if getattr(self, "_unseen_table", None) is None:
+            ids = [int(dr.reinterpret_array(mi.UInt32, mi.ShapePtr(s))[0]) for s in self.scene.shapes()
+                   if self.hidden and s.id().startswith(self.hidden)]
+            table = np.zeros(max(ids, default=0) + 2, bool)
+            table[ids] = True
+            self._unseen_shapes = ids
+            self._unseen_table = mi.Bool(table)
+
+    def _unseen(self, shape_ptr):
+        """Whether each ray's shape is one the camera sees through (the room softboxes: ``hidden``), as a Dr.Jit Bool:
+        a table by the shapes' registry ids, one gather."""
+        import drjit as dr
+        mi = self.mi
+        self._unseen_build()
+        idx = dr.reinterpret_array(mi.UInt32, shape_ptr)
+        n = dr.width(self._unseen_table)
+        return dr.gather(mi.Bool, self._unseen_table, dr.minimum(idx, n - 1)) & (idx < n)
+
+    def lidar_image(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float) -> list:
+        """What a LiDAR beam through each pixel's centre meets (hw.sensing.OusterLidar's noise model reads it), as
+        Dr.Jit arrays (LIDAR_CHANNELS), queued on the GPU:
+
+        * ``range_m``: the path length to the first surface that sends light back (0: none), along the ray: through
+          glass and off mirrors (delta BSDFs), up to LIDAR_BOUNCES surfaces, so a mirror gives phantom points behind it;
+        * ``return``: that surface's monostatic reflectance in the near-infrared lane (the RGBN variant's fourth, as
+          rgb2nir gives it; a LiDAR's 865 nm): pi times the BSDF evaluated with the light going back the way it came,
+          its cosine included, so a white Lambertian surface head-on gives 1 and at 60 degrees 0.5; glossy surfaces
+          give their highlight's value toward the sensor; times what the glass and mirrors on the way let through;
+        * ``cos``: the cosine of the incidence there;
+        * ``first_m``, ``first_kind``, ``first_cos``: the first surface when it is glass (2) or a mirror (1), else 0:
+          a real LiDAR sometimes sees the glass itself near normal incidence.
+
+        Glass is passed straight (no refraction offset). The scene as the last launch left it, as depth_image."""
+        import drjit as dr
+        mi = self.mi
+        self.depth_image(c2w, width, height, hfov_deg)   # the pixel directions, cached per size (and a depth, unused)
+        m = np.asarray(c2w, dtype=np.float64)
+        r = [dr.opaque(mi.Float, float(m[i, j])) for i in range(3) for j in range(3)]
+        o = [dr.opaque(mi.Float, float(m[i, 3])) for i in range(3)]
+        cx, cy, cz = self._depth_dirs
+        # the shape tables the kernel reads, made before it is traced
+        self._unseen_build()
+        mirror, _ = self._shape_table("mirror", lambda sh: sh.bsdf() is not None and self._mirror_like(sh.bsdf()))
+        tables = [self._unseen_table, mirror]
+        if not self.freeze:
+            out = self._lidar_trace(self.scene, cx, cy, cz, o, r, tables)
+        else:
+            # frozen as the renders are: tracing the BSDF calls of every material (a robot's bodies bring dozens) took a
+            # minute a scan; a replay takes milliseconds
+            frozen = self.__dict__.setdefault("_lidar_frozen", {})
+            key = (int(width), int(height))
+            if key not in frozen:
+                frozen[key] = dr.freeze(lambda scene, cx, cy, cz, o, r, t: self._lidar_trace(scene, cx, cy, cz, o, r, t),
+                                        backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=4)
+            out = frozen[key](self.scene, cx, cy, cz, o, r, tables)
+        out = list(out)
+        dr.schedule(*out)
+        return out
+
+    def _lidar_trace(self, scene, cx, cy, cz, o, r, tables) -> list:
+        """lidar_image's kernel: ``o`` the origin (3 opaque Floats), ``r`` the rotation (9, row by row), ``tables`` the
+        shapes it passes through and the mirrors (Bool tables by registry id: inputs, for a frozen kernel)."""
+        import drjit as dr
+        mi = self.mi
+
+        def lookup(table, shape_ptr):
+            idx = dr.reinterpret_array(mi.UInt32, shape_ptr)
+            n = dr.width(table)
+            return dr.gather(mi.Bool, table, dr.minimum(idx, n - 1)) & (idx < n)
+        d = mi.Vector3f(*(r[3 * i] * cx + r[3 * i + 1] * cy + r[3 * i + 2] * cz for i in range(3)))
+        o = mi.Point3f(*o)
+        ray = mi.Ray3f(o, d)
+        n = dr.width(cx)
+        F = mi.Float
+        first_m, first_kind, first_cos = dr.zeros(F, n), dr.zeros(F, n), dr.zeros(F, n)
+        total, through = dr.zeros(F, n), dr.full(F, 1.0, n)
+        end_o, end_d, end_total = mi.Point3f(o), mi.Vector3f(d), dr.zeros(F, n)
+        found = dr.zeros(mi.Bool, n)
+        active = dr.full(mi.Bool, True, n)
+        first = dr.full(mi.Bool, True, n)          # no glass or mirror met yet
+        BF = mi.BSDFFlags
+        # follow each ray through what it passes (glass, the room softboxes) and off mirrors, by the BSDFs' flags alone;
+        # the BSDF itself is evaluated once, at the surface each ray ends on (tracing an evaluation of every material
+        # of the scene is what costs)
+        for k in range(self.LIDAR_BOUNCES + 2):
+            si = scene.ray_intersect(ray, active)
+            hit = active & si.is_valid()
+            unseen = hit & lookup(tables[0], si.shape)     # what the camera sees through, the LiDAR does too
+            valid = hit & ~unseen
+            fl = si.bsdf(ray).flags()
+            smooth_r = mi.has_flag(fl, BF.DeltaReflection)
+            smooth_t = mi.has_flag(fl, BF.DeltaTransmission)
+            rough = mi.has_flag(fl, BF.Diffuse) | mi.has_flag(fl, BF.Glossy)
+            mirror = lookup(tables[1], si.shape)
+            smooth_r |= mirror
+            delta = ((smooth_r | smooth_t) & ~rough) | mirror
+            stop = valid & ~delta
+            end_o = dr.select(stop, ray.o, end_o)
+            end_d = dr.select(stop, ray.d, end_d)
+            end_total = dr.select(stop, total, end_total)
+            found |= stop
+            c = dr.abs(mi.Frame3f.cos_theta(si.wi))
+            meet = valid & delta & first
+            first_m = dr.select(meet, total + si.t, first_m)
+            first_kind = dr.select(meet, dr.select(smooth_t, 2.0, 1.0), first_kind)
+            first_cos = dr.select(meet, c, first_cos)
+            first &= ~(valid & delta)
+            go = valid & delta
+            reflected = ray.d - 2.0 * dr.dot(ray.d, si.n) * si.n
+            through = dr.select(go, through * dr.select(smooth_t, self.LIDAR_GLASS_T, self.LIDAR_MIRROR_R), through)
+            total = dr.select(go | unseen, total + si.t, total)
+            ray = si.spawn_ray(dr.select(smooth_t | unseen, ray.d, reflected))
+            active = go | unseen
+        # the surface each ray ends on, again, and its BSDF toward the sensor
+        ray = mi.Ray3f(end_o, end_d)
+        si = scene.ray_intersect(ray, found)
+        found &= si.is_valid()
+        cos_i = mi.Frame3f.cos_theta(si.wi)
+        # the back of a one-sided BSDF is black to the path tracer, but a real surface returns a laser either way: seen
+        # from behind, it is read as from the front
+        si.wi = dr.select(cos_i < 0.0, mi.Vector3f(si.wi.x, si.wi.y, -si.wi.z), si.wi)
+        f = mi.unpolarized_spectrum(si.bsdf(ray).eval(mi.BSDFContext(), si, si.wi, found))
+        rho = dr.pi * dr.maximum(f[3], 0.0)
+        lamp = found & (rho <= 0.0) & (si.emitter(scene) != None)  # noqa: E711 - a Dr.Jit pointer array
+        c = dr.abs(cos_i)
+        rho = dr.select(lamp, self.LIDAR_LAMP * c, rho)
+        rng = dr.select(found, end_total + si.t, 0.0)
+        ret = dr.select(found, through * rho, 0.0)
+        cos = dr.select(found, c, 0.0)
+        return [rng, ret, cos, first_m, first_kind, first_cos]
+
     def raster_views(self, cams: list, width: int, height: int, hfov_deg: float, follow: bool, look: Look,
-                     aa: str = "edge", solid: bool = False) -> tuple:
+                     aa: str = "edge", solid: bool = False, solid_filter: str | None = None) -> tuple:
         """The rasterized preview (raster.py) of each camera, with the scene as ``look`` has it (written into the
         scene as a launch would, so the path tracer and the preview always show the same state). Returns
         (each view's Stokes images [S0..S3] in R, G, B and near-infrared lanes, depths, timing parts)."""
@@ -1842,10 +2036,11 @@ class Resident:
             if getattr(self, "_raster", None) is None or type(self._raster) is not raster.RasterScene:
                 self._raster = None
                 self._raster = raster.RasterScene(self)
+                self._raster.scene_dir, self._raster.scene_xml = getattr(self, "scene_dir", None), getattr(self, "scene_xml", "base.xml")
                 parts["raster_build_s"] += self._raster.build_s
             self._raster.sync(look.hidden)
             t2 = time.perf_counter()
-            lanes, z = self._raster.render_solid(c2w, width, height, hfov_deg, look, aa) if solid else \
+            lanes, z = self._raster.render_solid(c2w, width, height, hfov_deg, look, aa, solid_filter) if solid else \
                 self._raster.render(c2w, width, height, hfov_deg, look, follow, aa)
             parts["scene_update_s"] += t1 - t0
             parts["raster_s"] += time.perf_counter() - t2
@@ -2931,6 +3126,7 @@ class Renderer:
                 bodies=body_models.scene_xml(self.body_models, [(b, name) for b, name, _ in with_bodies[0]])
                 if with_bodies else "",
                 objects=self.object_shapes(scan) if with_bodies and OBJECT_INSTANCES else None)   # pushed: instances
+        loaded.scene_dir, loaded.scene_xml = base, xml   # the Solid preview's object filters read the scene's parts
         self.cache[rkey] = loaded
         return loaded
 
@@ -3090,8 +3286,12 @@ class Renderer:
         renderer = str(view.get("renderer", "path"))  # "raster": the rasterized preview (raster.py); "cycles": its .blend
         # "depth": no image, the depth alone (one ray a pixel, nothing sampled or recorded: hw.sensing's depth sensors)
         # "solid": a structural preview of the raster scene (raster.RasterScene.render_solid: material colours, a studio light)
-        if renderer not in ("path", "raster", "solid", "cycles", "depth"):
+        # "lidar": what a LiDAR beam meets through each pixel (Resident.lidar_image: path length through glass and off
+        # mirrors, near-infrared return, incidence), for hw.sensing's LiDAR noise models
+        if renderer not in ("path", "raster", "solid", "cycles", "depth", "lidar"):
             raise ValueError("renderer must be 'path', 'raster', 'cycles' or 'depth'")
+        # the Solid preview's filter (solid_filters.NAMES): one property in colour, the rest grey
+        solid_filter = solid_filters.check(view.get("solid_filter")) if renderer == "solid" else None
         if renderer in ("raster", "solid"):   # drawn from the RGBN polar variant whatever the mode: its Stokes images, not "radiance"
             mode = "polar"         # (an "rgb" raster request came back empty: the rgb reply keeps "radiance" alone)
         if renderer == "cycles" and self.blend_of(scan) is None:
@@ -3120,7 +3320,7 @@ class Renderer:
         placed = tuple(sorted(placed))
         if len({p[0] for p in placed}) != len(placed):
             raise ValueError("body ids repeat in one view")
-        if placed and renderer not in ("path", "depth"):
+        if placed and renderer not in ("path", "depth", "lidar"):
             raise ValueError("bodies are drawn by the path tracer only (renderer 'path', or its 'depth')")
         # objects: {physics object id: 4x4}: a movable object pushed by the physics step (hw/physics.py), as the change of
         # its pose since the scene file (simulator frame: x = X, y = -Z, z = Y); its dyn_ meshes are moved by it
@@ -3131,11 +3331,11 @@ class Renderer:
                 raise ValueError(f"object {oid!r}: a pose that is not finite")
             moved.append((str(oid), m.tobytes()))
         moved = tuple(moved)
-        if moved and renderer not in ("path", "depth"):
+        if moved and renderer not in ("path", "depth", "lidar"):
             raise ValueError("moved objects are drawn by the path tracer only (renderer 'path', or its 'depth')")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
                 mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth,
-                renderer, raster_aa, placed, moved)
+                renderer, raster_aa, placed, moved, solid_filter)
         return (scan, variant, mode, width, height, hfov, spp, seed, denoise, look), c2w
 
     def _start(self, key: tuple, cams: list, submitted: float, depth: bool = False, hfovs: list | None = None):
@@ -3146,7 +3346,8 @@ class Renderer:
                                                                         flash_band, nir, lighting, mirrors, lamps,
                                                                         flash_scale, flash_pdf, flash_offset, max_depth,
                                                                         caustics, split, nir_range, rr_depth,
-                                                                        renderer, raster_aa, placed, moved) = key
+                                                                        renderer, raster_aa, placed, moved,
+                                                                        solid_filter) = key
         if renderer == "cycles":  # a Blender process, not a Mitsuba scene: nothing of the path tracer is loaded for it
             return self._cycles_start(key, cams, started - submitted)
         if self.mi.variant() != self.variant_of[mode]:
@@ -3198,9 +3399,11 @@ class Renderer:
                          for b in {"rgb": (0,), "nir": (1,), "both": (0, 1)}[bands]}
             if renderer in ("raster", "solid"):  # the rasterized preview (raster.py): drawn here, one image a view
                 return self._raster_start(key, resident, cams, next(iter(looks.values())), follow, started - submitted,
-                                          bands, depth, raster_aa, solid=renderer == "solid")
+                                          bands, depth, raster_aa, solid=renderer == "solid", solid_filter=solid_filter)
             if renderer == "depth":
                 return self._depth_start(resident, cams, width, height, hfov, next(iter(looks.values())), started - submitted)
+            if renderer == "lidar":
+                return self._lidar_start(resident, cams, width, height, hfov, next(iter(looks.values())), started - submitted)
             if self.kernel_history:
                 self.dr.kernel_history()  # discard kernels launched before this call
             t0 = time.perf_counter()
@@ -3320,8 +3523,21 @@ class Renderer:
         kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0, "queue_s": queue_s, "launch_s": 0.0, "split_s": 0.0}
         return lambda: lambda: ([{"depth": z} for z in maps], kernels, render_s, 0.0)
 
+    def _lidar_start(self, resident, cams: list, width: int, height: int, hfov: float, look, queue_s: float):
+        """_start for a LiDAR view (Resident.lidar_image): H x W x 6 float32 (LIDAR_CHANNELS) per camera."""
+        t0 = time.perf_counter()
+        with ACTIVITY.doing("rendering"):
+            resident._set_camera(cams[0], width, height, hfov, False, look)
+            chans = [resident.lidar_image(c, width, height, hfov) for c in cams]
+            self.dr.eval(*[a for ch in chans for a in ch])
+            maps = [np.stack([np.array(a, dtype=np.float32).reshape(int(height), int(width)) for a in ch], axis=-1)
+                    for ch in chans]
+        render_s = time.perf_counter() - t0
+        kernels = {"kernels": 0, "codegen_s": 0.0, "compile_s": 0.0, "gpu_s": 0.0, "queue_s": queue_s, "launch_s": 0.0, "split_s": 0.0}
+        return lambda: lambda: ([{"lidar": z} for z in maps], kernels, render_s, 0.0)
+
     def _raster_start(self, key: tuple, resident, cams: list, look, follow: bool, queue_s: float, bands: str,
-                      depth: bool, aa: str = "edge", solid: bool = False):
+                      depth: bool, aa: str = "edge", solid: bool = False, solid_filter: str | None = None):
         """_start for the rasterized preview: the views drawn and read back here, handed on in the path tracer's
         bands (RGB Stokes images, near-infrared ones) without its film split."""
         if not resident.rgbn:
@@ -3329,7 +3545,9 @@ class Renderer:
         t0 = time.perf_counter()
         width, height, hfov = key[3], key[4], key[5]
         with ACTIVITY.doing("rasterizing"):
-            views, depths, parts = resident.raster_views(cams, width, height, hfov, follow, look, aa, solid)
+            views, depths, parts = resident.raster_views(cams, width, height, hfov, follow, look, aa, solid, solid_filter)
+        if solid:
+            self.last_solid = resident._raster   # what GET /v1/pick reads
         render_s = time.perf_counter() - t0
         parts.update(queue_s=queue_s, launch_s=0.0)
 
@@ -3426,6 +3644,8 @@ class Renderer:
                   if k == "nir" or (k.startswith("nir_s") and (s3 or k != "nir_s3"))}
         if "depth" in out:  # metres, float32 whatever the Stokes dtype (float16 steps 8 mm at 10 m)
             result["depth"] = out["depth"]
+        if "lidar" in out:  # H x W x 6 (Resident.LIDAR_CHANNELS), float32
+            result["lidar"] = out["lidar"]
         if mode == "rgb":
             if "radiance" in out:
                 rad = out["radiance"]
@@ -3540,6 +3760,12 @@ def make_handler(renderer: Renderer, token: str | None = None):
                         # a change that should replay leaves it unchanged
                         "recordings": sum(getattr(f, "n_recordings", 0) for r in list(renderer.cache.values())
                                           for f in list(r.frozen.values()))})
+                if parts == ["v1", "pick"]:  # ?x=&y=: what the last Solid frame shows at that pixel (raster.RasterScene.pick)
+                    q = dict(urllib.parse.parse_qsl(self.path.partition("?")[2]))
+                    scene = getattr(renderer, "last_solid", None)
+                    if scene is None:
+                        return self._json(404, {"error": "no Solid frame yet"})
+                    return self._json(200, scene.pick(int(q["x"]), int(q["y"])))
                 if parts == ["v1", "info"]:
                     return self._json(200, {
                         "server": "opticalnav_sim", "mitsuba_variant": renderer.variant,

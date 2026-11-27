@@ -77,6 +77,10 @@ class RenderClient:
         """What the render server is doing now (loading a scene, recording a freeze, rendering)."""
         return self._json("/v1/status")
 
+    def pick(self, x: int, y: int) -> dict:
+        """What the server's last Solid frame shows at pixel (x, y): shape, material, object (raster.RasterScene.pick)."""
+        return self._json(f"/v1/pick?x={int(x)}&y={int(y)}")
+
     def scans(self) -> list[str]:
         return self._json("/v1/scans")
 

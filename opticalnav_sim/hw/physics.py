@@ -549,6 +549,8 @@ class PushWorld:
         self.stalled = 0.0          # share of the last step's substeps it could not push on
         self._ghost = False         # after a jump: the robot passes through bodies until it overlaps none
         self._carry = 0.0           # time asked for but not yet stepped (dt not a multiple of the timestep)
+        self._held = {}             # object index -> its world frame while something holds it (hold)
+        self._geom_types = {g: (int(m.geom_contype[g]), int(m.geom_conaffinity[g])) for g in self._geom_object}
         self.info["depenetrated"] = self._depenetrate()
         self.info["held"] = self._settle()
         # the first step() returns every body the settling moved, so the renderer agrees with the physics from then on
@@ -762,13 +764,55 @@ class PushWorld:
             else:
                 stalled += 1
             self._set_robot(nxt, (nxt - phys) / ts)
+            if self._held:
+                self._place_held()
             mujoco.mj_step(m, d)
             phys = nxt
+        if self._held:   # where they are held, as of this step's end
+            self._place_held()
+            mujoco.mj_kinematics(m, d)
         self._set_robot(phys, 0.0)
         self._robot, self._phys = target, phys
         self.lag = float(np.linalg.norm(target[:3] - phys[:3]))
         self.stalled = stalled / n if n else 0.0
         return self._moved()
+
+    # --- holding --------------------------------------------------------------------------------------------------
+    def hold(self, oid: str, pose) -> None:
+        """Something (a gripper) holds object ``oid`` with its frame at ``pose`` (4x4, world; its frame as world_poses
+        gives it): from the next step on the body is put there every substep, still, and collides with nothing (what
+        holds it decides where it goes)."""
+        k = self.ids.index(oid)
+        if k not in self._held:
+            for g, ok in self._geom_object.items():
+                if ok == k:
+                    self.model.geom_contype[g] = self.model.geom_conaffinity[g] = 0
+            self._wake(k)
+        self._held[k] = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+
+    def release(self, oid: str) -> None:
+        """Let go of ``oid``: it falls, collides and rests as a free body again, from where it was held."""
+        k = self.ids.index(oid)
+        if self._held.pop(k, None) is not None:
+            for g, ok in self._geom_object.items():
+                if ok == k:
+                    self.model.geom_contype[g], self.model.geom_conaffinity[g] = self._geom_types[g]
+
+    def _wake(self, k: int) -> None:
+        """Keep object ``k`` awake from now on (held, then let go in mid-air, it must not sleep where it was let go: a
+        body released at rest is still and would)."""
+        if self.sleeps:
+            import mujoco
+            self.model.tree_sleep_policy[int(self.model.body_treeid[self._body[k]])] = int(mujoco.mjtSleepPolicy.mjSLEEP_NEVER)
+
+    def _place_held(self) -> None:
+        d = self.data
+        for k, m in self._held.items():
+            a = int(self._qadr[k])
+            d.qpos[a:a + 3] = m[:3, 3]
+            d.qpos[a + 3:a + 7] = _quat(m[:3, :3])
+            dof = int(self.model.jnt_dofadr[self.model.body_jntadr[self._body[k]]])
+            d.qvel[dof:dof + 6] = 0.0
 
     def _moved(self) -> dict:
         now = self._current()

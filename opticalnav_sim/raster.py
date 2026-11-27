@@ -51,7 +51,7 @@ import torch
 import torch.utils.cpp_extension
 import nvdiffrast.torch as drt
 
-from . import raster_gi, raster_kernels
+from . import raster_gi, raster_kernels, solid_filters
 
 # nvdiffrast 0.3.3 builds its plugin with torch.utils.cpp_extension.load, then imports it by name from sys.path,
 # where torch 2.12's load no longer puts its build directory: "No module named 'nvdiffrast_plugin'"
@@ -225,6 +225,7 @@ class RasterScene:
         self._srgb: list[bool] = []
         self._uv: list[np.ndarray] = []
         materials, mat_of = [], {}
+        self._twosided: list[bool] = []
         shapes, self.meshes = [], []
         for s in resident.scene.shapes():
             sid = s.id()
@@ -359,6 +360,8 @@ class RasterScene:
         params = self.mi.traverse(bsdf)
         node = self._node(params, "")
         glass = all(leaf.kind == KIND_NONE for leaf in node[1:3])
+        # twosided (its parameters under brdf_0): both sides shade; else the back of the surface renders black
+        self._twosided.append(any("brdf_0." in k for k in params.keys()))
         return node, glass
 
     def _build_materials(self, mats) -> None:
@@ -405,6 +408,23 @@ class RasterScene:
                 mirror[i] |= (kind[i, j] == KIND_CONDUCTOR and rough[i, j] < MIRROR_ALPHA and rtex[i, j] < 0
                               and share > 0.99)
         self.m_mirror = t(mirror)
+        self.m_twosided = t(np.array(self._twosided or [True] * M, bool))
+        # the Solid preview's "bsdf" filter: each material's kind (solid_filters.COLORS["bsdf"])
+        cat = []
+        for i in range(M):
+            if mats[i][1]:
+                cat.append("glass")
+                continue
+            if mirror[i]:
+                cat.append("mirror")
+                continue
+            shares = (0.5, 0.5) if wtex[i] >= 0 else (1 - wconst[i], wconst[i])
+            used = [j for j in range(2) if shares[j] > 0.01 and kind[i, j] != KIND_NONE]
+            metal = any(kind[i, j] == KIND_CONDUCTOR for j in used)
+            other = any(kind[i, j] == KIND_PLASTIC for j in used)
+            coated = any(kind[i, j] == KIND_PLASTIC and eta[i, j, 0] > 1.0001 for j in used)
+            cat.append("blend" if metal and other else "metal" if metal else "coated" if coated else "diffuse")
+        self.m_category = cat
         layers = self._layers or [torch.zeros((1, 1, 3), dtype=torch.uint8, device=dev)]
         srgb = self._srgb or [False]
         # every texture's mip levels, one after another: [T, MIP_LEVELS] offsets and sizes (a short chain repeats
@@ -466,14 +486,17 @@ class RasterScene:
         self.pos_h = torch.cat([torch.cat(pos), torch.ones((first, 1), device=dev)], dim=1).contiguous()
         self.attr = torch.cat([torch.cat(normals), torch.cat(uvs)], dim=1).contiguous()  # normal, uv
         tris, tri_shape = torch.cat(tris).to(torch.int32), torch.cat(tri_shape)
+        self.tri_all, self.tri_shape_all = tris, tri_shape   # every triangle, by its number (tidx_o, tidx_g)
+        tidx = torch.arange(tris.shape[0], dtype=torch.int32, device=dev)
         glass = self.m_glass[self.shape_mat[tri_shape.long()]]
         # shapes the camera sees through (the room softboxes, Resident.hidden): lights, never drawn
         prefix = getattr(self.resident, "hidden", "")
         unseen = torch.as_tensor([bool(prefix) and sid.startswith(prefix) for sid in self.shape_ids], device=dev)
         drawn = ~unseen[tri_shape.long()]
-        tris, tri_shape, glass = tris[drawn], tri_shape[drawn], glass[drawn]
+        tris, tri_shape, glass, tidx = tris[drawn], tri_shape[drawn], glass[drawn], tidx[drawn]
         self.tri_o, self.shape_o = tris[~glass].contiguous(), tri_shape[~glass].contiguous()
         self.tri_g, self.shape_g = tris[glass].contiguous(), tri_shape[glass].contiguous()
+        self.tidx_o, self.tidx_g = tidx[~glass].contiguous(), tidx[glass].contiguous()
         self.n_tris, self.n_glass = int(tris.shape[0]), int(self.tri_g.shape[0])
         if self.tri_o.shape[0] >= 1 << 24:
             raise RuntimeError("more triangles than a float32 triangle id holds exactly (2^24)")
@@ -501,6 +524,7 @@ class RasterScene:
         pad = torch.cat([order, order[-1:].expand(count * CHUNK - n)])  # the last triangle again: drawn twice, same
         self.chunk_tri = self.tri_o[pad].view(count, CHUNK, 3).contiguous()
         self.chunk_shape = self.shape_o[pad].view(count, CHUNK).contiguous()
+        self.chunk_tidx = self.tidx_o[pad].view(count, CHUNK).contiguous()
         self._chunk_boxes()
 
     def _chunk_boxes(self) -> None:
@@ -514,12 +538,16 @@ class RasterScene:
         self.chunk_corners = torch.cat([torch.stack(corners, dim=1), torch.ones((lo.shape[0], 8, 1), device=self.dev)],
                                        dim=2)  # C x 8 x 4
 
-    def _in_view(self, mvp: torch.Tensor) -> tuple:
-        """The opaque triangles (and their shapes) of the chunks whose boxes the view's frustum meets."""
+    def _chunks_in_view(self, mvp: torch.Tensor) -> torch.Tensor:
+        """The chunks whose boxes the view's frustum meets."""
         c = self.chunk_corners @ mvp.T  # C x 8 x 4
         w = c[..., 3:4]
         outside = torch.cat([c[..., :3] < -w, c[..., :3] > w], dim=-1).all(dim=1).any(dim=1)  # all 8 beyond one plane
-        keep = torch.nonzero(~outside)[:, 0]
+        return torch.nonzero(~outside)[:, 0]
+
+    def _in_view(self, mvp: torch.Tensor) -> tuple:
+        """The opaque triangles (and their shapes) of the chunks whose boxes the view's frustum meets."""
+        keep = self._chunks_in_view(mvp)
         return self.chunk_tri[keep].view(-1, 3), self.chunk_shape[keep].view(-1)
 
     def _build_lights(self) -> None:
@@ -1002,14 +1030,18 @@ class RasterScene:
             traceback.print_exc()
             raise
 
-    def render_solid(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, look, aa: str = "edge") -> tuple:
+    def render_solid(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, look, aa: str = "edge",
+                     filt: str | None = None) -> tuple:
         """A structural preview, like Blender's Solid viewport: each surface in its material's colour (textures at the
         mip its pixel footprint picks), lit by a fixed studio light that follows the camera (a key light over the
         shoulder, a fill from the other side, a sky-and-ground hemisphere), no shadows, light probes, mirrors or glass.
         Returns ([S0, None, None, None], depth) like ``render`` (no polarization; the near-infrared lane is the material's).
         Display-referred: 1 is
         white (the viewer shows it at a fixed tone). Nothing is built for it beyond the scene's geometry and
-        materials: the lights' structures and the probes are left for ``render``."""
+        materials: the lights' structures and the probes are left for ``render``.
+
+        ``filt``: one of solid_filters.NAMES: that property in colour, the rest grey (see solid_filters). Every frame
+        keeps what ``pick`` reads (each pixel's shape, triangle and side)."""
         if aa not in AA_MODES:
             raise ValueError(f"raster antialiasing is one of {AA_MODES}")
         k = 2 if aa == "ssaa2" else 1
@@ -1020,7 +1052,7 @@ class RasterScene:
         film = torch.zeros((w * h, 4), device=dev)   # S0 alone: R, G, B, near-infrared (read back: a third of render's)
         depth = torch.zeros(w * h, device=dev)
         if surf.hit.numel():
-            kd, f0, _, _, _ = self._surface(surf.mat, surf.uv, surf.duv, look.nir_range)
+            kd, f0, alpha, _, _ = self._surface(surf.mat, surf.uv, surf.duv, look.nir_range)
             base = (kd + f0).clamp(0.0, 1.0)                     # the surface's colour: diffuse, or a metal's tint
             right, up, back = m[:3, 0], m[:3, 1], m[:3, 2]       # camera axes (it looks along -back)
             key = back * 0.75 + up * 0.55 - right * 0.35
@@ -1030,12 +1062,25 @@ class RasterScene:
             sky = 0.35 + 0.65 * (0.5 + 0.5 * n[:, 1])           # the scene is Y up; a ceiling still gets some
             light = SOLID_AMBIENT + SOLID_SKY * sky + SOLID_KEY * (n @ key).clamp_min(0.0) \
                 + SOLID_FILL * (n @ fill).clamp_min(0.0)
-            film[surf.hit, :4] = base * light[:, None]
+            if filt:
+                film[surf.hit, :4] = self._filtered(filt, surf, base, alpha, light)
+            else:
+                film[surf.hit, :4] = base * light[:, None]
             depth[surf.hit] = surf.zbuf[surf.hit]
         miss = torch.nonzero(surf.tid <= 0)[:, 0]
         if miss.numel():   # a grey backdrop, lighter above the horizon
             d = self._ray_dirs(m, w, h, hfov_deg)[miss]
             film[miss, :4] = (SOLID_BACK[0] + (SOLID_BACK[1] - SOLID_BACK[0]) * (0.5 + 0.5 * d[:, 1:2])).expand(-1, 4)
+        if filt in ("bsdf", "lights") and self.n_glass:   # glass over what is behind it, half see-through
+            rg, _ = drt.rasterize(self.ctx, surf.clip, self.tri_g, (h, w))
+            gid = rg[0, :, :, 3].reshape(-1)
+            gz = rg[0, :, :, 2].reshape(-1)
+            g = torch.nonzero((gid > 0) & ((surf.tid <= 0) | (gz < surf.rast[0, :, :, 2].reshape(-1))))[:, 0]
+            if g.numel():
+                tint = torch.tensor(solid_filters.colour(filt, "glass" if filt == "bsdf" else "window"), device=dev)
+                film[g, :3] = 0.45 * film[g, :3] + 0.55 * tint
+                film[g, 3] = 0.45 * film[g, 3] + 0.55 * tint.mean()
+        self._keep_pick(surf, w, h, k)
         film = film.view(1, h, w, 4)
         if aa == "edge":
             film = drt.antialias(film.contiguous(), surf.rast, surf.clip, surf.tri_v)
@@ -1044,6 +1089,166 @@ class RasterScene:
             film = film.view(int(height), k, int(width), k, 4).mean(dim=(1, 3))
             depth = depth[::k, ::k]
         return [film.contiguous().cpu().numpy(), None, None, None], depth.contiguous().cpu().numpy()
+
+    # --- the Solid preview's filters (solid_filters) ---
+    @staticmethod
+    def _hashed(ids: torch.Tensor) -> torch.Tensor:
+        """A colour per id (P x 3, linear): hues a golden angle apart, two lightnesses."""
+        hue = torch.frac(ids.float() * 0.6180339887 + 0.13)
+        val = torch.where(ids % 2 == 0, 0.95, 0.7)
+        sat = torch.where((ids // 2) % 2 == 0, 0.7, 0.5)
+        k = torch.stack([torch.frac(hue + o) for o in (1.0, 2 / 3, 1 / 3)], dim=1) * 6.0
+        rgb = val[:, None] * (1 - sat[:, None] * (1 - (((k - 3).abs() - 1).clamp(0, 1))))
+        return rgb ** 2.2
+
+    def _ramp(self, t: torch.Tensor) -> torch.Tensor:
+        """solid_filters.RAMP_STOPS at t (P, 0..1): P x 3, linear."""
+        if not hasattr(self, "_ramp_stops"):
+            self._ramp_stops = torch.tensor([solid_filters.srgb_linear(c) for c in solid_filters.RAMP_STOPS], device=self.dev)
+        stops = self._ramp_stops
+        x = t.clamp(0, 1) * (stops.shape[0] - 1)
+        i = x.floor().long().clamp_max(stops.shape[0] - 2)
+        f = (x - i)[:, None]
+        return stops[i] * (1 - f) + stops[i + 1] * f
+
+    def _weight(self, mat, uv, duv) -> torch.Tensor:
+        return self._lookup(self.m_wtex[mat], uv, duv, self.m_wconst[mat][:, None].expand(-1, 3))[:, 0]
+
+    def _filtered(self, filt: str, surf, base: torch.Tensor, alpha: torch.Tensor, light: torch.Tensor) -> torch.Tensor:
+        """The hit pixels' colours (P x 4) under filter ``filt``: what it is about in its colours, the rest grey, all
+        under the studio light (emitters unlit, at full colour)."""
+        dev, P = self.dev, surf.hit.shape[0]
+        lum = base[:, :3] @ torch.tensor(LUMA, device=dev)
+        grey = (0.16 + 0.3 * lum)[:, None].expand(-1, 3)
+        col, on = grey.clone(), torch.zeros(P, dtype=torch.bool, device=dev)
+        c = lambda key: torch.tensor(solid_filters.colour(filt, key), device=dev)
+        mat, shape = surf.mat, surf.shape
+        emitter = self.shape_light[shape] >= 0
+        if filt == "movable":
+            obj = self._triangle_objects()[surf.tglob]
+            cls = self._object_class[obj.clamp_min(0)]
+            cls = torch.where(obj >= 0, cls, 4)
+            for code, key in enumerate(("reachable", "rider", "movable", "fixed", "unknown")):
+                sel = cls == code
+                col[sel] = c(key) if key not in ("fixed",) else grey[sel]
+                on |= sel & (code < 3)
+            col[cls == 4] = grey[cls == 4] * 0.6
+        elif filt == "bsdf":
+            if not hasattr(self, "_mat_cat"):
+                names = [k for k, _, _ in solid_filters.COLORS["bsdf"]]
+                self._mat_cat = torch.tensor([names.index(x) for x in self.m_category], device=dev)
+                self._cat_colour = torch.tensor([solid_filters.srgb_linear(x) for _, x, _ in solid_filters.COLORS["bsdf"]],
+                                                device=dev)
+            cat = torch.where(emitter, len(solid_filters.COLORS["bsdf"]) - 1, self._mat_cat[mat])
+            col, on = self._cat_colour[cat], torch.ones(P, dtype=torch.bool, device=dev)
+        elif filt in ("roughness", "metallic"):
+            w = self._weight(mat, surf.uv, surf.duv)
+            k0, k1 = self.m_kind[mat, 0], self.m_kind[mat, 1]
+            if filt == "metallic":
+                t = (1 - w) * (k0 == KIND_CONDUCTOR) + w * (k1 == KIND_CONDUCTOR)
+                on = t > 1e-3                                     # no metal at all: grey
+            else:
+                t = alpha
+                # a surface with a specular layer: a conductor, or a plastic with a coat (ior over 1)
+                spec = lambda j, kk: (kk == KIND_CONDUCTOR) | ((kk == KIND_PLASTIC) & (self.m_eta[mat, j, 0] > 1.0001))
+                on = spec(0, k0) | spec(1, k1)
+            col = torch.where(on[:, None], self._ramp(t), grey)
+        elif filt == "facing":
+            two = self.m_twosided[mat]
+            col = torch.where(surf.front[:, None], c("front"), torch.where(two[:, None], c("back_two"), c("back_one")))
+            on = ~surf.front
+        elif filt == "lights":
+            col[emitter], on = c("emitter"), emitter
+        elif filt == "objects":
+            obj = self._triangle_objects()[surf.tglob]
+            col = torch.where((obj >= 0)[:, None], self._hashed(obj), grey * 0.6)
+            on = obj >= 0
+        elif filt == "materials":
+            col, on = self._hashed(mat), torch.ones(P, dtype=torch.bool, device=dev)
+        shade = 1.35 * light   # the plain preview's light, a little brighter: the colours read on the dark side too
+        out = col * shade[:, None]
+        out = torch.where((emitter & (filt in ("bsdf", "lights")))[:, None], col, out)
+        return torch.cat([out, (out @ torch.tensor(LUMA, device=dev))[:, None]], dim=1)
+
+    def _triangle_objects(self) -> torch.Tensor:
+        """Each triangle's object (physics.json's number, -1 for none), found once by matching the triangles'
+        centroids to the scene's parts (solid_filters.scene_index); with ``_object_class`` per object: 0 a robot
+        pushes it, 1 it rides on one (kept apart with it), 2 movable, 3 fixed."""
+        if getattr(self, "_tri_object", None) is not None:
+            return self._tri_object
+        scene_dir = getattr(self, "scene_dir", None)
+        t0 = time.perf_counter()
+        index = solid_filters.scene_index(scene_dir, getattr(self, "scene_xml", "base.xml")) if scene_dir else \
+            {"centroids": np.zeros((0, 3), np.float32), "part": np.zeros(0, np.int32), "parts": [], "objects": []}
+        tri = self.tri_all.long()
+        cen = ((self.pos_h[tri[:, 0], :3] + self.pos_h[tri[:, 1], :3] + self.pos_h[tri[:, 2], :3]) / 3.0).cpu().numpy()
+        part = solid_filters.match(index, cen)
+        part_object = np.array([p["object"] for p in index["parts"]] + [-1], np.int64)
+        obj = part_object[part]                                  # part -1 -> the appended -1
+        self.index, self.tri_part = index, torch.as_tensor(part, device=self.dev)
+        self._tri_object = torch.as_tensor(obj, device=self.dev)
+        cls = [0 if o["reachable"] else 1 if o["kept"] else 2 if o["movable"] else 3 for o in index["objects"]]
+        self._object_class = torch.as_tensor(cls or [3], device=self.dev)
+        print(f"[raster] objects of {len(tri)} triangles: {int((part >= 0).sum())} matched to {len(index['parts'])} "
+              f"parts, {len(index['objects'])} objects ({time.perf_counter() - t0:.1f} s)", flush=True)
+        return self._tri_object
+
+    def _keep_pick(self, surf, w: int, h: int, k: int) -> None:
+        """What ``pick`` reads of this frame, per pixel: shape, triangle (-1: none) and side."""
+        shape = torch.full((w * h,), -1, dtype=torch.int32, device=self.dev)
+        tri = torch.full((w * h,), -1, dtype=torch.int32, device=self.dev)
+        front = torch.ones(w * h, dtype=torch.bool, device=self.dev)
+        if surf.hit.numel():
+            shape[surf.hit], tri[surf.hit], front[surf.hit] = surf.shape.int(), surf.tglob.int(), surf.front
+        self.last_pick = {"w": w, "h": h, "k": k, "shape": shape, "tri": tri, "front": front, "uv": (surf.hit, surf.uv,
+                                                                                                   surf.duv)}
+
+    def pick(self, x: int, y: int) -> dict:
+        """What the last Solid frame shows at pixel (x, y) (its own size): the shape, its material as the preview reads
+        it, its object (physics.json's decision and why)."""
+        p = getattr(self, "last_pick", None)
+        if p is None:
+            raise ValueError("no Solid frame yet")
+        k = p["k"]
+        x, y = min(max(int(x) * k, 0), p["w"] - 1), min(max(int(y) * k, 0), p["h"] - 1)
+        i = y * p["w"] + x
+        s = int(p["shape"][i])
+        if s < 0:
+            return {"hit": False}
+        t = int(p["tri"][i])
+        mat = int(self.shape_mat[s])
+        hit, uv, duv = p["uv"]
+        j = torch.nonzero(hit == i)[:, 0]
+        alpha = metal = None
+        if j.numel():
+            mt = self.shape_mat[s:s + 1]
+            _, _, a, _, _ = self._surface(mt, uv[j[:1]], duv[j[:1]], (0.0, 1.0))
+            w = float(self._weight(mt, uv[j[:1]], duv[j[:1]])[0])
+            k0, k1 = int(self.m_kind[mat, 0]), int(self.m_kind[mat, 1])
+            metal = round((1 - w) * (k0 == KIND_CONDUCTOR) + w * (k1 == KIND_CONDUCTOR), 3)
+            alpha = round(float(a[0]), 3)
+        kinds = {KIND_PLASTIC: "plastic", KIND_CONDUCTOR: "conductor", KIND_NONE: "dielectric"}
+        leaves = []
+        for jj in range(2):
+            leaves.append({"kind": kinds[int(self.m_kind[mat, jj])], "eta": round(float(self.m_eta[mat, jj, 0]), 3),
+                           "k": round(float(self.m_k[mat, jj, 0]), 3), "alpha": round(float(self.m_alpha[mat, jj]), 3),
+                           "alpha_textured": bool(self.m_atex[mat, jj] >= 0),
+                           "colour_textured": bool(self.m_ctex[mat, jj] >= 0)})
+        out = {"hit": True, "shape": self.shape_ids[s], "triangle": t, "front": bool(p["front"][i]),
+               "material": {"number": mat, "kind": self.m_category[mat], "twosided": bool(self.m_twosided[mat]),
+                            "emitter": bool(self.shape_light[s] >= 0), "normal_map": bool(self.m_ntex[mat] >= 0),
+                            "blend_textured": bool(self.m_wtex[mat] >= 0),
+                            "blend": round(float(self.m_wconst[mat]), 3), "leaves": leaves if leaves[0] != leaves[1] else leaves[:1],
+                            "alpha_here": alpha, "metallic_here": metal}}
+        tri_object = self._triangle_objects()
+        part = int(self.tri_part[t]) if t >= 0 else -1
+        if part >= 0:
+            pr = self.index["parts"][part]
+            out["part"] = {"id": pr["id"], "label": pr["label"], "material": pr["material"]}
+            o = int(tri_object[t])
+            if o >= 0:
+                out["object"] = dict(self.index["objects"][o])
+        return out
 
     def _render(self, c2w, width, height, hfov_deg, look, follow, edge=False):
         prof = PROFILE and []
@@ -1126,9 +1331,12 @@ class RasterScene:
             proj = self._oblique(proj, plane @ m)
         mvp = proj @ w2c
         clip = (self.pos_h @ mvp.T)[None].contiguous()
-        tri_v, shape_v = self._in_view(mvp)
+        keep = self._chunks_in_view(mvp)
+        tri_v, shape_v, tidx_v = (self.chunk_tri[keep].view(-1, 3), self.chunk_shape[keep].view(-1),
+                                  self.chunk_tidx[keep].view(-1))
         if tri_v.shape[0] == 0:  # nothing in view (a mirror facing out of a window): one triangle of no area
             tri_v, shape_v = self.tri_o[:1, :1].expand(1, 3).contiguous(), self.shape_o[:1]
+            tidx_v = self.tidx_o[:1]
         rast, rast_db = drt.rasterize(self.ctx, clip, tri_v, (height, width))
         tid = rast[0, :, :, 3].reshape(-1)
         hit = torch.nonzero(tid > 0)[:, 0]
@@ -1152,6 +1360,9 @@ class RasterScene:
         eye = m[:3, 3]
         view = eye - x
         view = view / view.norm(dim=1, keepdim=True).clamp_min(1e-9)
+        # the side the camera sees, as Mitsuba tells it: the interpolated normal (the face's without one) toward it
+        ln0 = n_sh.norm(dim=1, keepdim=True)
+        front = ((torch.where(ln0 > 1e-6, n_sh, n_geo) * view).sum(1) >= 0)
         n_geo = torch.where((n_geo * view).sum(1, keepdim=True) < 0, -n_geo, n_geo)  # both sides face the camera
         ln = n_sh.norm(dim=1, keepdim=True)
         n = torch.where(ln > 1e-6, n_sh / ln.clamp_min(1e-12), n_geo)
@@ -1162,12 +1373,13 @@ class RasterScene:
         zbuf[hit] = ((x - eye) * forward).sum(1)
         return SimpleNamespace(hit=hit, tid=tid, x=x, n=n, n_geo=n_geo, uv=uv, duv=duv, corners=corners, pa=pa, pb=pb,
                                pc=pc, shape=shape, mat=self.shape_mat[shape], view=view, eye=eye, forward=forward,
+                               tglob=tidx_v[tri].long(), front=front,
                                zbuf=zbuf, mvp=mvp, rast=rast, clip=clip, tri_v=tri_v, width=width, height=height)
 
     @staticmethod
     def _subset(surf, sel: torch.Tensor):
         """``surf`` (from _rasterize) for its hit pixels ``sel`` only."""
-        per = ("hit", "x", "n", "n_geo", "uv", "duv", "corners", "pa", "pb", "pc", "shape", "mat", "view")
+        per = ("hit", "x", "n", "n_geo", "uv", "duv", "corners", "pa", "pb", "pc", "shape", "mat", "view", "tglob", "front")
         return SimpleNamespace(**{k: (v[sel] if k in per else v) for k, v in vars(surf).items()})
 
     def _frame_lights(self, look, follow: bool, c2w, m: torch.Tensor, hfov_deg: float = 90.0, aspect: float = 1.0):

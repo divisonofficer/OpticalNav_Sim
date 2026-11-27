@@ -359,6 +359,15 @@ def test_gui_draws_the_robot_and_rides_with_it():
     sim.renderer = "raster"                                                        # the preview rasteriser draws no bodies
     session.run("moved", session._moved)
     assert "bodies" not in session.view
+    sim.renderer = "solid"                                                         # the Solid preview's filter rides in its view
+    session.configure({"solid_filter": "movable"})
+    session.run("moved", session._moved)
+    assert session.view["renderer"] == "solid" and session.view["solid_filter"] == "movable"
+    session.configure({"solid_filter": None})
+    session.run("moved", session._moved)
+    assert "solid_filter" not in session.view
+    with pytest.raises(ValueError):
+        sim.setSolidFilter("shiny")
     sim.renderer = "path"
     session.run("start", session.start, "other", "v0", 0.0)                        # another scene: the robot stays behind
     assert robot.gone == 1 and session.follow is None and "bodies" not in session.view

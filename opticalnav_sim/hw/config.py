@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 from . import cameras as camera_models
-from . import drive, lights, rigs, robots, sensing, urdf
+from . import arm, drive, lights, ouster, rigs, robots, sensing, urdf
 from .actor import Actor, Spec, World
 from .isp import Isp
 from .sensor import ExposureControl
@@ -613,6 +613,8 @@ register_part("urdf", _urdf_body, ("urdf", "positions"))
 register_sensor("camera", _camera, ("model", "lens", "sensor", "isp", "exposure", "calibrated"))
 register_sensor("depth", _plain(sensing.DepthCamera))
 register_sensor("lidar", _plain(sensing.Lidar))
+register_sensor("ouster", _plain(ouster.OusterLidar))
+register_part("arm", _plain(arm.MjcfArm))
 
 
 def _oak_d_pro_rgb(**kw):

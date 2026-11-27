@@ -280,3 +280,45 @@ def test_merge_makes_one_body_per_kept_object_and_follows_the_scope(tmp_path):
     mm.unmerge_scene(scene)
     assert (scene / "base.xml").read_bytes() == original
     assert "merge" not in json.loads((scene / po.PHYSICS).read_text())
+
+
+def test_solid_filter_index_finds_each_triangles_object(tmp_path, monkeypatch):
+    """solid_filters: the Solid preview's object filters find a loaded triangle's object by its centroid (scene_index,
+    match); the index is cached by the scene files and read again when physics.json changes."""
+    from opticalnav_sim import solid_filters as sf
+
+    monkeypatch.setattr(sf, "CACHE", tmp_path / "cache")
+    scene = room(tmp_path)
+    physics_tag.tag_scene(scene)
+    index = sf.scene_index(scene)
+    parts = {p["id"]: p for p in index["parts"]}
+    objects = index["objects"]
+    assert set(parts) >= {"floor", "stool_seat", "stool_leg", "cup", "chair_seat"}
+    stool = objects[parts["stool_seat"]["object"]]
+    assert parts["stool_leg"]["object"] == parts["stool_seat"]["object"] and stool["movable"] and stool["reachable"]
+    assert not objects[parts["floor"]["object"]]["movable"]
+    assert parts["chair_seat"]["object"] == parts["chair_base"]["object"]
+    # a loaded triangle: one of the stool leg's, its centroid moved by float rounding; one nowhere near anything
+    v, f = box_mesh([1.15, 0, 1.15], [1.2, 0.45, 1.2])
+    cen = np.array([v[f[0]].mean(0) + 1e-5, [9.0, 9.0, 9.0]], np.float32)
+    got = sf.match(index, cen)
+    assert index["parts"][got[0]]["id"] == "stool_leg" and got[1] == -1
+    assert len(list((tmp_path / "cache").glob("*.npz"))) == 1
+    sf.scene_index(scene)                                     # cached: no second file
+    assert len(list((tmp_path / "cache").glob("*.npz"))) == 1
+    (scene / "physics.json").write_text((scene / "physics.json").read_text() + " ")   # changed: indexed again
+    sf.scene_index(scene)
+    assert len(list((tmp_path / "cache").glob("*.npz"))) == 2
+
+
+def test_solid_filter_names_and_legend():
+    from opticalnav_sim import solid_filters as sf
+
+    assert sf.check(None) is None and sf.check("") is None and sf.check("none") is None and sf.check("bsdf") == "bsdf"
+    with pytest.raises(ValueError):
+        sf.check("shiny")
+    legend = sf.legend()
+    assert list(legend) == list(sf.NAMES)
+    assert {i["key"] for i in legend["bsdf"]["items"]} == {"diffuse", "coated", "metal", "blend", "mirror", "glass", "emitter"}
+    assert legend["roughness"]["ramp"]["stops"] == sf.RAMP_STOPS and "note" in legend["objects"]
+    assert all(0.0 <= c <= 1.0 for c in sf.colour("facing", "back_one")) and sf.srgb_linear("#ffffff") == (1.0, 1.0, 1.0)

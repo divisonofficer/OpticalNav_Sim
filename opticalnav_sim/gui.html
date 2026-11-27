@@ -229,6 +229,13 @@ main .pane.drop { outline: 2px dashed var(--accent); outline-offset: -3px; }
 .progress { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); width: 0; transition: width .12s linear; }
 .legend { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font: 11.5px var(--mono); color: var(--muted); min-height: 16px; }
 .legend-bar { height: 8px; border-radius: 3px; }
+.sflegend { position: absolute; left: 8px; bottom: 44px; max-width: calc(100% - 16px); font: 11.5px var(--mono); background: rgba(10, 14, 16, .82); padding: 6px 9px; border-radius: 6px; pointer-events: none; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
+.sflegend b { color: var(--text, #e6e6e6); margin-right: 2px; }
+.sflegend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.sflegend .ramp { display: inline-block; width: 120px; height: 9px; border-radius: 3px; margin: 0 6px; vertical-align: 0; }
+body:not(.solid) .solid-only { display: none; }
+#pickinfo:empty { display: none; }
+#pickinfo { margin-top: 10px; border-top: 1px solid var(--line, #333); padding-top: 8px; }
 .pad { display: none; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .pad button { min-height: 52px; font: 600 14px var(--sans); color: var(--ink); background: var(--panel-2); border: 1px solid var(--rule); border-radius: 10px; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0; line-height: 1.2; }
 .pad button span { font: 11px var(--sans); color: var(--muted); }
@@ -365,6 +372,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <label class="f mitsuba-only" for="polmode" title="Mitsuba 편광 렌더(모든 카메라에 걸리는 전역 설정). 끔: 모든 카메라를 편광 계산 없는 RGB+NIR로(씬 한 벌, 빠름). 켬 · 카메라별: 에디터와 편광 카메라만 편광, 나머지 로봇 카메라는 비편광(씬 두 벌: GPU 메모리와 freeze 기록이 늘어남). 켬 · 통일: 모든 카메라를 편광으로(씬 한 벌)."><span>편광</span><select id="polmode"><option value="off">끔</option><option value="split">켬 · 카메라별</option><option value="unified">켬 · 편광으로 통일</option></select></label>
         <label class="f mitsuba-only" for="maxdepth" title="빛 경로 길이 상한(Mitsuba max_depth). 1: 직접 보이는 광원만, 2: 직접광, 3: 간접광 한 번 더, …. 노이즈와 흰 점(firefly)이 몇 번째 반사에서 오는지 가르는 진단용입니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>경로 깊이</span><select id="maxdepth" class="as-slider"><option value="0">씬 기본</option><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option><option>12</option></select></label>
         <label class="f mitsuba-only" for="rrdepth" title="이 깊이부터 Russian roulette로 경로를 확률적으로 끊습니다(Mitsuba rr_depth). 어두운 경로가 일찍 끝나 빨라지고, 살아남은 경로에 가중치를 줘서 평균은 그대로지만 노이즈는 조금 늘어납니다. 깊이마다 처음 한 번 freeze를 기록합니다."><span>RR 시작 깊이</span><select id="rrdepth" class="as-slider"><option value="0">Mitsuba 기본 (5)</option><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+        <label class="f solid-only" for="solidfilter" title="솔리드 미리보기에서 한 가지 성질만 색으로 강조하고 나머지는 회색으로 봅니다. 움직이는 물체(physics.json의 판별), BSDF 종류(diffuse·코팅·금속·섞임·거울·유리·발광), 거칠기(GGX alpha), 금속도, 앞면/뒷면(단면 재질의 뒷면은 경로 추적에서 검게 나옴), 광원, 오브젝트 ID, 재질 ID. 픽셀 값 탭에서 마우스를 올린 곳의 물체·재질 정보를 볼 수 있습니다. 물체 필터는 처음 쓸 때 장면의 물체를 찾느라 몇 초 걸립니다."><span>필터</span><select id="solidfilter" class="as-slider"><option value="">없음</option></select></label>
         <label class="f raster-only" for="rasteraa" title="래스터 미리보기의 안티에일리어싱. 끔: 픽셀당 한 샘플. 가장자리: 물체 윤곽선을 덮은 비율만큼 섞습니다(nvdiffrast antialias, 거의 공짜). 2×2: 픽셀당 네 샘플을 평균합니다(텍스처 반짝임, 하이라이트, 그림자 경계까지 부드러워지지만 셰이딩이 4배)."><span>안티에일리어싱</span><select id="rasteraa" class="as-slider"><option value="off">끔</option><option value="edge">가장자리</option><option value="ssaa2">2×2</option></select></label>
       </div>
     </section>
@@ -417,6 +425,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <img id="img-a" alt="현재 시점">
       <div class="cands" id="cands"></div>
       <span class="badge" id="badge"></span>
+      <div class="sflegend" id="sflegend" hidden></div>
       <div class="progress" id="progress"></div>
     </div></div>
     <div class="legend" id="legend-a"></div>
@@ -496,6 +505,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <section class="ppanel" role="tabpanel" id="p-state" aria-labelledby="t-state" hidden><dl id="readout"></dl></section>
       <section class="ppanel" role="tabpanel" id="p-probe" aria-labelledby="t-probe" hidden>
         <dl id="probe"><div><dt>위치</dt><dd class="desk-only">이미지 위에 마우스를 올리세요</dd><dd class="touch-only">이미지를 탭하세요</dd></div></dl>
+        <dl id="pickinfo"></dl>
       </section>
       <section class="ppanel" role="tabpanel" id="p-scene" aria-labelledby="t-scene" hidden>
         <dl id="scene-stats"><div><dt>씬</dt><dd>불러오는 중…</dd></div></dl>
@@ -849,6 +859,7 @@ function connect() {
       const done = acks.get(m.id);   // it takes itself out of acks
       if (done) done(m.error);
     } else if (m.type === "probe") showProbe(m);
+    else if (m.type === "pick") showPick(m);
   };
   ws.onclose = () => {
     for (const done of acks.values()) done("연결이 끊겼습니다");
@@ -1076,7 +1087,7 @@ function apply(st) {
     loadPhysics();
   }
   if (S.has_frame) {
-    $("badge").textContent = oneImage() ? ENGINE_NAMES[S.render_mode] : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
+    $("badge").textContent = oneImage() ? ENGINE_NAMES[S.render_mode] + (S.render_mode === "solid" && S.solid_filter && SOLID_FILTERS ? ` · ${SOLID_FILTERS[S.solid_filter].label}` : "") : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
     $("progress").style.width = oneImage() ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
@@ -1123,6 +1134,9 @@ function renderSky() {
   const raster = oneImage();  // the raster preview or its Solid view (S.renderer: the render server's state)
   if (document.activeElement !== $("rasteraa")) $("rasteraa").value = S.raster_aa || "edge";
   document.body.classList.toggle("raster", raster);
+  document.body.classList.toggle("solid", S.render_mode === "solid");
+  if (document.activeElement !== $("solidfilter")) $("solidfilter").value = S.solid_filter || "";
+  renderSolidLegend();
   document.body.classList.toggle("cycles", S.render_mode === "cycles");
   const blends = ((S.server_info || {}).cycles || {}).scans || [];  // scenes whose pack carries a .blend
   for (const b of $("engine").querySelectorAll("button")) {
@@ -1377,6 +1391,49 @@ function legendHtml(pane, sc) {
   if (ch === "aolp") return `<span>0°</span><div class="legend-bar" style="background:${GRAD.aolp}"></div><span>180° · 밝기 = DoLP/${sc}</span>`;
   return `<span>−${sc}</span><div class="legend-bar" style="background:${GRAD.s}"></div><span>+${sc}</span>`;
 }
+// --- the Solid preview's filters (solid_filters.py): the choices, the legend over the editor view, what a pixel is ---
+var SOLID_FILTERS = null;   // var: read by apply() before this line runs
+fetch("/api/solid_filters").then((r) => r.json()).then((f) => {
+  SOLID_FILTERS = f;
+  $("solidfilter").innerHTML = `<option value="">없음</option>` +
+    Object.entries(f).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("");
+  if (S) { $("solidfilter").value = S.solid_filter || ""; renderSolidLegend(); }
+}).catch(() => {});
+function renderSolidLegend() {
+  const el = $("sflegend"), name = S && S.render_mode === "solid" ? S.solid_filter : null;
+  const f = name && SOLID_FILTERS && SOLID_FILTERS[name];
+  el.hidden = !f;
+  if (!f) return;
+  const key = name + "|" + (f.items ? f.items.length : 0);
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  let html = `<b>${esc(f.label)}</b>`;
+  if (f.items) html += f.items.map((it) => `<span><i class="sw" style="background:${it.colour}"></i>${esc(it.label)}</span>`).join("");
+  else if (f.ramp) html += `<span>${esc(f.ramp.low_label)} ${f.ramp.low}<i class="ramp" style="background:linear-gradient(90deg,${f.ramp.stops.join(",")})"></i>${f.ramp.high} ${esc(f.ramp.high_label)}</span><span style="opacity:.7">회색: 해당 없음</span>`;
+  else html += `<span style="opacity:.8">${esc(f.note || "")}</span>`;
+  el.innerHTML = html;
+}
+function showPick(p) {
+  const el = $("pickinfo");
+  if (p.error) { el.innerHTML = `<div><dt>물체</dt><dd>${esc(p.error)}</dd></div>`; return; }
+  if (!p.hit) { el.innerHTML = `<div><dt>물체</dt><dd>배경</dd></div>`; return; }
+  const m = p.material || {}, o = p.object, part = p.part;
+  const kinds = { diffuse: "diffuse", coated: "plastic (코팅)", metal: "금속", blend: "금속+코팅", mirror: "거울", glass: "유리" };
+  const leaf = (l) => l.kind === "conductor" ? `conductor η ${l.eta} k ${l.k}, α ${l.alpha_textured ? "텍스처" : l.alpha}`
+    : l.kind === "plastic" ? (l.eta > 1.0001 ? `plastic ior ${l.eta}, α ${l.alpha_textured ? "텍스처" : l.alpha}` : "diffuse") : l.kind;
+  const rows = [
+    ["물체", o ? `${esc(o.label || o.id)}` : part ? esc(part.label) : "—"],
+    ["판별", o ? `${o.reachable ? "로봇이 밂" : o.kept ? "얹혀서 같이 움직임" : o.movable ? "움직임 (닿지 않음)" : "고정"}${o.mass_kg != null ? ` · ${o.mass_kg.toFixed(1)} kg` : ""}` : "—"],
+    ["이유", o && o.reason ? esc(o.reason) : "—"],
+    ["부품", part ? `${esc(part.id)}${part.material ? ` · ${esc(part.material)}` : ""}` : esc(p.shape)],
+    ["메시", p.shape ? esc(p.shape) : "(Mitsuba가 합친 메시)"],
+    ["재질", `${kinds[m.kind] || m.kind}${m.emitter ? " · 발광" : ""}${m.twosided ? " · 양면" : " · 단면"}${m.normal_map ? " · 노멀맵" : ""}`],
+    ["BSDF", (m.leaves || []).map(leaf).join(" + ") + (m.leaves && m.leaves.length > 1 ? (m.blend_textured ? " (비율 텍스처)" : ` (비율 ${m.blend})`) : "")],
+    ["여기 값", `α ${m.alpha_here ?? "—"} · 금속 ${m.metallic_here ?? "—"}`],
+    ["보이는 면", p.front ? "앞면" : (m.twosided ? "뒷면 (양면 재질)" : "뒷면 · 단면 재질이라 경로 추적에선 검게 나옴")],
+  ];
+  el.innerHTML = rows.map(([k2, v]) => `<div><dt>${k2}</dt><dd>${v}</dd></div>`).join("");
+}
 function renderLegends() {
   const sc = Number($("scale").value).toFixed(2);
   $("scale-v").textContent = sc;
@@ -1397,6 +1454,7 @@ function probeAt(img, clientX, clientY) {
   probeTimer = setTimeout(() => wsSend({ type: "probe", frame: S.frame_id, x, y, pol }), 40);
 }
 function showProbe(p) {
+  if (!S || S.render_mode !== "solid") $("pickinfo").innerHTML = "";   // what a pixel is: the Solid preview's (showPick)
   const band = { luma: "휘도", r: "R", g: "G", b: "B", nir: "NIR" }[p.channel || "luma"];
   $("probe").innerHTML = [["위치", `${p.x}, ${p.y}`], ["채널 (왼쪽 화면)", band], ["S0", p.s0.toFixed(4)], ["DoLP", p.dolp.toFixed(4)],
     ["AoLP", `${p.aolp_deg.toFixed(1)}°`], ["S1/S0", p.s1_over_s0.toFixed(4)], ["S2/S0", p.s2_over_s0.toFixed(4)],
@@ -1555,6 +1613,7 @@ $("caustics").addEventListener("change", () => configure({ caustics: $("caustics
 $("maxdepth").addEventListener("change", () => configure({ max_depth: Number($("maxdepth").value) }, "경로 깊이"));
 $("rrdepth").addEventListener("change", () => configure({ rr_depth: Number($("rrdepth").value) }, "RR 시작 깊이"));
 $("rasteraa").addEventListener("change", () => configure({ raster_aa: $("rasteraa").value }, "안티에일리어싱"));
+$("solidfilter").addEventListener("change", () => configure({ solid_filter: $("solidfilter").value || null }, "솔리드 필터"));
 for (const b of $("engine").querySelectorAll("button")) {
   b.addEventListener("click", () => configure({ renderer: b.dataset.engine }, { raster: "래스터 미리보기", solid: "솔리드 미리보기", cycles: "Cycles 렌더" }[b.dataset.engine] || "Mitsuba 경로 추적"));
 }

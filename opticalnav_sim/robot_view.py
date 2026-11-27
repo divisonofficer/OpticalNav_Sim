@@ -476,7 +476,7 @@ class RobotSession:
                     view[k] = template[k]
         view["mode"] = self.camera_mode(polarized)
         view["bands"] = "rgb"
-        if view.get("renderer") != "depth":
+        if view.get("renderer") not in ("depth", "lidar"):   # geometry sensors keep their own renderer
             view["renderer"], view["depth"] = "path", False
         return view, json.dumps({k: view.get(k) for k in (*LOOK, "mode")}, sort_keys=True, default=str)
 

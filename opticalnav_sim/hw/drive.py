@@ -36,6 +36,8 @@ class DriveState:
     ground: object = None                              # hw.ground.Ground, set when it enters a world
     collided: bool = False                             # the last step was stopped by an obstacle
     contact: np.ndarray = None                         # the floor's height under each contact point (with a height map)
+    dt: float = 0.05                                   # the last step's length (the suspension's: hw.suspension)
+    body: object = None                                # hw.suspension.BodyState: the body on its springs
 
 
 @dataclass
@@ -154,6 +156,27 @@ class Drive(Spec):
             self.stop(state)
             return old
         state.collided, state.contact = False, z
+        hz = float(getattr(self, "suspension_hz", 0.0) or 0.0)
+        if hz > 0.0 and hasattr(self, "wheel_xy"):
+            # on springs (hw.suspension): each wheel's ground where its rim meets it, the body bounced toward them
+            from . import suspension
+            wheels = np.asarray(self.wheel_xy(), dtype=np.float64)
+            world = np.c_[pose.xyz[0] + c * wheels[:, 0] - s * wheels[:, 1], pose.xyz[1] + s * wheels[:, 0] + c * wheels[:, 1]]
+            g = suspension.rim_heights(ground, world, yaw, float(getattr(self, "wheel_radius", 0.1)), near=z[:len(wheels)])
+            body = state.body
+            if body is None:   # it starts at rest on the plane through them
+                ga, gb, gz = (float(v) for v in np.linalg.lstsq(np.c_[wheels, np.ones(len(wheels))], g, rcond=None)[0])
+                body = suspension.BodyState(gz, ga, gb, ground=g.copy())
+            share = self.load_share()[:len(wheels)] if hasattr(self, "load_share") else np.full(len(wheels), 1.0 / len(wheels))
+            share = share / max(float(share.sum()), 1e-9)
+            size = getattr(self, "size", (0.6, 0.5, 0.3))
+            mass = float(getattr(self, "mass", 20.0))
+            inertia = (mass * (size[1] ** 2 + size[2] ** 2) / 12.0 * 1.5, mass * (size[0] ** 2 + size[2] ** 2) / 12.0 * 1.5)
+            body = suspension.advance(body, g, wheels, share, mass, inertia, hz, float(getattr(self, "suspension_zeta", 0.2)),
+                                      float(state.dt))
+            state.body = body
+            return Transform((pose.xyz[0], pose.xyz[1], body.z), (math.degrees(math.atan(body.b)), -math.degrees(math.atan(body.a)),
+                                                                pose.rpy_deg[2]))
         return Transform((pose.xyz[0], pose.xyz[1], z0), (math.degrees(math.atan(b)), -math.degrees(math.atan(a)), pose.rpy_deg[2]))
 
 
@@ -183,6 +206,9 @@ class WheeledDrive(Drive):
     slip_speed: float = 0.03            # m/s: below it a tyre's force rises with slip, above it is the friction limit
     drive_gain: float = 40.0            # N m per rad/s of wheel speed error (the drives' speed loop)
     substep: float = 5.0e-4             # s
+    # --- suspension (hw.suspension): 0 Hz is none, the body set on the plane through its contacts ---
+    suspension_hz: float = 0.0          # the body's bounce frequency on its springs
+    suspension_zeta: float = 0.2        # their damping ratio
 
     # --- the wheels --------------------------------------------------------------------------------------------------
     def wheel_xy(self) -> np.ndarray:
@@ -276,6 +302,7 @@ class WheeledDrive(Drive):
         return Twist(float(vx), float(vy), float(wz))
 
     def step(self, state: WheeledState, pose: Transform, dt: float) -> Transform:
+        state.dt = float(dt)
         want_steer, want_speed = self.wheel_targets(state.command, state.steer)
         turn = math.radians(self.max_steer_rate_deg) * dt
         state.steer = state.steer + np.clip(want_steer - state.steer, -turn, turn)

@@ -637,6 +637,9 @@ class Session:
         if "renderer" in settings:  # "path", "raster" or "cycles" (MatterSim.setRenderer)
             self.sim.setRenderer(str(settings["renderer"]))
             restart = True
+        if "solid_filter" in settings:  # the Solid preview's filter (MatterSim.setSolidFilter; None: none)
+            self.sim.setSolidFilter(settings["solid_filter"])
+            restart = True
         if "raster_aa" in settings:  # MatterSim.setRasterAntialiasing
             self.sim.setRasterAntialiasing(str(settings["raster_aa"]))
             restart = True
@@ -756,6 +759,8 @@ class Session:
                 "flash_scale": sim.flash_scale, "flash_offset": list(sim.flash_offset), "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                 "renderer": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "active_split": sim.active_split,
                 "mirrors": dict(sim.mirrors) if sim.mirrors is not None else None}
+        if sim.renderer == "solid" and getattr(sim, "solid_filter", None):
+            view["solid_filter"] = sim.solid_filter
         if self.robot is not None:
             if self.robot.scene and self.robot.running and self.robot.scene != scene:  # another scene: the robot stays behind
                 self.robot.despawn()
@@ -1086,7 +1091,7 @@ class Session:
                    "bands": sim.bands, "flash_band": sim.flash_band, "nir_available": self.nir_available, "bands_here": self.bands_here(),
                    "lighting": sim.lighting, "lamps": sim.lamps, "flash_scale": sim.flash_scale,
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
-                   "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
+                   "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "solid_filter": getattr(sim, "solid_filter", None), "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
                    "active_split": sim.active_split, "polarization": self.polarization, "polar_cameras": self.polar_cameras, "modes": self.modes,
                    "editor_render": self.render_on,
                    "has_frame": bool(self.frame_meta),
@@ -1297,6 +1302,36 @@ class Session:
                 "aolp_deg": float(d["aolp_deg"][y, x]), "s1_over_s0": float(d["s1_over_s0"][y, x]),
                 "s2_over_s0": float(d["s2_over_s0"][y, x])}
 
+    def pick_later(self, frame_id: int, x: int, y: int, reply) -> None:
+        """What the render server's last Solid frame shows at (x, y) (GET /v1/pick: shape, material, object), handed to
+        ``reply`` from a thread of its own: the first pick of a scene matches its triangles to its objects (seconds),
+        and the socket must not wait for it. Only the newest request is answered."""
+        with self.cv:
+            self._pick_req = (frame_id, x, y, reply)
+            if getattr(self, "_pick_thread", None) is None:
+                self._pick_thread = threading.Thread(target=self._picker, name="pick", daemon=True)
+                self._pick_thread.start()
+            self.cv.notify_all()
+
+    def _picker(self) -> None:
+        client = None
+        while True:
+            with self.cv:
+                while getattr(self, "_pick_req", None) is None:
+                    self.cv.wait()
+                frame_id, x, y, reply = self._pick_req
+                self._pick_req = None
+            try:
+                if client is None:
+                    main = self.sim._client
+                    client = RenderClient(main.url, timeout=60.0, token=main.token)
+                out = {"type": "pick", "frame": frame_id, "x": x, "y": y, **client.pick(x, y)}
+            except Exception as exc:  # noqa: BLE001 - an older server, none yet: say so on the page
+                client = None
+                out = {"type": "pick", "frame": frame_id, "x": x, "y": y, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            with contextlib.suppress(Exception):
+                reply(out)
+
     def graph(self, scene: str) -> dict:
         if scene not in self.scans:
             raise KeyError(f"scene {scene!r}")
@@ -1505,6 +1540,9 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                     if pic is None:
                         return self._json(404, {"error": "no picture yet"})
                     return self._send(200, pic[0], pic[1], {"Cache-Control": "max-age=60"})
+                if parts == ["api", "solid_filters"]:  # the Solid preview's filters: labels, colours (solid_filters.legend)
+                    from . import solid_filters
+                    return self._json(200, solid_filters.legend())
                 if parts == ["api", "physics"]:  # the scene's movable objects (tools/physics_tag.py physics.json), for the page
                     return self._json(200, session.physics(q["scene"]))
                 if parts == ["api", "scene_stats"]:  # the scene tab: asks the render server each time
@@ -1656,6 +1694,8 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                         try:
                             ws.send_json({"type": "probe", **session.probe(int(msg["frame"]), int(msg["x"]), int(msg["y"]),
                                                                            str(msg.get("pol", "luma")))})
+                            if session._frame(int(msg["frame"])).get("renderer") == "solid":   # and what it is
+                                session.pick_later(int(msg["frame"]), int(msg["x"]), int(msg["y"]), ws.send_json)
                         except KeyError:
                             pass
             except (ConnectionError, OSError, ValueError):

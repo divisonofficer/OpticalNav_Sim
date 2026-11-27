@@ -100,6 +100,7 @@ class Simulator:
         self.rr_depth = 0  # setRussianRouletteDepth: 0 is Mitsuba's 5
         self.renderer = "path"  # setRenderer: "path" (Mitsuba), "raster" (the rasterized preview) or "cycles" (the scene's .blend)
         self.raster_aa = "edge"  # setRasterAntialiasing: the preview's antialiasing
+        self.solid_filter = None  # setSolidFilter: the Solid preview's filter (solid_filters.NAMES), None for none
         self.caustics = True  # setCaustics
         self.nir_range = (0.5, 1.0)  # setNirRange
         self.active_split = True  # setActiveSplit
@@ -282,6 +283,13 @@ class Simulator:
         if name not in ("path", "raster", "solid", "cycles"):
             raise ValueError("renderer must be 'path', 'raster', 'solid' or 'cycles'")
         self.renderer = str(name)
+
+    def setSolidFilter(self, name: str | None) -> None:
+        """The Solid preview's filter (solid_filters): "movable", "bsdf", "roughness", "metallic", "facing", "lights",
+        "objects" or "materials" shows that property in colour and the rest grey; None (or "none") the plain preview.
+        Applies to the "solid" renderer only."""
+        from . import solid_filters
+        self.solid_filter = solid_filters.check(name)
 
     def setRasterAntialiasing(self, mode: str) -> None:
         """The raster preview's antialiasing: "off" (one sample a pixel), "edge" (silhouettes blended by coverage,
@@ -563,7 +571,7 @@ class Simulator:
                 "denoise": self.denoise, "preview": self.preview, "lights": self.lights, "env": dict(self.env),
                 "bands": self.bands, "flash_band": self.flash_band, "nir": dict(self.nir), "lighting": self.lighting, "lamps": self.lamps,
                 "flash_scale": self.flash_scale, "flash_offset": list(self.flash_offset), "max_depth": self.max_depth, "rr_depth": self.rr_depth,
-                "renderer": self.renderer, "raster_aa": self.raster_aa, "caustics": self.caustics, "nir_range": list(self.nir_range), "active_split": self.active_split,
+                "renderer": self.renderer, "raster_aa": self.raster_aa, "solid_filter": self.solid_filter, "caustics": self.caustics, "nir_range": list(self.nir_range), "active_split": self.active_split,
                 "mirrors": dict(self.mirrors) if self.mirrors is not None else None}
 
     def _set_heading_elevation(self, heading, elevation) -> None:
