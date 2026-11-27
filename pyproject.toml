@@ -14,6 +14,7 @@ dependencies = ["numpy"]
 [project.optional-dependencies]
 server = ["pillow"]   # plus a Mitsuba 3 build with an *_rgb_polarized variant (see README)
 gui = ["pillow"]
+physics = ["mujoco", "scipy"]   # hw/physics.py (pushed objects): measured with MuJoCo 3.9, whose island sleeping it uses
 
 [tool.setuptools]
 packages = ["opticalnav_sim", "opticalnav_sim.hw"]
