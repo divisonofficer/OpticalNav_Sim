@@ -20,7 +20,9 @@ Python (the render server's "on open", not wired in):
     physics_tag.tag_pack(pack, [scene], if_needed=True)     # a text check when up to date
     merge_meshes.merge_pack(pack, [scene], if_needed=True)
 
-``--if-needed`` (needs_tagging): physics.json missing, of another version or rules, or the scene file (as converted, before
+Decisions set by hand (the viewer's selection: physics_overrides.json, physics_objects.read_overrides) go over the rules.
+
+``--if-needed`` (needs_tagging): physics.json missing, of another version or rules, its decisions by hand changed, or the scene file (as converted, before
 any merge) changed since. No Mitsuba: numpy/scipy on the PLY files, one core. Measured: blend_REF_CS02 (4,960 shapes, merged)
 15 s, blend_REF_PH46 22 s, blend_REF_PH43 (1,756 shapes, 300 shrub instances: 76 M triangles before thinning) 46 s,
 the opticalnav-sim-v1 Infinigen scenes 4 to 10 s; a scene up to date costs the text check (~1 s on CS02).
@@ -66,6 +68,8 @@ def needs_tagging(scene_dir, xml: str = "base.xml") -> bool:
     data = read_physics(scene_dir)
     if data is None or data.get("version") != VERSION or data.get("rules_sha1") != physics_objects.rules_sha1():
         return True
+    if data.get("overrides_sha1") != physics_objects.overrides_sha1(scene_dir):   # decisions set by hand changed
+        return True
     return data.get("source_sha1") != physics_objects.source_sha1(scene_dir, xml)
 
 
@@ -80,7 +84,8 @@ def tag_scene(scene_dir, xml: str = "base.xml", dry_run: bool = False, show: boo
     (compact_assets.scene_lock) so a merge does not rewrite the files under it."""
     scene_dir = Path(scene_dir)
     with scene_lock(scene_dir):
-        result = physics_objects.analyse(scene_dir, xml)
+        result = physics_objects.analyse(scene_dir, xml, overrides=physics_objects.read_overrides(scene_dir))
+        result["overrides_sha1"] = physics_objects.overrides_sha1(scene_dir)
         # what is not the analysis carries over: the scope a person set ("keep") and what the last merge recorded
         # ("merge": a new movable list changes the merge plan, and that merge writes it again)
         for key in ("keep", "merge"):

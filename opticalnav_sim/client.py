@@ -93,6 +93,11 @@ class RenderClient:
         key = "id" if not str(id_or_path).startswith("/") and "=" not in str(id_or_path) else "path"
         return json.loads(self._request("POST", "/v1/blend", json.dumps({key: id_or_path}).encode())[0])
 
+    def refresh_physics(self, scan: str) -> dict:
+        """Have the server find the scene's movable objects again (physics_tag: decisions set by hand changed) and merge
+        its meshes again, dropping the loaded scene when that changed it: ``{"changed"}``. Seconds to a minute."""
+        return json.loads(self._request("POST", "/v1/physics/refresh", json.dumps({"scan": scan}).encode())[0])
+
     def register_body(self, name: str, links: dict) -> dict:
         """Register a body model (robots, equipment: opticalnav_sim/bodies.py). A view then places it with
         ``"bodies": [{"id", "model": name, "links": {link: object-to-world 4x4}}]``."""

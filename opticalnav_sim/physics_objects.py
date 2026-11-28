@@ -52,7 +52,7 @@ SKIP_PREFIXES = ("light_", "camera_assist", "body_")
 RULES = {
     "touch_m": 0.005,           # parts of one asset or label stem whose boxes come this close are one piece
     "contact_m": 0.015,         # a vertex this close to another object's surface touches it (walls, joined pieces)
-    "support_below_m": 0.03,    # a surface this far under an object's lowest points carries it ...
+    "support_below_m": 0.05,    # a surface this far under an object's lowest points carries it ...
     "support_above_m": 0.02,    # ... or this far above them (meshes sink into each other by a few mm)
     "thin_share": 0.05,         # the share given to a narrow support found by rays up (a column under a table top)
     "sunk_m": 0.10,             # floors and ground an object is sunk into by up to this much still carry it
@@ -62,16 +62,31 @@ RULES = {
     "structure_side_m": 2.5,    # a single part this long joins only by support, and counts as a wall for what touches it
     "ground_footprint_m2": 4.0,  # a part this wide and flat, with nothing of the kind under it, is ground
     "ground_height_m": 0.3,
+    "ground_area_m2": 20.0,     # ... or any part with this much upward floor-like surface (a street and its buildings in
+                                # one mesh, named by its material: PH45's ph45_galvanised, PH40's ph40_paint_white)
+    "marking_m": 0.02,          # on the floor and lower than this: a marking, a tactile strip, a mat (part of the floor)
+    "mounted_rise_m": 2.0,      # carried by structure this far over the floor: a fixture (downlights on a duct)
+    "holds_light_kg": 5.0,      # lighter than this, or a movable word: leaning on a wall or a column does not hold it up
     "max_mass_kg": 50.0,        # heavier than a small robot pushes (a TurtleBot 4 is 3.9 kg, a Ranger Mini 64.5 kg)
     "free_height_m": 1.2,       # a floor object without a keyword: lower, smaller and lighter than this
     "free_footprint_m2": 0.6,
     "free_mass_kg": 30.0,
+    "tall_light_kg": 10.0,      # ... taller (to tall_height_m) when lighter than this: floor lamps, potted trees
+    "tall_height_m": 2.2,
+    "low_table_m": 0.6,         # ... wider (to low_footprint_m2) when lower than this and lighter than free_mass_kg / 1.5:
+    "low_footprint_m2": 1.5,    # coffee tables, pallets
+    "wall_light_kg": 10.0,      # ... touching a wall when lighter than this (a potted plant against the brick)
+    "thin_m": 0.06,             # ... not a slab thinner than this and longer than thin_long_m (a counter's legs)
+    "thin_long_m": 1.0,
     "item_mass_kg": 10.0,       # an object on top of another: lighter and smaller than this
     "item_side_m": 0.6,
     "piece_m": 0.15,            # a part word on something smaller than this: a piece of whatever it touches most
+    "overlay_m": 0.006,         # ... and a sheet thinner than this, up to overlay_long_m long: an overlay (a screen's trace)
+    "overlay_long_m": 0.5,
+    "member_m": 1.0,            # a structure word on an asset's member shorter than this is the asset's (a stage's column)
     "flat_m": 0.003,           # thinner than this: a decal, a wear mark, a sheet (no body to push)
     "small_m": 0.05,            # nothing longer than this: a detail (a screw, a connector) left fixed ...
-    "light_kg": 0.05,           # ... nor lighter than this (a glowing trace before a display, a case's loose handle)
+    "light_kg": 0.03,           # ... nor lighter than this (a glowing trace before a display, a case's loose handle)
     "reach_m": 0.4,           # a movable object whose bottom is this close to the floor: the robot's body can meet it
     "hull_vertices": 64,
 }
@@ -94,9 +109,23 @@ FURNITURE = set("""shelf shelves shelving rack racks cabinet cabinets cupboard w
 showcase vitrine kiosk booth vending vend machine fridge refrigerator freezer oven stove sink toilet urinal bathtub shower
 radiator boiler bench benches workbench bed sofa couch piano drawer drawers dresser island gate turnstile barrier bollard tree
 trees hedge bush bushes shrub rock rocks stone stones boulder planted planter car cars bus truck van vehicle sign signs signage
-billboard banner poster board whiteboard noticeboard ad ads fixture chandelier cassette gantry rig carrier housing harness
-extrusion stage""".split())
-MOVABLE = set("""chair chairs stool stools cart carts trolley trolleys dolly box boxes carton cartons crate crates case cases
+billboard banner poster board whiteboard noticeboard ad ads fixture chandelier cassette gantry rig carrier housing
+extrusion stage sconce sconces uplight uplights downlight downlights spotlight spotlights""".split())
+# fixed-furniture words for things that also come free-standing and small: on the floor and off the walls, such a one is
+# judged as a floor object without a keyword (a wet-floor sign, an A-frame), on a wall or overhead it is fixed as before
+FREE_STANDING = {"sign", "signs", "signage", "board", "banner", "poster", "bollard", "barrier", "tree", "trees", "planter"}
+# plants: in soil (a bed, a lawn, the terrain) they are planted, fixed; in a pot on a floor they are judged as floor objects
+PLANTS = {"tree", "trees", "bush", "bushes", "shrub", "shrubs", "hedge", "plant", "plants", "flower", "flowers", "leafy"}
+SOIL = {"soil", "mulch", "grass", "lawn", "terrain", "dirt", "earth", "bed", "planting", "garden", "ground"}
+# ... and a plant with none of these words has no pot: it grows where it stands (Infinigen's OliveTreeFactory makes
+# potted indoor trees, so "olive" counts as potted)
+POTTED = {"pot", "pots", "potted", "planter", "planters", "container", "vase", "tub", "olive"}
+# two words whose second decides against the first's list (a hand truck is no truck, a step ladder no step)
+COMPOUNDS = {("hand", "truck"): ("movable", "hand truck"), ("platform", "cart"): ("movable", "cart"),
+             ("step", "ladder"): ("movable", "ladder"), ("fire", "extinguisher"): ("movable", "extinguisher"),
+             ("floor", "lamp"): ("movable", "floor lamp"), ("lead", "harness"): ("movable", "harness"),
+             ("metrology", "stage"): ("movable", "instrument")}
+MOVABLE = set("""ladder ladders extinguisher extinguishers chair chairs stool stools cart carts trolley trolleys dolly box boxes carton cartons crate crates case cases
 suitcase luggage bin bins bucket buckets basket baskets cone cones bag bags trashbag backpack ball balls bottle bottles can
 cans jar jars pot pots vase vases cup cups mug mugs plate plates bowl bowls toolbox tool tools spool driver screwdriver wrench
 hammer pliers monitor keyboard mouse laptop phone book books binder binders magazine folder pillow cushion toy toys pallet
@@ -153,6 +182,9 @@ def label_class(label: str) -> tuple[str | None, str | None]:
     if CABLE_TRAY.search(str(label).lower()):
         return "structure", "cable tray"
     ws = words(label)
+    for a, b in zip(ws, ws[1:]):
+        if (a, b) in COMPOUNDS:
+            return COMPOUNDS[(a, b)]
     hits = []
     for k, w in enumerate(ws):
         for cls, table in (("movable", MOVABLE), ("furniture", FURNITURE), ("structure", STRUCTURE)):
@@ -195,6 +227,7 @@ def label_stem(label: str) -> str:
 
 
 _ASSET = re.compile(r"^(.+?_r\d{3})(?=[_\s]|$)")
+_BLEND_OBJECT = re.compile(r"^([A-Za-z][\w.-]*?)_(?:ph|cs|PH|CS|ref|REF)\d+_[\w.-]+$")
 _INFINIGEN = re.compile(r"^(.*?Factory)[(_](.*?)[)_]\.spawn_asset[(_]([^)_]*)[)_]?(\.\d+)?")
 
 
@@ -209,6 +242,11 @@ def asset_key(label: str) -> str | None:
     m = _INFINIGEN.match(str(label))
     if m:
         return "|".join(re.sub(r"\W", "_", g or "") for g in m.groups())   # ids write "/" as "_"
+    # a .blend converted as it is (tools/blend_to_pack.py): <Blender object>_<scene code>_<material>, one shape a material
+    # (``stanchions_ph33_black_metal``, ``stanchions_ph33_steel``): the object is the asset
+    m = _BLEND_OBJECT.match(str(label))
+    if m:
+        return "blend|" + m.group(1)
     return None
 
 
@@ -245,6 +283,88 @@ def _merged_slices(scene_dir: Path, text: str) -> dict:
             for p in g["parts"]:
                 out[p["id"]] = (g["file"], p["vertex_range"], p["face_range"])
     return out
+
+
+# ---------------------------------------------------------------- pieces of one shape
+# A shape can hold several things: an asset modelled as two bins (PH33's PH_metal_trash_can), a material's mesh
+# along a corridor (ph19's extinguishers' red paint). Such a shape is split into its pieces: its connected parts
+# (vertices welded), those whose boxes come within PIECE_GAP_M joined (a lid on its bin). A piece is a part of its own,
+# ``<shape>__p<k>``, k from 1 in the order of the pieces' lowest corners (x, z, y). tools/merge_meshes.py splits the
+# shape the same way (piece_labels on the mesh Mitsuba loads) when a piece is a movable object's, so the pieces move apart.
+PIECE_GAP_M = 0.02       # pieces nearer than this (box to box) are one: a lid on its bin, a handle on its case
+PIECE_MIN_M = 0.1        # split only when every piece is at least this long (not a row of tape dashes or screws)
+PIECE_MAX = 16           # ... and into at most this many (a material's mesh over a whole street is not split)
+PIECE_FACES = 400_000    # ... and the shape has at most this many triangles
+PIECE_COMPONENTS = 4096  # ... and falls apart into at most this many connected parts (not a shrub's leaves, grass)
+
+
+def piece_labels(v: np.ndarray, f: np.ndarray, gap: float = PIECE_GAP_M, world: np.ndarray | None = None
+                 ) -> tuple[np.ndarray, int, np.ndarray, np.ndarray]:
+    """Each triangle's piece (0 .. n-1), n, and the pieces' boxes (lo, hi: n x 3), pieces ordered by their lowest corner.
+    ``v``: where the pieces are found (an instance's group in its own frame); ``world``: the same vertices placed, for the
+    order and the boxes (default ``v``). n is 0 when the mesh falls apart into more than PIECE_COMPONENTS parts."""
+    raw, n = _raw_pieces(v, f, gap)
+    if n == 0:
+        return raw, 0, np.zeros((0, 3)), np.zeros((0, 3))
+    tri = np.asarray(v if world is None else world, np.float64)[np.asarray(f, np.int64)]
+    plo = np.full((n, 3), np.inf)
+    phi = np.full((n, 3), -np.inf)
+    np.minimum.at(plo, raw, tri.min(1))
+    np.maximum.at(phi, raw, tri.max(1))
+    order = sorted(range(n), key=lambda i: (round(plo[i, 0], 3), round(plo[i, 2], 3), round(plo[i, 1], 3)))
+    rank = np.empty(n, np.int64)
+    rank[order] = np.arange(n)
+    return rank[raw], n, plo[order], phi[order]
+
+
+def _raw_pieces(v: np.ndarray, f: np.ndarray, gap: float) -> tuple[np.ndarray, int]:
+    """Each triangle's piece, unordered, and their number (0: too many connected parts, PIECE_COMPONENTS)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    v = np.asarray(v, np.float64)
+    f = np.asarray(f, np.int64)
+    if not len(f):
+        return np.zeros(0, np.int64), 0
+    _, weld = np.unique(np.round(v / 1e-4).astype(np.int64), axis=0, return_inverse=True)
+    fv = weld.reshape(-1)[f]
+    nf, nv = len(f), int(fv.max()) + 1
+    rows = np.repeat(np.arange(nf), 3)
+    g = coo_matrix((np.ones(len(rows), np.int8), (rows, fv.ravel() + nf)), shape=(nf + nv, nf + nv))
+    _, lab = connected_components(g, directed=False)
+    comp = np.unique(lab[:nf], return_inverse=True)[1].reshape(-1)
+    nc = int(comp.max()) + 1
+    if nc > PIECE_COMPONENTS:
+        return comp, 0
+    tri = v[f]
+    lo = np.full((nc, 3), np.inf)
+    hi = np.full((nc, 3), -np.inf)
+    np.minimum.at(lo, comp, tri.min(1))
+    np.maximum.at(hi, comp, tri.max(1))
+    uf = _Union(nc)
+    for a, b in _touching_boxes(lo, hi, gap):
+        uf.join(a, b)
+    root = np.array([uf.find(i) for i in range(nc)])
+    _, piece = np.unique(root, return_inverse=True)
+    return piece.reshape(-1)[comp], int(piece.max()) + 1
+
+
+PIECE_FULL = 0.8         # ... each piece standing on the shape's bottom, at least this share of its height tall
+
+
+def split_pieces(v: np.ndarray, f: np.ndarray, label: str, world: np.ndarray | None = None) -> np.ndarray | None:
+    """Each triangle's piece when the shape is several of one movable thing (two bins in one mesh), else None: its
+    label a movable word, two to PIECE_MAX pieces (piece_labels), each at least PIECE_MIN_M long and standing on its own
+    (from the shape's bottom, PIECE_FULL of its height: not a pallet's boards, not a loaded pallet's layers); at most
+    PIECE_FACES triangles. A material's mesh (``ph45_wood_warm``) is never split: nothing says what its pieces are."""
+    if len(f) > PIECE_FACES or label_class(label)[0] != "movable":
+        return None
+    labels, n, lo, hi = piece_labels(v, f, world=world)
+    if not 2 <= n <= PIECE_MAX or float((hi - lo).max(1).min()) < PIECE_MIN_M:
+        return None
+    bottom, height = float(lo[:, 1].min()), float(hi[:, 1].max() - lo[:, 1].min())
+    if np.any(lo[:, 1] > bottom + PIECE_GAP_M) or np.any(hi[:, 1] - lo[:, 1] < PIECE_FULL * height):
+        return None
+    return labels
 
 
 def read_parts(scene_dir, xml: str = "base.xml") -> list[dict]:
@@ -300,7 +420,7 @@ def read_parts(scene_dir, xml: str = "base.xml") -> list[dict]:
             return None
         return note if isinstance(note, dict) else None
 
-    groups, labels, thinned = {}, {}, {}
+    groups, labels, thinned, piece_cache = {}, {}, {}, {}
     for shape, meta in walk(root):
         if shape.get("type") == "shapegroup":
             groups[shape.get("id")] = [c for c, _ in walk(shape)]
@@ -326,18 +446,43 @@ def read_parts(scene_dir, xml: str = "base.xml") -> list[dict]:
             at = _to_world(shape)
             at = np.eye(4) if at is None else at
             meshes, full_lo, full_hi = [], [], []
+            fulls = []
             for c in members:
                 if id(c) not in thinned:
                     m = mesh_of(c)
-                    thinned[id(c)] = None if m is None else (m[0],) + _thin(m[0], m[1], INSTANCE_TRIANGLES)
+                    thinned[id(c)] = None if m is None else (m[0],) + _thin(m[0], m[1], INSTANCE_TRIANGLES) + (m[1],)
                 if thinned[id(c)] is None:
                     continue
-                full, tv, tf = thinned[id(c)]
+                full, tv, tf, ff = thinned[id(c)]
                 world_full = full @ at[:3, :3].T + at[:3, 3]
                 full_lo.append(world_full.min(0))
                 full_hi.append(world_full.max(0))
                 meshes.append((tv @ at[:3, :3].T + at[:3, 3], tf))
+                fulls.append((world_full, ff))
             if not meshes:
+                continue
+            # an instance of several things (an asset modelled as two bins): its pieces, found in the group's own frame
+            # once per group (PH45 draws a 287,000-triangle shrub 300 times), ordered where this instance puts them
+            gkey = (ref.get("id") if ref is not None else None, label)
+            fv = np.concatenate([m[0] for m in fulls])
+            fo = np.cumsum([0] + [len(m[0]) for m in fulls])
+            ffc = np.concatenate([m[1] + o for m, o in zip(fulls, fo)])
+            if gkey not in piece_cache:
+                local = np.concatenate([thinned[id(c)][0] for c in members if thinned[id(c)] is not None])
+                ok = len(ffc) <= PIECE_FACES and label_class(label)[0] == "movable"
+                piece_cache[gkey] = (local, _raw_pieces(local, ffc, PIECE_GAP_M)) if ok else None
+            cut = None
+            if piece_cache[gkey] is not None and 2 <= piece_cache[gkey][1][1] <= PIECE_MAX:
+                cut = split_pieces(piece_cache[gkey][0], ffc, label, world=fv)
+            if cut is not None:
+                for k in range(int(cut.max()) + 1):
+                    sub = ffc[cut == k]
+                    used, inv = np.unique(sub, return_inverse=True)
+                    pv = np.asarray(fv[used], np.float32)
+                    parts.append({"id": f"{sid}__p{k + 1}", "label": label, "material": "", "note": note, "kind": kind,
+                                  "verts": pv, "faces": inv.reshape(-1, 3).astype(np.int32),
+                                  "lo": pv.min(0).astype(np.float64), "hi": pv.max(0).astype(np.float64), "order": order,
+                                  "emitter": False, "piece_of": sid})
                 continue
             off = np.cumsum([0] + [len(m[0]) for m in meshes])
             v = np.concatenate([m[0] for m in meshes])
@@ -359,6 +504,17 @@ def read_parts(scene_dir, xml: str = "base.xml") -> list[dict]:
         if not len(v) or not len(f):
             continue
         v = np.asarray(v, np.float32)   # single precision: half the memory (see _mass)
+        cut = split_pieces(v, f, label) if kind != "instance" else None
+        if cut is not None:   # a shape of several things: a part each
+            f = np.asarray(f, np.int64)
+            for k in range(int(cut.max()) + 1):
+                used, inv = np.unique(f[cut == k], return_inverse=True)
+                pv = v[used]
+                parts.append({"id": f"{sid}__p{k + 1}", "label": label, "material": material, "note": note, "kind": kind,
+                              "verts": pv, "faces": inv.reshape(-1, 3).astype(np.int32), "lo": pv.min(0).astype(np.float64),
+                              "hi": pv.max(0).astype(np.float64), "order": order,
+                              "emitter": shape.find("emitter") is not None, "piece_of": sid})
+            continue
         parts.append({"id": sid, "label": label, "material": material, "note": note, "kind": kind, "verts": v,
                       "faces": np.asarray(f, np.int32), "lo": v.min(0).astype(np.float64),
                       "hi": v.max(0).astype(np.float64), "order": order,
@@ -564,6 +720,18 @@ def _touching_boxes(lo: np.ndarray, hi: np.ndarray, tol: float) -> list[tuple[in
     return pairs
 
 
+def up_area(part, cos: float = 0.9) -> float:
+    """The area of a part's faces that look up (their normal within ~25 degrees of +Y): a floor's, a road's."""
+    tri = _tris(part)
+    if not len(tri):
+        return 0.0
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    a = np.linalg.norm(n, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        up = n[:, 1] / a > cos
+    return float(0.5 * a[up].sum())
+
+
 def _part_flags(parts: list, rules: dict) -> None:
     """Per part: ``class``/``keyword`` (label_class), ``ground`` (a surface to stand on: a ground word, or wide and flat),
     ``structure`` (a structure word or ground: never part of an object), ``large`` (longer than structure_side_m: joins
@@ -581,13 +749,28 @@ def _part_flags(parts: list, rules: dict) -> None:
         # decal: dial ticks printed on an instrument's front, which also graze the bench under it); a leg, an upright or
         # a bezel is a member that joins everything it touches, not a piece that joins the one thing it touches most
         last = words(p["label"])[-1:]
-        p["piece"] = bool((last and last[0] in PIECES and size.max() < rules["piece_m"]) or size.min() < rules["flat_m"])
+        p["overlay"] = bool(size.min() < rules["overlay_m"] and size.max() < rules["overlay_long_m"] and cls != "structure"
+                            and not (last and last[0] in PIECES and size.max() < rules["piece_m"]) and size.min() >= rules["flat_m"])
+        # (a flat one a decal on something, not a tape line along a floor: a bin standing on it is not its owner)
+        p["piece"] = bool((last and last[0] in PIECES and size.max() < rules["piece_m"])
+                          or (size.min() < rules["flat_m"] and size.max() < rules["member_m"]) or p["overlay"])
+        # a structure word on a small member of an asset (a metrology stage's columns, a pendant lamp's dome): the asset's
+        # part, not the building's
+        if p["structure"] and not p["ground"] and size.max() < rules["member_m"] and asset_key(p["label"]):
+            p["structure"] = False
         p["flat_wide"] = bool(flat_wide and not (cls == "structure" and (ws & GROUND)))
-    # a wide flat part with ground under it is not ground (a skylight, a big table top): only the lowest is
+        # a mesh holding a wide upward floor-like surface is ground whatever it is called or how tall it is (a street
+        # with its buildings and kerbs, merged by material): its upward faces carry what stands on them
+        if not p["ground"] and size[0] * size[2] > rules["ground_area_m2"] and up_area(p) > rules["ground_area_m2"]:
+            p["ground"] = p["structure"] = True
+    # a wide flat part with ground under it is not ground (a skylight, a big table top): only the lowest is; unless it is
+    # wider than any table (ground_area_m2) and not high over that ground (a raised car park over the terrain is ground)
     named = [p for p in parts if p["ground"] and not p["flat_wide"]]
     wide = [p for p in parts if p["flat_wide"]]
     for p in wide:
-        if any(q is not p and q["hi"][1] < p["lo"][1] - 0.5 and np.all(q["lo"][[0, 2]] < p["hi"][[0, 2]])
+        area = (p["hi"][0] - p["lo"][0]) * (p["hi"][2] - p["lo"][2])
+        gap = rules["structure_side_m"] if area > rules["ground_area_m2"] else 0.5
+        if any(q is not p and q["hi"][1] < p["lo"][1] - gap and np.all(q["lo"][[0, 2]] < p["hi"][[0, 2]])
                and np.all(q["hi"][[0, 2]] > p["lo"][[0, 2]]) for q in named + wide):
             p["ground"] = False
             p["structure"] = p["class"] == "structure"
@@ -745,8 +928,10 @@ def _overhangs(item: Body, base: Body) -> bool:
 
 def _contained(item: Body, base: Body, slack: float = 0.01) -> bool:
     """Whether ``item`` lies wholly inside ``base``'s box (loose parts in a bin, tools in a case: they go with it), its top
-    under the base's top (a phone lying on a table is not in it)."""
-    return bool(np.all(item.lo >= base.lo - slack) and np.all(item.hi <= base.hi + slack) and item.hi[1] <= base.hi[1])
+    under the base's top (a phone lying on a table is not in it), the base at least as tall as the item (a mouse lying in
+    the ring of a cable coil is not in it)."""
+    return bool(np.all(item.lo >= base.lo - slack) and np.all(item.hi <= base.hi + slack) and item.hi[1] <= base.hi[1]
+                and base.hi[1] - base.lo[1] >= item.hi[1] - item.lo[1])
 
 
 def surface_points(tri: np.ndarray, n: int, seed: int = 0) -> np.ndarray:
@@ -811,8 +996,10 @@ def group(parts: list, rules: dict = RULES) -> list[list[int]]:
     structure = [all(parts[i]["structure"] for i in idx) for idx in comps]
     large = [any(parts[i]["large"] for i in idx) for idx in comps]
     piece = [all(parts[i]["piece"] for i in idx) for idx in comps]
+    overlay = [all(parts[i].get("overlay") for i in idx) for idx in comps]
     names = [{w for i in idx for w in words(parts[i]["label"])} for idx in comps]
-    kinds = [_word_class(parts, idx)[0] for idx in comps]
+    words_of = [_word_class(parts, idx) for idx in comps]
+    kinds = [w[0] for w in words_of]
     sup = [supporters(b, parts, part_lo, part_hi, set(idx), rules) for b, idx in zip(bodies, comps)]
 
     def may_join(a: int, b: int, attached: bool = False) -> bool:
@@ -822,6 +1009,8 @@ def group(parts: list, rules: dict = RULES) -> list[list[int]]:
             return False
         if kinds[a] and kinds[b] and kinds[a] != kinds[b] and not (piece[a] or piece[b]):
             return False   # their words disagree: a bin and the stones (or the shrub) around it are two things
+        if kinds[a] == kinds[b] == "movable" and words_of[a][1] != words_of[b][1] and not (piece[a] or piece[b]):
+            return False   # two movable things by name (a mouse lying in the ring of a cable coil)
         # two assets stay two (a case on a cart), unless one is fixed to the other (an asset of knobs, of wear decals)
         return attached or seed[a] == seed[b] or not (seed[a][0] == "asset" and seed[b][0] == "asset")
 
@@ -840,9 +1029,11 @@ def group(parts: list, rules: dict = RULES) -> list[list[int]]:
             best, best_o = (0, 0.0), None
             for o in np.nonzero(np.all((lo <= bodies[c].hi + tol) & (hi >= bodies[c].lo - tol), 1))[0]:
                 o = int(o)
-                if o != c and seed[o] != seed[c] and may_join(c, o, attached=True):   # not its own kind: key to key
+                if o != c and (seed[o] != seed[c] or not piece[o]) and may_join(c, o, attached=True):   # not key to key
                     touch = contact(bodies[c], bodies[o], tol)
-                    if touch > 0.0:
+                    # an overlay (a sheet, no part word: a screen's trace) lies on a face of what it belongs to; a cable
+                    # coil grazing a mouse it lies beside does not
+                    if touch > (0.6 if overlay[c] else 0.0):
                         score = (len(names[c] & names[o]), touch)
                         if score > best:
                             best, best_o = score, o
@@ -1079,6 +1270,7 @@ def classify(f: dict, rules: dict = RULES) -> tuple[bool, float, str]:
     side, fp, mass = max(sx, sy, sz), f["footprint_m2"], f["mass_kg"]
     on, under = f["support"]["kind"], f["support"]["on"]
     walls, ceiling = f["touches"]["wall"], f["touches"]["ceiling"]
+    rise = f.get("rise")   # its bottom over the floor under it (m); None: no floor under it
     what = f"'{kw}'" if kw else "no keyword"
     if cls == "structure":
         return False, 0.95, f"structure: {what} in '{f['label']}'"
@@ -1086,9 +1278,11 @@ def classify(f: dict, rules: dict = RULES) -> tuple[bool, float, str]:
         return False, 0.9, f"large: {sx:.2f} x {sz:.2f} m, {sy:.2f} m tall, footprint {fp:.2f} m2"
     if min(sx, sy, sz) < rules["flat_m"]:
         return False, 0.8, f"flat ({min(sx, sy, sz) * 1000:.1f} mm): a decal, a mark or a sheet, nothing to push"
+    if on == "floor" and sy < rules["marking_m"]:
+        return False, 0.8, f"on the floor, {sy * 100:.1f} cm tall: a marking, a strip or a mat, part of the floor"
     if side < rules["small_m"] or mass < rules["light_kg"]:
         return False, 0.7, f"tiny ({side * 100:.1f} cm, {mass * 1000:.0f} g): a detail, not a body worth simulating"
-    if f["holds_up"]:
+    if f["holds_up"] and cls != "movable" and mass >= rules["holds_light_kg"]:
         return False, 0.85, f"holds up {', '.join(f['holds_up'][:3])}"
     if ceiling:
         return False, 0.9, f"touches the ceiling ({', '.join(ceiling[:2])})"
@@ -1098,20 +1292,34 @@ def classify(f: dict, rules: dict = RULES) -> tuple[bool, float, str]:
         if walls:
             return False, 0.85, f"nothing under it, touches {', '.join(walls[:2])}: mounted"
         return False, 0.6, "nothing under it: hangs or floats"
-    if cls == "furniture":
+    if on == "structure" and rise is not None and rise > rules["mounted_rise_m"]:
+        return False, 0.8, f"on {', '.join(under[:2]) or 'structure'}, {rise:.2f} m over the floor: a fixture"
+    soil = [g for g in f.get("ground_on") or () if set(words(g)) & SOIL]
+    names = set(words(f["label"])).union(*(set(words(x)) for x in f.get("labels") or ()))
+    if on == "floor" and names & PLANTS and (soil or not names & POTTED):
+        return False, 0.8, f"planted: a plant {'in ' + soil[0] if soil else 'without a pot'}"
+    free_word = kw in FREE_STANDING and on == "floor" and (not walls or mass < rules["wall_light_kg"])
+    if cls == "furniture" and not free_word:
         return False, 0.8, f"fixed furniture: {what}"
+    if cls == "furniture":   # a sign standing on the floor: as a floor object without a keyword (free if small and light)
+        cls, what = None, f"'{kw}' standing free"
     where = "the floor" if on == "floor" else ", ".join(under[:2]) or on
     if cls == "movable":
         conf = (0.9 if on == "floor" else 0.8) - (0.15 if walls else 0.0)
         return True, round(conf, 2), f"{what} on {where}, ~{mass:.1f} kg" + (f", touches {walls[0]}" if walls else "")
+    if on == "object" and under and label_stem(under[0]) == label_stem(f["label"]) and cls is None:
+        return False, 0.7, f"on another '{label_stem(f['label'])}': a piece of the same thing (a leaf on a leaf)"
     if on == "floor":
-        bad = [w for w, ok in ((f"{sy:.2f} m tall", sy < rules["free_height_m"]),
-                               (f"footprint {fp:.2f} m2", fp < rules["free_footprint_m2"]),
+        light, low = mass < rules["tall_light_kg"], sy < rules["low_table_m"] and mass < rules["free_mass_kg"] / 1.5
+        flat = sorted((sx, sz))
+        bad = [w for w, ok in ((f"{sy:.2f} m tall", sy < (rules["tall_height_m"] if light else rules["free_height_m"])),
+                               (f"footprint {fp:.2f} m2", fp < (rules["low_footprint_m2"] if low else rules["free_footprint_m2"])),
                                (f"~{mass:.0f} kg", mass < rules["free_mass_kg"]),
-                               (f"touches {', '.join(walls[:2])}", not walls)) if not ok]
+                               (f"a slab {flat[0]:.2f} x {flat[1]:.2f} m", not (flat[0] < rules["thin_m"] and flat[1] > rules["thin_long_m"])),
+                               (f"touches {', '.join(walls[:2])}", not walls or mass < rules["wall_light_kg"])) if not ok]
         if not bad:
-            return True, 0.6, f"free-standing on the floor, no keyword: {sy:.2f} m tall, footprint {fp:.2f} m2, ~{mass:.1f} kg"
-        return False, 0.6, f"floor object, no keyword, not free: {'; '.join(bad)}"
+            return True, 0.6, f"free-standing on the floor, {what if kw else 'no keyword'}: {sy:.2f} m tall, footprint {fp:.2f} m2, ~{mass:.1f} kg"
+        return False, 0.6, f"floor object, {what if kw else 'no keyword'}, not free: {'; '.join(bad)}"
     if mass < rules["item_mass_kg"] and side < rules["item_side_m"]:
         return True, 0.55, f"small item on {where}, no keyword: {side:.2f} m, ~{mass:.1f} kg"
     return False, 0.6, f"on {where}, no keyword, not a small item: {side:.2f} m, ~{mass:.0f} kg"
@@ -1125,7 +1333,35 @@ def source_sha1(scene_dir, xml: str = "base.xml") -> str:
 
 def rules_sha1(rules: dict = RULES) -> str:
     return hashlib.sha1(json.dumps([VERSION, rules, sorted(STRUCTURE), sorted(FURNITURE), sorted(MOVABLE), sorted(MODIFIERS),
-                                    sorted(GROUND), sorted(PIECES), MATERIALS], sort_keys=True).encode()).hexdigest()[:16]
+                                    sorted(GROUND), sorted(PIECES), MATERIALS, sorted(FREE_STANDING),
+                                    sorted(" ".join(k) + ">" + v[1] for k, v in COMPOUNDS.items()), sorted(PLANTS), sorted(SOIL), sorted(POTTED), 5],
+                                   sort_keys=True).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- decisions set by hand
+# A person's say over the rules, per scene (the viewer's selection: a click on an object, then 고정 / 밂 / 움직임):
+# physics_overrides.json beside physics.json, object id -> {"movable", "robot_reachable"}. The analysis takes it over the
+# rules (and keeps what the rules said); every such click is also logged with the object's features (LABELS), the
+# material to tune the rules on.
+OVERRIDES = "physics_overrides.json"
+LABELS = "physics_labels.jsonl"     # in the pack's folder: one line per decision set by hand, every scene
+
+
+def read_overrides(scene_dir) -> dict:
+    path = Path(scene_dir) / OVERRIDES
+    try:
+        data = json.loads(path.read_text()) if path.is_file() else {}
+    except ValueError:
+        return {}
+    return {str(k): v for k, v in (data.get("objects") or {}).items() if isinstance(v, dict) and "movable" in v}
+
+
+def overrides_sha1(scene_dir) -> str | None:
+    found = read_overrides(scene_dir)
+    if not found:
+        return None
+    return hashlib.sha1(json.dumps({k: [bool(v["movable"]), v.get("robot_reachable")] for k, v in found.items()},
+                                   sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _summary(labels: list[str]) -> list[str]:
@@ -1153,9 +1389,11 @@ def _main_label(parts: list, idx: list[int]) -> str:
     return main.most_common(1)[0][0]
 
 
-def analyse(scene_dir, xml: str = "base.xml", rules: dict | None = None) -> dict:
-    """The physics.json content of a scene (see the module doc)."""
+def analyse(scene_dir, xml: str = "base.xml", rules: dict | None = None, overrides: dict | None = None) -> dict:
+    """The physics.json content of a scene (see the module doc). ``overrides``: object id -> {"movable",
+    "robot_reachable"} set by hand (read_overrides), over what the rules decide."""
     rules = dict(RULES, **(rules or {}))
+    overrides = overrides or {}
     started = time.monotonic()
     scene_dir = Path(scene_dir)
     parts = read_parts(scene_dir, xml)
@@ -1206,15 +1444,26 @@ def analyse(scene_dir, xml: str = "base.xml", rules: dict | None = None) -> dict
         size = body.hi - body.lo
         # structure and large objects are fixed whatever they weigh or touch: their volume (hulls of whole facades) and
         # contacts are not worked out (PH46's 8.5 M triangles are mostly buildings, buses and trees)
-        weigh = cls != "structure" and size.max() <= rules["large_side_m"]
+        weigh = (cls != "structure" and size.max() <= rules["large_side_m"]) or bool(overrides.get(ids[k], {}).get("movable"))
         m = _mass(parts, idx, body) if weigh else None
         fp = footprint(body.verts) if weigh else float(size[0] * size[2])
         touches = wall_contact(body, parts, walls, own, rules) if weigh else {"wall": [], "ceiling": []}
         f = {"label": labels[k], "class": cls, "keyword": kw, "size_m": [float(size[0]), float(size[1]), float(size[2])],
              "footprint_m2": fp, "mass_kg": m["mass_kg"] if m else None, "support": {"kind": kind, "on": under},
-             "touches": touches, "holds_up": sorted(held.get(k, ()))}
+             "touches": touches, "holds_up": sorted(held.get(k, ())),
+             "rise": None if floor_y is None else float(body.lo[1] - floor_y),
+             "ground_on": sorted({parts[i]["label"] for i in sup if parts[i]["ground"]}),
+             "labels": _summary([parts[i]["label"] for i in idx])}
         movable, conf, reason = classify(f, rules)
-        reach = bool(movable and floor_y is not None and body.lo[1] - floor_y <= rules["reach_m"])
+        # within the robot's reach: standing on the floor (or the ground), its bottom low; not low on a shelf, inside a rack
+        reach = bool(movable and kind == "floor" and floor_y is not None and body.lo[1] - floor_y <= rules["reach_m"])
+        ruled = {"movable": movable, "robot_reachable": reach, "confidence": conf, "reason": reason}
+        hand = overrides.get(ids[k])
+        if hand is not None:   # set by hand in the viewer: over the rules (what they said kept under "rules_said")
+            movable = bool(hand["movable"])
+            reach = bool(movable and (hand.get("robot_reachable") if hand.get("robot_reachable") is not None else
+                                      floor_y is not None and body.lo[1] - floor_y <= rules["reach_m"]))
+            conf, reason = 1.0, f"set by hand ({'pushed by a robot' if reach else 'movable' if movable else 'fixed'}); the rules said: {reason}"
         out = {"id": ids[k], "parts": [parts[i]["id"] for i in idx], "label": labels[k],
                "labels": _summary([parts[i]["label"] for i in idx]), "movable": movable, "robot_reachable": reach,
                "confidence": conf, "reason": reason, "class": cls, "keyword": kw,
@@ -1228,6 +1477,11 @@ def analyse(scene_dir, xml: str = "base.xml", rules: dict | None = None) -> dict
                "support": {"kind": kind, "on": under[:4], "bottom_z": round(float(body.lo[1]), 4),
                            "floor_z": None if floor_y is None else round(floor_y, 4)},
                "touches": f["touches"], "holds_up": f["holds_up"]}
+        if hand is not None:
+            out["set_by_hand"], out["rules_said"] = True, ruled
+        if movable and m is None:   # a structure or large object made movable by hand: weighed now
+            m = _mass(parts, idx, body)
+            out.update(mass_kg=round(m["mass_kg"], 3), volume_m3=round(m["volume_m3"], 6), com=_sim(m["com"]))
         if movable:
             # the friction of the material most of its surface is (by the scene's material name, as groundmap reads it)
             area = Counter()

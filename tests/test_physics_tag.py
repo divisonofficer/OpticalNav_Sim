@@ -186,6 +186,85 @@ def test_physics_json_and_needs_tagging(tmp_path):
     assert physics_tag.needs_tagging(scene)
 
 
+def test_signs_free_standing_and_decisions_set_by_hand(tmp_path):
+    """A sign standing free on the floor is judged as a floor object (movable when small and light), one on a wall stays
+    fixed; decisions set by hand (physics_overrides.json) go over the rules, keep what the rules said, and make
+    physics.json stale until tagged again."""
+    s = Scene(tmp_path)
+    s.box("floor", [-5, -0.1, -5], [5, 0, 5], label="room floor", material="Gray epoxy floor")
+    s.box("north_wall", [-5, 0, -5.2], [5, 3, -5], label="north wall", material="Wall paint")
+    s.box("wet_sign", [1, 0, 1], [1.45, 0.62, 1.44], label="wet_sign", material="Yellow plastic")
+    s.box("wall_sign", [-1, 1.5, -5], [-0.4, 1.8, -4.98], label="exit sign", material="Plastic")
+    s.box("table_top", [-2, 0.72, 0], [-0.8, 0.76, 0.8], label="table top")
+    for k, (x, z) in enumerate([(-2, 0), (-0.85, 0), (-2, 0.75), (-0.85, 0.75)]):
+        s.box(f"table_leg_{k}", [x, 0, z], [x + 0.05, 0.72, z + 0.05], label=f"table leg.00{k}")
+    scene = s.write()
+    obj = by_part(po.analyse(scene))
+    assert obj["wet_sign"]["movable"] and obj["wet_sign"]["robot_reachable"] and "'sign' standing free" in obj["wet_sign"]["reason"]
+    assert not obj["wall_sign"]["movable"]
+    physics_tag.tag_scene(scene)
+    assert not physics_tag.needs_tagging(scene)
+    table, sign = obj["table_top"]["id"], obj["wet_sign"]["id"]
+    (scene / po.OVERRIDES).write_text(json.dumps({"objects": {table: {"movable": True, "robot_reachable": True},
+                                                              sign: {"movable": False, "robot_reachable": None}}}))
+    assert physics_tag.needs_tagging(scene)                           # decisions by hand changed: tagged again
+    physics_tag.tag_scene(scene)
+    data = json.loads((scene / po.PHYSICS).read_text())
+    got = by_part(data)
+    assert got["table_top"]["movable"] and got["table_top"]["robot_reachable"] and got["table_top"]["set_by_hand"]
+    assert not got["table_top"]["rules_said"]["movable"] and got["table_top"]["hull"] and got["table_top"]["mass_kg"] > 0
+    assert not got["wet_sign"]["movable"] and got["wet_sign"]["rules_said"]["movable"] and got["wet_sign"]["confidence"] == 1.0
+    assert table in data["movable"] and sign not in data["movable"] and not physics_tag.needs_tagging(scene)
+
+
+def test_grouping_joins_pieces_and_keeps_things_apart(tmp_path):
+    """A case's carry handle 8 mm over it joins the case (a piece of its own asset); a stanchion's posts set into its base
+    plate join it (one .blend object, two materials); a screen's trace (a 3 mm sheet on the display) joins its
+    instrument; a mouse lying in the ring of a cable coil stays apart from it (two movable things by name)."""
+    s = Scene(tmp_path)
+    s.box("floor", [-5, -0.1, -5], [5, 0, 5], label="room floor", material="Gray epoxy floor")
+    s.box("bench", [-2, 0, -2], [2, 0.9, -1], label="west bench", material="Steel")
+    s.box("case", [0, 0.9, -1.8], [0.43, 1.1, -1.48], label="XX_r003_shelf transport case case", material="ABS")
+    s.box("handle", [0.15, 1.108, -1.7], [0.27, 1.124, -1.68], label="XX_r003_shelf transport case carry handle", material="ABS")
+    s.box("st_base", [2, 0, 2], [2.3, 0.04, 2.3], label="stanchions_ph33_black_metal", material="Black metal")
+    s.box("st_post", [2.12, 0.04, 2.12], [2.18, 1.0, 2.18], label="stanchions_ph33_steel", material="Steel")
+    s.box("unit", [-1.5, 0.9, -1.8], [-1.2, 1.1, -1.4], label="XX_wired bench unit 0 case", material="Steel")
+    s.box("trace", [-1.2, 0.95, -1.7], [-1.197, 1.02, -1.5], label="XX_wired bench unit 0 signal trace", material="Glow")
+    s.box("coil", [1.0, 0.9, -1.9], [1.2, 0.906, -1.7], label="XX_r007_bench spare lead harness", material="Rubber")
+    s.box("mouse", [1.07, 0.9, -1.83], [1.13, 0.925, -1.77], label="XX_control monitor mouse", material="Plastic")
+    scene = s.write()
+    obj = by_part(po.analyse(scene))
+    assert obj["handle"]["id"] == obj["case"]["id"] and obj["case"]["movable"]
+    assert obj["st_post"]["id"] == obj["st_base"]["id"] and obj["st_base"]["robot_reachable"]
+    assert obj["trace"]["id"] == obj["unit"]["id"]
+    assert obj["mouse"]["id"] != obj["coil"]["id"] and obj["mouse"]["movable"] and obj["coil"]["movable"]
+
+
+def test_viewer_flags_are_kept_and_logged(tmp_path):
+    """The viewer's 고정 / 밂 / 움직임 / 규칙대로 on a selected object: physics_overrides.json for the scene, a line of
+    the object's features and the rules' verdict in the pack's physics_labels.jsonl, pending until tagged again."""
+    import threading
+    from opticalnav_sim import gui
+    scene = room(tmp_path)
+    physics_tag.tag_scene(scene)
+    stool = by_part(json.loads((scene / po.PHYSICS).read_text()))["stool_seat"]["id"]
+    session = gui.Session.__new__(gui.Session)
+    session.cv, session.version = threading.Condition(), 0
+    session.scene_dir = lambda name: scene
+    out = session.set_object_flag("toy", stool, "fixed")
+    assert out["objects"][stool]["movable"] is False and out["pending"]
+    out = session.set_object_flag("toy", stool, "movable")
+    assert out["objects"][stool] ["robot_reachable"] is False
+    lines = [json.loads(x) for x in (tmp_path / po.LABELS).read_text().splitlines()]
+    assert [x["set"] for x in lines] == ["fixed", "movable"] and lines[0]["rules"]["movable"] and lines[0]["mass_kg"] > 0
+    assert lines[0]["label"] and lines[0]["support"]["kind"] == "floor" and lines[0]["rules_sha1"]
+    physics_tag.tag_scene(scene)
+    assert not session.object_flags("toy")["pending"]
+    assert session.set_object_flag("toy", stool, "rule")["objects"] == {} and session.object_flags("toy")["pending"]
+    with pytest.raises(ValueError):
+        session.set_object_flag("toy", "nope", "fixed")
+
+
 def _mitsuba():
     pytest.importorskip("mitsuba")
     try:
@@ -280,6 +359,49 @@ def test_merge_makes_one_body_per_kept_object_and_follows_the_scope(tmp_path):
     mm.unmerge_scene(scene)
     assert (scene / "base.xml").read_bytes() == original
     assert "merge" not in json.loads((scene / po.PHYSICS).read_text())
+
+
+def test_a_shape_of_two_bins_becomes_two_bodies(tmp_path):
+    """A mesh holding two bins (one shape, as PH33's trash can asset) and an instance of a group holding two (as PH33's
+    bins are drawn): physics_objects splits each into its pieces, a movable object each; the merge writes the pieces as
+    meshes of their own (dyn_ bodies the render server moves) and gives every file back byte for byte."""
+    _mitsuba()
+    s = Scene(tmp_path)
+    s.box("floor", [-5, -0.1, -5], [5, 0, 5], label="room floor", material="Gray epoxy floor")
+    scene = s.dir
+    va, fa = box_mesh([0, 0, 0], [0.4, 0.7, 0.4])
+    vb, fb = box_mesh([1.0, 0, 0], [1.4, 0.7, 0.4])
+    pair = (np.concatenate([va, vb]).astype(np.float32), np.concatenate([fa, fb + len(va)]))
+    bodies.write_ply(scene / "assets" / "pair.ply", *pair)
+    note = {"id": "twin_bin", "type": "landmark", "label": "twin bin", "material": "Steel",
+            "geometry": {"center": [0, 0], "size_m": [1, 1, 1], "base_height_m": 0.0}, "nav": {"blocks": True}}
+    s.shapes.append(f'\n  <!--opticalnav-obj:{json.dumps(note, separators=(",", ":"))}-->\n  <shape type="ply" id="twin_bin">\n'
+                    f'    <string name="filename" value="assets/pair.ply" />\n{BSDF}  </shape>')
+    s.shapes.append(f'\n  <shape type="shapegroup" id="group_bins">\n    <shape type="ply">\n'
+                    f'      <string name="filename" value="assets/pair.ply" />\n  {BSDF}    </shape>\n  </shape>'
+                    f'\n  <shape type="instance" id="bins__inst">\n    <ref id="group_bins" />\n'
+                    f'    <transform name="to_world"><matrix value="1 0 0 0 0 1 0 0 0 0 1 2 0 0 0 1" /></transform>\n  </shape>')
+    s.write()
+    original = (scene / "base.xml").read_bytes()
+    physics_tag.tag_scene(scene)
+    data = json.loads((scene / po.PHYSICS).read_text())
+    got = by_part(data)
+    for sid in ("twin_bin", "bins__inst"):
+        a, b = got[f"{sid}__p1"], got[f"{sid}__p2"]
+        assert a["id"] != b["id"] and a["robot_reachable"] and b["robot_reachable"]
+    summary = mm.merge_scene(scene)
+    record = json.loads((scene / po.PHYSICS).read_text())["merge"]["objects"]
+    ids = shape_ids(scene)
+    assert "twin_bin" not in ids and "bins__inst" not in ids
+    for sid in ("twin_bin", "bins__inst"):
+        for k in (1, 2):
+            shapes = record[got[f"{sid}__p{k}"]["id"]]["shapes"]
+            assert record[got[f"{sid}__p{k}"]["id"]]["kept"] and shapes and all(x.startswith("dyn_") and x in ids for x in shapes)
+    assert not mm.needs_merging(scene) and summary["merged_groups"] >= 4
+    # the scene as it was, for the analysis (tagging again gives the same) and byte for byte after unmerging
+    assert by_part(po.analyse(scene)).keys() == got.keys()
+    mm.unmerge_scene(scene)
+    assert (scene / "base.xml").read_bytes() == original
 
 
 def test_solid_filter_index_finds_each_triangles_object(tmp_path, monkeypatch):

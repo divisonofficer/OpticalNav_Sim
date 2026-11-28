@@ -41,6 +41,8 @@ def parse_spec(spec: str) -> tuple[str, Path]:
 
 
 def up_to_date(pack: Path, sid: str, blend: Path) -> bool:
+    """Whether the scene was converted from this file as it is (its size and time: a file moved since, as a scene library's
+    are, is the same file) by this converter."""
     stamp = pack / "scenes" / sid / ".source.json"
     if not (pack / "scenes" / sid / "base.xml").is_file() or not stamp.is_file():
         return False
@@ -49,11 +51,14 @@ def up_to_date(pack: Path, sid: str, blend: Path) -> bool:
         old = json.loads(stamp.read_text())
     except ValueError:
         return False
-    return old == {"blend": str(blend), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "converter": converter_version()}
+    return (old.get("size"), old.get("mtime_ns"), old.get("converter")) == (st.st_size, st.st_mtime_ns, converter_version())
 
 
-def ensure(pack: Path, sid: str, blend: Path, force: bool = False) -> float:
-    """Convert ``blend`` into the scene ``sid`` of ``pack`` unless it is already (seconds spent; 0 if nothing to do)."""
+def ensure(pack: Path, sid: str, blend: Path, force: bool = False, moved: dict | None = None) -> float:
+    """Convert ``blend`` into the scene ``sid`` of ``pack`` unless it is already (seconds spent; 0 if nothing to do). The file
+    itself is never opened: a working copy is (blend_paths.working_copy), its relative paths read from where the file was
+    made (``moved``: a scene library's manifests, old path -> new path)."""
+    from . import blend_paths
     if not blend.is_file():
         raise SystemExit(f"--blend: {blend} is not a file")
     if not force and up_to_date(pack, sid, blend):
@@ -61,8 +66,15 @@ def ensure(pack: Path, sid: str, blend: Path, force: bool = False) -> float:
     pack.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
     print(f"[blend] converting {blend.name} -> {sid} (the first time takes seconds to minutes)", flush=True)
-    PROGRESS[sid] = {"fraction": 0.01, "stage": "시작", "t0": t0}
-    proc = subprocess.Popen([sys.executable, str(CONVERTER), "--pack", str(pack), "--blend", str(blend), "--scene-id", sid, "--link-blend"],
+    PROGRESS[sid] = {"fraction": 0.01, "stage": "복사", "t0": t0}
+    moved = moved or {}
+    copy = blend_paths.working_copy(blend, sid)
+    origin = blend_paths.origin_of(blend, moved)
+    moves_file = copy.parent / "moves.json"
+    moves_file.write_text(json.dumps(moved))
+    PROGRESS[sid] = {"fraction": 0.02, "stage": "시작", "t0": t0}
+    proc = subprocess.Popen([sys.executable, str(CONVERTER), "--pack", str(pack), "--blend", str(copy), "--scene-id", sid, "--link-blend",
+                             "--origin", str(origin), "--moves", str(moves_file)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     tail: list[str] = []
     try:
@@ -83,9 +95,11 @@ def ensure(pack: Path, sid: str, blend: Path, force: bool = False) -> float:
     return time.monotonic() - t0
 
 
-def listed(dirs: list[str], tsvs: list[str]) -> dict[str, Path]:
+def listed(dirs: list[str], tsvs: list[str], libraries: list[str] = ()) -> dict[str, Path]:
     """The .blend files offered in the viewer's scene list (id -> file), not converted until one is chosen: every ``*.blend`` directly in a
-    directory, and the ``id`` / ``passed_blend`` columns of robomituba's promoted_ref_scenes tsv (id ``blend_<id>``)."""
+    directory, the ``id`` / ``passed_blend`` columns of robomituba's promoted_ref_scenes tsv (id ``blend_<id>``), and every scene of a
+    scene library (blend_paths.library: ``<series>/<id>/``), which wins over a tsv row whose file is no longer there."""
+    from . import blend_paths
     out: dict[str, Path] = {}
     for d in dirs:
         for f in sorted(Path(d).expanduser().glob("*.blend")):
@@ -97,6 +111,10 @@ def listed(dirs: list[str], tsvs: list[str]) -> dict[str, Path]:
         for r in rows[1:]:
             if len(r) > max(ci, cp) and r[cp]:
                 out["blend_" + re.sub(r"[^0-9A-Za-z._-]+", "_", r[ci])] = Path(r[cp])
+    for root in libraries:
+        for sid, path in blend_paths.library(root).items():
+            if sid not in out or not Path(out[sid]).is_file():
+                out[sid] = path
     return out
 
 

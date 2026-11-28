@@ -180,7 +180,8 @@ main.dock-bottom #splitter { top: -10px; left: 0; right: 0; height: 10px; cursor
 .sub .pane-head select.src { flex: none; max-width: 46%; background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 7px; padding: 4px 6px; font: inherit; font-size: 12.5px; }
 .sub .pane-head h2 { font-size: 13px; font-weight: 600; }
 .sub h2 small { font: 11.5px var(--mono); color: var(--muted); font-weight: 400; }
-.sub[data-kind=sensor] .tabsets, .sub[data-kind=sensor] .frame-wrap, .sub[data-kind=sensor] .legend, .sub[data-kind=sensor] [data-act=grid] { display: none; }
+.sub[data-kind=editor] .stabs, .stabs:empty { display: none; }
+.sub[data-kind=sensor] .tabsets:not(.stabs), .sub[data-kind=sensor] .frame-wrap, .sub[data-kind=sensor] .legend, .sub[data-kind=sensor] [data-act=grid] { display: none; }
 .sub[data-kind=editor] .sensor-wrap { display: none; }
 .sub[data-kind=sensor] .pdot { background: var(--accent-2); }
 .sensor-wrap { flex: 1; min-height: 120px; position: relative; background: #000; border-radius: 6px; overflow: hidden; }
@@ -214,6 +215,11 @@ main .pane.drop { outline: 2px dashed var(--accent); outline-offset: -3px; }
   overflow: hidden; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
 .frame.paused { outline: 2px dashed var(--warn); outline-offset: -2px; }
+.frame .overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+.frame.placing img { cursor: copy; }
+.place-hint { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); background: rgba(14, 19, 22, .82); color: var(--ink);
+  font: 12px var(--mono); padding: 5px 10px; border-radius: 6px; pointer-events: none; white-space: nowrap; }
+.place-hint.bad { color: var(--bad, #ff6b6b); }
 .frame.grid::after { content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(90deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)),
               linear-gradient(0deg, transparent calc(33.33% - .5px), rgba(255,255,255,.28) calc(33.33% - .5px) calc(33.33% + .5px), transparent calc(33.33% + .5px) calc(66.67% - .5px), rgba(255,255,255,.28) calc(66.67% - .5px) calc(66.67% + .5px), transparent calc(66.67% + .5px)); }
@@ -363,7 +369,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
     </section>
     <section class="card">
-      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="cycles" aria-pressed="false" title="Cycles: 장면의 .blend를 Blender Cycles로 렌더합니다(RGB만, 편광 없음). 카메라·해상도·spp는 다른 렌더러와 같고, 멈추면 패스를 쌓는 방식도 같습니다. 조명·하늘·플래시 등 Mitsuba 설정은 적용되지 않고 .blend 안의 것을 씁니다. 디노이저는 쓸 수 있습니다. 장면 폴더에 .blend가 있어야 켤 수 있습니다.">Cycles</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button><button type="button" data-engine="solid" aria-pressed="false" title="솔리드 미리보기: Blender의 Solid 뷰처럼 구조만 봅니다. 면마다 재질 색(텍스처 포함)에 카메라를 따라오는 고정 스튜디오 조명(어깨 너머 키 라이트, 반대편 보조광, 위아래 반구광)만 씁니다. 그림자, 간접광(프로브), 거울, 유리는 그리지 않아 래스터보다 빠르고, 래스터의 장면 데이터를 같이 써서 따로 준비하는 시간(프로브 굽기 등)이 없습니다. 로봇 몸체는 아직 그리지 않습니다.">솔리드</button></span></h2>
+      <h2><svg class="i"><use href="#i-render"/></svg>Render<span class="tabs seg card-act" id="engine" role="group" aria-label="렌더러"><button type="button" data-engine="path" aria-pressed="true" title="Mitsuba 경로 추적(편광, 패스를 쌓을수록 깨끗해짐). 아래 설정은 모두 Mitsuba용입니다.">Mitsuba</button><button type="button" data-engine="cycles" aria-pressed="false" title="Cycles: 장면의 .blend를 Blender Cycles로 렌더합니다(RGB만, 편광 없음). 카메라·해상도·spp는 다른 렌더러와 같고, 멈추면 패스를 쌓는 방식도 같습니다. 조명·하늘·플래시 등 Mitsuba 설정은 적용되지 않고 .blend 안의 것을 씁니다. 디노이저는 쓸 수 있습니다. 장면 폴더에 .blend가 있어야 켤 수 있습니다.">Cycles</button><button type="button" data-engine="raster" aria-pressed="false" title="래스터 미리보기: 같은 장면(숨긴 물체, 거울, 조명 등급, 플래시)을 GPU 래스터라이저(nvdiffrast)로 한 장에 그립니다. 노이즈 없이 빠르게 움직이며 보는 용도로, 광원마다 부드러운 그림자의 직접광과 하늘이 보이는 창의 빛에 GGX 반사(거칠기·금속성·노멀맵), 간접광은 광선 추적으로 구운 조명 프로브(조명·하늘을 바꾸면 2초쯤 다시 굽기), 구석은 AO로 어둡게 합니다. 편광은 한 번 반사까지 Mitsuba와 같은 Mueller 행렬(pplastic, conductor, 유리, 편광 플래시)로 계산하고, 거울은 거울면에 비친 카메라로 한 번 더 그려 반사합니다(거울 속 거울은 한 번까지, 화면에 큰 거울 4개). 처음 켤 때 장면을 옮겨 담느라 몇 초 걸립니다.">래스터</button><button type="button" data-engine="solid" aria-pressed="false" title="솔리드 미리보기: Blender의 Solid 뷰처럼 구조만 봅니다. 면마다 재질 색(텍스처 포함)에 카메라를 따라오는 고정 스튜디오 조명(어깨 너머 키 라이트, 반대편 보조광, 위아래 반구광)만 씁니다. 그림자, 간접광(프로브), 거울, 유리는 그리지 않아 래스터보다 빠르고, 래스터의 장면 데이터를 같이 써서 따로 준비하는 시간(프로브 굽기 등)이 없습니다. 로봇과 밀린 물체도 그립니다.">솔리드</button></span></h2>
       <div class="toggles">
         <label class="tg mitsuba-only" for="caustics" title="끄면 조명 패스도 플래시 패스처럼 caustic(거울·유리·광택면을 거쳐 광원에 닿는 빛)을 뺍니다. 그 경로의 흰 점(firefly)이 사라지지만 그 빛도 빠집니다(유리창을 거쳐 들어오는 하늘빛 등). 진단용, 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="caustics" checked> caustic</label>
         <label class="tg mitsuba-only" for="split" title="플래시를 켰을 때 조명과 플래시를 한 경로로 렌더합니다(path_nocaustics split). 두 경로로 따로 렌더한 것과 같은 그림이고(1024 spp 평균 0.1% 이내) GPU 시간은 약 3분의 1 줄어듭니다(127 → 84 ms). 끄면 두 경로. 설정마다 처음 한 번 freeze를 기록합니다."><input type="checkbox" class="sw" id="split" checked> split</label>
@@ -398,8 +404,17 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       </div>
     </section>
     <section class="card">
-      <h2><svg class="i"><use href="#i-eye"/></svg>View · Exposure<button type="button" id="refit" class="flash primary card-act" title="지금 화면의 밝은 부분에 맞춰 RGB와 NIR의 노출 기준점을 다시 잡고, 노출 조절을 0으로 돌립니다">자동 노출</button></h2>
+      <h2><svg class="i"><use href="#i-eye"/></svg>View · Exposure<button type="button" id="refit" class="flash card-act" title="지금 화면의 밝은 부분에 맞춰 이 카메라의 노출 기준점을 한 번 다시 잡고, 노출 조절을 0으로 돌립니다">지금 맞춤</button></h2>
       <div class="fields">
+        <label class="f" for="ev-cam" title="노출을 맞출 카메라: 에디터 카메라, 또는 로봇의 카메라 각각 (카메라마다 따로 저장됩니다)"><span>카메라</span><select id="ev-cam"><option value="editor">에디터 카메라</option></select></label>
+        <label class="tg" for="ev-auto" title="켜면 노출이 화면을 따라 바뀝니다(밝은 곳·어두운 곳으로 돌면 몇 프레임에 걸쳐 따라감). 끄면 지금 노출에 고정되고 아래 값으로 직접 정합니다"><input type="checkbox" class="sw" id="ev-auto"> 자동 노출</label>
+      </div>
+      <div class="fields" id="ev-robot" hidden>
+        <label class="f" for="ev-comp" title="자동 노출의 목표 밝기를 옮깁니다 (+1 EV = 두 배 밝게)"><span>노출 보정</span><input type="range" id="ev-comp" min="-4" max="4" step="0.25" value="0"><span class="v" id="ev-comp-v">0 EV</span></label>
+        <label class="f" for="ev-time" title="노출 시간 (자동 노출을 끄면 직접 정합니다). 자동일 때는 지금 값"><span>노출 시간</span><input type="range" id="ev-time" min="-4.7" max="-1.52" step="0.02" value="-2.3"><span class="v" id="ev-time-v">5 ms</span></label>
+        <label class="f" for="ev-gain" title="아날로그 게인 (자동 노출을 끄면 직접 정합니다). 자동일 때는 지금 값"><span>게인</span><input type="range" id="ev-gain" min="0" max="24" step="0.5" value="0"><span class="v" id="ev-gain-v">0 dB</span></label>
+      </div>
+      <div class="fields" id="ev-editor">
         <label class="f" for="bands" title="근적외선 대역을 같이 렌더합니다(같은 경로에서 의사 NIR 재질로). freeze 기록은 같이 씁니다."><span>대역</span><select id="bands"><option value="rgb">RGB</option><option value="both">RGB+NIR</option><option value="nir">NIR</option></select></label>
         <label class="f" for="scale" title="DoLP·S1·S2 색 범위"><span>범위</span><input type="range" id="scale" min="0.05" max="1" step="0.05" value="0.2"><span class="v" id="scale-v">0.20</span></label>
         <label class="f" for="ev-rgb" title="RGB 화면의 노출 기준점을 옮깁니다 (1 = 두 배 밝게). 렌더는 다시 하지 않습니다"><span>RGB 노출</span><input type="range" id="ev-rgb" min="-4" max="4" step="0.25" value="0"><span class="v" id="ev-rgb-v">0 EV</span></label>
@@ -423,6 +438,9 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
     <div class="tabsets"><div class="tabs" role="group" aria-label="왼쪽 화면 대역" data-pane="a" data-kind="band"></div><div class="tabs" role="group" aria-label="왼쪽 화면 보기" data-pane="a" data-kind="view"></div><div class="tabs" role="group" aria-label="왼쪽 화면 채널 무관 (AOV)" data-pane="a" data-kind="aov"></div></div>
     <div class="frame-wrap"><div class="frame" id="frame-a">
       <img id="img-a" alt="현재 시점">
+      <img class="overlay" id="selmask-a" alt="" hidden>
+      <svg class="overlay" id="place-a" preserveAspectRatio="xMidYMid meet" hidden></svg>
+      <div class="place-hint" id="place-hint" hidden></div>
       <div class="cands" id="cands"></div>
       <span class="badge" id="badge"></span>
       <div class="sflegend" id="sflegend" hidden></div>
@@ -443,6 +461,7 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <button type="button" role="tab" id="t-rig" aria-controls="p-rig" data-tab="rig">카메라</button>
         <button type="button" role="tab" id="t-state" aria-controls="p-state" data-tab="state">현재 상태</button>
         <button type="button" role="tab" id="t-probe" aria-controls="p-probe" data-tab="probe">픽셀 값</button>
+        <button type="button" role="tab" id="t-select" aria-controls="p-select" data-tab="select" title="에디터 뷰에서 클릭한 것: 물체, 메시, 재질, 로봇">선택</button>
         <button type="button" role="tab" id="t-scene" aria-controls="p-scene" data-tab="scene">씬 정보</button>
         <button type="button" role="tab" id="t-robot" aria-controls="p-robot" data-tab="robot">로봇</button>
       </div>
@@ -507,6 +526,9 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
         <dl id="probe"><div><dt>위치</dt><dd class="desk-only">이미지 위에 마우스를 올리세요</dd><dd class="touch-only">이미지를 탭하세요</dd></div></dl>
         <dl id="pickinfo"></dl>
       </section>
+      <section class="ppanel" role="tabpanel" id="p-select" aria-labelledby="t-select" hidden>
+        <dl id="selinfo"><div><dt>선택</dt><dd>에디터 뷰에서 물체를 클릭하세요 (Esc: 해제)</dd></div></dl>
+      </section>
       <section class="ppanel" role="tabpanel" id="p-scene" aria-labelledby="t-scene" hidden>
         <dl id="scene-stats"><div><dt>씬</dt><dd>불러오는 중…</dd></div></dl>
         <p class="hint">렌더 서버에 올라간 씬 기준, 5초마다 갱신. GPU는 장치 전체 사용량(다른 프로세스 포함).</p>
@@ -518,11 +540,12 @@ dialog#help::backdrop { background: rgba(5, 8, 10, .62); }
       <section class="ppanel" role="tabpanel" id="p-robot" aria-labelledby="t-robot" hidden>
         <div id="robot-empty">
           <p class="empty-title">로봇이 없습니다</p>
-          <p class="hint">로봇을 추가하면 에디터 카메라가 보는 바닥에 놓이고, 그 로봇의 카메라·센서가 카메라 탭의 목록에 들어갑니다.</p>
+          <p class="hint">로봇을 고른 뒤 에디터 뷰에서 놓을 바닥을 클릭하면 그 자리에 놓이고(마우스 휠: 방향), 그 로봇의 카메라·센서가 카메라 탭의 목록에 들어갑니다.</p>
           <button type="button" class="flash primary" id="robot-add">로봇 추가하기</button>
         </div>
         <div id="robot-head" hidden>
           <div class="robot-title"><b id="robot-name"></b><small id="robot-rigname"></small></div>
+          <button type="button" class="flash" id="robot-move" title="에디터 뷰에서 놓을 곳을 클릭해 옮깁니다 (휠: 방향, Esc: 취소)">옮기기</button>
           <button type="button" class="flash" id="robot-swap" title="다른 로봇이나 상부 구성으로 바꿉니다(그 자리에서)">교체</button>
           <button type="button" class="flash" id="robot-despawn">제거</button>
         </div>
@@ -666,6 +689,14 @@ const editorPanes = () => ["a", ...SUBS.filter((x) => x.kind === "editor").map((
 let ws = null, nextId = 1, pending = 0;
 // renderers whose one image is the frame (no passes to add up), and their names on the page
 const ENGINE_NAMES = { raster: "래스터", solid: "솔리드" };
+// what the render server is doing while the editor shows the Solid preview (Session._previewer)
+function previewWhy() {
+  const act = (S.renderer && S.renderer.activity) || {}, what = act.what || "", p = act.progress || {};
+  const pct = p.overall != null ? ` ${p.overall}%` : p.percent != null ? ` ${p.percent}%` : "";
+  return what.startsWith("recording") ? ` (freeze 기록${pct})` : what.startsWith("loading") ? ` (로드${pct})`
+    : what.startsWith("merging") ? " (메시 병합)" : what.startsWith("finding movable") ? " (움직이는 물체 판별)"
+    : what.startsWith("converting") ? " (변환)" : S.renderer && S.renderer.reachable === false ? " (서버 바쁨)" : "";
+}
 const oneImage = () => !!(S && ENGINE_NAMES[S.render_mode]);
 const acks = new Map();
 
@@ -860,6 +891,8 @@ function connect() {
       if (done) done(m.error);
     } else if (m.type === "probe") showProbe(m);
     else if (m.type === "pick") showPick(m);
+    else if (m.type === "selection") showSelection(m);
+    else if (m.type === "place_preview") showPlacePreview(m);
   };
   ws.onclose = () => {
     for (const done of acks.values()) done("연결이 끊겼습니다");
@@ -1074,11 +1107,15 @@ function showError(text) { $("error").hidden = !text; $("error").textContent = t
 function apply(st) {
   if (!st || (S && st.version < S.version && st.started === S.started)) return;  // an older answer than we have
   S = st;
+  if (SEL && S.frame_id !== SEL.frame) refreshSelection();
+  if (expCam() === "editor" && document.activeElement !== $("ev-auto")) $("ev-auto").checked = !!S.auto_exposure;
   if (!S.started) { if (!pending && ws && ws.readyState === WebSocket.OPEN) send("/api/start", { scene: startScene() }, "첫 프레임"); return; }  // GUI server restarted
   showOpening();
   syncSceneButton();
+  // a render's error, else a .blend that failed to open (showOpening said so; this line used to clear it at once)
   showError(S.error ? `렌더 실패: ${S.error}` + (/frozen|not permitted|record/.test(S.error)
-    ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "") : "");
+    ? "\n\nfreeze 기록이 실패하면 렌더 서버를 다시 띄워야 합니다(이후 모든 렌더가 같은 오류로 실패합니다)." : "")
+    : S.opening && S.opening.error ? `.blend 열기 실패 (${S.opening.id.replace(/^blend_/, "")}): ${S.opening.error}` : "");
   const key = JSON.stringify([S.scene, S.position, S.heading_deg, S.elevation_deg, S.height_m, S.viewpoint, S.candidates.length, S.variant, S.bands]);
   if (key !== poseKey) {
     poseKey = key;
@@ -1087,8 +1124,9 @@ function apply(st) {
     loadPhysics();
   }
   if (S.has_frame) {
-    $("badge").textContent = oneImage() ? ENGINE_NAMES[S.render_mode] + (S.render_mode === "solid" && S.solid_filter && SOLID_FILTERS ? ` · ${SOLID_FILTERS[S.solid_filter].label}` : "") : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
-    $("progress").style.width = oneImage() ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
+    $("badge").textContent = S.preview ? `솔리드 미리보기 · ${({path: "Mitsuba", cycles: "Cycles", raster: "래스터"})[S.render_mode] || S.render_mode} 준비 중${previewWhy()}`
+      : oneImage() ? ENGINE_NAMES[S.render_mode] + (S.render_mode === "solid" && S.solid_filter && SOLID_FILTERS ? ` · ${SOLID_FILTERS[S.solid_filter].label}` : "") : `${S.frame_spp} spp · ${S.passes} 패스${S.done ? " · 완료" : ""}${S.polarization ? "" : " · 비편광"}${S.editor_render === false ? " · 렌더 꺼짐" : ""}`;
+    $("progress").style.width = S.preview ? "0%" : oneImage() ? "100%" : `${Math.min(100, 100 * S.frame_spp / S.target_spp)}%`;
   }
   renderStatus(); renderLegends(); renderMonitor(); renderFlash(); renderSky(); renderBands(); renderMirrors(); renderSysinfo();
   syncSppSelects();
@@ -1461,9 +1499,167 @@ function showProbe(p) {
     ["깊이", p.depth_m == null ? "—" : `${p.depth_m.toFixed(3)} m`]]
     .map(([k2, v]) => `<div><dt>${k2}</dt><dd>${v}</dd></div>`).join("");
 }
+// --- selection (Isaac's): a click on the editor view selects what is there; the "선택" tab says what it is ---
+let SEL = null;   // {frame: the frame its outline was made for}
+function framePixel(img, clientX, clientY) {
+  const r = img.parentElement.getBoundingClientRect();
+  const k = Math.min(r.width / S.width, r.height / S.height);
+  const x = Math.floor((clientX - r.left - (r.width - k * S.width) / 2) / k), y = Math.floor((clientY - r.top - (r.height - k * S.height) / 2) / k);
+  return x < 0 || y < 0 || x >= S.width || y >= S.height ? null : { x, y };
+}
+function selectAt(img, clientX, clientY) {
+  if (!S || !S.has_frame) return;
+  const p = framePixel(img, clientX, clientY);
+  if (p) wsSend({ type: "select", frame: S.frame_id, ...p });
+}
+function clearSelection() {
+  SEL = null; $("selmask-a").hidden = true;
+  $("selinfo").innerHTML = `<div><dt>선택</dt><dd>에디터 뷰에서 물체를 클릭하세요 (Esc: 해제)</dd></div>`;
+}
+let selLoading = false;
+function refreshSelection() {
+  if (!SEL || selLoading || !S.frame_id) return;
+  const frame = S.frame_id;
+  selLoading = true;
+  fetch(`/api/selection.png?frame=${frame}`, { cache: "no-store" }).then(async (r) => {
+    const m = $("selmask-a");
+    if (SEL) SEL.frame = frame;
+    if (r.status !== 200 || !SEL) { m.hidden = true; return; }
+    const url = URL.createObjectURL(await r.blob());
+    if (m.dataset.url) URL.revokeObjectURL(m.dataset.url);
+    m.dataset.url = url; m.src = url; m.hidden = false;
+  }).catch(() => {}).finally(() => { selLoading = false; });
+}
+function showSelection(p) {
+  const fmt = (v) => v.map((x) => x.toFixed(2)).join(", ");
+  let rows;
+  if (p.error) rows = [["선택", esc(p.error)]];
+  else if (!p.hit) { clearSelection(); return; }
+  else if (p.kind === "robot") rows = [["로봇", esc(p.label)], ["구성", esc(p.config || "—")], ["위치", `${fmt(p.position)} m`],
+    ["방향", `${p.yaw_deg}°`], ["높이", `${p.height_m} m`], ["센서", esc((p.sensors || []).join(", ") || "—")]];
+  else {
+    const o = p.object, part = p.part, m = p.material || {};
+    rows = [
+      ["물체", o ? esc(o.label || o.id) : part ? esc(part.label) : "— (물체로 묶이지 않음)"],
+      ...(o ? [["판별", `${o.reachable ? "로봇이 밂" : o.kept ? "얹혀서 같이 움직임" : o.movable ? "움직임 (닿지 않음)" : "고정"}${o.mass_kg != null ? ` · ${o.mass_kg.toFixed(1)} kg` : ""}`],
+               ["이유", esc(o.reason || "—")]] : []),
+      ...(part ? [["부품", `${esc(part.id)}${part.material ? ` · ${esc(part.material)}` : ""}`]] : []),
+      ["메시", `${esc(p.shape || "—")}${p.instance ? ` <small>(instance ${esc(p.instance)})</small>` : ""}`],
+      ["파일", esc(p.mesh || "—")],
+      ["재질", `${esc(m.id || "—")} <small>${esc((m.types || []).join(" → "))}</small>${p.emitter ? " · 발광" : ""}`],
+      ["색", `<span style="display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;background:rgb(${p.colour.map((c) => Math.round(255 * Math.pow(Math.min(1, c), 1 / 2.2))).join(",")})"></span> ${p.colour.join(", ")}`],
+      ["클릭 지점", `${fmt(p.point)} m · ${p.distance_m.toFixed(2)} m 앞`],
+      ["법선", fmt(p.normal)],
+      ["메시 크기", `${fmt(p.shape_size_m)} m · 삼각형 ${p.shape_triangles.toLocaleString()}`],
+    ];
+  }
+  $("selinfo").innerHTML = rows.map(([k2, v]) => `<div><dt>${k2}</dt><dd>${v}</dd></div>`).join("") + flagRows(p);
+  wireFlags(p);
+  if (p.hit && !p.error) { SEL = { frame: -1, pick: p }; refreshSelection(); showTab("select"); }
+}
+// an object's flag set by hand (고정 / 밂 / 움직임 / 규칙대로): kept for the scene and logged (physics_labels.jsonl) to
+// tune the rules on; 적용 finds the movable objects and merges the scene again, and reloads it
+const FLAG_NAMES = [["fixed", "고정", "움직이지 않는 물체"], ["push", "밂", "로봇이 밀 수 있는 물체 (바닥 가까이)"],
+  ["movable", "움직임", "움직이지만 로봇이 닿지 않음 (선반 위 등)"], ["rule", "규칙대로", "손으로 정한 것을 지우고 규칙의 판별을 따름"]];
+function flagRows(p) {
+  if (!p.object || !p.flags || !p.object.id) return "";
+  const hand = (p.flags.objects || {})[p.object.id];
+  const now = hand ? (!hand.movable ? "fixed" : hand.robot_reachable === false ? "movable" : "push") : "rule";
+  const ap = p.flags.applying || {}, busy = ap.state === "running";
+  const n = Object.keys(p.flags.objects || {}).length;
+  const note = busy ? "적용 중… (판별·병합 후 씬을 다시 올립니다)" : ap.state === "error" ? `적용 실패: ${esc(ap.error || "")}`
+    : p.flags.pending ? `손으로 정한 것 ${n}개 · 적용 대기` : n ? `손으로 정한 것 ${n}개 · 적용됨` : "";
+  return `<div><dt>지정</dt><dd><span class="tabs" id="flagbtns" role="group" aria-label="이 물체를 손으로 지정">${FLAG_NAMES.map(([v, t, tip]) =>
+    `<button type="button" data-flag="${v}" aria-pressed="${v === now}" title="${tip}">${t}</button>`).join("")}</span></dd></div>` +
+    (note || p.flags.pending ? `<div><dt></dt><dd><small id="flagnote">${note}</small> ${p.flags.pending && !busy ? `<button type="button" class="flash" id="flagapply" title="판별과 메시 병합을 다시 하고 씬을 다시 올립니다 (그동안 솔리드 미리보기)">적용</button>` : ""}</dd></div>` : "");
+}
+function wireFlags(p) {
+  document.querySelectorAll("#flagbtns button").forEach((b) => b.addEventListener("click", async () => {
+    try {
+      p.flags = await api("/api/physics/flag", { scene: S.scene, object: p.object.id, flag: b.dataset.flag });
+      showSelection(p);
+    } catch (e) { showError(e.message); }
+  }));
+  const ap = $("flagapply");
+  if (ap) ap.addEventListener("click", async () => {
+    try { p.flags = await api("/api/physics/apply", { scene: S.scene }); showSelection(p); watchApply(p); }
+    catch (e) { showError(e.message); }
+  });
+}
+function watchApply(p) {   // the panel follows the apply until it ends
+  const tick = async () => {
+    try {
+      p.flags = await (await fetch(`/api/physics/flags?scene=${encodeURIComponent(S.scene)}`)).json();
+      if (SEL && SEL.pick === p) showSelection(p);
+      if ((p.flags.applying || {}).state === "running") setTimeout(tick, 1000);
+    } catch (e) { /* the next selection says */ }
+  };
+  setTimeout(tick, 1000);
+}
+
+// --- placing the robot: its box follows the mouse over the editor view, a click puts it there ---
+let placing = null;   // {yaw: degrees or null (facing the camera's way), seq, last}
+function startPlacing() {
+  placing = { yaw: null, seq: 0, last: null };
+  $("frame-a").classList.add("placing");
+  const h = $("place-hint"); h.hidden = false; h.classList.remove("bad");
+  h.textContent = "놓을 바닥을 클릭하세요 · 휠: 방향 · Esc: 취소";
+  robotNote("에디터 뷰에서 놓을 곳을 클릭하세요 (휠: 방향, Esc: 취소)");
+}
+function stopPlacing() {
+  placing = null;
+  $("frame-a").classList.remove("placing");
+  $("place-a").hidden = true; $("place-hint").hidden = true;
+  robotNote("");
+}
+let placeTimer = null;
+function placeHover(img, clientX, clientY) {
+  if (!placing || !S || !S.has_frame) return;
+  const p = framePixel(img, clientX, clientY);
+  if (!p) return;
+  placing.last = { img, clientX, clientY };
+  clearTimeout(placeTimer);
+  placeTimer = setTimeout(() => wsSend({ type: "place_hover", frame: S.frame_id, ...p, yaw_deg: placing ? placing.yaw : null, seq: placing ? ++placing.seq : 0 }), 25);
+}
+function showPlacePreview(m) {
+  if (!placing || (m.seq != null && m.seq < placing.seq)) return;
+  const svg = $("place-a"), h = $("place-hint");
+  if (m.error) { h.textContent = m.error; h.classList.add("bad"); return; }
+  if (placing.yaw == null && m.yaw_deg != null) placing.base = m.yaw_deg;
+  const col = m.ok ? "#4ade80" : "#ff6b6b";
+  svg.setAttribute("viewBox", `0 0 ${S.width} ${S.height}`);
+  svg.innerHTML = (m.edges || []).map(([x0, y0, x1, y1]) => `<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y1}" stroke="${col}" stroke-width="2" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`).join("");
+  svg.hidden = false;
+  h.classList.toggle("bad", !m.ok);
+  h.textContent = m.ok ? `클릭: 여기에 놓기 · ${Math.round(m.yaw_deg)}° · 휠: 방향 · Esc: 취소` : `${m.why || "놓을 수 없는 곳"} · Esc: 취소`;
+}
+async function placeAt(img, clientX, clientY) {
+  const p = framePixel(img, clientX, clientY);
+  if (!p || !placing) return;
+  const yaw = placing.yaw;
+  try {
+    robotNote("로봇을 놓는 중…");
+    await robotApi("place", { frame: S.frame_id, ...p, yaw_deg: yaw });
+    stopPlacing(); robotNote("로봇을 준비하는 중…"); pollRobot();
+  } catch (e) { $("place-hint").textContent = e.message; $("place-hint").classList.add("bad"); }
+}
+$("robot-move").addEventListener("click", startPlacing);
+$("frame-a").addEventListener("wheel", (ev) => {
+  if (!placing) return;
+  ev.preventDefault();
+  const from = placing.yaw != null ? placing.yaw : (placing.base || 0);
+  placing.yaw = ((from + (ev.deltaY > 0 ? -15 : 15)) % 360 + 360) % 360;
+  if (placing.last) placeHover(placing.last.img, placing.last.clientX, placing.last.clientY);
+}, { passive: false });
+
 function wireFrame(frame) {
   const img = frame.querySelector("img");
-  frame.addEventListener("mousemove", (ev) => { if (!mouselook) probeAt(img, ev.clientX, ev.clientY); });
+  const editor = frame.id === "frame-a";
+  frame.addEventListener("mousemove", (ev) => {
+    if (mouselook) return;
+    if (editor && placing) placeHover(img, ev.clientX, ev.clientY);
+    else probeAt(img, ev.clientX, ev.clientY);
+  });
   // touch: a horizontal swipe turns (drag the world: swipe left looks right), a tap probes
   let start = null;
   frame.addEventListener("pointerdown", (ev) => {
@@ -1473,7 +1669,7 @@ function wireFrame(frame) {
       ev.preventDefault();
       return;
     }
-    if (ev.pointerType !== "mouse") start = { x: ev.clientX, y: ev.clientY };
+    if (ev.pointerType !== "mouse" || (editor && ev.button === 0)) start = { x: ev.clientX, y: ev.clientY, mouse: ev.pointerType === "mouse" };
   });
   frame.addEventListener("pointermove", (ev) => {
     if (!mouselook) return;
@@ -1492,8 +1688,14 @@ function wireFrame(frame) {
       return;
     }
     if (!start || ev.target.closest(".cand")) { start = null; return; }
-    const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
+    const dx = ev.clientX - start.x, dy = ev.clientY - start.y, mouse = start.mouse;
     start = null;
+    if (editor && Math.abs(dx) < 5 && Math.abs(dy) < 5) {   // a click: put the robot there, or select what is there
+      if (placing) placeAt(img, ev.clientX, ev.clientY);
+      else selectAt(img, ev.clientX, ev.clientY);
+      if (mouse) return;
+    }
+    if (mouse) return;
     if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) {
       fly({ yaw_deg: -dx * S.hfov_deg / img.parentElement.getBoundingClientRect().width });
     } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) probeAt(img, ev.clientX, ev.clientY);
@@ -1524,10 +1726,58 @@ for (const band of ["rgb", "nir"]) {
   showEv(band);
   $(`ev-${band}`).addEventListener("input", () => { showEv(band); showImages(); });
 }
-$("refit").addEventListener("click", () => configure({ refit_tone: true }, "노출 맞춤").then(() => {
-  for (const band of ["rgb", "nir"]) { $(`ev-${band}`).value = 0; showEv(band); }
-  showImages();
-}));
+$("refit").addEventListener("click", () => {
+  if (expCam() !== "editor") return robotExposure({ auto_exposure: true, ev: 0 });   // a robot camera: back to auto, 0 EV
+  configure({ refit_tone: true }, "노출 맞춤").then(() => {
+    for (const band of ["rgb", "nir"]) { $(`ev-${band}`).value = 0; showEv(band); }
+    showImages();
+  });
+});
+// --- exposure per camera: the editor camera (its tone: fixed per scene, or following the frames) or a robot camera (its
+// sensor model's auto exposure, or a time and gain set by hand); the camera tab's choice and this card's follow each other
+function expCam() { return $("ev-cam").value || "editor"; }
+function robotCameras() { return ((R && R.spawned && R.sensors) || []).filter((x) => x.type === "camera"); }
+function syncExposure() {
+  const box = $("ev-cam"), cams = robotCameras();
+  const want = [["editor", "에디터 카메라"], ...cams.map((x) => [`sensor:${x.name}`, `로봇 · ${x.label || x.name}`])];
+  if (box.options.length !== want.length || want.some(([v], i) => box.options[i].value !== v))
+    box.innerHTML = want.map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join("");
+  const sel = want.some(([v]) => v === CAM_SEL) ? CAM_SEL : (want.some(([v]) => v === box.value) ? box.value : "editor");
+  if (document.activeElement !== box) box.value = sel;
+  const robot = expCam() !== "editor";
+  $("ev-robot").hidden = !robot; $("ev-editor").hidden = robot;
+  $("refit").textContent = robot ? "자동으로" : "지금 맞춤";
+  if (!robot) { if (document.activeElement !== $("ev-auto")) $("ev-auto").checked = !!(S && S.auto_exposure); return; }
+  const st = ((cams.find((x) => `sensor:${x.name}` === expCam()) || {}).settings) || {};
+  const auto = st.auto_exposure !== false;
+  if (document.activeElement !== $("ev-auto")) $("ev-auto").checked = auto;
+  if (document.activeElement !== $("ev-comp")) $("ev-comp").value = st.ev || 0;
+  $("ev-comp-v").textContent = `${Number($("ev-comp").value) > 0 ? "+" : ""}${Number($("ev-comp").value)} EV`;
+  for (const [id, v] of [["ev-time", Math.log10(Math.max((st.exposure_ms || 5) / 1000, 1e-6))], ["ev-gain", st.gain_db || 0]])
+    if (document.activeElement !== $(id)) $(id).value = v;
+  showRobotExposure();
+  $("ev-comp").disabled = !auto; $("ev-time").disabled = auto; $("ev-gain").disabled = auto;
+}
+function showRobotExposure() {
+  const ms = 1000 * Math.pow(10, Number($("ev-time").value));
+  $("ev-time-v").textContent = ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(ms < 10 ? 2 : 1)} ms`;
+  $("ev-gain-v").textContent = `${Number($("ev-gain").value).toFixed(1)} dB`;
+}
+function robotExposure(changes) {
+  const name = expCam().slice(7);
+  return api("/api/robot/sensor_settings", { name, ...changes }).then(() => pollRobot()).catch((e) => showError(e.message));
+}
+$("ev-cam").addEventListener("change", () => { selectCam($("ev-cam").value); syncExposure(); });
+$("ev-auto").addEventListener("change", () => {
+  if (expCam() === "editor") configure({ auto_exposure: $("ev-auto").checked }, "자동 노출 전환");
+  else robotExposure({ auto_exposure: $("ev-auto").checked });
+});
+$("ev-comp").addEventListener("input", () => { $("ev-comp-v").textContent = `${Number($("ev-comp").value) > 0 ? "+" : ""}${Number($("ev-comp").value)} EV`; });
+$("ev-comp").addEventListener("change", () => robotExposure({ ev: Number($("ev-comp").value) }));
+for (const id of ["ev-time", "ev-gain"]) {
+  $(id).addEventListener("input", showRobotExposure);
+  $(id).addEventListener("change", () => robotExposure({ exposure_ms: 1000 * Math.pow(10, Number($("ev-time").value)), gain_db: Number($("ev-gain").value) }));
+}
 async function chooseScene(sc, isBlend) {
   if (isBlend) {  // a .blend not converted yet: the server converts it in the background, then the scene starts
     try { apply(await api("/api/open_blend", { id: sc })); } catch (e) { showError(`.blend 열기 실패: ${e.message}`); }
@@ -1594,6 +1844,8 @@ $("gallery").addEventListener("click", (e) => { if (e.target === $("gallery")) c
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("gallery").hidden) { closeGallery(); e.stopPropagation(); }
   else if (e.key === "Escape" && !$("robots").hidden) { closeRobots(); e.stopPropagation(); }
+  else if (e.key === "Escape" && placing) { stopPlacing(); e.stopPropagation(); }
+  else if (e.key === "Escape" && SEL) { clearSelection(); e.stopPropagation(); }
 }, true);
 $("flash").addEventListener("click", toggleFlash);
 $("mirrors").addEventListener("click", toggleMirrors);
@@ -2008,7 +2260,7 @@ let panelTab = "state", statsTimer = null;
 function showTab(name) {
   panelTab = name;
   document.querySelectorAll(".ptabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
-  for (const t of ["rig", "state", "probe", "scene", "robot"]) $(`p-${t}`).hidden = t !== name;
+  for (const t of ["rig", "state", "probe", "select", "scene", "robot"]) $(`p-${t}`).hidden = t !== name;
   try { localStorage.setItem("opticalnav-panel-tab", name); } catch (e) { /* not remembered */ }
   if (name === "rig") rigLoad().then(rigSync).catch((e) => { $("rig-mode").textContent = `three.js를 불러오지 못했습니다 (${e.message})`; });
   clearInterval(statsTimer);
@@ -2102,7 +2354,7 @@ function renderRobot() {
   $("robot-on").hidden = !on;
   $("robot-name").textContent = R.config ? R.config.label : "";
   $("robot-rigname").textContent = R.config ? (R.config.rig ? `상부 구성: ${R.config.rig_label || R.config.rig}` : "상부 구성 없음") + (busy ? " · 준비하는 중" : "") : "";
-  const raster = on && S && S.render_mode && S.render_mode !== "path" ? "지금 렌더러는 로봇을 그리지 않습니다 (Mitsuba 경로 추적에서만 보입니다). " : "";
+  const raster = on && S && S.render_mode && S.render_mode === "cycles" ? "Cycles는 로봇을 그리지 않습니다 (Mitsuba, 래스터, 솔리드에서 보입니다). " : "";
   $("robot-note").classList.remove("bad");
   if (R.error) { const n = $("robot-note"); n.textContent = `로봇: ${R.error}`; n.classList.add("bad"); }
   else { robotNote(raster + (R.message || "")); if (performance.now() < robotFail.until) $("robot-note").classList.add("bad"); }
@@ -2127,12 +2379,14 @@ function renderRobot() {
     $("robot-parts").innerHTML = on ? `<div><dt>탑재</dt><dd>${c.mass} kg${(c.warnings || []).length ? " · ⚠ " + esc(c.warnings.join(", ")) : ""}</dd></div>` : "";
   }
   syncSensorList();
+  syncExposure();
   for (const sn of R.sensors || []) {
     const mine = SUBS.filter((x) => x.kind === "sensor" && x.sensor === sn.name), box = $(`sensor-on-${sn.name}`);
     if (box && box.checked !== mine.length > 0) box.checked = mine.length > 0;
     if (mine.length && on && !sn.enabled) wantSensor();   // shown here, not rendered yet (a new robot, a restarted viewer): say it again
     for (const sub of mine) {
       const img = $(`simg-${sub.id}`), wait = $(`swait-${sub.id}`);
+      sensorTabs(sub, on ? sn : null);
       if (!on) {
         sub.seq = 0; img.hidden = true; wait.hidden = false; $(`title-${sub.id}`).innerHTML = "";
         wait.textContent = busy ? "로봇을 준비하는 중…" : "로봇이 없습니다. 오른쪽 로봇 탭에서 스폰하세요.";
@@ -2202,7 +2456,7 @@ let CONFIGS = [];
 function openRobots() {
   const on = !!(R && R.spawned);
   $("robots-title").textContent = on ? "로봇 교체" : "로봇 추가";
-  $("robots-hint").textContent = on ? "고른 로봇과 상부 구성으로 지금 자리에서 바꿉니다." : "로봇을 누르면 에디터 카메라가 보는 바닥에 놓입니다. 구조 파일(robot.yaml)이 있는 폴더를 packs/hardware 나 $OPTICALNAV_ROBOTS 에 넣으면 여기에 뜹니다.";
+  $("robots-hint").textContent = on ? "고른 로봇과 상부 구성으로 지금 자리에서 바꿉니다." : "로봇을 고른 뒤 에디터 뷰에서 놓을 바닥을 클릭하세요(휠: 방향, Esc: 취소). 구조 파일(robot.yaml)이 있는 폴더를 packs/hardware 나 $OPTICALNAV_ROBOTS 에 넣으면 여기에 뜹니다.";
   if (R && R.config) $("robot-rig").value = R.config.rig || "none";
   $("robots").hidden = false;
   renderRobotCards();
@@ -2217,9 +2471,8 @@ function renderRobotCards() {
     const body = { config: b.dataset.config, rig: $("robot-rig").value || "none" };
     closeRobots(); showTab("robot");
     try {
-      robotNote("로봇을 준비하는 중…");
-      if (R && R.spawned) await exchange(body);
-      else { await robotApi("spawn", body); pollRobot(); }
+      if (R && R.spawned) { robotNote("로봇을 준비하는 중…"); await exchange(body); }
+      else { await robotApi("config", body); startPlacing(); }
     } catch (e) { robotNote(e.message, true); }
   }));
 }
@@ -2301,7 +2554,7 @@ function editorTree() {
     children: [{ id: "editor/camera", cam: "editor", label: "에디터 카메라", kind: "camera", detail: `${S ? `${S.width}×${S.height} · 수평 ${Number(S.hfov_deg || 0).toFixed(0)}°` : ""} · 오프셋 ${off(r.camera_offset)} m`, children: [] },
       { id: "editor/flash", label: "플래시", kind: "flash", detail: r.flash ? `${S && S.variant === "active_polar" ? "켜짐" : "꺼짐"} · 오프셋 ${off(r.flash_offset)} m` : "이 씬에는 없음", children: [] }] };
 }
-function selectCam(id) { CAM_SEL = id; renderCams(); renderRobot.tree = null; if (R) renderRobot(); }
+function selectCam(id) { CAM_SEL = id; renderCams(); renderRobot.tree = null; if (R) renderRobot(); syncExposure(); }
 function renderCams() {
   if (!R && !S) return;
   const robotCams = (R && R.spawned && R.sensors) || [];
@@ -2464,6 +2717,7 @@ function addSub(spec, quiet) {
     </div>
     <div class="tabsets"><div class="tabs" role="group" aria-label="대역" data-pane="${id}" data-kind="band"></div><div class="tabs" role="group" aria-label="보기" data-pane="${id}" data-kind="view"></div><div class="tabs" role="group" aria-label="채널 무관 (AOV)" data-pane="${id}" data-kind="aov"></div></div>
     <div class="frame-wrap"><div class="frame" id="frame-${id}"><img id="img-${id}" alt="에디터 뷰의 다른 채널"></div></div>
+    <div class="tabsets stabs" id="stabs-${id}"></div>
     <div class="sensor-wrap" id="sframe-${id}"><div class="wait" id="swait-${id}">로봇이 없습니다. 오른쪽 로봇 탭에서 스폰하세요.</div><img id="simg-${id}" alt="로봇 센서 영상" hidden></div>
     <div class="legend" id="legend-${id}"></div>`;
   $("subs").appendChild(el);
@@ -2475,6 +2729,22 @@ function addSub(spec, quiet) {
   if (sub.kind === "sensor") $(`title-${id}`).textContent = "";
   if (!quiet) { layout(); saveLayout(); subscribe(); renderLegends(); renderRobot(); }
   return sub;
+}
+// a sensor sub viewer's own buttons: what its picture shows (a LiDAR: 3D points, depth, intensity, all; the sensor's
+// "views" in its settings), switched on the server for that sensor (every viewer of it follows)
+function sensorTabs(sub, sn) {
+  const box = $(`stabs-${sub.id}`), st = (sn && sn.settings) || {}, views = st.views || [];
+  const key = views.length ? `${sn.name}|${views.map((v) => v[0]).join(",")}` : "";
+  if (box.dataset.key !== key) {
+    box.dataset.key = key;
+    box.innerHTML = views.length ? `<div class="tabs" role="group" aria-label="센서 보기">${views.map(([v, t]) =>
+      `<button type="button" data-value="${esc(v)}">${esc(t)}</button>`).join("")}</div>` : "";
+    box.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+      box.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+      api("/api/robot/sensor_settings", { name: sn.name, view: b.dataset.value }).then(() => pollRobot()).catch((e) => showError(e.message));
+    }));
+  }
+  box.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.value === st.view)));
 }
 function removeSub(id) {
   const i = SUBS.findIndex((x) => x.id === id);

@@ -17,6 +17,8 @@ on through the render server, with the editor's lighting:
     GET  /api/robot/rig?name=              a rig's file, as text
     POST /api/robot/rig      {"name", "text"}    check a rig written by hand, keep it (packs/hardware/rigs) and use it
     POST /api/robot/spawn    {"config", "rig"}   put the robot on the floor in front of the editor camera
+    POST /api/robot/place    {"frame", "x", "y", "yaw_deg"?}   put it (spawned or moved) on the floor a click on the editor
+                                           view shows (gui.Session.place_robot)
     POST /api/robot/despawn
     POST /api/robot/sensors  {"hdr": true, "12bit": false}       sensors rendered whoever watches (a script's; a page's
                                                                  sub viewers name theirs in its socket subscription:
@@ -177,6 +179,16 @@ class RobotSession:
         eye = tuple(float(v) for v in eye)
         return self._start(scene, lambda run, sc: self._build(run, sc, eye, float(heading), float(elevation)))
 
+    PLACE_SHIFT_M = 0.75   # a placed robot is nudged at most this far to a clear spot (a spawn in front of the camera: 6 m)
+
+    def place(self, scene: str, x: float, y: float, floor_z: float, yaw_deg: float) -> dict:
+        """Put the robot at (x, y) on the floor at ``floor_z`` facing ``yaw_deg`` (simulator frame): where a click on
+        the editor view says (gui.Session.place_robot). Built there anew (a robot standing elsewhere is taken away);
+        nudged at most PLACE_SHIFT_M to where its footprint is clear."""
+        from .hw.transform import pose2d
+        pose = pose2d(float(x), float(y), float(floor_z), float(yaw_deg))
+        return self._start(scene, lambda run, sc: self._build_at(run, sc, pose, self.PLACE_SHIFT_M))
+
     def _start(self, scene: str, build) -> dict:
         self.despawn()
         with self.lock:
@@ -261,13 +273,13 @@ class RobotSession:
         return hw.SimWorld(self.server_url, scene=scene, spp=16) if self.client is None else \
             hw.SimWorld(scene=scene, spp=16, client=self.client)
 
-    def _build_at(self, run: int, scene: str, pose) -> None:
-        """The robot at a pose another stood at."""
+    def _build_at(self, run: int, scene: str, pose, shift: float = 6.0) -> None:
+        """The robot at a pose another stood at (or a click put it)."""
         world = self._world(scene)
         self._say("지면 지도 읽는 중")
         gm = world.load_ground(floor_z=pose.xyz[2], center=pose.xyz[:2], top=self._headroom())
         self._map(gm)
-        self._put(run, world, pose.xyz[0], pose.xyz[1], pose.rpy_deg[2])
+        self._put(run, world, pose.xyz[0], pose.xyz[1], pose.rpy_deg[2], shift)
 
     def _build(self, run: int, scene: str, eye, heading: float, elevation: float) -> None:
         from . import groundmap, hw
@@ -294,11 +306,11 @@ class RobotSession:
         self._map(gm)
         self._put(run, world, x, y, yaw_deg)
 
-    def _put(self, run: int, world, x: float, y: float, yaw_deg: float) -> None:
+    def _put(self, run: int, world, x: float, y: float, yaw_deg: float, shift: float = 6.0) -> None:
         from .hw import config as robot_config
         from .hw.tree import robot_tree
         cfg = self.config
-        x, y = self._free_spot(world, robot_config.base_spec(cfg), x, y, yaw_deg)
+        x, y = self._free_spot(world, robot_config.base_spec(cfg), x, y, yaw_deg, shift)
         start = world.on_floor(x, y, yaw_deg)
         # the robot as its configuration lists it: the base, then its lights, masts and cameras on their links
         built = robot_config.spawn(world, cfg, at=start, name="robot",
@@ -317,9 +329,9 @@ class RobotSession:
             self.message = "로봇이 든 씬을 올리는 중 (처음 한 번, 씬에 따라 30초쯤)"
 
     @staticmethod
-    def _free_spot(world, spec, x: float, y: float, yaw_deg: float) -> tuple[float, float]:
-        """(x, y) or the nearest place around it where the robot's footprint is clear (in front of a camera may be a
-        table)."""
+    def _free_spot(world, spec, x: float, y: float, yaw_deg: float, shift: float = 6.0) -> tuple[float, float]:
+        """(x, y) or the nearest place around it, ``shift`` m at most, where the robot's footprint is clear (in front of
+        a camera may be a table)."""
         from .hw.drive import Drive
         ground = world.ground
         if ground.heights is None or not isinstance(spec, Drive):
@@ -331,7 +343,7 @@ class RobotSession:
             corners = np.c_[px + c * foot[:, 0] - s * foot[:, 1], py + s * foot[:, 0] + c * foot[:, 1]]
             floor = ground.height(px, py, near=ground.z)
             return abs(floor - ground.z) <= 0.5 and not ground.blocked(corners, floor)
-        for radius in np.arange(0.0, 6.01, 0.25):
+        for radius in np.arange(0.0, shift + 0.01, 0.25):
             for angle in np.arange(0.0, 2.0 * math.pi, math.pi / 8.0) if radius else (0.0,):
                 px, py = x + radius * math.cos(angle), y + radius * math.sin(angle)
                 if clear(px, py):
@@ -489,7 +501,9 @@ class RobotSession:
             return "polar"
         return "rgb" if self.polar_policy == "off" else "polar" if self.polar_policy == "unified" or polarized else "rgb"
 
-    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale", "isp", "denoise")
+    SETTING_KEYS = ("pass_spp", "target_spp", "accumulate", "scale", "isp", "denoise", "view", "auto_exposure", "ev",
+                    "exposure_ms", "gain_db")
+    AE_TARGET = 0.27   # hw.sensor.ExposureControl's target at 0 EV (LUCID's default brightness)
 
     def sensor_settings(self, name: str, mode: str | None = None) -> dict:
         """A sensor's render settings: ``pass_spp`` (a frame while moving: one pass, denoised from 64 spp), ``target_spp`` (at rest:
@@ -509,8 +523,34 @@ class RobotSession:
                    # a camera's sensor model and ISP (False: the render itself, lens distortion and a tone alone)
                    "isp": True if getattr(spec, "kind", None) == "camera" else None,
                    # the denoiser on this camera's pictures (from DENOISE_MIN_SPP samples on); geometry sensors have none
-                   "denoise": True if spec.lit else None}
-        return {**default, **self.settings.get(name, {})}
+                   "denoise": True if spec.lit else None,
+                   # what its picture shows, of the model's VIEWS (a LiDAR: 3D points, depth, intensity, all): the sub viewer's buttons
+                   "view": getattr(spec, "display", None) if getattr(spec, "VIEWS", None) else None,
+                   "views": [list(v) for v in getattr(spec, "VIEWS", ())] or None}
+        ctl = getattr(getattr(actor, "state", None), "exposure", None)
+        if ctl is not None:   # a camera's exposure (hw.sensor.ExposureControl): auto or set, and where it stands now
+            default.update(auto_exposure=bool(ctl.auto), ev=0.0,
+                           exposure_ms=round(1000.0 * (ctl.exposure_s or 0.005), 4), gain_db=round(float(ctl.gain_db), 2),
+                           exposure_limits_ms=[1000.0 * v for v in ctl.exposure_limits], gain_limits_db=list(ctl.gain_limits))
+        own = dict(self.settings.get(name, {}))
+        if ctl is not None:   # what the camera holds now, not what was last set (auto exposure moves it)
+            own.pop("exposure_ms", None)
+            own.pop("gain_db", None)
+        return {**default, **own}
+
+    def _apply_exposure(self, name: str, actor) -> None:
+        """A camera's own exposure settings onto its ExposureControl (each frame: a robot built again keeps them)."""
+        ctl = getattr(getattr(actor, "state", None), "exposure", None)
+        own = self.settings.get(name, {})
+        if ctl is None or not own:
+            return
+        if "auto_exposure" in own:
+            ctl.auto = bool(own["auto_exposure"])
+        ctl.target = self.AE_TARGET * 2.0 ** float(own.get("ev", 0.0))
+        if not ctl.auto and own.get("exposure_ms") is not None:
+            ctl.exposure_s = float(np.clip(own["exposure_ms"] / 1000.0, *ctl.exposure_limits))
+        if not ctl.auto and own.get("gain_db") is not None:
+            ctl.gain_db = float(np.clip(own["gain_db"], *ctl.gain_limits))
 
     def set_sensor_settings(self, name: str, changes: dict) -> dict:
         """Change some of a sensor's render settings (sensor_settings); the rest stay."""
@@ -540,6 +580,33 @@ class RobotSession:
                 if getattr(actor.spec, "kind", None) != "camera":
                     raise ValueError(f"{name} is not a camera: it has no ISP")
                 own["isp"] = bool(changes["isp"])
+            ctl = getattr(getattr(actor, "state", None), "exposure", None)
+            exposure_keys = {"auto_exposure", "ev", "exposure_ms", "gain_db"} & set(changes)
+            if exposure_keys and getattr(actor.spec, "kind", None) != "camera":
+                raise ValueError(f"{name} is not a camera: it has no exposure")
+            if "auto_exposure" in changes:
+                own["auto_exposure"] = bool(changes["auto_exposure"])
+                if not own["auto_exposure"] and ctl is not None:   # off: held where the auto exposure stands now
+                    own.setdefault("exposure_ms", 1000.0 * (ctl.exposure_s or 0.005))
+                    own.setdefault("gain_db", float(ctl.gain_db))
+                elif own["auto_exposure"]:
+                    own.pop("exposure_ms", None)
+                    own.pop("gain_db", None)
+            if "ev" in changes:
+                own["ev"] = float(changes["ev"])
+                if not -4.0 <= own["ev"] <= 4.0:
+                    raise ValueError("ev: -4 to 4")
+            for key in ("exposure_ms", "gain_db"):
+                if key in changes:
+                    own[key] = float(changes[key])
+                    own["auto_exposure"] = False   # an exposure set by hand: the auto exposure off
+            if exposure_keys and ctl is not None:
+                self._apply_exposure(name, actor)
+            if "view" in changes:
+                views = [v for v, _ in getattr(actor.spec, "VIEWS", ())]
+                if str(changes["view"]) not in views:
+                    raise ValueError(f"{name}: view is one of {views}" if views else f"{name} has one picture")
+                own["view"] = actor.spec.display = str(changes["view"])
             if "scale" in changes:
                 if not hasattr(actor.spec, "render_scale"):
                     raise ValueError(f"{name} has no render scale (its resolution is its model's)")
@@ -593,6 +660,10 @@ class RobotSession:
         from .hw import offload
         from .hw.cameras import CameraSpec
         spec = actor.spec
+        self._apply_exposure(name, actor)
+        want = self.settings.get(name, {}).get("view")   # the picture asked for (a robot built again keeps it)
+        if want and getattr(spec, "display", want) != want:
+            spec.display = want
         if not isp and getattr(spec, "kind", None) == "camera":
             return self.picture_without_isp(name, actor, request, outs[0])
         pool = offload.shared() if isinstance(spec, CameraSpec) else None
@@ -612,11 +683,15 @@ class RobotSession:
         lum = np.maximum(s0[::4, ::4] @ tonemap.LUMA, 1e-6)
         exposure = 0.18 / max(float(np.exp(np.mean(np.log(lum)))), 1e-9)
         now = {"exposure": exposure, "white": max(1.0, float(np.percentile(lum, 99.9)) * exposure)}
+        own = self.settings.get(name, {})
         with self.lock:
             last = self._tones.get(name)
-            tone = now if last is None else {k: math.exp(0.7 * math.log(last[k]) + 0.3 * math.log(now[k])) for k in now}
+            if last is not None and own.get("auto_exposure") is False:
+                tone = last                     # auto exposure off: the tone held where it was
+            else:
+                tone = now if last is None else {k: math.exp(0.7 * math.log(last[k]) + 0.3 * math.log(now[k])) for k in now}
             self._tones[name] = tone
-        picture = tonemap.fast("filmic", s0, tone["exposure"], tone["white"])
+        picture = tonemap.fast("filmic", s0, tone["exposure"] * 2.0 ** float(own.get("ev", 0.0)), tone["white"])
         return Reading(actor.name, actor.spec.modality, frame.time, frame.pose, {"frame": frame}, picture,
                        {"model": actor.spec.model, "format": "센서·ISP 꺼짐 (렌더 그대로)",
                         "size": f"{picture.shape[1]}x{picture.shape[0]}"})
@@ -928,6 +1003,11 @@ def post(handler, robot: RobotSession, parts: list, body: dict) -> None:
         robot.use(body.get("config"), body.get("rig"))
     elif tail == ["rig"]:
         robot.save_rig(str(body.get("name") or ""), str(body.get("text") or ""))
+    elif tail == ["place"] and session is not None:   # {"frame", "x", "y", "yaw_deg"?}: the robot on the floor a click shows
+        if body.get("config") or body.get("rig") is not None:
+            robot.use(body.get("config"), body.get("rig"))
+        yaw = body.get("yaw_deg")
+        session.run("robot", session.place_robot, body.get("frame"), int(body["x"]), int(body["y"]), None if yaw is None else float(yaw))
     elif tail == ["despawn"] and session is not None:
         session.run("robot", session.despawn_robot)
     elif tail == ["follow"] and session is not None:

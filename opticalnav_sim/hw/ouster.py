@@ -107,7 +107,8 @@ class OusterLidar(Lidar):
     photons_10: float = 60.0          # SIGNAL of the 10 % target at its 10 % range (estimate)
     oversample: int = 2               # rendered pixels per column, each way
     rate_hz: float = 10.0
-    display: str = "cloud"            # the picture: "cloud" (3D view over the two images) or "image" (the images alone)
+    display: str = "all"              # the picture (VIEWS): "all" (the 3D view over the range and reflectivity images),
+                                      # "cloud" (the 3D view), "range" or "intensity" (one image); a viewer's buttons switch it
 
     def __post_init__(self):
         if self.model not in MODELS:
@@ -302,12 +303,17 @@ class OusterLidar(Lidar):
         px = np.rint(self.stagger / (360.0 / self.samples)).astype(int)
         return np.stack([np.roll(row, int(s)) for row, s in zip(image, px)])
 
+    # what a viewer can show of a scan (``display``): value, label
+    VIEWS = (("cloud", "3D 점"), ("range", "깊이"), ("intensity", "강도"), ("all", "전체"))
+
     def picture(self, m: dict, width: int = 1024) -> np.ndarray:
-        """What a viewer shows of a scan: the point cloud in 3D (``cloud_picture``) over Ouster Studio's two images
-        (``images``); with ``display`` "image", the images alone."""
-        strips = self.images(m, width, stretch=2 if self.display == "cloud" else 4)
-        if self.display != "cloud":
-            return strips
+        """What a viewer shows of a scan (``display``): the point cloud in 3D (``cloud_picture``), Ouster Studio's range
+        or reflectivity image (``images``), or all three (the 3D view over the two images)."""
+        if self.display == "cloud":
+            return self.cloud_picture(m, width, round(width * 9 / 16))
+        if self.display in ("range", "intensity"):
+            return self.images(m, width, stretch=6, which=self.display)
+        strips = self.images(m, width, stretch=2)
         cloud = self.cloud_picture(m, width, round(width * 9 / 16))
         return np.concatenate([cloud, np.full((4, width, 3), 20, np.uint8), strips], axis=0)
 
@@ -363,7 +369,7 @@ class OusterLidar(Lidar):
             img = np.asarray(im)
         return img
 
-    def images(self, m: dict, width: int = 1024, stretch: int = 4) -> np.ndarray:
+    def images(self, m: dict, width: int = 1024, stretch: int = 4, which: str = "both") -> np.ndarray:
         """Ouster Studio's two images, one over the other: range (near red to far blue, black: no return) and
         reflectivity (grey), each beam a row (``stretch`` pixels tall), the columns destaggered, forward in the middle."""
         r, refl = self.destagger(m["range"]), self.destagger(m["reflectivity"])
@@ -375,7 +381,8 @@ class OusterLidar(Lidar):
         a[r <= 0] = 0
         g = np.clip(np.sqrt(refl / 100.0) * 255.0, 0, 255).astype(np.uint8)
         b = np.repeat(g[..., None], 3, axis=2)
-        img = np.concatenate([a, np.zeros((2, a.shape[1], 3), np.uint8), b], axis=0)
+        img = a if which == "range" else b if which == "intensity" else \
+            np.concatenate([a, np.zeros((2, a.shape[1], 3), np.uint8), b], axis=0)
         from PIL import Image
         rows = max(1, round(img.shape[0] * width / img.shape[1] * stretch))   # beams stretched: they are far apart
         return np.asarray(Image.fromarray(img).resize((width, rows), Image.NEAREST))

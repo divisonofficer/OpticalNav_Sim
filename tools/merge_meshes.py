@@ -242,7 +242,8 @@ def plain_properties(rest: str) -> bool:
 
 
 # ---------------------------------------------------------------- the plan (text only)
-def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> dict:
+def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None, dynamic: dict | None = None,
+          fresh: set | None = None) -> dict:
     """Which shapes merge with which, from the unmerged scene files: {"groups": [[id, ...], ...] (base order), "kept":
     Counter of reasons, "shapes": {id: shape of base}, "keys": [key per group], "keep": the regexes used}."""
     names = list(texts)
@@ -269,7 +270,8 @@ def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> di
         lamp_ids |= {sid for sid in shape_m if sid == o["id"] or sid.startswith(o["id"] + "__part_")}
     lamp_ids |= {L["id"] for L in list(paired.values()) + list(orphans)}
     physics = [re.compile(r) for r in ((meta or {}).get("physics") or {}).get("dynamic") or []]
-    dynamic = physics_dynamic(scene_dir, meta)
+    dynamic = physics_dynamic(scene_dir, meta) if dynamic is None else dynamic
+    fresh = fresh or set()
     keep_rx = [re.compile(r) for r in keep]
 
     def matches(rxs, s) -> bool:
@@ -307,7 +309,7 @@ def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> di
         elif not s["note_ok"]:
             reason = "note_layout"
         elif file is None or file.group(1).startswith("/") or ".." in Path(file.group(1)).parts \
-                or not (scene_dir / file.group(1)).is_file():
+                or (sid not in fresh and not (scene_dir / file.group(1)).is_file()):
             reason = "file"
         elif not plain_properties(rest):
             reason = "properties"
@@ -329,6 +331,110 @@ def _plan(scene_dir: Path, texts: dict[str, str], keep, meta: dict | None) -> di
     return {"groups": out_groups, "keys": keys, "objects": [k[2] for k in keys], "kept": kept,
             "shapes": {s["id"]: s for s in shapes}, "keep": list(keep), "count": len(shapes), "dynamic": dynamic,
             "scope": physics_scope(scene_dir, meta)}
+
+
+# ---------------------------------------------------------------- pieces: a shape of several things split
+def _matrix(shape_xml: str):
+    """A shape element's to_world (4x4 numpy), identity when it has none."""
+    import numpy as np
+
+    from opticalnav_sim.groundmap import _to_world
+    m = _to_world(ET.fromstring(shape_xml))
+    return np.eye(4) if m is None else m
+
+
+def _expand(scene_dir: Path, texts: dict[str, str], dynamic: dict, write: bool = True) -> tuple[dict, dict]:
+    """The scene files with the shapes a movable object needs apart written as plain meshes, each piece of each of its
+    materials ``<shape>__p<k>m<j>``: a shape physics_objects split into pieces (``<shape>__p<k>`` in physics.json: an
+    asset modelled as two bins) and an instance of a kept object (a shape group drawn at a matrix: as a plain mesh the
+    merge makes it the object's dyn_ mesh, which the render server moves). The pieces are those of
+    physics_objects.piece_labels on the mesh as loaded, so the same as physics.json's. Returns (texts, {"records": {file:
+    [{"id", "block", "xml"}]} (restore_text puts ``block`` back for ``xml``), "dynamic": {new id: object}, "part": {new id:
+    physics part}, "fresh": new ids}). ``write`` False: the plan alone, no mesh written (needs_merging)."""
+    import numpy as np
+
+    from opticalnav_sim.physics_objects import piece_labels
+    targets: dict = {}
+    for pid in dynamic:
+        m = re.match(r"^(.*)__p(\d+)$", pid)
+        targets.setdefault(m.group(1) if m else pid, set()).add(pid)
+    names = list(texts)
+    shapes = {s["id"]: s for s in top_shapes(texts[names[0]])}
+    out = dict(texts)
+    info = {"records": {n: [] for n in names}, "dynamic": {}, "part": {}, "fresh": set()}
+    for sid in sorted(targets):
+        s = shapes.get(sid)
+        split = any(p != sid for p in targets[sid])
+        if s is None or not (s["type"] == "instance" or (s["type"] in MESH_TYPES and split)):
+            continue
+        if s["type"] == "instance":
+            ref = _REF_ID.search(s["inner"])
+            group = shapes.get(ref.group(1)) if ref else None
+            if group is None:
+                continue
+            at = _matrix(s["shape"])
+            children = []
+            for c in top_shapes(f"<scene>{group['inner']}</scene>"):
+                if c["type"] not in MESH_TYPES or not _FILENAME.search(c["inner"]):
+                    continue
+                children.append((c["inner"], at @ _matrix(c["shape"])))
+        else:
+            children = [(s["inner"], _matrix(s["shape"]))]
+        arrays, inners = [], []
+        for inner, mat in children:
+            geo = (f'<string name="filename" value="{_FILENAME.search(inner).group(1)}" />'
+                   f'<transform name="to_world"><matrix value="{" ".join(repr(float(x)) for x in mat.ravel())}" /></transform>')
+            arrays.append(load_arrays(scene_dir, "ply", geo + "".join(re.findall(r'<boolean name="(?:' + "|".join(FLAGS)
+                                                                                    + r')"[^>]*/>', inner))))
+            inners.append(inner)
+        if not arrays or any(a["extra"] for a in arrays):
+            continue
+        offs = np.cumsum([0] + [len(a["positions"]) for a in arrays])
+        faces = np.concatenate([a["faces"].astype(np.int64) + o for a, o in zip(arrays, offs)])
+        child = np.concatenate([np.full(len(a["faces"]), j) for j, a in enumerate(arrays)])
+        if split:   # found in the group's own frame (as physics_objects does), ordered where the instance puts them
+            world = np.concatenate([a["positions"] for a in arrays]).astype(np.float64)
+            inv = np.linalg.inv(_matrix(s["shape"])) if s["type"] == "instance" else np.eye(4)
+            local = world @ inv[:3, :3].T + inv[:3, 3]
+            labels, n, _, _ = piece_labels(local, faces, world=world)
+            if n < max(int(p.rsplit("__p", 1)[1]) for p in targets[sid] if p != sid):
+                print(f"  ! {sid}: {n} pieces here, physics.json names more (left whole)", flush=True)
+                continue
+        else:
+            labels, n = np.zeros(len(faces), np.int64), 1
+        blocks = []
+        for k in range(n):
+            part = f"{sid}__p{k + 1}" if split else sid
+            for j, a in enumerate(arrays):
+                pick = (labels == k) & (child == j)
+                if not pick.any():
+                    continue
+                sub_f = faces[pick] - offs[j]
+                used, inv = np.unique(sub_f, return_inverse=True)
+                sub = {"positions": a["positions"][used], "faces": inv.reshape(-1, 3).astype(np.uint32), "extra": [],
+                       "normals": a["normals"][used] if a["normals"] is not None else None,
+                       "uvs": a["uvs"][used] if a["uvs"] is not None else None}
+                rest = rest_of(inners[j])
+                nid = f"{sid}__p{k + 1}m{j + 1}"
+                file = write_merged(scene_dir, [sub], f'\n    <string name="filename" value="assets/merged.ply" />{rest}')[0] \
+                    if write else f"assets/{nid}.ply"
+                mat = _REF_ID.search(rest) or re.search(r'<bsdf\b[^>]*\bid="([^"]+)"', rest)
+                note = {"id": nid, "label": f"{(s['note'] or {}).get('label') or sid} (piece {k + 1})" if isinstance(s["note"], dict)
+                        else f"{sid} (piece {k + 1})", "material": mat.group(1) if mat else nid, "piece_of": sid,
+                        "nav": {"blocks": True}}
+                blocks.append(f"\n  {NOTE_HEAD}{json.dumps(note, separators=(',', ':'))}-->\n  <shape type=\"ply\" id=\"{nid}\">"
+                              f'\n    <string name="filename" value="{file}" />{rest}</shape>')
+                info["part"][nid] = part
+                info["fresh"].add(nid)
+                if dynamic.get(part):
+                    info["dynamic"][nid] = dynamic[part]
+        xml = "".join(blocks)
+        block = s["lead"] + s["shape"]
+        for name in names:
+            if out[name].count(block) == 1:
+                out[name] = out[name].replace(block, xml, 1)
+                info["records"][name].append({"id": sid, "block": block, "xml": xml})
+    return out, info
 
 
 def _original_texts(scene_dir: Path, manifest: dict | None) -> dict[str, str]:
@@ -353,7 +459,10 @@ def needs_merging(scene_dir: Path, keep=None) -> bool:
     manifest = read_manifest(scene_dir)
     if keep is None:
         keep = manifest.get("keep", []) if manifest else []
-    plan = _plan(scene_dir, _original_texts(scene_dir, manifest), keep, _meta(scene_dir))
+    meta = _meta(scene_dir)
+    dynamic = physics_dynamic(scene_dir, meta)
+    texts, info = _expand(scene_dir, _original_texts(scene_dir, manifest), dynamic, write=False)
+    plan = _plan(scene_dir, texts, keep, meta, {**dynamic, **info["dynamic"]}, info["fresh"])
     # physics.json's record of the bodies out of date (another scope, other movable objects), even where the shapes merge
     # the same (the Infinigen scenes: few of their shapes merge at all)
     physics = read_physics(scene_dir)
@@ -362,6 +471,9 @@ def needs_merging(scene_dir: Path, keep=None) -> bool:
         kept = {o for o, r in (record.get("objects") or {}).items() if r.get("kept")}
         if record.get("keep") != plan["scope"] or kept != set(plan["dynamic"].values()):
             return True
+    if manifest is not None and [r["id"] for rs in (manifest.get("expanded") or {}).values() for r in rs] != \
+            [r["id"] for rs in info["records"].values() for r in rs]:
+        return True
     if manifest is None:
         return bool(plan["groups"])
     if any(not (scene_dir / g["file"]).is_file() for g in manifest["merged"]):
@@ -509,20 +621,27 @@ def _restore_files(scene_dir: Path, manifest: dict) -> dict:
     return exact
 
 
-def _record_bodies(scene_dir: Path, plan: dict, merged: list[dict], base_text: str) -> None:
+def _record_bodies(scene_dir: Path, plan: dict, merged: list[dict], base_text: str, part_of: dict | None = None) -> None:
     """physics.json ``merge``: per movable object the shapes of the scene file that now hold its parts. Kept: its own
     ``dyn_`` meshes and the parts left alone (a single shape of a material, an emitter), which a physics step moves by
     their transforms or makes one body of; not kept: the static merged meshes it went into. And the scope used."""
     data = read_physics(scene_dir)
     if data is None:
         return
-    holder = {p["id"]: g["id"] for g in merged for p in g["parts"]}
+    part_of = part_of or {}
+    holder: dict = {}
+    for g in merged:   # a physics part -> the shapes holding it (a piece of a split shape: its pieces' dyn_ meshes)
+        for p in g["parts"]:
+            holder.setdefault(part_of.get(p["id"], p["id"]), []).append(g["id"])
+    for nid, part in part_of.items():   # pieces left alone (a single shape of a material)
+        if not any(nid == p["id"] for g in merged for p in g["parts"]):
+            holder.setdefault(part, []).append(nid)
     present = {s["id"] for s in top_shapes(base_text)}
     kept_objects = set(plan["dynamic"].values())
     objects = {}
     for o in data.get("objects") or []:
         if o.get("movable"):
-            shapes = list(dict.fromkeys(holder.get(p, p) for p in o.get("parts") or []))
+            shapes = list(dict.fromkeys(x for p in o.get("parts") or [] for x in holder.get(p, [p])))
             objects[o["id"]] = {"kept": o["id"] in kept_objects, "shapes": [x for x in shapes if x in present]}
     new = {"keep": plan["scope"], "manifest": MANIFEST if merged else None, "objects": objects}
     if data.get("merge") != new:
@@ -573,18 +692,24 @@ def _merge_scene(scene_dir: Path, keep, dry_run: bool) -> dict:
     if keep is None:
         keep = manifest.get("keep", []) if manifest else []
     keep = list(keep)
-    texts = _original_texts(scene_dir, manifest)
+    originals = _original_texts(scene_dir, manifest)
     meta = _meta(scene_dir)
-    plan = _plan(scene_dir, texts, keep, meta)
+    dynamic = physics_dynamic(scene_dir, meta)
+    if dry_run:
+        texts, info = _expand(scene_dir, originals, dynamic, write=False)
+    else:
+        if manifest is not None:  # the originals' files back first: the pieces are cut from them
+            _restore_files(scene_dir, manifest)
+            (scene_dir / MANIFEST).unlink()
+            manifest = None
+        texts, info = _expand(scene_dir, originals, dynamic)
+    plan = _plan(scene_dir, texts, keep, meta, {**dynamic, **info["dynamic"]}, info["fresh"])
     if dry_run:
         parts = sum(len(g) for g in plan["groups"])
         summary = {"shapes_before": plan["count"], "shapes_after": plan["count"] - parts + len(plan["groups"]),
                    "merged_groups": len(plan["groups"]), "parts": parts, "kept": dict(sorted(plan["kept"].items()))}
         print(f"{scene_dir.name} (dry run): {summary}", flush=True)
         return summary
-    if manifest is not None:  # back to the originals first: the new plan starts from them
-        _restore_files(scene_dir, manifest)
-        (scene_dir / MANIFEST).unlink()
     names = list(texts)
     shapes = plan["shapes"]
     kept = Counter(plan["kept"])
@@ -670,9 +795,10 @@ def _merge_scene(scene_dir: Path, keep, dry_run: bool) -> dict:
         out_texts[n] = "".join(out)
         records[n] = {"residual_sha1": sha1_text(residual), "original_sha1": sha1_text(text),
                       "parts": [[pid, offsets[pid]] for _, _, pid in gone]}
+    expanded = {n: r for n, r in info["records"].items() if r}
     for n in names:  # a check before anything is written: the manifest gives every file back
-        probe = {"merged": merged, "xmls": records}
-        if restore_text(out_texts[n], probe, n) != (texts[n], True):
+        probe = {"merged": merged, "xmls": records, "expanded": expanded}
+        if restore_text(out_texts[n], probe, n) != (originals[n], True):
             raise RuntimeError(f"{scene_dir.name}/{n}: the merged file does not restore exactly")
     after = len(top_shapes(out_texts[names[0]]))
     parts_n = sum(len(g["parts"]) for g in merged)
@@ -680,13 +806,13 @@ def _merge_scene(scene_dir: Path, keep, dry_run: bool) -> dict:
                "shapes_before": plan["count"], "shapes_after": after, "merged_groups": len(merged), "parts": parts_n,
                "kept": dict(sorted(kept.items())), "keep": keep, "triangles": triangles, "merged_bytes": new_bytes,
                "seconds": round(time.time() - started, 1)}
-    if merged:
+    if merged or expanded:
         manifest_out = {"version": VERSION, "tool": "tools/merge_meshes.py", "at": summary["at"], "keep": keep,
                         "plan": plan["groups"], "plan_objects": plan["objects"], "physics_keep": plan["scope"],
-                        "xmls": records, "merged": merged}
+                        "xmls": records, "merged": merged, "expanded": expanded}
         _write(scene_dir / MANIFEST, json.dumps(manifest_out, separators=(",", ":")))
         for n in names:
-            if out_texts[n] != texts[n]:
+            if out_texts[n] != originals[n]:
                 _write(scene_dir / n, out_texts[n])
     meta = _meta(scene_dir)
     if meta is not None and (merged or "mesh_merge" in meta):
@@ -695,7 +821,7 @@ def _merge_scene(scene_dir: Path, keep, dry_run: bool) -> dict:
         else:
             del meta["mesh_merge"]
         _write(scene_dir / "scene.json", json.dumps(meta, indent=1))
-    _record_bodies(scene_dir, plan, merged, out_texts[names[0]])
+    _record_bodies(scene_dir, plan, merged, out_texts[names[0]], info["part"])
     unlinked = _unlink_unused_merged(scene_dir)
     print(f"{scene_dir.name}: shapes {summary['shapes_before']} -> {after}, {len(merged)} merged meshes of {parts_n} parts "
           f"({triangles} triangles, {new_bytes / 1e6:.1f} MB new), kept {summary['kept']}, "

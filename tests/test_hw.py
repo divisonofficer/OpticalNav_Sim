@@ -1427,6 +1427,34 @@ def test_sensor_render_settings_are_each_cameras_own():
     assert session.sensor_settings("hdr", "polar")["denoise"] is True              # each camera's own denoiser switch
     assert session.set_sensor_settings("hdr", {"denoise": False})["denoise"] is False
     assert session.sensor_settings("12bit", "polar")["denoise"] is True
+    # each camera's own exposure: auto (its ExposureControl) with a compensation, or held where it stood, or set by hand
+    hdr = robot.sensors["hdr"]
+    s = session.sensor_settings("hdr", "polar")
+    assert s["auto_exposure"] is True and s["ev"] == 0.0 and s["exposure_ms"] > 0
+    s = session.set_sensor_settings("hdr", {"ev": 1.0})
+    assert s["ev"] == 1.0 and hdr.state.exposure.target == pytest.approx(2 * session.AE_TARGET)
+    hdr.state.exposure.exposure_s = 0.004
+    s = session.set_sensor_settings("hdr", {"auto_exposure": False})
+    assert s["auto_exposure"] is False and not hdr.state.exposure.auto and s["exposure_ms"] == pytest.approx(4.0)
+    s = session.set_sensor_settings("hdr", {"exposure_ms": 12.5, "gain_db": 6.0})
+    assert hdr.state.exposure.exposure_s == pytest.approx(0.0125) and hdr.state.exposure.gain_db == 6.0
+    assert session.sensor_settings("12bit", "polar")["auto_exposure"] is True      # the other camera keeps its own
+    assert session.set_sensor_settings("hdr", {"auto_exposure": True})["auto_exposure"] and hdr.state.exposure.auto
+    for bad in ({"ev": 9}, ):
+        with pytest.raises(ValueError):
+            session.set_sensor_settings("hdr", bad)
+    assert session.sensor_settings("hdr", "polar")["view"] is None                # a camera has one picture
+    with pytest.raises(ValueError):
+        session.set_sensor_settings("hdr", {"view": "cloud"})
+    # a LiDAR's picture: the sub viewer's buttons (3D points, depth, intensity, all)
+    rig = hw.config.spawn(hw.World(), "ranger_mini", rig="hdr_12bit_mast_ouster")
+    session.sensors = dict(rig.sensors)
+    lidar = next(n for n, a in rig.sensors.items() if a.spec.modality == "lidar" and hasattr(a.spec, "VIEWS"))
+    s = session.sensor_settings(lidar, None)
+    assert s["view"] == "all" and [v for v, _ in s["views"]] == ["cloud", "range", "intensity", "all"]
+    assert session.set_sensor_settings(lidar, {"view": "range"})["view"] == "range" and rig.sensors[lidar].spec.display == "range"
+    with pytest.raises(ValueError):
+        session.set_sensor_settings(lidar, {"view": "polar"})
 
 
 def test_camera_without_isp_is_its_render_through_the_lens():
@@ -1575,6 +1603,14 @@ def test_ouster_model_in_a_room():
     assert list(ouster.reflectivity_code(np.array([0.004, 0.5, 1.0, 864.0]))) == [1.0, 50.0, 100.0, 255.0]
     with pytest.raises(ValueError):
         ouster.OusterLidar(model="OS9")
+    # the viewer's pictures (VIEWS): the 3D view, one image, or all three stacked
+    shapes = {}
+    for view, _ in ouster.OusterLidar.VIEWS:
+        ideal.spec.display = view
+        pic = world.sense(ideal).picture
+        assert pic.dtype == np.uint8 and pic.ndim == 3 and pic.shape[1] == 1024
+        shapes[view] = pic.shape[0]
+    assert shapes["range"] == shapes["intensity"] and shapes["all"] > shapes["cloud"] > 0 and shapes["all"] > shapes["range"]
 
 
 def test_suspension_bounces_over_a_bump_and_settles():

@@ -267,6 +267,7 @@ class Session:
         self.subs: dict[int, dict] = {}  # each page's panes, scale and exposure: the JPEGs a frame makes ahead
         self.trail: list[tuple[float, float]] = []
         self.robot = None                 # robot_view.RobotSession (attach_robot): its links are bodies of this view
+        self.auto_tone = False            # the editor's auto exposure: the tone follows the frames (else fixed per scene)
         self.polarization = True          # False: the path tracer's plain RGB variant (no Stokes vectors: several times faster)
         # with polarization on, the robot's cameras: "split" each by its model (a polarization camera polarized, any other
         # unpolarized: two scenes on the GPU), "unified" all polarized (one scene); off, every camera unpolarized
@@ -288,6 +289,11 @@ class Session:
         self._loop_thread.start()
         self.renderer: dict = {}          # the render server's /v1/status, refreshed every second
         threading.Thread(target=self._watch_renderer, name="renderer-watch", daemon=True).start()
+        # the Solid preview drawn here from the scene's files while the engine has nothing to show (_previewer)
+        self.engine_live: tuple | None = None   # (scene, renderer) the engine has shown a frame of
+        self.preview_gen = -1                    # the camera last previewed
+        self.preview_note = ""                   # why the preview could not be drawn (once)
+        threading.Thread(target=self._previewer, name="solid-preview", daemon=True).start()
 
     # --- inputs: change the simulator state, never wait for a render ---
     def run(self, what: str, fn, *args) -> dict:
@@ -714,6 +720,10 @@ class Session:
             restart = True
         if settings.get("refit_tone"):  # display only: nothing renders again
             self.refit_tone()
+        if "auto_exposure" in settings:  # the editor camera's auto exposure (display only): the tone follows the frames
+            self.auto_tone = bool(settings["auto_exposure"])
+            if self.auto_tone and self.frame_meta:
+                self.refit_tone()
         if "denoise" in settings:
             self.sim.setDenoiser(bool(settings["denoise"]))
             restart = True
@@ -765,10 +775,11 @@ class Session:
             if self.robot.scene and self.robot.running and self.robot.scene != scene:  # another scene: the robot stays behind
                 self.robot.despawn()
                 self.follow = None
-            bodies = self.robot.bodies(scene) if sim.renderer == "path" else []   # the preview rasteriser draws none
+            drawn = sim.renderer in ("path", "raster", "solid")   # Cycles draws no robot
+            bodies = self.robot.bodies(scene) if drawn else []
             if bodies:
                 view["bodies"] = bodies
-            pushed = self.robot.objects(scene) if sim.renderer == "path" and hasattr(self.robot, "objects") else {}   # hw.physics
+            pushed = self.robot.objects(scene) if drawn and hasattr(self.robot, "objects") else {}   # hw.physics
             if pushed:
                 view["objects"] = pushed
         pos = st._free_position or (st.location.x, st.location.y)
@@ -963,9 +974,59 @@ class Session:
                         self.version += 1
                     self.cv.notify_all()
 
+    # --- the Solid preview while the engine prepares ---
+    PREVIEW_AFTER_S = 1.0   # a camera the engine has not shown this long gets the preview meanwhile
+
+    def _preview_due(self) -> float | None:
+        """Under ``cv``: 0 when the current camera should be previewed now, else seconds until it may be (None: not)."""
+        v = self.view
+        if v is None or not self.render_on or v.get("renderer", "path") == "solid" or self.preview_gen == self.gen:
+            return None
+        if self.frame_meta.get("frame_gen") == self.gen and not self.frame_meta.get("preview"):
+            return None   # the engine showed this camera
+        if self.engine_live != (v["scan"], v.get("renderer", "path")):
+            return 0.0    # a scene (or engine) not shown yet: converting, merging, loading, recording
+        return max(0.0, self.PREVIEW_AFTER_S - (time.monotonic() - self.gen_started))
+
+    def _previewer(self) -> None:
+        """While the render engine has nothing to show for the current camera (a scene's first start: merging, finding its
+        movable objects, loading, recording its frozen render, minutes; a robot loaded into it; a slow first pass), draw
+        the camera in Solid from the scene's files here (pack_solid: this process's own GPU context, so the render
+        server's long recording, which holds its Python lock, does not hold it up) and show that. The engine's first
+        frame of the camera takes the screen back."""
+        if not isinstance(self.sim._client, RenderClient):
+            return   # a test double: no scene files to read
+        while True:
+            with self.cv:
+                while True:
+                    due = self._preview_due()
+                    if due == 0.0:
+                        break
+                    self.cv.wait(due + 0.01 if due else None)
+                gen, view = self.gen, dict(self.view)
+                self.preview_gen = gen
+            started = time.perf_counter()
+            try:
+                from . import pack_solid
+                solid = pack_solid.for_scene(self.scene_dir(view["scan"]))
+                film, z = solid.render(np.asarray(view["camera_to_world"], dtype=np.float64), view["width"], view["height"],
+                                       view["hfov_deg"])
+            except Exception as exc:  # noqa: BLE001 - no preview (no GPU here, a scene file not written yet): the engine's frame comes
+                note = f"{type(exc).__name__}: {exc}"
+                if note != self.preview_note:
+                    self.preview_note = note
+                    print(f"[preview] {note}", flush=True)
+                continue
+            wall = time.perf_counter() - started
+            one = {"s0": np.ascontiguousarray(film[..., :3]), "nir_s0": np.ascontiguousarray(film[..., 3])}
+            self._publish({"gen": gen, "view": dict(view, renderer="solid", spp=1), "one": one, "depth": z, "started": started,
+                           "wall": wall, "timing": {"render_s": wall, "wait_s": wall}, "server_s": wall, "denoised": True,
+                           "preview": True})
+
     def _publish(self, job: dict) -> None:
         made = time.perf_counter()
         gen, view = job["gen"], job["view"]
+        preview = bool(job.get("preview"))   # the Solid preview (_previewer): shown until the engine's frame of the camera
         if job["one"] is not None:   # a pass of a camera already left: shown as it is
             mean, passes, spp_shown = job["one"], 1, int(view["spp"])
         else:
@@ -1017,7 +1078,7 @@ class Session:
         # the radiance itself: the page's exposure and the tone fit apply when a pane is sent (Session.image)
         frame = {"s0": s0, "scan": view["scan"], "s0_luma": s0 @ stokes.LUMA, **extra,
                  "derived": stokes.derived(s0, s1, s2), "s1": s1, "s2": s2, "spp": spp_shown, "passes": passes,
-                 "variant": view["variant"], "depth": job["depth"], "renderer": view.get("renderer", "path"),
+                 "variant": view["variant"], "depth": job["depth"], "renderer": view.get("renderer", "path"), "preview": preview,
                  "c2w": [round(float(v), 5) for v in np.asarray(view["camera_to_world"]).ravel()]}
         # Where a pass's time went (ms), for the pass this picture was made after. gpu: the server waiting for the GPU
         # after queuing the pass's kernels, the GPU time no CPU work hid (exact kernel times would need a sync per
@@ -1031,12 +1092,17 @@ class Session:
             "round_trip_ms": 1000.0 * job["wall"], "queue_ms": g("queue_s"), "gpu_ms": g("wait_s"),
             "server_cpu_ms": g("render_s") - g("wait_s") + g("split_s") + g("post_s") + g("encode_s"),
             "transfer_ms": max(0.0, 1000.0 * (job["wall"] - job["server_s"])), "viewer_ms": 1000.0 * (time.perf_counter() - made)}
+        if self.auto_tone and not preview and frame["renderer"] != "solid":
+            self._follow_tone(frame)
         jpeg_from = time.perf_counter()
         self._prepare(frame)
         frame["timing"]["jpeg_ms"] = 1000.0 * (time.perf_counter() - jpeg_from)
         frame["timing"]["wall_ms"] = 1000.0 * (time.perf_counter() - job["started"])
         with self.cv:
-            if gen == self.gen:
+            if preview:
+                if gen != self.gen or (self.frame_meta.get("frame_gen") == gen and not self.frame_meta.get("preview")):
+                    return    # moved on, or the engine showed this camera meanwhile
+            elif gen == self.gen:
                 if passes <= self.published:  # nothing new since the last picture of this camera
                     return
                 self.published = passes
@@ -1048,9 +1114,12 @@ class Session:
                 del self.frames[old]
             self.arrivals.append(time.monotonic())
             self.timings.append((time.monotonic(), frame["timing"]))
-            self.frame_meta = {"frame_id": self.frame_id, "frame_gen": gen, "frame_spp": frame["spp"],
-                               "frame_variant": frame["variant"], "passes": passes,
-                               "frame_c2w": frame["c2w"]}  # the camera the frame was rendered from
+            self.frame_meta = {"frame_id": self.frame_id, "frame_gen": gen, "frame_spp": 0 if preview else frame["spp"],
+                               "frame_variant": frame["variant"], "passes": 0 if preview else passes,
+                               "frame_c2w": frame["c2w"],  # the camera the frame was rendered from
+                               "preview": preview}         # the Solid preview, the engine still preparing
+            if not preview:
+                self.engine_live = (view["scan"], view.get("renderer", "path"))
             self.version += 1
             self.cv.notify_all()
 
@@ -1079,7 +1148,8 @@ class Session:
         with self.cv:
             now = time.monotonic()
             arrivals, timings, screens = list(self.arrivals), list(self.timings), list(self.screens)
-            waiting = (self.frame_meta.get("frame_gen") != self.gen) and self.view is not None and not self.error and self.render_on
+            waiting = (self.frame_meta.get("frame_gen") != self.gen or bool(self.frame_meta.get("preview"))) \
+                and self.view is not None and not self.error and self.render_on
             spp_now = self.frame_meta.get("frame_spp", 0) if self.frame_meta.get("frame_gen") == self.gen else 0
             conv = ((self.renderer or {}).get("converting") or {}).get(self.opening["id"]) if self.opening else None  # the converter's own progress
             out = {"opening": ({**self.opening, "elapsed_s": round(time.monotonic() - self.opening["t0"], 1),
@@ -1093,7 +1163,7 @@ class Session:
                    "flash_offset": list(sim.flash_offset), "mirrors": sim.mirrors, "max_depth": sim.max_depth, "rr_depth": sim.rr_depth,
                    "render_mode": sim.renderer, "raster_aa": sim.raster_aa, "solid_filter": getattr(sim, "solid_filter", None), "caustics": sim.caustics, "nir_range": list(sim.nir_range), "server_info": self.server_info,
                    "active_split": sim.active_split, "polarization": self.polarization, "polar_cameras": self.polar_cameras, "modes": self.modes,
-                   "editor_render": self.render_on,
+                   "editor_render": self.render_on, "auto_exposure": self.auto_tone, "physics_applying": getattr(self, "physics_applying", None),
                    "has_frame": bool(self.frame_meta),
                    "error": self.error, "version": self.version,
                    "turn_deg": round(math.degrees(self.turn), 3), "pitch_deg": round(math.degrees(self.pitch), 3),
@@ -1181,7 +1251,8 @@ class Session:
         """Wait for a frame of the current camera newer than ``after_frame`` (for scripts and tests)."""
         end = time.monotonic() + timeout
         with self.cv:
-            while not (self.frame_meta.get("frame_gen") == self.gen and self.frame_id > after_frame) and not self.error:
+            while not (self.frame_meta.get("frame_gen") == self.gen and self.frame_id > after_frame
+                       and not self.frame_meta.get("preview")) and not self.error:
                 left = end - time.monotonic()
                 if left <= 0:
                     raise TimeoutError("no frame")
@@ -1274,6 +1345,23 @@ class Session:
         tone = self._tone(key[0], key[1], radiance, own_frame=band == "nir")
         return tonemap.fast(self.tone_curve, radiance, tone["exposure"] * 2.0 ** ev, tone["white"])
 
+    AUTO_TONE_STEP = 0.35   # the editor's auto exposure: this share of the way (in stops) to the new frame's tone a frame
+
+    def _follow_tone(self, frame: dict) -> None:
+        """The editor's auto exposure: the scene's tone moved towards the one this frame's own highlights give
+        (tonemap.global_params), a share of the way in stops each frame, so a turn into a dark corner brightens over a few
+        frames and nothing flickers."""
+        for key, img in (((frame["scan"], frame["variant"]), frame["s0"]),
+                         ((frame["scan"], frame["variant"] + "|nir"),
+                          np.repeat(frame["nir_grey"][..., None], 3, axis=2) if "nir_grey" in frame else None)):
+            if img is None:
+                continue
+            now = tonemap.global_params([img])
+            last = self.tones.get(key)
+            k = self.AUTO_TONE_STEP
+            self.tones[key] = now if last is None else {
+                n: math.exp((1 - k) * math.log(last[n]) + k * math.log(now[n])) for n in ("exposure", "white")}
+
     def refit_tone(self) -> None:
         """Fit both bands' tone to the frame on screen now (instead of the dataset frames, or the band's first
         frame): its exposure puts that frame's own bright percentile at white."""
@@ -1301,6 +1389,329 @@ class Session:
                 "depth_m": None if depth is None or depth[y, x] <= 0 else round(float(depth[y, x]), 3),
                 "aolp_deg": float(d["aolp_deg"][y, x]), "s1_over_s0": float(d["s1_over_s0"][y, x]),
                 "s2_over_s0": float(d["s2_over_s0"][y, x])}
+
+    # --- picking (Isaac's way): what a click on the editor view is on, and the robot put where a click says ---------------
+    # From the scene's own files (pack_solid: triangles and depth for the camera the shown frame was made from), so it
+    # works whatever renders the view (Mitsuba, Cycles, raster) and while the render server still prepares the scene.
+    # Coordinates: the scene files' frame (Mitsuba, Y up) -> the simulator's (x = X, y = -Z, z = Y).
+    @staticmethod
+    def sim_from_scene(p) -> list:
+        return [float(p[0]), -float(p[2]), float(p[1])]
+
+    @staticmethod
+    def scene_from_sim(p) -> np.ndarray:
+        return np.array([p[0], p[2], -p[1]], dtype=np.float64)
+
+    def _shown_camera(self, frame_id: int | None = None) -> tuple:
+        """(scene, camera to world 4 x 4, width, height, hfov) of a frame shown (the newest when None)."""
+        with self.cv:
+            fid = self.frame_id if frame_id is None else int(frame_id)
+            f = self.frames.get(fid) or (self.frames.get(self.frame_id) if self.frames else None)
+            if f is None:
+                raise KeyError("no frame shown yet")
+        h, w = f["s0_luma"].shape
+        return f["scan"], np.asarray(f["c2w"], dtype=np.float64).reshape(4, 4), w, h, self.sim._hfov_deg(w, h)
+
+    def _pick_ray(self, frame_id, x: int, y: int) -> dict:
+        """What pixel (x, y) of a shown frame is on: its triangle (-1: nothing), depth, the point (scene frame), and the
+        camera's ray."""
+        from . import pack_solid
+        scene, c2w, w, h, hfov = self._shown_camera(frame_id)
+        solid = pack_solid.for_scene(self.scene_dir(scene))
+        ids, depth = solid.ids(c2w, w, h, hfov)
+        x, y = min(max(int(x), 0), w - 1), min(max(int(y), 0), h - 1)
+        t = math.tan(math.radians(hfov) / 2.0)
+        d_cam = np.array([(2.0 * (x + 0.5) / w - 1.0) * t, (1.0 - 2.0 * (y + 0.5) / h) * t * h / w, -1.0])
+        eye, ray = c2w[:3, 3], c2w[:3, :3] @ d_cam            # ray: one metre along the view axis per unit
+        tri, z = int(ids[y, x]), float(depth[y, x])
+        return {"scene": scene, "solid": solid, "tri": tri, "depth": z, "eye": eye, "ray": ray,
+                "point": eye + ray * z if tri >= 0 else None, "c2w": c2w, "size": (w, h, hfov)}
+
+    def _object_index(self, scene: str, solid) -> tuple:
+        """physics.json's parts and objects of the scene (solid_filters.scene_index), and each of the PackSolid's
+        triangles' part (matched once by centroid)."""
+        from . import solid_filters
+        phys = self.scene_dir(scene) / "physics.json"
+        key = (scene, id(solid), phys.stat().st_mtime_ns if phys.is_file() else 0)
+        if getattr(self, "_obj_index_key", None) != key:
+            index = solid_filters.scene_index(self.scene_dir(scene))
+            cen = (solid.v[solid.f[:, 0]] + solid.v[solid.f[:, 1]] + solid.v[solid.f[:, 2]]) / 3.0
+            self._obj_index = (index, solid_filters.match(index, cen.astype(np.float32)))
+            self._obj_index_key = key
+        return self._obj_index
+
+    def _robot_box(self) -> dict | None:
+        """The robot standing in the scene as a box (simulator frame): its place, yaw, footprint and height."""
+        robot = self.robot
+        pose = robot.pose2d() if robot is not None else None
+        if pose is None:
+            return None
+        spec = robot.robot.spec if getattr(robot, "robot", None) is not None else None
+        foot = np.asarray(spec.footprint(), dtype=np.float64)[:, :2] if spec is not None and hasattr(spec, "footprint") else None
+        if foot is None:
+            return None
+        return {"x": pose[0], "y": pose[1], "z": pose[2], "yaw": pose[3], "foot": foot, "height": self._robot_height()}
+
+    def _robot_height(self) -> float:
+        from .hw import config as robot_config
+        cfg = getattr(self.robot, "config", None)
+        if getattr(self, "_height_of", (None, 0.0))[0] != cfg:
+            try:
+                self._height_of = (cfg, float(robot_config.height(cfg)))
+            except Exception:  # noqa: BLE001 - a robot's height unknown: a metre
+                self._height_of = (cfg, 1.0)
+        return self._height_of[1]
+
+    def _box_edges(self, box: dict, c2w: np.ndarray, size: tuple) -> list:
+        """The robot box's edges as the camera sees them (pixel segments [x0, y0, x1, y1], clipped at the near plane),
+        and an arrow on the floor for its heading."""
+        w, h, hfov = size
+        c, s = math.cos(box["yaw"]), math.sin(box["yaw"])
+        foot = box["foot"]
+        ring = np.c_[box["x"] + c * foot[:, 0] - s * foot[:, 1], box["y"] + s * foot[:, 0] + c * foot[:, 1]]
+        lo = [(px, py, box["z"] + 0.01) for px, py in ring]
+        hi = [(px, py, box["z"] + box["height"]) for px, py in ring]
+        n = len(ring)
+        segs = [(lo[i], lo[(i + 1) % n]) for i in range(n)] + [(hi[i], hi[(i + 1) % n]) for i in range(n)] + \
+               [(lo[i], hi[i]) for i in range(n)]
+        reach = float(np.abs(foot[:, 0]).max()) + 0.25
+        tip = (box["x"] + c * reach, box["y"] + s * reach, box["z"] + 0.01)
+        base = (box["x"], box["y"], box["z"] + 0.01)
+        segs += [(base, tip), (tip, (tip[0] - c * 0.15 - s * 0.1, tip[1] - s * 0.15 + c * 0.1, tip[2])),
+                 (tip, (tip[0] - c * 0.15 + s * 0.1, tip[1] - s * 0.15 - c * 0.1, tip[2]))]
+        w2c = np.linalg.inv(c2w)
+        t = math.tan(math.radians(hfov) / 2.0)
+        out = []
+        for a, b in segs:
+            pa, pb = ((w2c @ np.r_[self.scene_from_sim(q), 1.0])[:3] for q in (a, b))
+            near = -0.05
+            if pa[2] > near and pb[2] > near:
+                continue
+            if pa[2] > near or pb[2] > near:   # clip the part behind the camera
+                k = (near - pa[2]) / (pb[2] - pa[2])
+                q = pa + k * (pb - pa)
+                pa, pb = (q, pb) if pa[2] > near else (pa, q)
+            px = lambda q: [round(float((q[0] / -q[2] / t + 1.0) * 0.5 * w), 1),
+                            round(float((1.0 - q[1] / -q[2] / (t * h / w)) * 0.5 * h), 1)]
+            out.append(px(pa) + px(pb))
+        return out
+
+    def select(self, frame_id, x: int, y: int) -> dict:
+        """What a click on the editor view is on (Isaac's selection): the robot, else the scene's shape there, its
+        material, the object physics.json makes it part of; kept to be outlined on the next frames (selection_png)."""
+        r = self._pick_ray(frame_id, x, y)
+        box = self._robot_box()
+        if box is not None:   # the robot first, when the ray meets its box nearer than the scene
+            hit = _ray_box(r["eye"], r["ray"], box, self.scene_from_sim)
+            if hit is not None and (r["tri"] < 0 or hit < r["depth"]):
+                rb = self.robot
+                self.selected = {"kind": "robot"}
+                st = rb.state() if hasattr(rb, "state") else {}
+                return {"hit": True, "kind": "robot", "label": (st.get("config") or {}).get("label") or "로봇",
+                        "config": (st.get("config") or {}).get("name"),
+                        "position": [round(box["x"], 3), round(box["y"], 3), round(box["z"], 3)],
+                        "yaw_deg": round(math.degrees(box["yaw"]), 1), "height_m": round(box["height"], 2),
+                        "sensors": [sn.get("label") or sn.get("name") for sn in st.get("sensors") or []]}
+        if r["tri"] < 0:
+            self.selected = None
+            return {"hit": False}
+        solid = r["solid"]
+        tri = solid.triangle(r["tri"])
+        sh = solid.shapes[tri["shape"]]
+        lo, hi = solid.shape_box(tri["shape"])
+        index, parts = self._object_index(r["scene"], solid)
+        part = int(parts[r["tri"]])
+        out = {"hit": True, "kind": "shape", "shape": sh["id"], "mesh": sh["file"], "instance": sh["instance"],
+               "material": sh["material"], "colour": sh["colour"], "emitter": sh["emitter"],
+               "point": [round(v, 3) for v in self.sim_from_scene(r["point"])], "distance_m": round(r["depth"], 3),
+               "normal": [round(v, 3) for v in self.sim_from_scene(tri["normal"])],
+               "shape_size_m": [round(float(v), 3) for v in np.abs(np.array(self.sim_from_scene(hi - lo)))],
+               "shape_triangles": int((solid.tri_shape == tri["shape"]).sum())}
+        self.selected = {"kind": "shape", "scene": r["scene"], "shape": tri["shape"]}
+        if part >= 0:
+            pr = index["parts"][part]
+            out["part"] = {"id": pr["id"], "label": pr["label"], "material": pr["material"]}
+            if pr["object"] >= 0:
+                out["object"] = dict(index["objects"][pr["object"]])
+                out["kind"] = "object"
+                out["flags"] = self.object_flags(r["scene"])
+                self.selected = {"kind": "object", "scene": r["scene"], "object": int(pr["object"]), "shape": tri["shape"]}
+        return out
+
+    def selection_png(self, frame_id) -> bytes | None:
+        """The selection outlined over a shown frame (RGBA PNG of its size): an object's or shape's pixels edged and
+        lightly filled; the robot as its box's edges are drawn by the page. None: nothing selected here."""
+        sel = getattr(self, "selected", None)
+        if not sel:
+            return None
+        from . import pack_solid
+        from PIL import Image, ImageDraw
+        scene, c2w, w, h, hfov = self._shown_camera(frame_id)
+        if sel["kind"] == "robot":   # its box's edges
+            box = self._robot_box()
+            if box is None:
+                return None
+            im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(im)
+            for x0, y0, x1, y1 in self._box_edges(box, c2w, (w, h, hfov)):
+                draw.line((x0, y0, x1, y1), fill=(255, 170, 40, 255), width=2)
+            buf = io.BytesIO()
+            im.save(buf, "PNG", compress_level=1)
+            return buf.getvalue()
+        if scene != sel["scene"]:
+            return None
+        solid = pack_solid.for_scene(self.scene_dir(scene))
+        ids, _ = solid.ids(c2w, w, h, hfov)
+        ok = ids >= 0
+        tri = np.where(ok, ids, 0)
+        if sel["kind"] == "object":
+            index, parts = self._object_index(scene, solid)
+            part_obj = np.array([p["object"] for p in index["parts"]] + [-1], np.int64)
+            mask = ok & (part_obj[parts[tri]] == sel["object"])
+        else:
+            mask = ok & (solid.tri_shape[tri] == sel["shape"])
+        if not mask.any():
+            return None
+        edge = mask & ~(np.roll(mask, 1, 0) & np.roll(mask, -1, 0) & np.roll(mask, 1, 1) & np.roll(mask, -1, 1))
+        edge = edge | np.roll(edge, 1, 0) | np.roll(edge, 1, 1)      # two pixels wide
+        img = np.zeros((h, w, 4), np.uint8)
+        img[mask] = (255, 170, 40, 46)
+        img[edge] = (255, 170, 40, 255)
+        buf = io.BytesIO()
+        Image.fromarray(img, "RGBA").save(buf, "PNG", compress_level=1)
+        return buf.getvalue()
+
+    def place_preview(self, frame_id, x: int, y: int, yaw_deg: float | None = None) -> dict:
+        """The robot's box where a click at (x, y) would put it (on the floor that pixel shows), as the shown frame's
+        pixel segments; ``ok`` False on what is not a floor (a wall, nothing). ``yaw_deg`` (simulator frame) default:
+        facing the way the camera looks."""
+        r = self._pick_ray(frame_id, x, y)
+        yaw = math.radians(yaw_deg) if yaw_deg is not None else self._camera_yaw(r["c2w"])
+        out = {"ok": False, "yaw_deg": round(math.degrees(yaw), 1), "edges": []}
+        if r["tri"] < 0:
+            out["why"] = "바닥이 아닙니다 (아무것도 없음)"
+            return out
+        n = r["solid"].triangle(r["tri"])["normal"]
+        n = n if np.dot(n, r["ray"]) < 0 else -n
+        p = self.sim_from_scene(r["point"])
+        out["point"] = [round(v, 3) for v in p]
+        out["ok"] = bool(n[1] > 0.8)   # facing up (scene frame Y): a floor, a step, a ramp
+        if not out["ok"]:
+            out["why"] = "바닥이 아닙니다 (벽이나 기울어진 면)"
+        from .hw import config as robot_config
+        try:
+            spec = robot_config.base_spec(self.robot.config)
+            foot = np.asarray(spec.footprint(), dtype=np.float64)[:, :2]
+        except Exception:  # noqa: BLE001 - a base with no footprint: a 0.6 m square
+            foot = np.array([[0.3, 0.3], [-0.3, 0.3], [-0.3, -0.3], [0.3, -0.3]])
+        box = {"x": p[0], "y": p[1], "z": p[2], "yaw": yaw, "foot": foot, "height": self._robot_height()}
+        out["edges"] = self._box_edges(box, r["c2w"], r["size"])
+        return out
+
+    @staticmethod
+    def _camera_yaw(c2w: np.ndarray) -> float:
+        """The way a camera looks, as a yaw in the simulator's frame (radians from +x)."""
+        f = -c2w[:3, 2]                        # its forward, scene frame
+        return math.atan2(-f[2], f[0])          # simulator (x, y) = (X, -Z)
+
+    def place_robot(self, frame_id, x: int, y: int, yaw_deg: float | None = None) -> dict:
+        """Put the robot (spawned there, or moved there) on the floor a click at (x, y) shows."""
+        if self.robot is None:
+            raise ValueError("this viewer has no robot")
+        pre = self.place_preview(frame_id, x, y, yaw_deg)
+        if not pre["ok"]:
+            raise ValueError(pre.get("why") or "바닥이 아닙니다")
+        scene = self._pick_ray(frame_id, x, y)["scene"]
+        px, py, pz = pre["point"]
+        self.follow = None
+        self.robot.place(scene, px, py, pz, pre["yaw_deg"])
+        return pre
+
+    # --- movable or fixed, set by hand: a selected object's flag (physics_objects.OVERRIDES), logged (LABELS) ----------
+    FLAGS = {"fixed": (False, None), "push": (True, True), "movable": (True, False)}   # flag -> (movable, robot_reachable)
+
+    def object_flags(self, scene: str) -> dict:
+        """The scene's decisions set by hand, and whether they wait to be applied (physics.json not made with them)."""
+        from . import physics_objects
+        folder = self.scene_dir(scene)
+        try:
+            made = json.loads((folder / "physics.json").read_text()).get("overrides_sha1")
+        except (OSError, ValueError):
+            made = None
+        return {"scene": scene, "objects": physics_objects.read_overrides(folder),
+                "pending": made != physics_objects.overrides_sha1(folder), "applying": getattr(self, "physics_applying", None)}
+
+    def set_object_flag(self, scene: str, object_id: str, flag: str) -> dict:
+        """Mark an object of physics.json fixed ("fixed"), pushed by a robot ("push"), movable but out of its reach
+        ("movable"), or back to what the rules say ("rule"); kept for the scene (applied by apply_physics), and logged with
+        the object's features and the rules' verdict, one line in the pack's physics_labels.jsonl."""
+        from . import physics_objects
+        if flag not in (*self.FLAGS, "rule"):
+            raise ValueError(f"flag is one of {[*self.FLAGS, 'rule']}")
+        folder = self.scene_dir(scene)
+        phys = json.loads((folder / "physics.json").read_text())
+        obj = next((o for o in phys.get("objects") or () if o["id"] == object_id), None)
+        if obj is None:
+            raise ValueError(f"no object {object_id!r} in {scene}'s physics.json")
+        path = folder / physics_objects.OVERRIDES
+        try:
+            data = json.loads(path.read_text()) if path.is_file() else {}
+        except ValueError:
+            data = {}
+        objects = dict(data.get("objects") or {})
+        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        if flag == "rule":
+            objects.pop(object_id, None)
+        else:
+            movable, reach = self.FLAGS[flag]
+            objects[object_id] = {"movable": movable, "robot_reachable": reach, "label": obj["label"], "at": now}
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"version": 1, "about": "decisions set by hand in the viewer, over physics_objects' rules",
+                                   "objects": objects}, indent=1, ensure_ascii=False))
+        os.replace(tmp, path)
+        said = obj.get("rules_said") or {k: obj.get(k) for k in ("movable", "robot_reachable", "confidence", "reason")}
+        line = {"at": now, "scene": scene, "object": object_id, "set": flag,
+                "label": obj["label"], "labels": obj.get("labels"), "class": obj.get("class"), "keyword": obj.get("keyword"),
+                "size_m": obj.get("size_m"), "footprint_m2": obj.get("footprint_m2"), "mass_kg": obj.get("mass_kg"),
+                "volume_method": obj.get("volume_method"), "material": obj.get("material"), "support": obj.get("support"),
+                "touches": obj.get("touches"), "holds_up": obj.get("holds_up"), "parts": len(obj.get("parts") or ()),
+                "rules": said, "rules_sha1": phys.get("rules_sha1")}
+        with open(folder.parent.parent / physics_objects.LABELS, "a") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        with self.cv:
+            self.version += 1
+            self.cv.notify_all()
+        return self.object_flags(scene)
+
+    def apply_physics(self, scene: str) -> dict:
+        """The decisions set by hand put to use: the render server finds the movable objects and merges the scene again
+        and drops it when that changed it (POST /v1/physics/refresh; the editor's view shows the Solid preview while
+        it loads again), then the robot's push world is built anew. In a thread; ``physics_applying`` says how far."""
+        if getattr(self, "physics_applying", None) and self.physics_applying.get("state") == "running":
+            return self.object_flags(scene)
+        self.physics_applying = {"scene": scene, "state": "running", "t0": time.monotonic()}
+
+        def job():
+            try:
+                main = self.sim._client
+                client = RenderClient(main.url, timeout=3600.0, token=main.token) if isinstance(main, RenderClient) else main
+                out = client.refresh_physics(scene)
+                rb = self.robot
+                if rb is not None and getattr(rb, "scene", None) == scene and getattr(rb, "world", None) is not None:
+                    with rb.lock:
+                        rb.pushed, rb.push = {}, None
+                    threading.Thread(target=rb._physics, args=(rb.run_id, rb.world), name="robot-physics-build", daemon=True).start()
+                self.physics_applying = {"scene": scene, "state": "done", "changed": out.get("changed"),
+                                         "seconds": round(time.monotonic() - self.physics_applying["t0"], 1)}
+                with self.lock:
+                    self._moved()   # rendered again (the scene loads anew when it changed)
+            except Exception as exc:  # noqa: BLE001 - said on the page
+                self.physics_applying = {"scene": scene, "state": "error", "error": f"{type(exc).__name__}: {exc}"[:300]}
+            with self.cv:
+                self.version += 1
+                self.cv.notify_all()
+        threading.Thread(target=job, name="physics-apply", daemon=True).start()
+        return self.object_flags(scene)
 
     def pick_later(self, frame_id: int, x: int, y: int, reply) -> None:
         """What the render server's last Solid frame shows at (x, y) (GET /v1/pick: shape, material, object), handed to
@@ -1469,6 +1880,10 @@ def dispatch(session: Session, path: str, body: dict) -> dict:
         return session.open_blend(str(body["id"]))
     if path == "refine":
         return session.run("pass", session.refine, int(body["frame_id"]))
+    if path == "physics/flag":   # {"scene", "object", "flag": "fixed" | "push" | "movable" | "rule"}: a decision by hand
+        return session.set_object_flag(str(body["scene"]), str(body["object"]), str(body["flag"]))
+    if path == "physics/apply":  # {"scene"}: the decisions by hand put to use (the scene found and merged again, reloaded)
+        return session.apply_physics(str(body["scene"]))
     raise KeyError(f"no route /api/{path}")
 
 
@@ -1554,6 +1969,13 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                     if bird is None:
                         return self._json(404, {"error": "no bird's-eye map"})
                     return self._send(200, Path(bird["path"]).read_bytes(), "image/png")
+                if parts == ["api", "physics", "flags"]:   # ?scene=: decisions set by hand, and whether they wait
+                    return self._json(200, session.object_flags(q["scene"]))
+                if parts == ["api", "selection.png"]:   # ?frame=: the selected object outlined over that frame (204: none)
+                    png = session.selection_png(q.get("frame"))
+                    if png is None:
+                        return self._send(204, b"", "image/png")
+                    return self._send(200, png, "image/png", {"Cache-Control": "no-store"})
                 if parts == ["api", "probe"]:
                     return self._json(200, session.probe(int(q["frame"]), int(q["x"]), int(q["y"]), q.get("pol", "luma")))
                 if len(parts) == 4 and parts[:2] == ["api", "frame"] and parts[3].endswith(".jpg"):
@@ -1694,10 +2116,23 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                         try:
                             ws.send_json({"type": "probe", **session.probe(int(msg["frame"]), int(msg["x"]), int(msg["y"]),
                                                                            str(msg.get("pol", "luma")))})
-                            if session._frame(int(msg["frame"])).get("renderer") == "solid":   # and what it is
+                            shown = session._frame(int(msg["frame"]))
+                            if shown.get("renderer") == "solid" and not shown.get("preview"):   # and what it is (not the preview's)
                                 session.pick_later(int(msg["frame"]), int(msg["x"]), int(msg["y"]), ws.send_json)
                         except KeyError:
                             pass
+                    elif kind in ("select", "place_hover"):   # a click's selection; the robot's box under the mouse
+                        try:
+                            if kind == "select":
+                                out = {"type": "selection", **session.select(msg.get("frame"), int(msg["x"]), int(msg["y"]))}
+                            else:
+                                yaw = msg.get("yaw_deg")
+                                out = {"type": "place_preview", "seq": msg.get("seq"),
+                                       **session.place_preview(msg.get("frame"), int(msg["x"]), int(msg["y"]),
+                                                               None if yaw is None else float(yaw))}
+                        except Exception as exc:  # noqa: BLE001 - said on the page
+                            out = {"type": "selection" if kind == "select" else "place_preview", "error": f"{type(exc).__name__}: {exc}"[:300]}
+                        ws.send_json(out)
             except (ConnectionError, OSError, ValueError):
                 pass
             finally:
@@ -1707,6 +2142,28 @@ def make_handler(session: Session, token: str | None = None, robot=None):
                     session.cv.notify_all()
 
     return Handler
+
+
+def _ray_box(eye: np.ndarray, ray: np.ndarray, box: dict, to_scene) -> float | None:
+    """Where a camera ray (scene frame; ``ray``: a metre along the view axis per unit) first meets the robot's box (its
+    footprint's bounding rectangle, its height), as depth along the view; None: it misses."""
+    c, s = math.cos(box["yaw"]), math.sin(box["yaw"])
+    lo, hi = box["foot"].min(0), box["foot"].max(0)
+    # into the box's frame: simulator frame about its origin, turned by -yaw
+    def local(p):
+        q = np.array([p[0], -p[2], p[1]]) - np.array([box["x"], box["y"], box["z"]])
+        return np.array([c * q[0] + s * q[1], -s * q[0] + c * q[1], q[2]])
+    o = local(eye)
+    d = local(eye + ray) - o
+    t0, t1 = 0.0, math.inf
+    for a, b0, b1 in zip(range(3), (lo[0], lo[1], 0.0), (hi[0], hi[1], box["height"])):
+        if abs(d[a]) < 1e-12:
+            if not b0 <= o[a] <= b1:
+                return None
+            continue
+        u, v = (b0 - o[a]) / d[a], (b1 - o[a]) / d[a]
+        t0, t1 = max(t0, min(u, v)), min(t1, max(u, v))
+    return t0 if t0 <= t1 and t0 > 0 else None
 
 
 def main() -> int:

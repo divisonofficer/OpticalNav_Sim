@@ -1333,6 +1333,18 @@ def object_instances_text(text: str, objects: dict) -> tuple[str, dict]:
     return text, out
 
 
+def instance_refs(text: str) -> dict:
+    """Each instance shape's id -> the id of the shapegroup it draws (its ``<ref id>``)."""
+    out = {}
+    for m in re.finditer(r'<shape\b[^>]*\btype="instance"[^>]*>', text):
+        sid = re.search(r'\bid="([^"]*)"', m.group(0))
+        end = text.find("</shape>", m.end())
+        ref = re.search(r'<ref\b[^>]*\bid="([^"]*)"', text[m.end():end if end >= 0 else None])
+        if sid and ref:
+            out[sid.group(1)] = ref.group(1)
+    return out
+
+
 def locate_blocks(meshes: dict, blocks: dict) -> dict:
     """Where each vertex block sits among the scene's meshes: {name: (mesh key, first vertex, count)}.
     The loader merges meshes that share a BSDF into one mesh by appending their vertices, so a shape's
@@ -1472,6 +1484,8 @@ class Resident:
         self.name = f"{xml.parent.name}/{xml.name}" + (f"+{flash_xml.name}" if flash_xml is not None else "")
         self.score = progress.scene_score(text)  # sizes the recording-time estimate before any history
         text = film_filter(text)
+        self.instance_groups = instance_refs(text)   # instance id -> its shapegroup's id: the raster preview draws their meshes
+        self.geometry_epoch = 0   # counts moves of bodies and pushed objects (set_bodies, set_objects): the raster preview follows
         with progress.watch_load(mi, text, self.name):
             self.scene = mi.load_string(text)
         # OPTICALNAV_UNIFORM_EMITTERS=1: Mitsuba's default, every emitter picked as often (for comparisons)
@@ -2039,6 +2053,7 @@ class Resident:
                 self._raster.scene_dir, self._raster.scene_xml = getattr(self, "scene_dir", None), getattr(self, "scene_xml", "base.xml")
                 parts["raster_build_s"] += self._raster.build_s
             self._raster.sync(look.hidden)
+            self._raster.follow_moves()   # bodies and pushed objects where this view placed them
             t2 = time.perf_counter()
             lanes, z = self._raster.render_solid(c2w, width, height, hfov_deg, look, aa, solid_filter) if solid else \
                 self._raster.render(c2w, width, height, hfov_deg, look, follow, aa)
@@ -2088,6 +2103,7 @@ class Resident:
             self.body_pose[sid], moved = m.tobytes(), True
         if moved:
             self.scene.parameters_changed([])
+            self.geometry_epoch += 1
         return time.perf_counter() - t0
 
     # simulator frame (x = X, y = -Z, z = Y of the scene files) <- Mitsuba's (Y up): a physics pose change into the scene's
@@ -2151,6 +2167,7 @@ class Resident:
                 self.object_pose[oid] = m.tobytes()
         if changed:
             self.scene.parameters_changed([])
+            self.geometry_epoch += 1
         self.objects_s = time.perf_counter() - t0   # in the next launch's time split (objects_s)
         return self.objects_s
 
@@ -2810,7 +2827,7 @@ class Renderer:
         else:
             sid, blend = blend_scenes.parse_spec(sid_or_path)
         with ACTIVITY.doing(f"converting {sid} in Blender"):
-            blend_scenes.ensure(self.blend_pack, sid, blend)
+            blend_scenes.ensure(self.blend_pack, sid, blend, moved=getattr(self, "blend_moves", {}))
         self.register_scene(self.blend_pack, sid)  # also when it was converted again: its scene.json is read anew
         return sid
 
@@ -2830,7 +2847,11 @@ class Renderer:
         if not blend:
             return None
         path = self.scene_dir(scan) / blend["file"]
-        return (path, tuple(blend["origin_offset"])) if path.is_file() else None
+        if not path.is_file():
+            return None
+        if blend.get("origin"):   # a working copy (blend_paths): Cycles needs where the original is, for its relative paths
+            return path, tuple(blend["origin_offset"]), {"origin": blend["origin"], "moves": blend.get("moves")}
+        return path, tuple(blend["origin_offset"])
 
     def cycles_worker(self, scan: str):
         """The Blender process of a scene's .blend, started when needed (the one of another scene is closed first)."""
@@ -2847,13 +2868,15 @@ class Renderer:
             ACTIVITY.rename(f"preparing Cycles kernels for {scan}")
         with ACTIVITY.doing(f"loading {scan} in Blender"):
             try:
-                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device, on_stage=stage)
+                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device, on_stage=stage,
+                                                     paths=blend[2] if len(blend) > 2 else None)
             except cycles_backend.CyclesError as exc:
                 if not cycles_backend.is_oom(exc):
                     raise
                 self.free_mitsuba()  # the GPU is full: hand the Mitsuba scenes' memory back and try again
                 ACTIVITY.rename(f"loading {scan} in Blender")
-                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device, on_stage=stage)
+                worker = cycles_backend.CyclesWorker(blend[0], blend[1], self.cycles_device, on_stage=stage,
+                                                     paths=blend[2] if len(blend) > 2 else None)
         self.cycles = (scan, worker)
         print(f"[cycles] {scan}: {blend[0].name} ready in {worker.load_s:.0f}s (GPU kernels {worker.info.get('warm_s')}s) {worker.info}", flush=True)
         return worker
@@ -2880,7 +2903,34 @@ class Renderer:
             print("[mitsuba] resident scenes freed", flush=True)
         return had
 
-    def merge_if_needed(self, scan: str) -> None:
+    def refresh_physics(self, scan: str) -> dict:
+        """Decisions set by hand changed (the viewer's 고정 / 밂 / 움직임: physics_overrides.json): find the movable objects
+        and merge again now (merge_if_needed), and drop the loaded scene when that changed its files (the next view
+        loads it again, the objects to push kept apart as the new decisions say)."""
+        if scan not in self.meta:
+            raise ValueError(f"unknown scan {scan!r}")
+        with self.merge_lock:
+            self.merge_checked.discard(scan)
+        changed = bool(self.merge_if_needed(scan))
+        if changed:
+            self.drop_scene(scan)
+        return {"changed": changed}
+
+    def drop_scene(self, scan: str) -> bool:
+        """The resident scenes of ``scan`` dropped (main thread; from elsewhere it queues)."""
+        if threading.current_thread() is not threading.main_thread():
+            return self.executor.submit(self.drop_scene, scan).result()
+        keys = [k for k in self.cache if k[0] == scan]
+        for k in keys:
+            del self.cache[k]
+        self.last_solid = None
+        gc.collect()
+        self.dr.flush_malloc_cache()
+        if keys:
+            print(f"[mitsuba] {scan} dropped: its files changed", flush=True)
+        return bool(keys)
+
+    def merge_if_needed(self, scan: str) -> bool:
         """The first time a scene is opened in this process: its static meshes of one material merged into one
         (tools/merge_meshes.py --if-needed, a subprocess: its Mitsuba runs scalar_rgb, which must not switch this
         process's variant), then its scene.json read again. Thousands of shapes in a scene file left the loaded meshes
@@ -2893,11 +2943,11 @@ class Renderer:
 
         with self.merge_lock:
             if scan in self.merge_checked or os.environ.get("OPTICALNAV_SIM_MERGE", "1") == "0":
-                return
+                return False
             self.merge_checked.add(scan)
             tools = Path(__file__).resolve().parents[1] / "tools"
             if not (tools / "merge_meshes.py").is_file() or scan not in self.pack_of:
-                return
+                return False
             started = time.monotonic()
             changed = False
             # first which objects a robot could push (tools/physics_tag.py: physics.json), then the merge, which keeps
@@ -2911,18 +2961,19 @@ class Renderer:
                                                "--scene", scan, "--if-needed"], capture_output=True, text=True, timeout=3600)
                     except subprocess.TimeoutExpired:
                         print(f"[merge] {scan}: {tool} gave no answer in an hour, served as it is", flush=True)
-                        return
+                        return changed
                 said = (done.stdout or "").strip()
                 if done.returncode:
                     print(f"[merge] {scan}: {tool} failed (exit {done.returncode}), served as it is: "
                           f"{(done.stderr or said)[-800:]}", flush=True)
-                    return
+                    return changed
                 if "nothing to do" not in said:
                     changed = True
                     print(f"[merge] {said[-400:]}", flush=True)
             if changed:
                 self.reload_meta(scan)
                 print(f"[merge] {scan} ready in {time.monotonic() - started:.0f} s", flush=True)
+            return changed
 
     def object_shapes(self, scan: str) -> dict:
         """Physics object id -> the dyn_ shapes that draw it (physics.json's merge record, tools/merge_meshes.py), for the
@@ -3320,8 +3371,8 @@ class Renderer:
         placed = tuple(sorted(placed))
         if len({p[0] for p in placed}) != len(placed):
             raise ValueError("body ids repeat in one view")
-        if placed and renderer not in ("path", "depth", "lidar"):
-            raise ValueError("bodies are drawn by the path tracer only (renderer 'path', or its 'depth')")
+        if placed and renderer not in ("path", "depth", "lidar", "raster", "solid"):
+            raise ValueError("bodies are drawn by the path tracer and the raster previews (not by Cycles)")
         # objects: {physics object id: 4x4}: a movable object pushed by the physics step (hw/physics.py), as the change of
         # its pose since the scene file (simulator frame: x = X, y = -Z, z = Y); its dyn_ meshes are moved by it
         moved = []
@@ -3331,8 +3382,8 @@ class Renderer:
                 raise ValueError(f"object {oid!r}: a pose that is not finite")
             moved.append((str(oid), m.tobytes()))
         moved = tuple(moved)
-        if moved and renderer not in ("path", "depth", "lidar"):
-            raise ValueError("moved objects are drawn by the path tracer only (renderer 'path', or its 'depth')")
+        if moved and renderer not in ("path", "depth", "lidar", "raster", "solid"):
+            raise ValueError("moved objects are drawn by the path tracer and the raster previews (not by Cycles)")
         look = (lights, env_map, env_scale, env_rot % 360.0, bands, flash_band, tuple(sorted(nir.items())), lighting,
                 mirrors, lamps, flash_scale, flash_pdf, flash_offset, max_depth, caustics, split, nir_range, rr_depth,
                 renderer, raster_aa, placed, moved, solid_filter)
@@ -3888,6 +3939,13 @@ def make_handler(renderer: Renderer, token: str | None = None):
                     return self._json(400, {"error": str(exc)})
                 except Exception as exc:  # noqa: BLE001
                     return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            if route == "/v1/physics/refresh":   # {"scan"}: decisions set by hand changed (Renderer.refresh_physics)
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    return self._json(200, renderer.refresh_physics(str(body["scan"])))
+                except Exception as exc:  # noqa: BLE001
+                    return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
             if route != "/v1/render":
                 return self._json(404, {"error": f"no route {self.path}"})
             try:
@@ -3996,6 +4054,9 @@ def main() -> int:
                          "the Cycles renderer renders the same file")
     ap.add_argument("--blend-dir", action="append", default=[], metavar="DIR",
                     help="offer every *.blend directly in DIR in the viewer's scene list (converted when chosen, not at start)")
+    ap.add_argument("--blend-library", action="append", default=[], metavar="DIR",
+                    help="a scene library (<series>/<id>/<file>.blend with MANIFEST*.json, as /bean/infinigen_invers3r): its scenes are "
+                         "listed too; a file is opened only as a copy (opticalnav_sim/blend_paths.py). Also $OPTICALNAV_BLEND_LIBRARY")
     ap.add_argument("--blend-tsv", action="append", default=[], metavar="FILE",
                     help="offer the .blend files of a promoted_ref_scenes tsv (columns id, passed_blend) the same way")
     ap.add_argument("--blend-pack", type=Path, default=None,
@@ -4097,7 +4158,12 @@ def main() -> int:
                         fill_gain=args.fill_gain, default_depth=args.default_depth, lamp_power=args.lamp_power, alpha_power=args.alpha_power,
                         freeze_spp=args.freeze_spp, cycles_gpu=args.cycles_gpu, cycles_device=args.cycles_device, ser=args.ser == "on")
     renderer.blend_pack = blend_pack
-    renderer.blend_files = blend_scenes.listed(args.blend_dir, args.blend_tsv)
+    libraries = list(args.blend_library) + [p for p in os.environ.get("OPTICALNAV_BLEND_LIBRARY", "").split(os.pathsep) if p]
+    renderer.blend_files = blend_scenes.listed(args.blend_dir, args.blend_tsv, libraries)
+    renderer.blend_moves = {}
+    for root in libraries:
+        from . import blend_paths
+        renderer.blend_moves.update(blend_paths.moves(root))
     # listen first: while --preload loads, /v1/status reports the load's progress and renders wait in the queue
     server = ThreadingHTTPServer((args.host, args.port), make_handler(renderer, args.token))
     threading.Thread(target=server.serve_forever, daemon=True).start()

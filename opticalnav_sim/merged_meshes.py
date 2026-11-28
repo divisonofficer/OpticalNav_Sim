@@ -49,10 +49,22 @@ def restore_text(text: str, manifest: dict, name: str) -> tuple[str, bool]:
             out += [residual[last:at], block[pid]]
             last = at
         out.append(residual[last:])
-        return "".join(out), True
+        return _unexpand("".join(out), manifest, name)
     for g in found:
         text = text.replace(g["xml"], "".join(p["lead"] + p["shape"] for p in g["parts"]), 1)
-    return text, False
+    return _unexpand(text, manifest, name)[0], False
+
+
+def _unexpand(text: str, manifest: dict, name: str) -> tuple[str, bool]:
+    """The shapes the merge wrote as pieces (tools/merge_meshes.py _expand: a shape of several things, an instance of a
+    movable object) back as they were: (text, every one found)."""
+    ok = True
+    for r in (manifest.get("expanded") or {}).get(name) or ():
+        if r["xml"] in text:
+            text = text.replace(r["xml"], r["block"], 1)
+        else:
+            ok = False
+    return text, ok
 
 
 def is_merged(text: str) -> bool:

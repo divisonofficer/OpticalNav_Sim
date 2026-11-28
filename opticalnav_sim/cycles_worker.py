@@ -78,6 +78,15 @@ def main() -> None:
     cmd_fd, reply_fd = (int(v) for v in sys.argv[sys.argv.index("--") + 1:][:2])
     cmd, reply = os.fdopen(cmd_fd, "r"), os.fdopen(reply_fd, "w")
     device = os.environ.get("OPTICALNAV_CYCLES_DEVICE", "OPTIX")
+    if os.environ.get("OPTICALNAV_BLEND_ORIGIN"):   # a working copy (blend_paths.py): its files read from where the original's are
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "opticalnav_blend_paths", os.path.join(os.environ["OPTICALNAV_REPO"], "opticalnav_sim", "blend_paths.py"))
+        paths = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(paths)
+        moves = os.environ.get("OPTICALNAV_BLEND_MOVES")
+        moved = json.loads(open(moves).read()) if moves and os.path.isfile(moves) else {}
+        paths.fix_paths(bpy, os.environ["OPTICALNAV_BLEND_ORIGIN"], moved)
     setup(device)
     t_open = time.perf_counter()
     # the first GPU render compiles the kernels for this card and for the features this scene uses (minutes, once per

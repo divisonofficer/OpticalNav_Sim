@@ -76,7 +76,9 @@ def lib_dir(blender: Path = BLENDER) -> Path:
 class CyclesWorker:
     """One Blender process rendering one ``.blend``; ``render`` is serialised by a lock."""
 
-    def __init__(self, blend: Path, origin_offset, device: str = "OPTIX", blender: Path = BLENDER, on_stage=None):
+    def __init__(self, blend: Path, origin_offset, device: str = "OPTIX", blender: Path = BLENDER, on_stage=None, paths: dict | None = None):
+        """``paths``: the .blend is a working copy (blend_paths): ``{"origin": the original, "moves": a JSON of moved files}``, for
+        the worker to read its relative and moved files from where they are."""
         self.blend, self.origin_offset, self.device = Path(blend), tuple(origin_offset), device
         self.lock = threading.Lock()
         self.load_s = 0.0
@@ -85,6 +87,9 @@ class CyclesWorker:
             raise CyclesError(f"no Blender at {blender} (OPTICALNAV_BLENDER)")
         env = dict(os.environ, OPTICALNAV_CYCLES_DEVICE=device,
                    LD_LIBRARY_PATH=f"{DRIVER_DIRS}:{blender.parent / 'lib'}:{lib_dir(blender)}")
+        if paths and paths.get("origin"):
+            env.update(OPTICALNAV_BLEND_ORIGIN=str(paths["origin"]), OPTICALNAV_BLEND_MOVES=str(paths.get("moves") or ""),
+                       OPTICALNAV_REPO=str(Path(__file__).resolve().parents[1]))
         cmd_r, self._cmd_w = os.pipe()
         self._reply_r, reply_w = os.pipe()
         self.log = tempfile.NamedTemporaryFile(prefix="opticalnav_blender_", suffix=".log", mode="w+b")

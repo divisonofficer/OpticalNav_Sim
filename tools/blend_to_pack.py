@@ -57,6 +57,14 @@ def run_inside(cfg: dict) -> None:
     assets.mkdir(parents=True, exist_ok=True)
     report = {"objects": 0, "shapes": 0, "triangles": 0, "materials": {}, "warnings": [], "lights": 0}
     bpy.ops.wm.open_mainfile(filepath=cfg["blend"])
+    if cfg.get("origin"):   # a working copy (blend_paths): its relative and moved files read from where the original's are
+        bp = __import__("importlib.util").util
+        spec = bp.spec_from_file_location("opticalnav_blend_paths", str(REPO / "opticalnav_sim" / "blend_paths.py"))
+        paths = bp.module_from_spec(spec)
+        spec.loader.exec_module(paths)
+        moved = json.loads(Path(cfg["moves"]).read_text()) if cfg.get("moves") else {}
+        report["paths"] = paths.fix_paths(bpy, cfg["origin"], moved)
+        print(f"[blend] file paths from {cfg['origin']}: {report['paths']}", flush=True)
     scene = bpy.context.scene
     if cfg["origin_offset"] is None:
         # no importer offset (a scene the old pipeline never imported): the plan frame starts at the scene's bounding box, so x, y and height
@@ -1178,6 +1186,8 @@ def main() -> int:
     ap.add_argument("--scene-id", help="the new scene (default: sim_v3_ + the scene's id without sim_v2a_)")
     ap.add_argument("--blend", type=Path)
     ap.add_argument("--origin-offset", type=float, nargs=3)
+    ap.add_argument("--origin", help="the .blend given is a copy (opticalnav_sim/blend_paths.py): the original's path, for its relative file paths")
+    ap.add_argument("--moves", help="a JSON file of old path -> new path (a scene library's manifests): files moved since the .blend was made")
     ap.add_argument("--max-texture", type=int, default=4096)
     ap.add_argument("--instance-min-polys", type=int, default=2000,
                     help="a mesh drawn 3+ times becomes a shapegroup with instances only from this many polygons (smaller ones are "
@@ -1220,7 +1230,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     cfg = {"blend": str(blend), "out": str(out), "origin_offset": list(offset) if offset else None, "max_texture": args.max_texture,
            "print_max_strength": args.print_max_strength, "instance_min_polys": args.instance_min_polys, "max_instances": args.max_instances, "map": not args.no_map,
-           "template_xml": str(template / "base.xml")}
+           "template_xml": str(template / "base.xml"), "origin": args.origin, "moves": args.moves}
     env = dict(os.environ, OPTICALNAV_B2M_INSIDE="1", OPTICALNAV_B2M_CFG=json.dumps(cfg),
                LD_LIBRARY_PATH=f"{cb.DRIVER_DIRS}:{cb.BLENDER.parent / 'lib'}:{cb.lib_dir()}")
     t0 = time.time()
@@ -1290,6 +1300,8 @@ def main() -> int:
     if args.link_blend:
         m2 = json.loads((out / "scene.json").read_text())
         m2["blend"] = {"file": str(Path(blend).resolve()), "origin_offset": list(offset), "linked": True}
+        if args.origin:   # a working copy: Cycles opens it, and needs the original's place for its relative paths
+            m2["blend"].update(origin=args.origin, moves=args.moves)
         (out / "scene.json").write_text(json.dumps(m2, indent=1))
     elif own_template and (template / "blend" / "scene.blend").is_file() and template.name != scene_id:
         (out / "blend").mkdir(exist_ok=True)

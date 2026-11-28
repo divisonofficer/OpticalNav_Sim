@@ -356,7 +356,10 @@ def test_gui_draws_the_robot_and_rides_with_it():
         time.sleep(0.02)
     assert len(sim._client.views) > n
     session.wait_idle(10)
-    sim.renderer = "raster"                                                        # the preview rasteriser draws no bodies
+    sim.renderer = "raster"                                                        # the raster previews draw the robot too
+    session.run("moved", session._moved)
+    assert session.view.get("bodies")
+    sim.renderer = "cycles"                                                        # Cycles draws none
     session.run("moved", session._moved)
     assert "bodies" not in session.view
     sim.renderer = "solid"                                                         # the Solid preview's filter rides in its view

@@ -107,6 +107,34 @@ FACES = [(0, 1.0, (0, 0, -1), (0, -1, 0)), (0, -1.0, (0, 0, 1), (0, -1, 0)),
          (2, 1.0, (1, 0, 0), (0, -1, 0)), (2, -1.0, (-1, 0, 0), (0, -1, 0))]
 
 
+def _shapegroups(scene) -> dict:
+    """The scene's shapegroups: id -> their meshes (Mitsuba objects; an instance names its group in the scene text,
+    Resident.instance_groups). Read through a traversal callback: an Instance does not hand out its group."""
+    import mitsuba as mi
+
+    class _Children(mi.TraversalCallback):
+        def __init__(self):
+            super().__init__()
+            self.found = []
+
+        def put(self, name, value, *rest):
+            self.found.append((name, value))
+
+        def put_value(self, *a, **k):
+            pass
+
+    def children(obj):
+        cb = _Children()
+        obj.traverse(cb)
+        return [(n, v) for n, v in cb.found if isinstance(v, mi.Object)]
+
+    out = {}
+    for name, obj in children(scene):
+        if obj.class_name() == "ShapeGroupPlugin":
+            out[name] = [v for _, v in children(obj) if isinstance(v, mi.Mesh)]
+    return out
+
+
 def _srgb_lut(device) -> torch.Tensor:
     c = torch.arange(256, dtype=torch.float32, device=device) / 255.0
     return torch.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
@@ -227,20 +255,35 @@ class RasterScene:
         materials, mat_of = [], {}
         self._twosided: list[bool] = []
         shapes, self.meshes = [], []
+        # instances (a scene's own shapegroups, the pushed objects of a scene loaded with bodies, the bodies' links):
+        # each mesh of the group, placed by the instance's to_world (read again when it moves: follow_moves)
+        groups = _shapegroups(resident.scene)
+        refs = getattr(resident, "instance_groups", {}) or {}
+        self.shape_inst: list = []    # per kept shape: its instance (a Shape), or None for a mesh of the scene itself
         for s in resident.scene.shapes():
             sid = s.id()
-            if sid.startswith(ASSIST_PREFIX) or not s.is_mesh():
+            if sid.startswith(ASSIST_PREFIX):
                 continue
-            b = s.bsdf()
-            if str(b).startswith("Null"):
+            if s.is_mesh():
+                members = [(s, sid, None)]
+            elif s.class_name() == "Instance" and refs.get(sid) in groups:
+                members = [(m, m.id(), s) for m in groups[refs[sid]]]
+            else:
                 continue
-            key = id(b)
-            if key not in mat_of:
-                mat_of[key] = len(materials)
-                materials.append((b, self._material(b)))
-            shapes.append((s, sid, mat_of[key]))
+            for m, mid, inst in members:
+                b = m.bsdf()
+                if str(b).startswith("Null"):
+                    continue
+                key = id(b)
+                if key not in mat_of:
+                    mat_of[key] = len(materials)
+                    materials.append((b, self._material(b)))
+                shapes.append((m, mid, mat_of[key]))
+                self.shape_inst.append(inst)
         self.shape_ids = [sid for _, sid, _ in shapes]
         self.shapes = [s for s, _, _ in shapes]
+        self.inst_m: dict = {}        # instance id -> its to_world as last read (torch 4 x 4)
+        self.geometry_epoch = getattr(resident, "geometry_epoch", 0)
         self.shape_mat = torch.tensor([m for _, _, m in shapes], dtype=torch.long, device=self.dev)
         self._build_materials([m for _, m in materials])
         self._build_geometry()
@@ -462,9 +505,50 @@ class RasterScene:
         return chain
 
     # --- geometry ---
+    def _inst_matrix(self, inst) -> torch.Tensor:
+        """An instance's to_world now (4 x 4, on the GPU), read once per instance per refresh."""
+        sid = inst.id()
+        if sid not in self.inst_m:
+            m = np.array(self.mi.traverse(inst)["to_world"].matrix, dtype=np.float32).reshape(4, 4)
+            self.inst_m[sid] = torch.as_tensor(m, device=self.dev)
+        return self.inst_m[sid]
+
     def _buffers(self):
-        """Every kept mesh's positions (V x 3), as the scene holds them now."""
-        return [torch.from_dlpack(s.vertex_positions_buffer()).view(-1, 3) for s in self.shapes]
+        """Every kept mesh's positions (V x 3), as the scene holds them now (an instance's meshes placed by it)."""
+        out = []
+        for s, inst in zip(self.shapes, self.shape_inst):
+            p = torch.from_dlpack(s.vertex_positions_buffer()).view(-1, 3)
+            if inst is not None:
+                m = self._inst_matrix(inst)
+                p = p @ m[:3, :3].T + m[:3, 3]
+            out.append(p)
+        return out
+
+    def _normals(self, s, inst, n: int) -> torch.Tensor:
+        if not s.has_vertex_normals():
+            return torch.zeros((n, 3), device=self.dev)
+        v = torch.from_dlpack(s.vertex_normals_buffer()).view(-1, 3)
+        if inst is not None:
+            v = v @ torch.linalg.inv(self._inst_matrix(inst)[:3, :3])   # (M^-T v) as rows
+            v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        return v
+
+    def follow_moves(self) -> bool:
+        """Follow the bodies and pushed objects the scene moved since (Resident.geometry_epoch): positions and normals
+        read again, the lights' places and shadows made anew (the light probes stay). True if anything moved."""
+        epoch = getattr(self.resident, "geometry_epoch", 0)
+        if epoch == self.geometry_epoch:
+            return False
+        self.dr.eval()
+        self.dr.sync_thread()
+        self.inst_m = {}
+        pos = self._buffers()
+        self.pos_h[:, :3] = torch.cat(pos)
+        self.attr[:, :3] = torch.cat([self._normals(s, inst, p.shape[0]) for s, inst, p in zip(self.shapes, self.shape_inst, pos)])
+        self._chunk_boxes()
+        self._light_geometry()
+        self.geometry_epoch = epoch
+        return True
 
     def _build_geometry(self) -> None:
         dev = self.dev
@@ -473,8 +557,7 @@ class RasterScene:
         first = 0
         for i, (s, p) in enumerate(zip(self.shapes, pos)):
             n = p.shape[0]
-            normals.append(torch.from_dlpack(s.vertex_normals_buffer()).view(-1, 3) if s.has_vertex_normals()
-                           else torch.zeros((n, 3), device=dev))
+            normals.append(self._normals(s, self.shape_inst[i], n))
             uvs.append(torch.from_dlpack(s.vertex_texcoords_buffer()).view(-1, 2) if s.has_vertex_texcoords()
                        else torch.zeros((n, 2), device=dev))
             f = torch.from_dlpack(s.faces_buffer()).view(-1, 3).to(torch.int64)
