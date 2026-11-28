@@ -215,6 +215,7 @@ main .pane.drop { outline: 2px dashed var(--accent); outline-offset: -3px; }
   overflow: hidden; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; -webkit-user-drag: none; }
 .frame.paused { outline: 2px dashed var(--warn); outline-offset: -2px; }
+.fields[hidden], .frame .overlay[hidden] { display: none !important; }
 .frame .overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
 .frame.placing img { cursor: copy; }
 .place-hint { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); background: rgba(14, 19, 22, .82); color: var(--ink);
@@ -1609,7 +1610,7 @@ function startPlacing() {
 function stopPlacing() {
   placing = null;
   $("frame-a").classList.remove("placing");
-  $("place-a").hidden = true; $("place-hint").hidden = true;
+  $("place-a").setAttribute("hidden", ""); $("place-hint").hidden = true;   // (an <svg> has no .hidden property)
   robotNote("");
 }
 let placeTimer = null;
@@ -1629,7 +1630,7 @@ function showPlacePreview(m) {
   const col = m.ok ? "#4ade80" : "#ff6b6b";
   svg.setAttribute("viewBox", `0 0 ${S.width} ${S.height}`);
   svg.innerHTML = (m.edges || []).map(([x0, y0, x1, y1]) => `<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y1}" stroke="${col}" stroke-width="2" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`).join("");
-  svg.hidden = false;
+  svg.removeAttribute("hidden");
   h.classList.toggle("bad", !m.ok);
   h.textContent = m.ok ? `클릭: 여기에 놓기 · ${Math.round(m.yaw_deg)}° · 휠: 방향 · Esc: 취소` : `${m.why || "놓을 수 없는 곳"} · Esc: 취소`;
 }

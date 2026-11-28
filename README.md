@@ -178,7 +178,7 @@ Most of these are per-view settings: the API takes them in a view, `MatterSim` h
 
 **Polarization on or off** (the Render card's **편광** switch; a view's `mode`: `"polar"` or `"rgb"`). Off, the path tracer runs Mitsuba's plain `cuda_rgb` variant: no Stokes vectors, no Mueller matrices. Measured on CS02 at 512 x 384: a 16 spp pass takes 13 ms instead of 74 ms on the server, and the viewer reaches 1024 spp 0.46 s after a move instead of 2.9 s (first picture after 41 ms against 88 ms). That is the render server's own pace in both modes (64 passes of 16 spp: 0.42 s and 3.0 s): a pass thread only fetches a pass and adds it to the running sums, and one publisher thread makes the picture of the newest sums (the mean with fireflies held back, the denoiser, the polarization images, each pane's JPEG, the panes side by side), so passes never wait for a picture. Before that split the unpolarized mode took 1.3 s: the mean alone cost 71 ms a pass on the pass thread (now 8 to 15 ms, the same numbers to 1e-7: only the pixels whose brightest bucket is over four times their darkest get a median). The image is the polarized render's S0: over 512 spp the two agree to 1.6% in the mean (median of 8 x 8 blocks 0.983), with the same median noise per pass (0.41 of the mean) but more outliers (0.16% of a pass's pixels over ten times their mean against 0.02%), so a still image needs the firefly hold-back or the denoiser a little more. DoLP, AoLP, S1 and S2 are zero and their tabs are struck through. A robot's cameras follow the switch unless their sensor measures polarization (those always render polarized). Each mode is a resident scene of its own (loaded once, 10 s on CS02): the server needs both modes, `--modes polar,rgb`, and `--max-resident 2` keeps both loaded so the switch is instant afterwards. Both variants in one server process ran 60 alternating renders here without a fault (an older OptiX 7 build crashed on that: there, one server per mode); a pass right after a switch pays about 25 ms for the variant change.
 
-**Solid preview** (the Render card's **솔리드** button; a view's `"renderer": "solid"`). The structure of the scene and nothing else, as in Blender's Solid viewport: each surface in its material's colour (its texture at the mip its pixel footprint picks), lit by a studio light that follows the camera (a key light over the shoulder, a fill from the other side, a sky-and-ground hemisphere). No shadows, light probes, mirrors, glass or polarization; the viewer shows it at a fixed tone. It draws the raster preview's scene (`raster.RasterScene.render_solid`) and builds nothing more: the raster preview's light structures and its probe bake (39 s on PH40) are left out, and there is nothing to compile. On CS02 at 512 x 384 a frame takes 5.7 ms on the server and 10 ms for the round trip (the raster preview: 14.9 and 21.8 ms; the path tracer at 16 spp: 13 ms), and the viewer kept up with 59 moves a second while turning. The robot's bodies and pushed objects are not drawn, as in the raster preview.
+**Solid preview** (the Render card's **솔리드** button; a view's `"renderer": "solid"`). The structure of the scene and nothing else, as in Blender's Solid viewport: each surface in its material's colour (its texture at the mip its pixel footprint picks), lit by a studio light that follows the camera (a key light over the shoulder, a fill from the other side, a sky-and-ground hemisphere). No shadows, light probes, mirrors, glass or polarization; the viewer shows it at a fixed tone. It draws the raster preview's scene (`raster.RasterScene.render_solid`) and builds nothing more: the raster preview's light structures and its probe bake (39 s on PH40) are left out, and there is nothing to compile. On CS02 at 512 x 384 a frame takes 5.7 ms on the server and 10 ms for the round trip (the raster preview: 14.9 and 21.8 ms; the path tracer at 16 spp: 13 ms), and the viewer kept up with 59 moves a second while turning. The robot's bodies, its pushed objects and instanced shapes are drawn (as in the raster preview), placed as the view has them.
 
 [![Solid preview: walking through REF_CS02 in the structural view](docs/media/solid_preview.gif)](docs/media/solid_preview.mp4)
 
@@ -205,6 +205,34 @@ The viewer (November 2026) going through the filters, the mouse on one object ea
 On the **픽셀 값** tab, the pixel under the mouse in a solid frame tells what it is (`GET /v1/pick` on the render server): the object, physics.json's decision and reason, the part and the mesh it was merged into, the BSDF's leaves (kind, ior or eta and k, alpha, the blend weight), alpha and metallic weight at that pixel, and the side seen. The loaded meshes no longer say which object a triangle came from (the pack is merged, and Mitsuba's loader merges further), so the first object filter or pick of a scene reads the scene object by object (`physics_objects.read_parts`), keeps each triangle's centroid and matches the loaded triangles to them (CS02: 445,856 of 445,864 triangles matched to 4,960 parts and 322 objects in 2.5 s; the index is cached in `~/.cache/opticalnav_sim/solid_index`). A filter costs nothing measurable: 7.4 ms a frame on the server at 512 x 384 with or without one. In CS02 the `facing` filter shows many objects (carton labels, instrument cases, the window) seen from the back of their normals; their BSDFs are two-sided, so the path tracer draws them right.
 
 ![The solid preview of REF_CS02 under each filter: none, movable, bsdf, roughness, metallic, facing, lights, objects, materials](docs/media/solid_filters.jpg)
+
+**Solid preview while a scene prepares.** Until the engine has a frame of the camera (a scene's first start: merging its meshes, finding its movable objects, loading, recording its frozen render: minutes; a robot loaded into it; a pass slower than a second), the viewer draws the camera in solid itself, from the scene's files (`opticalnav_sim/pack_solid.py`: the converted XML and its meshes, a colour per material, nvdiffrast in the viewer's own process), and shows it with a badge of what the server is doing ("솔리드 미리보기 · Mitsuba 준비 중 (freeze 기록 66%)"). One walks the scene meanwhile; the engine's first frame takes the screen back. Drawn in the viewer, not the render server: a freeze recording holds the server's Python lock for minutes. PH33: 1.5 s to read, 6 ms a frame.
+
+![The solid preview in PH33 while the render server records its frozen render for the scene with the robot](docs/media/viewer_2026-11-28/06_solid_preview_while_freeze_records.jpg)
+
+**Click to select** (Isaac-style; the **선택** tab). A left click on the editor view selects what is there, in any engine and while the scene still loads (the same scene files: each pixel's triangle): the object is outlined in orange on every frame after, and the tab says what it is (its object and physics.json's decision with the reason, the part, mesh and file, the material and its BSDF layers, the colour, the point clicked, the normal, the mesh's size). Clicking the robot outlines its box and lists its configuration, place, heading and sensors. Esc or the background clears it. Under an object, **고정 / 밂 / 움직임 / 규칙대로** set its decision by hand (kept in the scene's `physics_overrides.json` and logged, with the object's features and the rules' verdict, to the pack's `physics_labels.jsonl`); **적용** finds the movable objects and merges the scene again and reloads it (see [docs/physics_rules_review.md](docs/physics_rules_review.md)).
+
+![A click on a sign in PH33: its outline and the selection tab](docs/media/viewer_2026-11-28/02_click_select_object_info.jpg)
+
+![A click on the robot: its box and what it is](docs/media/viewer_2026-11-28/03_click_select_robot.jpg)
+
+**Placing the robot** (the robot tab: choose a robot, or **옮기기** for the one standing). The robot's box (its footprint, its height with what it carries, an arrow for its heading) follows the mouse on the floor under it, green on a floor and red on a wall; the wheel turns it 15 degrees a notch, a click puts it there (nudged at most 0.75 m to where its footprint is clear), Esc cancels.
+
+| on the floor | on a wall |
+|---|---|
+| ![The robot's box on the corridor floor](docs/media/viewer_2026-11-28/04_place_robot_floor_ok.jpg) | ![The robot's box over a wall, refused](docs/media/viewer_2026-11-28/05_place_robot_wall_refused.jpg) |
+
+**Exposure per camera** (the View · Exposure card's **카메라**). Each camera its own: the editor camera's tone fixed per scene, or **자동 노출** on (it follows the frames, a third of the way in stops each frame: a turn into a dark corner brightens over a few frames, nothing flickers); a robot camera's sensor-model auto exposure with a compensation (**노출 보정**, the meter's target), or off: its exposure time and gain held, set by hand. **지금 맞춤** / **자동으로** fit once and go back to auto.
+
+**LiDAR views.** An Ouster's sub viewer has buttons for what its picture shows: **3D 점** (the point cloud from behind and above), **깊이** (the range image), **강도** (reflectivity), **전체** (all three).
+
+![The HDR camera at +1 EV under its own auto exposure, beside the Ouster's 3D points](docs/media/viewer_2026-11-28/10_exposure_per_camera_hdr_plus1ev_lidar_3d.jpg)
+
+| 전체 | 깊이 | 강도 |
+|---|---|---|
+| ![](docs/media/viewer_2026-11-28/07_lidar_view_all.jpg) | ![](docs/media/viewer_2026-11-28/08_lidar_view_depth.jpg) | ![](docs/media/viewer_2026-11-28/09_lidar_view_intensity.jpg) |
+
+![The viewer in PH33 with the robot placed: the editor view (Mitsuba), the robot's HDR and 12-bit cameras and the Ouster OS1-128 in 3D](docs/media/viewer_2026-11-28/01_overview_robot_lidar_cameras.jpg)
 
 **Editor camera** (에디터 카메라 tab: the viewer's own camera; a robot's cameras are its configuration's). The flash switch, its size and band, the walking speed, and the mount editor (`setCameraOffset`, `setFlashOffset`). A three.js view of the observer (a disc and arrow on the floor), the camera and its frustum, and the flash rectangle. Wireframes mark the dataset positions. The axes follow Blender: X right, Y forward, Z up.
 
@@ -768,15 +796,21 @@ A converted `.blend` names every object a shape of its own: `REF_CS02` has 4,964
 
 **Movable objects** (`tools/physics_tag.py`, run just before the merge). For every object (its parts grouped by the converter's `object` note, the parent at the top of its Blender hierarchy, or, in older scenes, by asset prefix, label and contact) the tool estimates a mass (closed-mesh volume times a density by material, or shell area times a wall thickness), finds what holds it up (the floor, another object, a wall) and decides:
 
-* fixed: structure (walls, doors, rails, pipes), over 2.5 m or 2 m² of floor, thinner than 3 mm or lighter than 50 g, touching the ceiling, over 50 kg, nothing under it, fixed furniture (shelves, racks, benches, trees);
-* movable: a movable word (chair, stool, cart, box, case, bin, cone, ...) on something; else free-standing on the floor, under 1.2 m tall, 0.6 m² and 30 kg; else on something and under 10 kg and 0.6 m;
-* robot-reachable: movable with its bottom within 0.4 m of the floor.
+* fixed: structure (walls, doors, rails, pipes), over 2.5 m or 2 m² of floor, thinner than 3 mm or lighter than 30 g, a marking on the floor (under 2 cm), touching the ceiling, over 50 kg, nothing under it, carried by structure over 2 m (a downlight on a duct), fixed furniture (shelves, racks, benches, light fixtures), a plant without a pot;
+* movable: a movable word (chair, stool, cart, box, case, bin, cone, ...; compounds first: hand truck, platform cart, step ladder) on something; else free-standing on the floor, under 1.2 m tall (2.2 m under 10 kg), 0.6 m² (1.5 m² when under 0.6 m tall) and 30 kg, off the walls (unless under 10 kg); else on something and under 10 kg and 0.6 m;
+* robot-reachable: movable, standing on the floor (not on a rack's bottom shelf), its bottom within 0.4 m of it.
+
+Ground is a ground word or a part with over 20 m² of upward faces (a street merged with its buildings, named by its material). Every object of 10 scenes was reviewed by eye and the rules redesigned on it: 94.9 % -> 99.5 % agreement, every pushable object found ([docs/physics_rules_review.md](docs/physics_rules_review.md); `tools/physics_review.py` draws the contact sheets, `tools/physics_eval.py` scores against `docs/physics_truth/`).
 
 The decisions go to the scene's `physics.json` (each object's mass, centre of mass, bounding box, a convex hull of up to 64 vertices, friction, and the reason in words). On CS02: 322 objects, 79 movable, 13 at the robot's height (the service cart, a stool, cases, bins and binders on the rack's bottom shelf); on a cafe scene 30 of 127 (chairs, tables, stools); on a cafeteria 80 chairs. The merge keeps the reachable ones apart, and what lies on them (`physics.keep` in `scene.json`: `reachable`, `movable` or `none`; `physics.dynamic`: regexes of objects to treat as movable). Each kept object becomes one mesh per material (`dyn_<object>_<n>`) with a vertex attribute (`vertex_body`) that keeps Mitsuba's loader from merging it again. The viewer's scene tab lists them, the reachable first, with mass and reason, and the map marks them.
 
 ![The scene tab's movable objects of REF_CS02 and their footprints on the map (orange: at the robot's height)](docs/media/viewer_movable.jpg)
 
-Limits: masses are estimates; a scene modelled as one mesh across the room (PH27's bins, ph19's fire extinguishers) cannot be split into objects; tools that edit a pack's XML by object id must run before merging or after `--unmerge`.
+A shape holding several of one movable thing (PH33's bin asset, modelled as two cans) is split into its pieces, each its own body:
+
+![PH33: one of the two bins of one mesh pushed 0.6 m, its twin left where it was](docs/media/viewer_2026-11-28/11_split_bins_push_one.jpg)
+
+Limits: masses are estimates; a material's mesh across the room (ph19's fire extinguisher plates) is not split (nothing says what its pieces are); tools that edit a pack's XML by object id must run before merging or after `--unmerge`.
 
 ### Sharing packs
 
@@ -852,6 +886,7 @@ The render server can serve a `.blend` without a hand-made pack: it converts the
 ```bash
 python -m opticalnav_sim.server --blend /path/a.blend --blend /path/b.blend            # converted at start (seconds to minutes the first time)
 python -m opticalnav_sim.server --blend-tsv promoted_ref_scenes.tsv                    # offered in the viewer's scene list, converted when chosen
+python -m opticalnav_sim.server --blend-library /bean/infinigen_invers3r                # a scene library (ref/, cs/, old/ + MANIFEST moves): copies opened, never the originals
 python -m opticalnav_sim.server --blend-dir /path/to/blends                            # the same for every *.blend in a folder
 export OPTICALNAV_BLEND_TSV=/bean/.../promoted_ref_scenes_20261102.tsv                  # default list (also OPTICALNAV_BLEND_DIRS, ':'-separated)
 ```
