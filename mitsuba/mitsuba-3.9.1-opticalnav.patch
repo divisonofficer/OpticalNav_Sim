@@ -1075,10 +1075,10 @@ index bc145f5..2f73110 100644
                  /// Note: this assumes that sensor used sample_rgb_spectrum() to generate 'ray.wavelengths'
 diff --git a/src/integrators/path_nocaustics.cpp b/src/integrators/path_nocaustics.cpp
 new file mode 100755
-index 0000000..d666365
+index 0000000..7efffc7
 --- /dev/null
 +++ b/src/integrators/path_nocaustics.cpp
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,803 @@
 +#include <mitsuba/core/ray.h>
 +#include <mitsuba/core/properties.h>
 +#include <mitsuba/core/string.h>
@@ -1190,6 +1190,84 @@ index 0000000..d666365
 +            Throw("path_nocaustics: 'assist_mode' must be all, only, exclude or split (got \"%s\")", mode);
 +        if (m_assist_mode != AssistMode::All && m_assist.empty())
 +            Throw("path_nocaustics: 'assist_mode' %s needs an 'assist' shape id prefix", mode);
++    }
++
++    /* Spatial light selection (set by the render server, Resident.light_grid): the scene's box cut into cells of
++       ``grid_meta`` [lo x, lo y, lo z, cell, nx, ny, nz, emitters]; each cell an emitter pmf over the scene's
++       emitters (``grid_pdf``, cells x emitters) and its alias table (``grid_prob``, ``grid_alias``): a light sample
++       at a point picks among the lights that matter there (power over distance squared), as Cycles' light tree
++       does, instead of the scene's one pmf for the whole building. ``grid_lut``: an emitter's registry id -> its index
++       in scene->emitters_dr(), for the pmf of a light a BSDF sample hits (MIS). Unset (empty arrays): the scene's own
++       emitter sampling. Unbiased either way: the pmf is the one sampled. */
++    UInt32 grid_cell(const Point3f &p) const {
++        Vector3f q = (p - m_grid_lo) / m_grid_cellsize;
++        Int32 ix = dr::clip(dr::floor2int<Int32>(q.x()), 0, m_grid_dims.x() - 1),
++              iy = dr::clip(dr::floor2int<Int32>(q.y()), 0, m_grid_dims.y() - 1),
++              iz = dr::clip(dr::floor2int<Int32>(q.z()), 0, m_grid_dims.z() - 1);
++        return UInt32((iz * m_grid_dims.y() + iy) * m_grid_dims.x() + ix);
++    }
++
++    Float grid_pmf(const Point3f &p, const EmitterPtr &emitter, Mask active) const {
++        if constexpr (!dr::is_jit_v<Float>) {   // scalar variants: no grid (m_grid_on stays false)
++            (void) p; (void) emitter; (void) active;
++            return 0.f;
++        } else {
++        UInt32 id = dr::reinterpret_array<UInt32>(emitter);
++        UInt32 index = dr::gather<UInt32>(m_grid_lut, id, active && (id < (uint32_t) dr::width(m_grid_lut)));
++        return dr::gather<Float>(m_grid_pdf, grid_cell(p) * m_grid_n + index, active);
++        }
++    }
++
++    std::pair<DirectionSample3f, Spectrum> grid_sample_emitter(const Scene *scene, const SurfaceInteraction3f &si,
++                                                               const Point2f &sample_, bool test_visibility,
++                                                               Mask active) const {
++        if constexpr (!dr::is_jit_v<Float>) {   // scalar variants: the scene's own sampling (m_grid_on stays false)
++            return scene->sample_emitter_direction(si, sample_, test_visibility, active);
++        } else {
++        Point2f sample(sample_);
++        UInt32 cell = grid_cell(si.p);
++        Float u = sample.x() * (ScalarFloat) m_grid_n;
++        UInt32 i0 = dr::minimum(dr::floor2int<UInt32>(u), (uint32_t) (m_grid_n - 1));
++        Float frac = u - Float(i0);
++        UInt32 slot = cell * m_grid_n + i0;
++        Float prob = dr::gather<Float>(m_grid_prob, slot, active);
++        Mask keep = frac < prob;
++        UInt32 index = dr::select(keep, i0, dr::gather<UInt32>(m_grid_alias, slot, active));
++        // the sample's first coordinate reused, as Scene::sample_emitter does
++        sample.x() = dr::select(keep, frac / prob, (frac - prob) / (1.f - prob));
++        sample.x() = dr::clip(sample.x(), 0.f, dr::OneMinusEpsilon<Float>);
++        Float pmf = dr::gather<Float>(m_grid_pdf, cell * m_grid_n + index, active);
++        EmitterPtr emitter = dr::gather<EmitterPtr>(scene->emitters_dr(), index, active);
++        auto [ds, spec] = emitter->sample_direction(si, sample, active);
++        ds.pdf *= pmf;
++        spec *= dr::select(pmf > 0.f, dr::rcp(pmf), 0.f);
++        active &= (ds.pdf != 0.f);
++        if (test_visibility && dr::any_or<true>(active)) {
++            Mask occluded = scene->ray_test(si.spawn_ray_to(ds.p), active);
++            dr::masked(spec, occluded) = 0.f;
++            dr::masked(ds.pdf, occluded) = 0.f;
++        }
++        return { ds, spec };
++        }
++    }
++
++    void traverse(TraversalCallback *cb) override {
++        cb->put("grid_meta", m_grid_meta, ParamFlags::NonDifferentiable);
++        cb->put("grid_pdf", m_grid_pdf, ParamFlags::NonDifferentiable);
++        cb->put("grid_prob", m_grid_prob, ParamFlags::NonDifferentiable);
++        cb->put("grid_alias", m_grid_alias, ParamFlags::NonDifferentiable);
++        cb->put("grid_lut", m_grid_lut, ParamFlags::NonDifferentiable);
++    }
++
++    void parameters_changed(const std::vector<std::string> & /*keys*/) override {
++        m_grid_on = dr::is_jit_v<Float> && dr::width(m_grid_meta) >= 8 && dr::width(m_grid_pdf) > 0;
++        if (m_grid_on) {
++            auto meta = [](const Float &a, size_t i) { return (ScalarFloat) dr::slice(a, i); };
++            m_grid_lo = ScalarPoint3f(meta(m_grid_meta, 0), meta(m_grid_meta, 1), meta(m_grid_meta, 2));
++            m_grid_cellsize = meta(m_grid_meta, 3);
++            m_grid_dims = ScalarVector3i((int) meta(m_grid_meta, 4), (int) meta(m_grid_meta, 5), (int) meta(m_grid_meta, 6));
++            m_grid_n = (uint32_t) meta(m_grid_meta, 7);
++        }
 +    }
 +
 +    /* 'unpolarized' (a polarized variant): the path carries the light's intensity alone (UnpolarizedSpectrum: R, G, B
@@ -1503,6 +1581,9 @@ index 0000000..d666365
 +                    if (m_assist_mode == AssistMode::Only)
 +                        em_pdf = assist_emitter->pdf_direction(ls.prev_si, ds,
 +                                                               !ls.prev_bsdf_delta && counted);
++                    else if (m_grid_on)
++                        em_pdf = ds.emitter->pdf_direction(ls.prev_si, ds, !ls.prev_bsdf_delta) *
++                                 grid_pmf(ls.prev_si.p, ds.emitter, !ls.prev_bsdf_delta);
 +                    else
 +                        em_pdf = scene->pdf_emitter_direction(ls.prev_si, ds,
 +                                                              !ls.prev_bsdf_delta);
@@ -1558,8 +1639,9 @@ index 0000000..d666365
 +                    }
 +                } else {
 +                    // with hidden shapes in the scene the visibility test is ours (shadow_blocked)
-+                    auto [ds_s, w_s] = scene->sample_emitter_direction(
-+                        si, ls.sampler->next_2d(), hidden_shapes.empty(), active_em);
++                    auto [ds_s, w_s] = m_grid_on
++                        ? grid_sample_emitter(scene, si, ls.sampler->next_2d(), hidden_shapes.empty(), active_em)
++                        : scene->sample_emitter_direction(si, ls.sampler->next_2d(), hidden_shapes.empty(), active_em);
 +                    ds = ds_s;
 +                    em_weight = lift<S>(w_s);
 +                    if (m_assist_mode == AssistMode::Exclude || m_assist_mode == AssistMode::Split)
@@ -1784,9 +1866,18 @@ index 0000000..d666365
 +    std::string m_assist;
 +    std::string m_hidden;
 +    std::string m_hidden_spec;
++    // spatial light selection (grid_sample_emitter); m_grid_on once the server set the tables
++    Float m_grid_meta, m_grid_pdf, m_grid_prob;
++    UInt32 m_grid_alias, m_grid_lut;
++    bool m_grid_on = false;
++    ScalarPoint3f m_grid_lo = ScalarPoint3f(0.f);
++    ScalarFloat m_grid_cellsize = 1.f;
++    ScalarVector3i m_grid_dims = ScalarVector3i(1);
++    uint32_t m_grid_n = 1;
 +    AssistMode m_assist_mode;
 +
 +    MI_DECLARE_CLASS(PathNoCausticsIntegrator)
++    MI_TRAVERSE_CB(Base, m_grid_meta, m_grid_pdf, m_grid_prob, m_grid_alias, m_grid_lut)
 +};
 +
 +MI_EXPORT_PLUGIN(PathNoCausticsIntegrator)

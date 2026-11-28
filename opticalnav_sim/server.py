@@ -363,6 +363,17 @@ def band_lights_text(text: str, classes: dict[str, str], groups: dict[str, str])
 
     text = re.sub(r'\n  <shape type="([a-z_]+)" id="([^"]+)">(.*?)\n  </shape>',
                   lambda m: shape(m) if '<emitter type="' in m.group(3) else m.group(0), text, flags=re.S)
+
+    def delta(m):   # a point or spot light (point_light_xml): its intensity, as a shape's radiance
+        sid, body = m.group(2), m.group(3)
+        group = groups.get(sid, "fixture")
+        body = re.sub(r'<rgb name="intensity" value="([^"]*)"\s*/>',
+                      lambda r: (f'<texture name="intensity" type="bandscale"><rgb name="nested" value="{r.group(1)}" />'
+                                 f'<ref name="rgb" id="light_rgb_{group}" /><ref name="nir" id="light_nir_{group}_'
+                                 f'{classes.get(sid, "led")}" />{band}</texture>'), body)
+        return f'\n  <emitter type="{m.group(1)}" id="{sid}">{body}\n  </emitter>'
+
+    text = DELTA_LIGHT.sub(delta, text)
     opening = re.search(r"<scene\b[^>]*>", text)
     declare = "".join(f'\n  <texture type="uniform" id="{u}"><float name="value" value="{uniform_tag(u)}" />'
                       f'</texture>' for u in BAND_UNIFORMS if u != NIR_BAND_ID)
@@ -869,6 +880,82 @@ def lamp_lights_text(text: str, mesh_info=None, lit: bool = True, mesh_bounds=No
     return text, added
 
 
+POINT_EMITTERS = os.environ.get("OPTICALNAV_POINT_EMITTERS", "1") != "0"  # 0: spots as the earlier disk in a tube
+SPOT_RADIUS_M = 0.25    # a spot this soft or harder is a point spot (its radius only softens shadows; PH33: 0.1 m)
+POINT_SPHERE_M = 0.01   # a point light with a larger radius glows from a sphere of it (Cycles 4's sphere light)
+DELTA_LIGHT = re.compile(r'\n  <emitter type="(spot|point)" id="([^"]+)">(.*?)\n  </emitter>', re.S)
+
+
+def _light_frame(info: dict) -> np.ndarray | None:
+    """A Blender light's axes in the scene's frame (columns: its x, y and the way it shines, Blender's -z), from
+    metadata.light.basis (tools/blend_to_pack.py, the scene's frame) or its direction alone (plan frame: x, y, up)."""
+    if info.get("basis"):
+        b = np.asarray(info["basis"], float).reshape(3, 3)
+        x, y, z = (b[:, k] / max(float(np.linalg.norm(b[:, k])), 1e-9) for k in range(3))
+        return np.stack([x, y, -z], 1)
+    d = info.get("direction")
+    if not d or len(d) != 3:
+        return None
+    s = np.array([d[0], d[2], d[1]], float)
+    s /= max(float(np.linalg.norm(s)), 1e-9)
+    x = np.array([1.0, 0.0, 0.0]) - s[0] * s
+    if np.linalg.norm(x) < 1e-3:
+        x = np.array([0.0, 0.0, 1.0]) - s[2] * s
+    x /= np.linalg.norm(x)
+    return np.stack([x, np.cross(s, x), s], 1)
+
+
+def area_rotation_xml(info: dict) -> str | None:
+    """The rotation that turns a rectangle or disk (it shines along its +z) to shine the light's way, as a to_world
+    ``<matrix>``; None when it shines straight down with no basis known (the converter's ``rotate x 90`` holds)."""
+    f = _light_frame(info)
+    if f is None or (not info.get("basis") and f[1, 2] < -0.999):
+        return None
+    x, s = f[:, 0], f[:, 2]
+    y = np.cross(s, x)   # right-handed with x and the normal s
+    m = np.eye(4)
+    m[:3, 0], m[:3, 1], m[:3, 2] = x, y, s
+    return '<matrix value="' + " ".join(f"{v:.6f}" for v in m.ravel()) + '" />'
+
+
+def spot_beam_deg(cone_deg: float, blend: float) -> float:
+    """Mitsuba's spot beam_width for Blender's spot_size and spot_blend: Cycles 4 eases in over the inner
+    ``blend`` of the cone's (1 - cos) range (a smoothstep); Mitsuba ramps linearly in angle from beam_width to
+    cutoff_angle. The ramp starts where Cycles' smoothstep reaches full, so the beam's edge spans the same angles."""
+    half = math.radians(cone_deg / 2.0)
+    c = math.cos(half) + (1.0 - math.cos(half)) * min(max(blend, 0.0), 1.0)
+    return max(min(math.degrees(math.acos(min(c, 1.0))), cone_deg / 2.0 - 1e-3), 0.0)
+
+
+def point_light_xml(sid: str, info: dict, intensity: float, colour) -> str:
+    """A Blender point or spot light as Mitsuba's own: ``point`` or ``spot`` (``intensity`` W/sr, times colour),
+    a top-level emitter whose id is the light's; a point light with a radius over POINT_SPHERE_M glows from a
+    sphere of that radius (radiance intensity / (pi r^2): a sphere's intensity is its radiance x pi r^2)."""
+    p = info["position"]
+    c = (float(p[0]), float(p[2]), float(p[1]))   # plan (x, y, up) -> the scene's (x, up, y)
+    r = float(info.get("radius_m") or 0.0)
+    rgb_ = " ".join(f"{intensity * float(v):.5f}" for v in colour)
+    if info.get("type") == "POINT" and r > POINT_SPHERE_M:
+        rad = " ".join(f"{intensity * float(v) / (math.pi * r * r):.5f}" for v in colour)
+        return (f'\n  <shape type="sphere" id="{sid}">\n    <point name="center" x="{c[0]:.6f}" y="{c[1]:.6f}" z="{c[2]:.6f}" />'
+                f'\n    <float name="radius" value="{r:.6f}" />\n    <bsdf type="diffuse" />'
+                f'\n    <emitter type="area">\n      <rgb name="radiance" value="{rad}" />\n    </emitter>\n  </shape>')
+    if info.get("type") == "POINT":
+        return (f'\n  <emitter type="point" id="{sid}">\n    <point name="position" x="{c[0]:.6f}" y="{c[1]:.6f}" z="{c[2]:.6f}" />'
+                f'\n    <rgb name="intensity" value="{rgb_}" />\n  </emitter>')
+    f = _light_frame(info)
+    t = (c[0] + f[0, 2], c[1] + f[1, 2], c[2] + f[2, 2])
+    up = f[:, 1] if abs(float(f[1, 2])) > 0.99 else np.array([0.0, 1.0, 0.0])
+    cone = float(info["spot_size_deg"])
+    return (f'\n  <emitter type="spot" id="{sid}">\n    <transform name="to_world">'
+            f'\n      <lookat origin="{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}" target="{t[0]:.6f}, {t[1]:.6f}, {t[2]:.6f}"'
+            f' up="{up[0]:.6f}, {up[1]:.6f}, {up[2]:.6f}" />\n    </transform>'
+            f'\n    <rgb name="intensity" value="{rgb_}" />'
+            f'\n    <float name="cutoff_angle" value="{min(cone / 2.0, 90.0):.4f}" />'
+            f'\n    <float name="beam_width" value="{spot_beam_deg(min(cone, 180.0), float(info.get("spot_blend") or 0.0)):.4f}" />'
+            f'\n  </emitter>')
+
+
 def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0) -> str:
     """The importer's light boxes that no lamp took over (``light_*`` shapes with an area emitter: a corridor's ceiling
     panels ``light_0_al``, say) at Blender's power as well: radiance = energy / (pi^2 x emitting area), times the
@@ -882,6 +969,7 @@ def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0)
     meta = {n["id"]: ((n.get("metadata") or {}).get("light") or {}) for n in notes if n.get("id")}
     energy = {k: (v.get("energy"), v.get("type")) for k, v in meta.items()}
     housings: list[str] = []  # the tubes that cut a spot's emitter to its cone, added after the shapes
+    has_sun = '<emitter type="directional"' in text
 
     def shape(m):
         sid, body = m.group(2), m.group(3)
@@ -895,6 +983,8 @@ def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0)
         watts, kind = energy.get(sid, (None, None))
         if not watts:
             watts = (max(values) - 1.0) / IMPORTER_WATTS
+        if kind == "SUN" and has_sun:  # the converter's box at a sun (tools/blend_to_pack.py before it skipped them): the
+            return ""                  # scene's directional emitter is the sun, the box was a glowing square besides
         if watts <= 0 or kind == "SUN":
             return m.group(0)
         sx, sy = 2 * float(sc.group(1)), 2 * float(sc.group(2))
@@ -903,6 +993,14 @@ def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0)
         size = info.get("area_size_m")
         cone = info.get("spot_size_deg")
         pos = info.get("position")
+        colour = np.asarray(info.get("color") or values, float)[:3]
+        colour = colour if info.get("color") else colour / max(float(colour.max()), 1e-9)
+        if POINT_EMITTERS and pos and len(pos) == 3 and (
+                (info.get("type") == "SPOT" and cone and info.get("direction") and float(info.get("radius_m") or 0.0) <= SPOT_RADIUS_M)
+                or info.get("type") == "POINT"):
+            # Blender's own light at its intensity, energy / 4 pi W/sr (watt_gain pi on energy / 4 pi^2): a spot as
+            # Mitsuba's ``spot``, a point as ``point`` or, with a radius, a glowing sphere (point_light_xml)
+            return point_light_xml(sid, info, float(watts) * watt_gain / (4.0 * math.pi ** 2), colour)
         if info.get("type") == "SPOT" and cone and 5.0 <= float(cone) < 170.0 and pos and len(pos) == 3 and info.get("direction"):
             # a spot: a small disk at the light's place facing its direction, inside an absorbing tube as long as the
             # cone needs (the tube's mouth cuts the disk's Lambertian emission to the spot's cone, as the recess of a
@@ -921,7 +1019,6 @@ def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0)
                 tilt = f'\n      <rotate x="{axis[0]:.6f}" y="{axis[1]:.6f}" z="{axis[2]:.6f}" angle="{angle:.4f}" />'
             c = [float(pos[0]), float(pos[2]), float(pos[1])]
             e = [c[i] + length * d[i] for i in range(3)]
-            colour = np.asarray(values) / max(max(values), 1e-9)
             level = float(watts) * watt_gain / (4.0 * math.pi ** 2 * math.pi * r * r)
             new = " ".join(f"{level * x:.4f}" for x in colour)
             housings.append(
@@ -945,6 +1042,9 @@ def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0)
                 area = 4 * rx * ry
             shape_text = shape_text.replace(f'<shape type="{m.group(1)}"', f'<shape type="{kind_of_shape}"', 1)
             shape_text = shape_text.replace(sc.group(0), f'<scale x="{rx:.6f}" y="{ry:.6f}" />', 1)
+            turn = area_rotation_xml(info)  # facing the light's own way (a wall washer, a tilted panel), not the floor
+            if turn:
+                shape_text = shape_text.replace('<rotate x="1" angle="90" />', turn, 1)
             pos = info.get("position")
             if pos and len(pos) == 3:  # plan frame (x, y, up) -> the scene's height
                 shape_text = re.sub(r'(<translate x="[-\d.]+" y=")[-\d.]+(")', lambda t: f"{t.group(1)}{float(pos[2]):.6f}{t.group(2)}", shape_text, count=1)
@@ -953,7 +1053,6 @@ def boxes_at_blender_power(text: str, notes: list[dict], watt_gain: float = 1.0)
             area = 2 * (sx * sy + sx * sz + sy * sz)
         else:
             area = sx * sy
-        colour = np.asarray(values) / max(max(values), 1e-9)
         level = watts * watt_gain / ((4.0 if kind == "SPOT" or "_track_" in sid else 1.0) * math.pi ** 2 * max(area, 1e-6))
         new = " ".join(f"{level * c:.4f}" for c in colour)
         return shape_text.replace(rad.group(0), rad.group(1) + new + rad.group(3), 1)
@@ -1051,6 +1150,11 @@ def gpu_memory() -> list[dict]:
     return rows
 
 
+def light_of_key(key: str) -> str:
+    """The light's id in a radiance (``<id>.emitter.radiance...``) or point light's (``<id>.intensity...``) parameter key."""
+    return key.split(".emitter.radiance")[0].split(".intensity.")[0]
+
+
 def emitter_radiance(text: str) -> dict[str, float]:
     """Shape id -> mean radiance of its area emitter, as the scene file gives it."""
     out = {}
@@ -1061,6 +1165,251 @@ def emitter_radiance(text: str) -> dict[str, float]:
             with contextlib.suppress(ValueError):
                 out[m.group(1)] = float(np.mean([float(v) for v in re.split(r"[ ,]+", r.group(1).strip())]))
     return out
+
+
+# Large light meshes cut into pieces (split_emitter_meshes) and lights weighted by their distance from the camera
+# (Resident.aim_emitter_weights): PH33's light is 58 % three LED meshes spanning the building (27 x 26 m); one emitter
+# each, a light sample went to a strip in another corridor most of the time. Measured on PH33 (16 spp, relative MSE
+# against 4096 spp): 1.37 -> 0.81, the same mean (unbiased: only the choice of light changes).
+SPLIT_EMITTERS = os.environ.get("OPTICALNAV_SPLIT_EMITTERS", "1") != "0"
+VIEW_WEIGHTS = os.environ.get("OPTICALNAV_VIEW_EMITTER_WEIGHTS", "1") != "0"
+SPLIT_MIN_M = 2.0      # an emitting mesh whose box diagonal is longer than this is cut ...
+SPLIT_CELL_M = 1.0     # ... into pieces of a cell this big (its triangles first cut to edges this long)
+REWEIGHT_MOVE_M = 1.0  # the camera this far from where the weights were made: made again
+SPLIT_CACHE = Path(os.environ.get("OPTICALNAV_SIM_CACHE", Path.home() / ".cache" / "opticalnav_sim")) / "emitter_pieces"
+_EMITTING_PLY = re.compile(r'(\n[ \t]*<!--opticalnav-obj:(\{[^\n]*\})-->)?\n([ \t]*)<shape type="ply" id="([^"]+)">(.*?)\n\3</shape>', re.S)
+
+
+def _subdivide(v: np.ndarray, f: np.ndarray, edge: float) -> tuple[np.ndarray, np.ndarray]:
+    """Triangles halved along their longest edge until no edge is longer than ``edge``."""
+    v = [tuple(x) for x in v]
+    todo, done = [tuple(x) for x in f], []
+    while todo:
+        a, b, c = todo.pop()
+        P = (np.array(v[a]), np.array(v[b]), np.array(v[c]))
+        lens = (np.linalg.norm(P[1] - P[0]), np.linalg.norm(P[2] - P[1]), np.linalg.norm(P[0] - P[2]))
+        k = int(np.argmax(lens))
+        if lens[k] <= edge or len(done) + len(todo) > 200_000:
+            done.append((a, b, c))
+            continue
+        i, j, o = ((a, b, c), (b, c, a), (c, a, b))[k]
+        v.append(tuple((np.array(v[i]) + np.array(v[j])) / 2.0))
+        m = len(v) - 1
+        todo += [(i, m, o), (m, j, o)]
+    return np.array(v, np.float64), np.array(done, np.int64)
+
+
+def split_emitter_meshes(mi, text: str, base_dir: Path) -> tuple[str, int]:
+    """The scene text with every emitting PLY mesh longer than SPLIT_MIN_M (an LED strip along every corridor, a glow
+    under every wall) written as pieces of SPLIT_CELL_M, each an emitter of its own (``<id>__e<k>``, its note's id
+    changed, its geometry in world space): an emitter's own samples pick its triangles by area, wherever they are, so
+    one mesh across a building sent most light samples away; as pieces, the emitter weights (aim_emitter_weights) pick
+    the near ones. Only a constant radiance (a texture's uvs are not kept). The pieces are cached by the mesh file and
+    its transform. Returns (text, pieces written)."""
+    import hashlib
+    count = 0
+
+    def piece(m) -> str:
+        nonlocal count
+        note_raw, indent, sid, inner = m.group(2), m.group(3), m.group(4), m.group(5)
+        if "<emitter" not in inner or "<texture" in inner.split("<emitter", 1)[1] or "<shape" in inner:
+            return m.group(0)
+        file = re.search(r'<string name="filename" value="([^"]+)"', inner)
+        if file is None:
+            return m.group(0)
+        to_world = re.search(r'\s*<transform name="to_world"\s*>.*?</transform>', inner, re.S)
+        path = Path(file.group(1)) if file.group(1).startswith("/") else base_dir / file.group(1)
+        try:
+            key = hashlib.sha1(f"{path.stat().st_size}|{path.stat().st_mtime_ns}|{to_world.group(0) if to_world else ''}|"
+                               f"{SPLIT_MIN_M}|{SPLIT_CELL_M}".encode()).hexdigest()[:16]
+        except OSError:
+            return m.group(0)
+        folder = SPLIT_CACHE / f"{path.stem}_{key}"
+        listing = folder / "pieces.json"
+        if listing.is_file():
+            files = json.loads(listing.read_text())
+        else:
+            geo = f'<shape version="3.0.0" type="ply"><string name="filename" value="{path}" />' \
+                  f'{to_world.group(0) if to_world else ""}</shape>'
+            mesh = mi.load_string(geo)
+            ps = mi.traverse(mesh)
+            v = np.array(ps["vertex_positions"], np.float64).reshape(-1, 3)
+            f = np.array(ps["faces"], np.int64).reshape(-1, 3)
+            if not len(f) or np.linalg.norm(v.max(0) - v.min(0)) < SPLIT_MIN_M:
+                files = []
+            else:
+                v, f = _subdivide(v, f, SPLIT_CELL_M)
+                cell = np.floor(v[f].mean(1) / SPLIT_CELL_M).astype(np.int64)
+                _, group = np.unique(cell, axis=0, return_inverse=True)
+                folder.mkdir(parents=True, exist_ok=True)
+                files = []
+                for g in range(int(group.max()) + 1):
+                    tri = f[group.reshape(-1) == g]
+                    used, inv = np.unique(tri, return_inverse=True)
+                    pm = mi.Mesh(f"{sid}_{g}", len(used), len(tri))
+                    q = mi.traverse(pm)
+                    q["vertex_positions"] = type(q["vertex_positions"])(v[used].astype(np.float32).ravel())
+                    q["faces"] = type(q["faces"])(inv.reshape(-1).astype(np.uint32))
+                    q.update()
+                    out = folder / f"{g}.ply"
+                    pm.write_ply(str(out))
+                    files.append(str(out))
+            listing.parent.mkdir(parents=True, exist_ok=True)
+            listing.write_text(json.dumps(files))
+        if len(files) < 2:
+            return m.group(0)
+        rest = re.sub(r'\s*<string name="filename" value="[^"]+"\s*/>', "", inner, count=1)
+        if to_world:
+            rest = rest.replace(to_world.group(0), "", 1)
+        rest = re.sub(r'\s*<boolean name="face_normals"[^>]*/>', "", rest)
+        out = ""
+        for k, fp in enumerate(files):
+            pid = f"{sid}__e{k}"
+            note = ""
+            if note_raw:
+                with contextlib.suppress(ValueError):
+                    n = json.loads(note_raw)
+                    n["id"] = pid
+                    note = f"\n{indent}<!--opticalnav-obj:{json.dumps(n, separators=(',', ':'))}-->"
+            out += (f'{note}\n{indent}<shape type="ply" id="{pid}">\n{indent}    <string name="filename" value="{fp}" />'
+                    f'\n{indent}    <boolean name="face_normals" value="true" />{rest}\n{indent}</shape>')
+        count += len(files)
+        return out
+
+    return _EMITTING_PLY.sub(piece, text), count
+
+
+LIGHT_GRID = os.environ.get("OPTICALNAV_LIGHT_GRID", "1") != "0"
+GRID_CELL_M = 1.0        # the light grid's cells (larger in a large scene: at most GRID_MAX_CELLS)
+GRID_MAX_CELLS = 16384    # x the emitters x 12 bytes (PH33: 289 emitters, 3136 cells, 11 MB)
+GRID_MAX_ENTRIES = 8_000_000   # cells x emitters (96 MB of tables)
+GRID_PAD_M = 2.0
+GRID_WIDE_M = 25.0
+GRID_POINT_R = 0.05   # a point or spot light's size in the grid's weights
+GRID_MIX = 0.1           # each cell's pmf mixed with this share of the scene's own (no light starves behind a wall)
+GRID_SKY_M = 3.0         # the environment weighed as a light this far away
+
+
+def build_light_grid(mi, scene) -> dict | None:
+    """path_nocaustics' spatial light selection (its grid_* parameters; Mitsuba build b7 and later): the scene's box
+    in cells, each cell a pmf over the scene's emitters, their sampling weight (the power weights:
+    emitter_power_weights; the flash's 0.001) over the squared distance from the cell's centre (at least the light's
+    own size and half a cell), mixed with GRID_MIX of the plain weights, and its alias table. PH33: 16 spp light
+    samples land on the near pieces of the LED strips instead of the building's (prototype: relative MSE 1.37 ->
+    0.59 with the strips cut, the same mean). Returns the arrays by parameter name, or None (no or one emitter)."""
+    import drjit as dr
+    emitters = list(scene.emitters())
+    n = len(emitters)
+    if n < 2:
+        return None
+    shape_of = {id(s.emitter()): s for s in scene.shapes() if s.emitter() is not None}
+    bb = scene.bbox()
+    lo, hi = np.array(bb.min, np.float64).ravel(), np.array(bb.max, np.float64).ravel()
+    base, centre, radius = np.zeros(n), np.zeros((n, 3)), np.zeros(n)
+    spots: dict[int, tuple] = {}   # emitter index -> (axis, cutoff angle)
+    for i, e in enumerate(emitters):
+        base[i] = max(float(e.sampling_weight()), 0.0)
+        s = shape_of.get(id(e))
+        place = delta_light_place(mi, e) if s is None else None
+        if place is not None:   # a point or spot light: where it is; a spot lights only its cone (below)
+            centre[i], radius[i] = place[0], GRID_POINT_R
+            if place[1] is not None:
+                spots[i] = (place[1], math.radians(float(np.array(mi.traverse(e)["cutoff_angle"]).ravel()[0])))
+        elif s is None or "__light" in s.id():   # the environment, and a body's lamp (it moves): everywhere
+            centre[i], radius[i] = (lo + hi) / 2, -1.0
+        else:
+            b = s.bbox()
+            a, z = np.array(b.min, np.float64).ravel(), np.array(b.max, np.float64).ravel()
+            centre[i], radius[i] = (a + z) / 2, 0.5 * float(np.linalg.norm(z - a))
+    # the grid spans the lights (and GRID_PAD_M around them), not the scene: a ground plane or the robot's far props
+    # made PH33's cells 7.5 m; a point outside takes the nearest edge cell
+    radius[radius > GRID_WIDE_M] = -1.0   # a light wider than this (a sky dome): everywhere, as the environment
+    lit = radius >= 0
+    if lit.any():
+        lo = np.maximum(lo, (centre[lit] - radius[lit, None]).min(0) - GRID_PAD_M)
+        hi = np.minimum(hi, (centre[lit] + radius[lit, None]).max(0) + GRID_PAD_M)
+    ext = np.maximum(hi - lo, 1e-3)
+    cell = GRID_CELL_M
+    max_cells = max(64, min(GRID_MAX_CELLS, GRID_MAX_ENTRIES // n))
+    while np.prod(np.maximum(1, np.ceil(ext / cell))) > max_cells:
+        cell *= 1.25
+    dims = np.maximum(1, np.ceil(ext / cell)).astype(np.int64)
+    axes = [lo[a] + (np.arange(dims[a]) + 0.5) * cell for a in range(3)]
+    zz, yy, xx = np.meshgrid(axes[2], axes[1], axes[0], indexing="ij")
+    cells = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], -1)        # x fastest, as grid_cell
+    d2 = ((cells[:, None, :] - centre[None]) ** 2).sum(-1)
+    floor = np.where(radius < 0, GRID_SKY_M ** 2, radius ** 2 + (cell / 2) ** 2)
+    w = base[None] / np.where(radius[None] < 0, floor[None], np.maximum(d2, floor[None]))
+    for i, (axis, cut) in spots.items():   # a cell outside a spot's cone (widened by the cell's half diagonal): 2 %
+        v = cells - centre[i]
+        dist = np.maximum(np.linalg.norm(v, axis=1), 1e-6)
+        ang = np.arccos(np.clip(v @ axis / dist, -1.0, 1.0))
+        reach = cut + np.arcsin(np.minimum(1.0, 0.87 * cell / dist))
+        w[:, i] *= np.where(ang <= reach, 1.0, 0.02)
+    w = w / np.maximum(w.sum(1, keepdims=True), 1e-30)
+    w = (1.0 - GRID_MIX) * w + GRID_MIX * (base / max(base.sum(), 1e-30))[None]
+    pdf = w.astype(np.float64)
+    # alias tables (Vose), every cell at once: n rounds, each settling one small entry per cell
+    q = pdf * n
+    prob, alias = np.ones_like(q), np.tile(np.arange(n), (len(q), 1))
+    done = np.zeros_like(q, bool)
+    rows = np.arange(len(q))
+    for _ in range(n - 1):
+        qs = np.where(done, np.inf, q)
+        s_ = qs.argmin(1)
+        ql = np.where(done, -np.inf, q)
+        ql[rows, s_] = -np.inf
+        l_ = ql.argmax(1)
+        small = qs[rows, s_] < 1.0
+        r = rows[small]
+        prob[r, s_[small]] = q[r, s_[small]]
+        alias[r, s_[small]] = l_[small]
+        q[r, l_[small]] -= 1.0 - q[r, s_[small]]
+        done[r, s_[small]] = True
+        if not small.any():
+            break
+    ids = np.array(dr.reinterpret_array(mi.UInt32, scene.emitters_dr()), np.int64)
+    lut = np.zeros(int(ids.max()) + 1, np.uint32)
+    lut[ids] = np.arange(n, dtype=np.uint32)
+    meta = [lo[0], lo[1], lo[2], cell, dims[0], dims[1], dims[2], n]
+    return {"grid_meta": mi.Float(np.array(meta, np.float32)), "grid_pdf": mi.Float(pdf.astype(np.float32).ravel()),
+            "grid_prob": mi.Float(np.clip(prob, 0, 1).astype(np.float32).ravel()),
+            "grid_alias": mi.UInt32(alias.astype(np.uint32).ravel()), "grid_lut": mi.UInt32(lut),
+            "cells": int(len(cells)), "cell_m": float(cell), "emitters": n, "everywhere": int((radius < 0).sum()),
+            "span_m": [round(float(v), 1) for v in hi - lo]}
+
+
+EMITTER_PLACES: dict = {}   # id(scene) -> {weight key: (centre, radius)}
+EMITTER_POWER: dict = {}    # id(scene) -> {weight key: power}
+
+
+def view_emitter_weights(power: dict, places: dict, eye: np.ndarray) -> dict:
+    """Weights for an eye: each emitter's power over the square of its distance from the eye (at least its own radius
+    and 1 m), averaging 1 (the environment keeps its share) with no light under 5 % of the mean."""
+    raw = {}
+    for k, p in power.items():
+        c, r = places[k]
+        raw[k] = p / max(float(np.linalg.norm(c - eye)), r, 1.0) ** 2
+    mean = float(np.mean(list(raw.values())))
+    return {k: max(w, 0.05 * mean) / mean for k, w in raw.items()}
+
+
+def delta_light_place(mi, emitter):
+    """(position, shining axis, solid angle) of a point or spot light (point_light_xml), else None."""
+    kind = str(emitter).split("[", 1)[0].strip()
+    if kind not in ("PointLight", "SpotLight"):
+        return None
+    pe = mi.traverse(emitter)
+    if kind == "PointLight":
+        pos = np.array(pe["position"], np.float64).ravel()[:3] if "position" in pe else \
+            np.array(pe["to_world"].matrix, np.float64).reshape(4, 4)[:3, 3]
+        return pos, None, 4.0 * math.pi
+    m = np.array(pe["to_world"].matrix, np.float64).reshape(4, 4)
+    cut = math.radians(float(np.array(pe["cutoff_angle"]).ravel()[0]))
+    beam = math.radians(float(np.array(pe["beam_width"]).ravel()[0]))
+    # the ramp from beam to cutoff counted at half: about the falloff's mean there
+    half = 0.5 * (cut + beam)
+    return m[:3, 3], m[:3, 2] / max(float(np.linalg.norm(m[:3, 2])), 1e-12), 2.0 * math.pi * (1.0 - math.cos(half))
 
 
 def emitter_power_weights(mi, scene, radiance: dict[str, float]) -> dict[str, float]:
@@ -1080,10 +1429,24 @@ def emitter_power_weights(mi, scene, radiance: dict[str, float]) -> dict[str, fl
         key = f"{shape.id()}.emitter.sampling_weight"
         if key in params and float(params[key]) == 1.0:
             power[key] = radiance[shape.id()] * float(dr.ravel(shape.surface_area())[0])
+            b = shape.bbox()
+            lo, hi = np.array(b.min, np.float64).ravel(), np.array(b.max, np.float64).ravel()
+            EMITTER_PLACES.setdefault(id(scene), {})[key] = ((lo + hi) / 2.0, 0.5 * float(np.linalg.norm(hi - lo)))
+    for e in scene.emitters():   # point and spot lights (point_light_xml): power / pi = intensity x solid angle / pi
+        place = delta_light_place(mi, e)
+        key = f"{e.id()}.sampling_weight"
+        if place is None or key not in params or float(params[key]) != 1.0:
+            continue
+        pe = mi.traverse(e)
+        ik = next((k for k in ("intensity.nested.value", "intensity.value") if k in pe), None)
+        level = float(np.mean(np.array(pe[ik]).ravel()[:3])) if ik else 1.0
+        power[key] = level * place[2] / math.pi
+        EMITTER_PLACES.setdefault(id(scene), {})[key] = (place[0], 0.0)
     if len(power) < 2:
         return {}
     mean = float(np.mean(list(power.values())))
     weights = {k: max(p, 0.05 * mean) / mean for k, p in power.items()}
+    EMITTER_POWER[id(scene)] = power
     for k, w in weights.items():
         params[k] = w
     params.update()
@@ -1457,6 +1820,9 @@ class Resident:
             text = power_alpha_text(text, base_dir, alpha_power)
         if fill_gain != 1.0:  # the simulator's own scenes: the importer's room softboxes at a share of their radiance
             text = scale_fill_text(text, fill_gain)
+        self.emitter_pieces = 0
+        if SPLIT_EMITTERS:   # long light meshes as pieces (split_emitter_meshes): their light samples go to the near ones
+            text, self.emitter_pieces = split_emitter_meshes(mi, text, base_dir)
         radiance = emitter_radiance(text)  # before the band transforms wrap them
         self.classes = light_classes(text)  # shape id -> 'led' | 'incandescent'
         self.groups = light_groups(text)  # shape id -> 'fixture' | 'fill' | 'lamp' (lighting modes remove whole groups)
@@ -1491,6 +1857,12 @@ class Resident:
         # OPTICALNAV_UNIFORM_EMITTERS=1: Mitsuba's default, every emitter picked as often (for comparisons)
         self.emitter_weights = {} if os.environ.get("OPTICALNAV_UNIFORM_EMITTERS") else \
             emitter_power_weights(mi, self.scene, radiance)
+        self.weights_eye = None   # where the emitter weights were last aimed from (aim_emitter_weights)
+        self.light_grid = build_light_grid(mi, self.scene) if LIGHT_GRID and self.emitter_weights else None
+        if self.light_grid:
+            g = self.light_grid
+            print(f"[resident] light grid: {g['cells']} cells of {g['cell_m']:.2f} m over {g['emitters']} emitters "
+                  f"({g['everywhere']} everywhere), span {g['span_m']} m", flush=True)
         self.load_s = time.monotonic() - started
         self.stats = scene_stats(mi, self.scene, text)  # the viewer's scene tab
         self.envs = envs  # name -> environment image at ENV_RES (Renderer.env_image)
@@ -1561,10 +1933,14 @@ class Resident:
         params = mi.traverse(self.scene)
         # (type, loaded values) copied to the host: a reference to the parameter would alias the emitter's own
         # buffer, which the first write (lights off: 0) overwrites
-        emitted = (".emitter.radiance.value", ".emitter.radiance.nested.value")  # plain, or behind bandscale
+        # plain, or behind bandscale; a point or spot light (point_light_xml) has an intensity instead
+        self.delta_lights = {m.group(2) for m in DELTA_LIGHT.finditer(text)}
+        emitted = (".emitter.radiance.value", ".emitter.radiance.nested.value")
         self.radiance = {k: (type(params[k]), np.array(params[k], dtype=np.float64).ravel()) for k in keys
-                         if k.endswith(emitted) and not k.startswith(ASSIST_PREFIX)}
-        self.light_class = {k: self.classes.get(k.split(".emitter.radiance")[0], "led") for k in self.radiance}
+                         if (k.endswith(emitted) or (k.split(".intensity.")[0] in self.delta_lights and
+                                                     k.endswith((".intensity.value", ".intensity.nested.value"))))
+                         and not k.startswith(ASSIST_PREFIX)}
+        self.light_class = {k: self.classes.get(light_of_key(k), "led") for k in self.radiance}
         # per-band light levels as shared uniforms (band_lights_text): written once per change, read per ray
         tags = {uniform_tag(u): u for u in BAND_UNIFORMS}
         self.band_keys = {}
@@ -1663,7 +2039,26 @@ class Resident:
                 if spec["reference_axis"] is not None:
                     inner["reference_axis"] = self.mi.ScalarVector3f(*spec["reference_axis"])
             self.integrators[key] = self.mi.load_dict(inner)
+            self._give_light_grid(self.integrators[key])
         return self.integrators[key]
+
+    def _give_light_grid(self, integrator) -> bool:
+        """The scene's light grid (build_light_grid) into a path_nocaustics (inside its stokes wrapper or not); a build
+        without grid parameters (before b7) keeps the scene's own light sampling. True when given."""
+        grid = getattr(self, "light_grid", None)
+        if not grid:
+            return False
+        p = self.mi.traverse(integrator)
+        prefix = "integrator." if "integrator.grid_pdf" in p.keys() else ""
+        if prefix + "grid_pdf" not in p.keys():
+            return False
+        for k in ("grid_meta", "grid_pdf", "grid_prob", "grid_alias", "grid_lut"):
+            p[prefix + k] = grid[k]
+        p.update()
+        if not getattr(self, "grid_used", False):
+            print("[resident] light grid in the integrator: emitters picked per place", flush=True)
+        self.grid_used = True
+        return True
 
     def _key(self, spp: int, width: int, height: int, pass_name: str, dual, sky) -> tuple:
         """A recording's key: what is baked into it (spp, film size, the integrators and their settings)."""
@@ -1745,6 +2140,21 @@ class Resident:
                                                       look))
         return img
 
+    def aim_emitter_weights(self, eye: np.ndarray) -> bool:
+        """The emitters' sampling weights for a camera at ``eye`` (view_emitter_weights), made again when it has moved
+        REWEIGHT_MOVE_M since: the lights near the view get the light samples. True when written."""
+        power, places = EMITTER_POWER.get(id(self.scene)), EMITTER_PLACES.get(id(self.scene))
+        if not VIEW_WEIGHTS or not self.emitter_weights or not power or not places or getattr(self, "grid_used", False):
+            return False   # (the light grid picks per point: the camera's weights would only be what its base reads)
+        if self.weights_eye is not None and float(np.linalg.norm(eye - self.weights_eye)) < REWEIGHT_MOVE_M:
+            return False
+        p = self.mi.traverse(self.scene)
+        for k, w in view_emitter_weights(power, places, eye).items():
+            p[k] = w
+        p.update()
+        self.weights_eye = np.array(eye, np.float64)
+        return True
+
     def _set_camera(self, c2w: np.ndarray, width: int, height: int, hfov_deg: float, follow: bool,
                     look: Look = Look()) -> dict:
         """Write the camera, the assist shapes and the Look into the scene, unless already there."""
@@ -1754,6 +2164,7 @@ class Resident:
         if pose == self.pose:
             return {"traverse_s": 0.0, "update_s": 0.0}
         t0 = time.perf_counter()
+        self.aim_emitter_weights(np.asarray(c2w, np.float64)[:3, 3])   # the lights near this camera picked more often
         origin, target, up = frames.lookat(c2w)
         camera = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
         # The camera is always written through the sensor alone. Written through the whole scene's parameters
@@ -2222,9 +2633,11 @@ class Resident:
     def _emitter_level(self, key: str, look: Look) -> float:
         """An indoor emitter's radiance factor: 0 when removed; else 1 with bandscale lights (the shared
         uniforms carry the levels), or its level for this band without them."""
+        if light_of_key(key) in look.hidden and light_of_key(key) in self.delta_lights:
+            return 0.0   # a point or spot light: no shape to lift away, so dark
         if self.band_keys:  # levels and lighting modes are in the shared uniforms: the radiance stays as loaded
             return 1.0
-        if key.split(".emitter.radiance")[0] in look.hidden:
+        if light_of_key(key) in look.hidden:
             return 0.0
         return look.light_level(self.light_class[key])
 
@@ -2452,22 +2865,23 @@ class Resident:
         progress.FREEZE.begin(f"{self.name}|{self.mode}|{pass_name}|{spp}|{width}x{height}", calls=2, score=self.score)
         ok = False
         with ACTIVITY.doing(f"recording {spp} spp {width}x{height}" + ("" if pass_name == "own" else f" {pass_name}")):
+            # the integrators are inputs too: their light grid (light_grid) is arrays a recording must not capture
             if dual is not None:  # scene and dual sensor are inputs: slot poses change between frames
-                frozen = dr.freeze(lambda scene, sn, sd, n=spp, its=its: self.render_passes(scene, sn, its, n, sd),
+                frozen = dr.freeze(lambda scene, sn, it_, sd, n=spp: self.render_passes(scene, sn, it_, n, sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
-                self.frozen_args[key] = (self.scene, dual)
-                self._settle(frozen, self.scene, dual)
+                self.frozen_args[key] = (self.scene, dual, its)
+                self._settle(frozen, self.scene, dual, its)
             elif self.sensor_input:
                 scene = self.scene
-                frozen = dr.freeze(lambda sn, sd, n=spp, its=its: self.render_passes(scene, sn, its, n, sd),
+                frozen = dr.freeze(lambda sn, it_, sd, n=spp: self.render_passes(scene, sn, it_, n, sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
-                self.frozen_args[key] = (self.sensor,)
-                self._settle(frozen, self.sensor)
+                self.frozen_args[key] = (self.sensor, its)
+                self._settle(frozen, self.sensor, its)
             else:
-                frozen = dr.freeze(lambda scene, sd, n=spp, its=its: self.render_passes(scene, None, its, n, sd),
+                frozen = dr.freeze(lambda scene, it_, sd, n=spp: self.render_passes(scene, None, it_, n, sd),
                                    backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
-                self.frozen_args[key] = (self.scene,)
-                self._settle(frozen, self.scene)
+                self.frozen_args[key] = (self.scene, its)
+                self._settle(frozen, self.scene, its)
             self.frozen[key] = frozen  # listed by /v1/status only once both recordings are done
             ok = True
         progress.FREEZE.end(ok)
@@ -2569,13 +2983,13 @@ class Resident:
                 # the sensor and seed are arguments, not closure values: a frozen replay only sees updated
                 # slot poses on objects it receives as inputs (production keeps its batch sensor inside the scene)
                 self.frozen[fkey] = dr.freeze(
-                    lambda scene, sn, sd, n=int(spp), it=integrator:
+                    lambda scene, sn, it, sd, n=int(spp):
                     mi.render(scene, sensor=sn, integrator=it, spp=n, seed=sd),
                     backend=dr.JitBackend.CUDA, auto_opaque=False, warn_after=2)
-                self.frozen_args[fkey] = (self.scene, sensor)   # what _absorb replays it with, as the others
+                self.frozen_args[fkey] = (self.scene, sensor, integrator)   # what _absorb replays it with, as the others
                 self._prepare_inputs(sensor, integrator)
-                self._settle(self.frozen[fkey], self.scene, sensor)
-            img = self.frozen[fkey](self.scene, sensor, dr.opaque(mi.UInt32, int(seed)))
+                self._settle(self.frozen[fkey], self.scene, sensor, integrator)
+            img = self.frozen[fkey](self.scene, sensor, integrator, dr.opaque(mi.UInt32, int(seed)))
             img = np.array(self.intensity_lanes(img) if self.unpolarized and self.rgbn else img)
         w = int(width)
         return [img[:, i * w:(i + 1) * w] for i in range(k)]

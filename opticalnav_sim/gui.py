@@ -109,6 +109,7 @@ STILL_S = 0.06
 # picture denoised into blotches (the noise left is coarse and the network smooths it into flat patches); from 64 spp
 # on it is clean. Below, the raw mean is shown (fireflies held back).
 DENOISE_MIN_SPP = 64
+CYCLES_MAX_PASS_SPP = 512   # a Cycles call: ~38 ms of its own (session, scene sync, the EXR) + ~1.9 ms a sample at 512 x 384
 PANE_BANDS = ("rgb", "r", "g", "b", "nir")  # rgb: colour image, luminance polarization (the dataset's)
 PANE_VIEWS = ("img", "dolp", "aolp", "s1", "s2", "depth")  # depth: the same for every band
 _OLD_PANES = {"rgb": ("rgb", "img"), "dolp": ("rgb", "dolp"), "aolp": ("rgb", "aolp"), "s1": ("rgb", "s1"),
@@ -837,7 +838,9 @@ class Session:
         late on), at most ``max_pass_spp`` so a move is never behind a long pass, and not past ``target_spp``.
         A multiple of ``pass_spp`` (the server replays its 16 spp recording)."""
         base = self.pass_spp
-        want = base if self.spp_issued == 0 else min(self.max_pass_spp, self.spp_issued)
+        # Cycles: up to CYCLES_MAX_PASS_SPP a pass (each call costs ~38 ms besides its samples: fewer, larger calls)
+        top = max(self.max_pass_spp, CYCLES_MAX_PASS_SPP) if (getattr(self, "view", None) or {}).get("renderer") == "cycles" else self.max_pass_spp
+        want = base if self.spp_issued == 0 else min(top, self.spp_issued)
         want = max(base, want - want % base)
         left = self.target_spp - self.spp_issued
         return int(max(base, min(want, left - left % base))) if left >= base else int(base)
@@ -866,7 +869,9 @@ class Session:
                 # with the denoiser on, a new camera's first pass comes back denoised by the server in the same
                 # request (one denoiser run beside the render, no second trip queued behind the next passes): what a
                 # moving camera shows. It is for the screen only; the passes after it are accumulated raw, as before.
-                display = seed == 0 and self.sim.denoise and view.get("renderer", "path") == "path" and spp >= DENOISE_MIN_SPP
+                # Cycles: its own OptiX denoiser at any spp (16 spp denoised measured as clean as 256 raw on PH33: 0.29 s)
+                engine = view.get("renderer", "path")
+                display = seed == 0 and self.sim.denoise and ((engine == "path" and spp >= DENOISE_MIN_SPP) or engine == "cycles")
                 if display:
                     view["denoise"] = True
                 self.sent += 1

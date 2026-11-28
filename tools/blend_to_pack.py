@@ -1009,7 +1009,8 @@ def run_inside(cfg: dict) -> None:
 
     # ------------------------------------------------ lights (the importer's boxes: the server reads them as before)
     lights_xml: list[str] = []
-    for i, o in enumerate(o for o in scene.objects if o.type == "LIGHT" and not o.hide_render):
+    # a sun is the directional emitter below, not a box (its box glowed as a square where the sun object stood)
+    for i, o in enumerate(o for o in scene.objects if o.type == "LIGHT" and not o.hide_render and o.data.type != "SUN"):
         d = o.data
         W = np.array(o.matrix_world, dtype=np.float64)
         pos = L @ W[:3, 3] + T  # Mitsuba
@@ -1026,7 +1027,10 @@ def run_inside(cfg: dict) -> None:
                 "area_size_m": [float(d.size), float(d.size_y if d.shape in ("RECTANGLE", "ELLIPSE") else d.size)] if d.type == "AREA" else None,
                 "spread_deg": math.degrees(d.spread) if d.type == "AREA" else None,
                 "sun_angle_deg": math.degrees(d.angle) if d.type == "SUN" else None,
-                "use_shadow": bool(getattr(d, "use_shadow", True))}
+                "use_shadow": bool(getattr(d, "use_shadow", True)),
+                # the light's own axes in the scene's (Mitsuba) frame, columns x, y, z (it shines along -z): an area
+                # light's facing and in-plane turn, a spot's aim (server.area_rotation_xml, point_light_xml)
+                "basis": [[round(float(v), 6) for v in row] for row in (L @ W[:3, :3])]}
         radiance = [round(c * (1.0 + IMPORTER_WATTS * float(d.energy)), 5) for c in col]
         # a Blender light is not seen by the camera when its Ray Visibility > Camera is off (every light of PH19 and PH33): the
         # server's ``hidden`` prefix lets camera rays through such a box, which lights the room without a white square on the ceiling

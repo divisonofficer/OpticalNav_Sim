@@ -1167,7 +1167,8 @@ def test_unpaired_light_boxes_glow_at_blender_power_and_flat_whites_take_their_c
     assert 'value="0.5500 0.5200 0.4700"' in (scene / "base.xml").read_text()
 
 
-def test_an_unpaired_spot_light_is_a_small_disk_in_a_tube_that_cuts_its_cone():
+def test_an_unpaired_spot_light_is_a_small_disk_in_a_tube_that_cuts_its_cone(monkeypatch):
+    monkeypatch.setattr(server, "POINT_EMITTERS", False)   # the earlier stand-in (OPTICALNAV_POINT_EMITTERS=0)
     note = {"id": "light_18_blue_pool", "metadata": {"light": {
         "type": "SPOT", "energy": 1000.0, "color": [0.18, 0.38, 1.0], "position": [5.75, 28.15, 3.242],
         "direction": [0.0, 0.0, -1.0], "spot_size_deg": 58.0, "spot_blend": 0.9, "radius_m": 0.1}}}
@@ -1181,6 +1182,65 @@ def test_an_unpaired_spot_light_is_a_small_disk_in_a_tube_that_cuts_its_cone():
     assert math.isclose(3.242 - length, 2 * 0.1 / math.tan(math.radians(29.0)), rel_tol=1e-3)  # the tube hangs down to cut the cone
     radiance = [float(v) for v in re.search(r'name="radiance" value="([^"]+)"', out).group(1).split()]
     assert math.isclose(radiance[2], 1000.0 / (4 * math.pi ** 2 * math.pi * 0.01), rel_tol=1e-3) and radiance[0] < radiance[2]  # the light's colour
+
+
+_SPOT = {"type": "SPOT", "energy": 1000.0, "color": [0.18, 0.38, 1.0], "position": [5.75, 28.15, 3.242],
+         "direction": [0.0, 0.0, -1.0], "spot_size_deg": 58.0, "spot_blend": 0.9, "radius_m": 0.1}
+
+
+def _box(sid, radiance="1.8 3.8 10"):
+    return (f'\n  <shape type="rectangle" id="{sid}">\n    <transform name="to_world">\n      <scale x="0.300000" y="0.300000" />\n'
+            '      <rotate x="1" angle="90" />\n      <translate x="5.75" y="3.28" z="28.15" />\n    </transform>\n    <emitter type="area">\n'
+            f'      <rgb name="radiance" value="{radiance}" />\n    </emitter>\n  </shape>')
+
+
+def test_a_blender_spot_becomes_mitsubas_spot_at_its_intensity_cone_and_aim():
+    """Not a square, not a disk in a tube: Mitsuba's spot, energy / 4 pi W/sr (watt_gain pi), the cone's half angle as
+    the cutoff, the ramp starting where Cycles' smoothstep edge (spot_blend) reaches full, aimed along the light."""
+    out = server.boxes_at_blender_power("<scene>" + _box("light_18_blue_pool") + "\n</scene>",
+                                        [{"id": "light_18_blue_pool", "metadata": {"light": dict(_SPOT)}}], math.pi)
+    m = server.DELTA_LIGHT.search(out)
+    assert m and m.group(1) == "spot" and m.group(2) == "light_18_blue_pool" and "<shape" not in out
+    rgb = [float(v) for v in re.search(r'name="intensity" value="([^"]+)"', out).group(1).split()]
+    assert math.isclose(rgb[2], 1000.0 / (4 * math.pi), rel_tol=1e-4) and math.isclose(rgb[0] / rgb[2], 0.18, rel_tol=1e-3)
+    assert float(re.search(r'name="cutoff_angle" value="([^"]+)"', out).group(1)) == 29.0
+    c = math.cos(math.radians(29.0))
+    beam = float(re.search(r'name="beam_width" value="([^"]+)"', out).group(1))
+    assert math.isclose(math.cos(math.radians(beam)), c + (1 - c) * 0.9, rel_tol=1e-4)
+    o = [float(v) for v in re.search(r'origin="([^"]+)"', out).group(1).split(",")]
+    t = [float(v) for v in re.search(r'target="([^"]+)"', out).group(1).split(",")]
+    assert o == [5.75, 3.242, 28.15] and np.allclose(np.subtract(t, o), [0, -1, 0])   # plan (x, y, up) -> (x, up, y), down
+    # it loads, and its intensity goes behind the per-band levels as an area light's radiance does
+    banded = server.band_lights_text(out, {}, {})
+    assert '<texture name="intensity" type="bandscale">' in banded and 'id="light_rgb_fixture"' in banded
+
+
+def test_point_lights_and_a_sun_box():
+    point = dict(_SPOT, type="POINT", radius_m=0.0, spot_size_deg=None, energy=100.0)
+    out = server.boxes_at_blender_power("<scene>" + _box("light_1_p") + "\n</scene>",
+                                        [{"id": "light_1_p", "metadata": {"light": point}}], math.pi)
+    assert '<emitter type="point" id="light_1_p">' in out and 'x="5.750000" y="3.242000" z="28.150000"' in out
+    ball = dict(point, radius_m=0.05)   # Cycles 4's sphere light: radiance x pi r^2 = the point's intensity
+    out = server.boxes_at_blender_power("<scene>" + _box("light_1_p") + "\n</scene>",
+                                        [{"id": "light_1_p", "metadata": {"light": ball}}], math.pi)
+    rad = float(re.search(r'name="radiance" value="([^"]+)"', out).group(1).split()[2])
+    assert '<shape type="sphere" id="light_1_p">' in out and math.isclose(rad * math.pi * 0.05 ** 2, 100 / (4 * math.pi), rel_tol=1e-3)
+    sun = {"type": "SUN", "energy": 3.0, "color": [1, 1, 1], "position": [0, 0, 9], "direction": [0, 0, -1]}
+    scene = '<scene>\n  <emitter type="directional">\n  </emitter>' + _box("light_2_sun") + "\n</scene>"
+    assert 'id="light_2_sun"' not in server.boxes_at_blender_power(scene, [{"id": "light_2_sun", "metadata": {"light": sun}}])
+
+
+def test_an_area_light_faces_its_own_way():
+    """A wall washer (shining along +x) turns its rectangle to face +x; one shining down keeps the converter's turn."""
+    assert server.area_rotation_xml({"direction": [0.0, 0.0, -1.0]}) is None
+    m = np.array([float(v) for v in re.search(r'value="([^"]+)"', server.area_rotation_xml({"direction": [1.0, 0.0, 0.0]}))
+                  .group(1).split()]).reshape(4, 4)
+    assert np.allclose(m[:3, 2], [1, 0, 0]) and np.isclose(np.linalg.det(m[:3, :3]), 1.0)
+    # from the converter's basis (columns: the light's x, y, z in the scene's frame; it shines along -z)
+    b = np.stack([[1.0, 0, 0], [0, 0, -1.0], [0, 1.0, 0]], 1)   # its z is the scene's +y: it shines down
+    m = np.array([float(v) for v in re.search(r'value="([^"]+)"', server.area_rotation_xml({"basis": b.tolist()}))
+                  .group(1).split()]).reshape(4, 4)
+    assert np.allclose(m[:3, 2], [0, -1, 0]) and np.allclose(m[:3, 0], b[:, 0])
 
 
 def test_viewer_passes_double_the_running_total():

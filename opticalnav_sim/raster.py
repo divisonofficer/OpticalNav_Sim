@@ -41,6 +41,7 @@ are the ones the path tracer sees.
 from __future__ import annotations
 
 import math
+import re
 import time
 from types import SimpleNamespace
 
@@ -75,6 +76,7 @@ WINDOW_INSET = 0.3  # m: a window's light sits this far into the room (see _cube
 GRAZE = 0.1        # a light whose cosine with the surface's own normal is below this fades out (see _lights)
 NEAR, FAR = 0.05, 200.0
 SHADOW_NEAR, SHADOW_FAR = 0.02, 100.0
+DELTA_AREA = 0.01   # m^2: the small disk or sphere a point or spot light (no shape) is drawn as
 NIR_WEIGHTS = (0.229, 0.587, 0.114)     # rgb2nir's pseudo near-infrared (robomituba's pseudo_nir_albedo)
 LUMA = (0.2126, 0.7152, 0.0722)         # an RGBN variant's near-infrared lane of a plain colour
 PLASTIC_F0 = 0.04
@@ -636,10 +638,18 @@ class RasterScene:
     def _build_lights(self) -> None:
         """The scene's indoor emitters (shape index -> light index), their radiance and levels' keys."""
         r = self.resident
-        self.light_shape, self.light_le, self.light_level = [], [], []
+        self.light_shape, self.light_le, self.light_level = [], [], []   # light_shape: each light's shapes
         shape_light = np.full(len(self.shapes), -1, np.int64)
+        of_name: dict = {}
         for i, (s, sid) in enumerate(zip(self.shapes, self.shape_ids)):
             if s.emitter() is None:
+                continue
+            # the pieces of a long light mesh (server.split_emitter_meshes: "<id>__e<k>", for the path tracer's light
+            # samples) are one light here: a cube shadow map each, PH33's 251 pieces ran the GPU out of memory
+            whole = re.sub(r"__e\d+$", "", sid)
+            if whole != sid and whole in of_name:
+                shape_light[i] = of_name[whole]
+                self.light_shape[of_name[whole]].append(i)
                 continue
             # the emitter's own parameters: the scene's traverse lists a radiance texture shared by several
             # emitters (equal ones are merged on loading) under the first of them only
@@ -651,8 +661,26 @@ class RasterScene:
             le = np.resize(np.array(ps[key], dtype=np.float32).ravel(), 3)
             group = r.groups.get(sid, "fixture")
             shape_light[i] = len(self.light_shape)
-            self.light_shape.append(i)
+            of_name[whole] = len(self.light_shape)
+            self.light_shape.append([i])
             self.light_le.append(le)
+            self.light_level.append((f"light_rgb_{group}", f"light_nir_{group}_{r.classes.get(sid, 'led')}"))
+        # point and spot lights (server.point_light_xml): no shape; a small disk facing the spot's axis (its cosine in
+        # place of the cone) or a small sphere for a point, at the light's intensity
+        from .server import delta_light_place
+        self.delta_place = {}   # light index -> (position, axis or None)
+        for e in r.scene.emitters():
+            place = delta_light_place(self.mi, e)
+            ps = self.mi.traverse(e) if place is not None else {}
+            key = next((k for k in ("intensity.nested.value", "intensity.value") if k in ps), None)
+            if key is None:
+                continue
+            intensity = np.resize(np.array(ps[key], dtype=np.float32).ravel(), 3)
+            sid, group = e.id(), r.groups.get(e.id(), "fixture")
+            self.delta_place[len(self.light_shape)] = (place[0], place[1])
+            self.light_shape.append([])
+            # a disk's intensity on its axis is L A, a sphere's L A / 4
+            self.light_le.append(intensity * (1.0 if place[1] is not None else 4.0) / DELTA_AREA)
             self.light_level.append((f"light_rgb_{group}", f"light_nir_{group}_{r.classes.get(sid, 'led')}"))
         self.shape_light = torch.as_tensor(shape_light, device=self.dev)
         self.cubes, self.cube_made = None, set()  # cube shadow maps (_cubes)
@@ -663,11 +691,20 @@ class RasterScene:
         emitters, then the windows (``_windows``)."""
         starts = np.concatenate([[0], np.cumsum(self.counts)])
         cs, areas, ns, flat = [], [], [], []
-        for i in self.light_shape:
-            s = self.shapes[i]
-            p = self.pos_h[starts[i]:starts[i + 1], :3]
-            f = torch.from_dlpack(s.faces_buffer()).view(-1, 3).long()
-            a, b, c = p[f[:, 0]], p[f[:, 1]], p[f[:, 2]]
+        for li, members in enumerate(self.light_shape):
+            if not members:   # a point or spot light (_build_lights)
+                pos, axis = self.delta_place[li]
+                cs.append(torch.as_tensor(np.asarray(pos, np.float32), device=self.dev))
+                ns.append(torch.as_tensor(np.asarray(axis if axis is not None else [0.0, -1.0, 0.0], np.float32), device=self.dev))
+                areas.append(DELTA_AREA)
+                flat.append(axis is not None)
+                continue
+            tri = []
+            for i in members:
+                p = self.pos_h[starts[i]:starts[i + 1], :3]
+                tri.append(p[torch.from_dlpack(self.shapes[i].faces_buffer()).view(-1, 3).long()])
+            tri = torch.cat(tri)
+            a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
             cr = torch.cross(b - a, c - a, dim=1)
             area = 0.5 * cr.norm(dim=1)
             total = float(area.sum())
